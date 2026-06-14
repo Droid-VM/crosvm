@@ -15,7 +15,6 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Context;
-use base::debug;
 use base::error;
 use base::FromRawDescriptor;
 use base::IntoRawDescriptor;
@@ -29,6 +28,7 @@ use rutabaga_gfx::ResourceCreate3D;
 use rutabaga_gfx::ResourceCreateBlob;
 use rutabaga_gfx::Rutabaga;
 use rutabaga_gfx::RutabagaDescriptor;
+#[cfg(windows)]
 use rutabaga_gfx::RutabagaError;
 use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFromRawDescriptor;
@@ -381,7 +381,6 @@ impl VirtioGpuScanout {
         display: &Rc<RefCell<GpuDisplay>>,
         resource: &mut VirtioGpuResource,
         rutabaga: &mut Rutabaga,
-        mem: &GuestMemory,
     ) -> VirtioGpuResult {
         let surface_id = match self.surface_id {
             Some(id) => id,
@@ -420,108 +419,7 @@ impl VirtioGpuScanout {
             // SAFETY: trivially safe
             unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
         );
-
-        let transfer_ok = rutabaga
-            .transfer_read(0, resource.resource_id, transfer, Some(buf))
-            .is_ok();
-
-        if transfer_ok {
-            // Check if the transferred data is all zeros (possible GL readback failure).
-            // If so and we have backing memory, prefer that instead.
-            let all_zero = unsafe {
-                let ptr = fb_slice.as_ptr();
-                let len = fb_slice.size();
-                // Sample several positions to check for non-zero data.
-                let positions = [
-                    0,
-                    len / 4,
-                    len / 2,
-                    len * 3 / 4,
-                    len.saturating_sub(4),
-                ];
-                positions.iter().all(|&p| {
-                    p + 4 <= len && {
-                        let val = std::ptr::read_unaligned(ptr.add(p) as *const u32);
-                        // Mask off alpha channel (byte 3) for BGRX format
-                        val & 0x00FFFFFF == 0
-                    }
-                })
-            };
-            if all_zero && resource.backing_iovecs.is_some() {
-            } else {
-                display.flip(surface_id);
-                return Ok(OkNoData);
-            }
-        }
-
-        // transfer_read failed or returned blank data.
-        // Fall back to reading pixel data from guest backing memory directly.
-        {
-            if let Some(ref backing_iovecs) = resource.backing_iovecs {
-                let bpp = 4usize;
-                let src_stride = resource.width as usize * bpp;
-                let dst_stride = fb.stride() as usize;
-                let copy_w = std::cmp::min(self.width as usize * bpp, src_stride);
-                let mut src_offset = 0usize;
-                let mut nonzero_pixels = 0u32;
-                for &(addr, len) in backing_iovecs.iter() {
-                    let src_slice =
-                        mem.get_slice_at_addr(addr, len).map_err(|_| ErrUnspec)?;
-                    // SAFETY: src_slice is valid for the lifetime of this function.
-                    let src_bytes = unsafe {
-                        std::slice::from_raw_parts(src_slice.as_ptr(), src_slice.size())
-                    };
-                    let mut pos = 0;
-                    while pos < src_bytes.len() {
-                        let row = src_offset / src_stride;
-                        if row >= self.height as usize {
-                            break;
-                        }
-                        let col = src_offset % src_stride;
-                        let avail = std::cmp::min(src_bytes.len() - pos, src_stride - col);
-                        if col < copy_w {
-                            let n = std::cmp::min(avail, copy_w - col);
-                            let dst_off = row * dst_stride + col;
-                            if dst_off + n <= fb_slice.size() {
-                                // SAFETY: bounds checked above.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        src_bytes.as_ptr().add(pos),
-                                        fb_slice.as_mut_ptr().add(dst_off),
-                                        n,
-                                    );
-                                }
-                                // Sample a pixel from the copied data for diagnostics.
-                                if nonzero_pixels < 10 && n >= 4 {
-                                    let val = unsafe {
-                                        std::ptr::read_unaligned(
-                                            src_bytes.as_ptr().add(pos) as *const u32,
-                                        )
-                                    };
-                                    if val & 0x00FFFFFF != 0 {
-                                        nonzero_pixels += 1;
-                                    }
-                                }
-                            }
-                        }
-                        pos += avail;
-                        src_offset += avail;
-                    }
-                }
-                if nonzero_pixels == 0 {
-                    debug!(
-                        "backing memory also all zeros for resource {} ({}x{})",
-                        resource.resource_id, resource.width, resource.height
-                    );
-                }
-            } else {
-                if !transfer_ok {
-                    return Err(ErrUnspec);
-                }
-                // transfer_read succeeded but data was all zeros and no backing.
-                // Still flip the (empty) data.
-            }
-        }
+        rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
 
         display.flip(surface_id);
         Ok(OkNoData)
@@ -866,16 +764,14 @@ impl VirtioGpu {
     }
 
     /// If the resource is the scanout resource, flush it to the display.
-    pub fn flush_resource(&mut self, resource_id: u32, mem: &GuestMemory) -> VirtioGpuResult {
+    pub fn flush_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
         if resource_id == 0 {
             return Ok(OkNoData);
         }
 
+        #[cfg(windows)]
         match self.rutabaga.resource_flush(resource_id) {
-            Ok(_) => {
-                #[cfg(windows)]
-                return Ok(OkNoData);
-            }
+            Ok(_) => return Ok(OkNoData),
             Err(RutabagaError::Unsupported) => {}
             Err(e) => return Err(ErrRutabaga(e)),
         }
@@ -891,22 +787,14 @@ impl VirtioGpu {
             None => return Ok(OkNoData),
         };
 
-        let mut flushed = false;
         for scanout in self.scanouts.values_mut() {
             if scanout.resource_id == resource_id {
-                scanout.flush(&self.display, resource, &mut self.rutabaga, mem)?;
-                flushed = true;
+                scanout.flush(&self.display, resource, &mut self.rutabaga)?;
             }
-        }
-        if !flushed {
-            debug!(
-                "flush_resource: resource {:?} did not match any scanout",
-                resource_id,
-            );
         }
         if self.cursor_scanout.resource_id == resource_id {
             self.cursor_scanout
-                .flush(&self.display, resource, &mut self.rutabaga, mem)?;
+                .flush(&self.display, resource, &mut self.rutabaga)?;
         }
 
         Ok(OkNoData)
@@ -920,13 +808,12 @@ impl VirtioGpu {
         scanout_id: u32,
         x: u32,
         y: u32,
-        mem: &GuestMemory,
     ) -> VirtioGpuResult {
         self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
 
         self.cursor_scanout.set_position(&self.display, x, y)?;
 
-        self.flush_resource(resource_id, mem)
+        self.flush_resource(resource_id)
     }
 
     /// Moves the cursor's position to the given coordinates.
@@ -1206,44 +1093,25 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = match self.rutabaga.map_info(resource_id) {
-            Ok(info) => info,
-            Err(e) => {
-                error!("resource_map_blob: map_info failed for resource {}: {}", resource_id, e);
-                return Err(ErrUnspec);
-            }
-        };
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
 
         let mut source: Option<VmMemorySource> = None;
-        match self.rutabaga.export_blob(resource_id) {
-            Ok(export) => {
-                debug!(
-                    "resource_map_blob: export_blob OK for resource {}, handle_type=0x{:x}, size={}",
-                    resource_id, export.handle_type, resource.size
-                );
-                if let Ok(vulkan_info) = self.rutabaga.vulkan_info(resource_id) {
-                    source = Some(VmMemorySource::Vulkan {
-                        descriptor: to_safe_descriptor(export.os_handle),
-                        handle_type: export.handle_type,
-                        memory_idx: vulkan_info.memory_idx,
-                        device_uuid: vulkan_info.device_id.device_uuid,
-                        driver_uuid: vulkan_info.device_id.driver_uuid,
-                        size: resource.size,
-                    });
-                } else if export.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
-                    source = Some(VmMemorySource::Descriptor {
-                        descriptor: to_safe_descriptor(export.os_handle),
-                        offset: 0,
-                        size: resource.size,
-                    });
-                } else {
-                    debug!(
-                        "resource_map_blob: handle_type is MEM_OPAQUE_FD, cannot use Descriptor source"
-                    );
-                }
-            }
-            Err(e) => {
-                debug!("resource_map_blob: export_blob failed for resource {}: {}", resource_id, e);
+        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
+            if let Ok(vulkan_info) = self.rutabaga.vulkan_info(resource_id) {
+                source = Some(VmMemorySource::Vulkan {
+                    descriptor: to_safe_descriptor(export.os_handle),
+                    handle_type: export.handle_type,
+                    memory_idx: vulkan_info.memory_idx,
+                    device_uuid: vulkan_info.device_id.device_uuid,
+                    driver_uuid: vulkan_info.device_id.driver_uuid,
+                    size: resource.size,
+                });
+            } else if export.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
+                source = Some(VmMemorySource::Descriptor {
+                    descriptor: to_safe_descriptor(export.os_handle),
+                    offset: 0,
+                    size: resource.size,
+                });
             }
         }
 
@@ -1251,40 +1119,23 @@ impl VirtioGpu {
         // mapping are both disabled as neither is currently compatible.
         if source.is_none() {
             if self.external_blob || self.fixed_blob_mapping {
-                error!(
-                    "resource_map_blob: no source and external_blob={} fixed_blob_mapping={}, cannot fallback",
-                    self.external_blob, self.fixed_blob_mapping
-                );
                 return Err(ErrUnspec);
             }
 
-            match self.rutabaga.map(resource_id) {
-                Ok(mapping) => {
-                    debug!(
-                        "resource_map_blob: ExternalMapping fallback, ptr={:?} size={}",
-                        mapping.ptr, mapping.size
-                    );
-                    resource.rutabaga_external_mapping = true;
-                    source = Some(VmMemorySource::ExternalMapping {
-                        ptr: mapping.ptr,
-                        size: mapping.size,
-                    });
-                }
-                Err(e) => {
-                    error!("resource_map_blob: rutabaga.map() failed: {}", e);
-                    return Err(ErrRutabaga(e));
-                }
-            }
+            let mapping = self.rutabaga.map(resource_id)?;
+            // resources mapped via rutabaga must also be marked for unmap via rutabaga.
+            resource.rutabaga_external_mapping = true;
+            source = Some(VmMemorySource::ExternalMapping {
+                ptr: mapping.ptr,
+                size: mapping.size,
+            });
         };
 
         let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
             RUTABAGA_MAP_ACCESS_READ => Protection::read(),
             RUTABAGA_MAP_ACCESS_WRITE => Protection::write(),
             RUTABAGA_MAP_ACCESS_RW => Protection::read_write(),
-            _ => {
-                error!("resource_map_blob: invalid access mask 0x{:x}", map_info);
-                return Err(ErrUnspec);
-            }
+            _ => return Err(ErrUnspec),
         };
 
         let cache = if cfg!(feature = "noncoherent-dma")
@@ -1295,15 +1146,12 @@ impl VirtioGpu {
             MemCacheType::CacheCoherent
         };
 
-        if let Err(e) = self.mapper
+        self.mapper
             .lock()
             .as_mut()
             .expect("No backend request connection found")
             .add_mapping(source.unwrap(), offset, prot, cache)
-        {
-            error!("resource_map_blob: add_mapping failed at offset 0x{:x}: {:#}", offset, e);
-            return Err(ErrUnspec);
-        }
+            .map_err(|_| ErrUnspec)?;
 
         resource.shmem_offset = Some(offset);
         // Access flags not a part of the virtio-gpu spec.
@@ -1463,18 +1311,11 @@ impl VirtioGpu {
         match scanout_type {
             SurfaceType::Cursor => {
                 if let Some(scanout_parent_surface_id) = scanout_parent_surface_id {
-                    match scanout.create_surface(
+                    scanout.create_surface(
                         &self.display,
                         Some(scanout_parent_surface_id),
                         scanout_rect,
-                    ) {
-                        Ok(_) => {}
-                        Err(ErrDisplay(GpuDisplayError::Unsupported)) => {
-                            // Display doesn't support cursor subsurfaces (e.g. VNC).
-                            return Ok(OkNoData);
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    )?;
                 }
             }
             SurfaceType::Scanout => {
@@ -1498,24 +1339,6 @@ impl VirtioGpu {
         self.rutabaga
             .suspend()
             .context("failed to suspend rutabaga")
-    }
-
-    /// Clears all GPU resources and scanout bindings.
-    /// Called on device reset so the next driver starts with a clean state.
-    pub fn reset_state(&mut self) {
-        let resource_ids: Vec<u32> = self.resources.keys().copied().collect();
-        for id in resource_ids {
-            if let Some(resource) = self.resources.remove(&id) {
-                if resource.rutabaga_external_mapping {
-                    let _ = self.rutabaga.unmap(id);
-                }
-                let _ = self.rutabaga.unref_resource(id);
-            }
-        }
-        for scanout in self.scanouts.values_mut() {
-            scanout.resource_id = None;
-        }
-        self.cursor_scanout.resource_id = None;
     }
 
     pub fn snapshot(&self) -> anyhow::Result<VirtioGpuSnapshot> {
