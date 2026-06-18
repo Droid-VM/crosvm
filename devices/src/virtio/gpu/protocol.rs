@@ -528,7 +528,9 @@ pub struct virtio_gpu_resource_unmap_blob {
 pub struct virtio_gpu_resp_map_info {
     pub hdr: virtio_gpu_ctrl_hdr,
     pub map_info: Le32,
-    pub padding: u32,
+    // Was `padding`. On Gunyah, carries the resource-manager memparcel handle the guest must
+    // `gh_rm_mem_accept` to map the host-visible blob itself; 0 when not applicable.
+    pub gunyah_handle: Le32,
 }
 
 #[derive(Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -753,6 +755,8 @@ pub enum GpuResponse {
     },
     OkMapInfo {
         map_info: u32,
+        /// Gunyah memparcel handle for the guest to accept (0/None when not applicable).
+        gunyah_handle: Option<u32>,
     },
     ErrUnspec,
     ErrTube(TubeError),
@@ -806,7 +810,7 @@ impl Display for GpuResponse {
             OkEdid(_) => write!(f, "ok edid"),
             OkResourcePlaneInfo { .. } => write!(f, "ok resource plane info"),
             OkResourceUuid { .. } => write!(f, "ok resource uuid"),
-            OkMapInfo { map_info } => write!(f, "ok map info: {}", map_info),
+            OkMapInfo { map_info, .. } => write!(f, "ok map info: {}", map_info),
             ErrUnspec => write!(f, "unspecified error"),
             ErrTube(e) => write!(f, "tube error: {}", e),
             ErrBase(e) => write!(f, "base error: {}", e),
@@ -957,11 +961,14 @@ impl GpuResponse {
                 resp.write_obj(resp_info)?;
                 size_of_val(&resp_info)
             }
-            GpuResponse::OkMapInfo { map_info } => {
+            GpuResponse::OkMapInfo {
+                map_info,
+                gunyah_handle,
+            } => {
                 let resp_info = virtio_gpu_resp_map_info {
                     hdr,
                     map_info: Le32::from(map_info),
-                    padding: Default::default(),
+                    gunyah_handle: Le32::from(gunyah_handle.unwrap_or(0)),
                 };
 
                 resp.write_obj(resp_info)?;

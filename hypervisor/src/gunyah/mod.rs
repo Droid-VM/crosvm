@@ -25,6 +25,7 @@ use base::errno_result;
 use base::error;
 use base::info;
 use base::ioctl;
+use base::ioctl_with_mut_ref;
 use base::ioctl_with_ref;
 use base::ioctl_with_val;
 use base::pagesize;
@@ -147,13 +148,21 @@ unsafe fn set_user_memory_region(
     vm: &SafeDescriptor,
     slot: MemSlot,
     read_only: bool,
+    allow_exec: bool,
     guest_addr: u64,
     memory_size: u64,
     userspace_addr: *mut u8,
 ) -> Result<()> {
     let mut flags = 0;
 
-    flags |= GH_MEM_ALLOW_READ | GH_MEM_ALLOW_EXEC;
+    // In protected VMs, SHARE'd memory (GH_VM_SET_USER_MEM_REGION) cannot be made executable —
+    // requesting GH_MEM_ALLOW_EXEC prevents Gunyah from creating valid stage-2 mappings, so the
+    // guest faults (SIGBUS) on access. Only LEND'd memory gets exec at stage-2. Host-visible
+    // virtio-gpu blobs (gfxstream ASG rings) are data-only and must be SHARE'd without exec.
+    flags |= GH_MEM_ALLOW_READ;
+    if allow_exec {
+        flags |= GH_MEM_ALLOW_EXEC;
+    }
     if !read_only {
         flags |= GH_MEM_ALLOW_WRITE;
     }
@@ -218,6 +227,24 @@ pub struct GunyahIrqRoute {
     level: bool,
 }
 
+/// Selects how host-visible virtio-gpu blobs (gfxstream RingBlob / ASG rings) are mapped into
+/// the guest. Set via `--hypervisor "gunyah[blob_mode=...]"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GunyahBlobMode {
+    /// Host SHAREs the blob and returns the RM memparcel handle; the guest accepts it into its
+    /// own stage-2 with `gh_rm_mem_accept`. Required on host kernels that do NOT push a runtime
+    /// SHARE into a *protected* guest's stage-2 (the device's 6.1 mainline gunyah). Needs the
+    /// host `GH_VM_ANDROID_SHARE_BLOB` ioctl + the guest-side accept path.
+    #[default]
+    GuestAccept,
+    /// Plain `add_memory_region`: a runtime `GH_VM_SET_USER_MEM_REGION` SHARE with EEXIST-reuse —
+    /// the qemu-android-gunyah path. The guest never accepts (handle is `None`); it relies on the
+    /// host kernel itself mapping the runtime SHARE into the running guest's stage-2 (6.6 vendor
+    /// kernels with addrspace_map/memextent_donate). No custom ioctl, no guest-kernel change.
+    HostShare,
+}
+
 pub struct GunyahVm {
     gh: Gunyah,
     vm: SafeDescriptor,
@@ -227,8 +254,20 @@ pub struct GunyahVm {
     mem_regions: Arc<Mutex<BTreeMap<MemSlot, (Box<dyn MappedRegion>, GuestAddress)>>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
     mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
+    /// Host mappings whose slots were "removed" at runtime but must be kept alive.
+    ///
+    /// Gunyah SHARE mappings (used for host-visible virtio-gpu blobs) are permanent and
+    /// cannot be safely unshared, so we never munmap the host backing nor recycle the slot.
+    /// See `remove_memory_region`.
+    pinned_regions: Arc<Mutex<Vec<Box<dyn MappedRegion>>>>,
+    /// Host backings for runtime-shared virtio-gpu blobs, keyed by label (BAR page).
+    /// Re-sharing a label drops the previous backing (host already reclaimed it),
+    /// so this does not grow with blob map/unmap churn.
+    blob_regions: Arc<Mutex<BTreeMap<u32, Box<dyn MappedRegion>>>>,
     routes: Arc<Mutex<HashSet<GunyahIrqRoute>>>,
     hv_cfg: crate::Config,
+    /// How host-visible virtio-gpu blobs are mapped into the guest (see [`GunyahBlobMode`]).
+    blob_mode: GunyahBlobMode,
 }
 
 impl AsRawDescriptor for GunyahVm {
@@ -238,7 +277,7 @@ impl AsRawDescriptor for GunyahVm {
 }
 
 impl GunyahVm {
-    pub fn new(gh: &Gunyah, vm_id: Option<u16>, pas_id: Option<u32>, guest_mem: GuestMemory, cfg: Config) -> Result<GunyahVm> {
+    pub fn new(gh: &Gunyah, vm_id: Option<u16>, pas_id: Option<u32>, guest_mem: GuestMemory, cfg: Config, blob_mode: GunyahBlobMode) -> Result<GunyahVm> {
         // SAFETY:
         // Safe because we know gunyah is a real gunyah fd as this module is the only one that can
         // make Gunyah objects.
@@ -361,6 +400,9 @@ impl GunyahVm {
                         &vm_descriptor,
                         region.index as MemSlot,
                         false,
+                        // SHARE'd memory is executable only in non-protected VMs (where guest RAM
+                        // itself is SHARE'd). In protected VMs these are data-only regions.
+                        !cfg.protection_type.isolates_memory(),
                         region.guest_addr.offset(),
                         region.size.try_into().unwrap(),
                         region.host_addr as *mut u8,
@@ -368,6 +410,15 @@ impl GunyahVm {
                 }
             }
         }
+
+        warn!(
+            "GUNYAH-BLOB-MODE: {}",
+            match blob_mode {
+                GunyahBlobMode::GuestAccept => "guest-accept (host SHARE + guest mem_accept)",
+                GunyahBlobMode::HostShare =>
+                    "host-share (qemu-style runtime SET_USER_MEM_REGION SHARE)",
+            }
+        );
 
         Ok(GunyahVm {
             gh: gh.try_clone()?,
@@ -377,8 +428,11 @@ impl GunyahVm {
             guest_mem,
             mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
             mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
+            pinned_regions: Arc::new(Mutex::new(Vec::new())),
+            blob_regions: Arc::new(Mutex::new(BTreeMap::new())),
             routes: Arc::new(Mutex::new(HashSet::new())),
             hv_cfg: cfg,
+            blob_mode,
         })
     }
 
@@ -511,8 +565,11 @@ impl GunyahVm {
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
+            pinned_regions: self.pinned_regions.clone(),
+            blob_regions: self.blob_regions.clone(),
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
+            blob_mode: self.blob_mode,
         })
     }
 
@@ -620,8 +677,11 @@ impl Vm for GunyahVm {
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
+            pinned_regions: self.pinned_regions.clone(),
+            blob_regions: self.blob_regions.clone(),
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
+            blob_mode: self.blob_mode,
         })
     }
 
@@ -659,6 +719,76 @@ impl Vm for GunyahVm {
         &self.guest_mem
     }
 
+    fn supports_blob_share(&self) -> bool {
+        // `guest-accept` routes blobs through `share_blob` (host SHARE + guest mem_accept);
+        // `host-share` falls back to `add_memory_region` (qemu-style runtime SHARE, no accept).
+        self.blob_mode == GunyahBlobMode::GuestAccept
+    }
+
+    /// Runtime-SHARE a host blob to the running guest and return the resource-manager memparcel
+    /// handle. Unlike `add_memory_region` (which SHARE's but never reaches a protected guest's
+    /// stage-2 -> SIGBUS), this exposes the handle so the guest can `gh_rm_mem_accept` it itself
+    /// at `guest_addr`. The host keeps access (SHARE), as gfxstream host-visible blobs require.
+    /// The backing is pinned for the VM's lifetime (SHARE is permanent).
+    fn share_blob(
+        &mut self,
+        guest_addr: GuestAddress,
+        mem_region: Box<dyn MappedRegion>,
+        read_only: bool,
+    ) -> Result<u32> {
+        let pgsz = pagesize() as u64;
+        let size = (mem_region.size() as u64 + pgsz - 1) / pgsz * pgsz;
+
+        // Deterministic label per BAR page: the same GPA reused over time (blobs are
+        // mapped/freed at the same host-visible BAR offsets) maps to the same label, so the
+        // host kernel reclaims the stale parcel before re-sharing the new backing. Distinct
+        // concurrent blobs sit at distinct GPAs -> distinct labels (no false collision).
+        let label = (guest_addr.offset() >> 12) as u32;
+
+        // Host-visible blobs are data-only: READ|WRITE, never EXEC.
+        let mut flags = GH_MEM_ALLOW_READ;
+        if !read_only {
+            flags |= GH_MEM_ALLOW_WRITE;
+        }
+
+        // The runtime-SHARE ioctl is served by the out-of-tree `gunyah_share_mod` module via its
+        // own `/dev/gunyah_share` char device (the in-tree gh_vm_ioctl has no such case), so the
+        // gunyah VM fd is passed as a request field rather than as the ioctl target.
+        let share_dev = File::open("/dev/gunyah_share")
+            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+
+        let mut blob = ghsm_share_blob {
+            vm_fd: self.vm.as_raw_descriptor(),
+            label,
+            flags,
+            mem_handle: 0,
+            guest_phys_addr: guest_addr.offset(),
+            memory_size: size,
+            userspace_addr: mem_region.as_ptr() as u64,
+        };
+
+        // SAFETY: the ioctl reads the request and writes back mem_handle into `blob`; the return
+        // value is checked.
+        let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_BLOB, &mut blob) };
+        if ret != 0 {
+            return errno_result();
+        }
+
+        // Keep the host backing mapped while the parcel is shared, keyed by label. The host
+        // kernel already reclaimed+unpinned the previous parcel for this label, so dropping the
+        // old crosvm mapping here is safe and bounds RSS under blob map/unmap churn.
+        let old = self.blob_regions.lock().insert(label, mem_region);
+        drop(old);
+        warn!(
+            "GUNYAH-SHARE-BLOB: gpa=0x{:x} size=0x{:x} label={} handle=0x{:x}",
+            guest_addr.offset(),
+            size,
+            label,
+            blob.mem_handle,
+        );
+        Ok(blob.mem_handle)
+    }
+
     fn add_memory_region(
         &mut self,
         guest_addr: GuestAddress,
@@ -685,12 +815,29 @@ impl Vm for GunyahVm {
             None => (regions.len() + self.guest_mem.num_regions() as usize) as MemSlot,
         };
 
+        // Diagnostic: log what we are about to SHARE. (Do not read the mapping here — for the
+        // SingleMappingOnFirst BAR arena it is PROT_NONE until blobs are mapped into it.)
+        warn!(
+            "GUNYAH-ADD: slot={} gpa=0x{:x} share_size=0x{:x} region_size=0x{:x} hva={:p} exec={} ro={}",
+            slot,
+            guest_addr.offset(),
+            size,
+            mem_region.size(),
+            mem_region.as_ptr(),
+            !self.hv_cfg.protection_type.isolates_memory(),
+            read_only,
+        );
+
         // SAFETY: safe because memory is not modified and the return value is checked.
         let res = unsafe {
             set_user_memory_region(
                 &self.vm,
                 slot,
                 read_only,
+                // Host-visible virtio-gpu blobs (gfxstream ASG rings) are SHARE'd data — never
+                // executable. In protected VMs, requesting exec on SHARE'd memory breaks the
+                // stage-2 mapping and the guest SIGBUSes on access.
+                !self.hv_cfg.protection_type.isolates_memory(),
                 guest_addr.offset(),
                 size,
                 mem_region.as_ptr(),
@@ -699,24 +846,22 @@ impl Vm for GunyahVm {
 
         let res = if let Err(ref e) = res {
             if e.errno() == EEXIST {
+                // Gunyah workaround: this GPA was already SHARE'd and a Gunyah SHARE is
+                // permanent. This happens when the guest re-maps a host-visible virtio-gpu
+                // blob at a BAR offset that was used before. We must NOT fall back to
+                // android_lend here: LEND would hand the pages to the guest exclusively, so
+                // the host (gfxstream) could no longer see them. Instead, treat EEXIST as a
+                // successful re-use of the existing SHARE. The backing physical pages stay
+                // stable because gfxstream pins RingBlob memory (GFXSTREAM_GUNYAH_PIN_RINGBLOB),
+                // so the existing SHARE already points at the correct pages.
                 warn!(
-                    "Gunyah set_user_memory_region failed with EEXIST for slot {} \
-                     at GPA 0x{:x} size 0x{:x}, trying android_lend fallback",
+                    "Gunyah set_user_memory_region returned EEXIST for slot {} \
+                     at GPA 0x{:x} size 0x{:x}; reusing existing SHARE",
                     slot,
                     guest_addr.offset(),
                     size,
                 );
-                // SAFETY: safe because memory is not modified and the return value is checked.
-                unsafe {
-                    android_lend_user_memory_region(
-                        &self.vm,
-                        slot,
-                        read_only,
-                        guest_addr.offset(),
-                        size,
-                        mem_region.as_ptr(),
-                    )
-                }
+                Ok(())
             } else {
                 res
             }
@@ -728,6 +873,12 @@ impl Vm for GunyahVm {
             gaps.push(Reverse(slot));
             return Err(e);
         }
+        warn!(
+            "GUNYAH-ADD: SHARE established slot={} gpa=0x{:x} size=0x{:x}",
+            slot,
+            guest_addr.offset(),
+            size,
+        );
         regions.insert(slot, (mem_region, guest_addr));
         Ok(slot)
     }
@@ -764,28 +915,29 @@ impl Vm for GunyahVm {
 
     fn remove_memory_region(&mut self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
         let mut regions = self.mem_regions.lock();
-        let guest_addr = match regions.get(&slot) {
-            Some((_, addr)) => addr.offset(),
-            None => return Err(Error::new(ENOENT)),
-        };
-        // SAFETY:
-        // Safe because the slot is checked against the list of memory slots.
-        // Passing memory_size=0 signals the hypervisor to remove the region.
-        let res = unsafe {
-            set_user_memory_region(
-                &self.vm,
-                slot,
-                false,
-                guest_addr,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        if let Err(e) = res {
-            warn!("Gunyah remove_memory_region ioctl failed for slot {}: {}", slot, e);
-        }
-        self.mem_slot_gaps.lock().push(Reverse(slot));
-        Ok(regions.remove(&slot).unwrap().0)
+        let (region, guest_addr) = regions.remove(&slot).ok_or_else(|| Error::new(ENOENT))?;
+
+        // Gunyah workaround: a Gunyah SHARE is permanent and cannot be reliably unshared.
+        // Removing it and later re-SHARE'ing a different physical page at the same GPA makes
+        // the guest read stale data. So instead of unsharing, we:
+        //   * skip the memory_size=0 ioctl (it does not reliably unshare on Gunyah),
+        //   * keep the host mapping alive forever so its pages are never munmap'd (the
+        //     gfxstream-side RingBlob backing is likewise pinned), and
+        //   * do NOT recycle the slot, so a later mapping is given a fresh slot/GPA.
+        // The caller is handed a tiny placeholder mapping to satisfy the API; dropping it is
+        // harmless and does not affect the still-active SHARE.
+        warn!(
+            "Gunyah: not unsharing slot {} (GPA 0x{:x}); keeping host mapping alive \
+             (SHARE is permanent)",
+            slot,
+            guest_addr.offset(),
+        );
+        self.pinned_regions.lock().push(region);
+
+        let placeholder = MemoryMappingBuilder::new(pagesize())
+            .build()
+            .map_err(|_| Error::new(EINVAL))?;
+        Ok(Box::new(placeholder))
     }
 
     fn create_device(&self, _kind: DeviceKind) -> Result<SafeDescriptor> {

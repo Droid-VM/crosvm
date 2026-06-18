@@ -1096,22 +1096,40 @@ impl VirtioGpu {
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
 
         let mut source: Option<VmMemorySource> = None;
-        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
-            if let Ok(vulkan_info) = self.rutabaga.vulkan_info(resource_id) {
-                source = Some(VmMemorySource::Vulkan {
-                    descriptor: to_safe_descriptor(export.os_handle),
-                    handle_type: export.handle_type,
-                    memory_idx: vulkan_info.memory_idx,
-                    device_uuid: vulkan_info.device_id.device_uuid,
-                    driver_uuid: vulkan_info.device_id.driver_uuid,
-                    size: resource.size,
-                });
-            } else if export.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
-                source = Some(VmMemorySource::Descriptor {
-                    descriptor: to_safe_descriptor(export.os_handle),
-                    offset: 0,
-                    size: resource.size,
-                });
+        match self.rutabaga.export_blob(resource_id) {
+            Ok(export) => {
+                let has_vk = self.rutabaga.vulkan_info(resource_id).is_ok();
+                base::warn!(
+                    "GPU-MAPBLOB: res={} export OK handle_type=0x{:x} vulkan_info={} offset={}",
+                    resource_id,
+                    export.handle_type,
+                    has_vk,
+                    offset,
+                );
+                if let Ok(vulkan_info) = self.rutabaga.vulkan_info(resource_id) {
+                    source = Some(VmMemorySource::Vulkan {
+                        descriptor: to_safe_descriptor(export.os_handle),
+                        handle_type: export.handle_type,
+                        memory_idx: vulkan_info.memory_idx,
+                        device_uuid: vulkan_info.device_id.device_uuid,
+                        driver_uuid: vulkan_info.device_id.driver_uuid,
+                        size: resource.size,
+                    });
+                } else if export.handle_type != RUTABAGA_HANDLE_TYPE_MEM_OPAQUE_FD {
+                    source = Some(VmMemorySource::Descriptor {
+                        descriptor: to_safe_descriptor(export.os_handle),
+                        offset: 0,
+                        size: resource.size,
+                    });
+                }
+            }
+            Err(e) => {
+                base::warn!(
+                    "GPU-MAPBLOB: res={} export_blob ERR {:?} offset={}",
+                    resource_id,
+                    e,
+                    offset,
+                );
             }
         }
 
@@ -1146,22 +1164,34 @@ impl VirtioGpu {
             MemCacheType::CacheCoherent
         };
 
-        self.mapper
+        let gunyah_handle = self
+            .mapper
             .lock()
             .as_mut()
             .expect("No backend request connection found")
-            .add_mapping(source.unwrap(), offset, prot, cache)
+            .add_mapping_blob(source.unwrap(), offset, prot, cache)
             .map_err(|_| ErrUnspec)?;
 
         resource.shmem_offset = Some(offset);
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+            // On Gunyah, the guest must accept this memparcel handle to map the blob itself.
+            gunyah_handle,
         })
     }
 
     /// Uses the hypervisor to unmap the blob resource.
     pub fn resource_unmap_blob(&mut self, resource_id: u32) -> VirtioGpuResult {
+        // Gunyah workaround (mirrors qemu-android-gunyah rutabaga_cmd_resource_unmap_blob):
+        // a Gunyah SHARE is permanent and cannot be re-pointed, so do NOT tear down the mapping.
+        // Keep the blob SHARE'd and the BAR offset occupied forever; the guest kernel still
+        // processes the UNMAP response and frees the GPA on its side. gfxstream keeps the
+        // RingBlob memory pinned (GFXSTREAM_GUNYAH_PIN_RINGBLOB).
+        if std::env::var_os("GFXSTREAM_GUNYAH_PIN_RINGBLOB").is_some() {
+            return Ok(OkNoData);
+        }
+
         let resource = self
             .resources
             .get_mut(&resource_id)

@@ -78,15 +78,38 @@ impl VmAArch64 for GunyahVm {
         memory_node.set_prop("#address-cells", 2u32)?;
         memory_node.set_prop("#size-cells", 2u32)?;
 
-        let mut base_set = false;
+        // The gunyah-vm-config/memory node defines the VM's IPA layout
+        // [base-address, base-address + size-max). Gunyah only builds stage-2
+        // mappings (and generates MMIO exits) for IPAs WITHIN this layout;
+        // accesses outside cause stage-2 aborts injected into the guest (SIGBUS).
+        //
+        // base-address MUST stay at the primary GuestMemoryRegion (PHYS_MEM_START):
+        // for --protected-vm-without-firmware crosvm emits no firmware-address, so
+        // the Gunyah RM uses base-address to locate the guest kernel (loaded there).
+        // Setting it to 0 makes the RM fail to find the kernel -> VM init fails with
+        // ENODEV ("No such device") and never starts.
+        //
+        // Previously crosvm set NO size-max, so the layout did not extend past RAM
+        // and the host-visible virtio-gpu BAR (placed just above RAM in the 64-bit
+        // PCI MMIO window, see aarch64 get_system_allocator_config) fell outside it:
+        // the runtime SHARE was accepted by the ioctl but never mapped into the guest
+        // stage-2 -> guest SIGBUS on the gfxstream ASG ring. Extend size-max to cover
+        // RAM plus the high-MMIO window above it (>= 2 GiB headroom, minimum 4 GiB),
+        // keeping the BAR inside the layout.
+        const GIB: u64 = 1 << 30;
+        let mut base_address: Option<u64> = None;
+        let mut ram_top: u64 = 0;
         let mut firmware_set = false;
         for region in self.guest_mem.regions() {
+            let region_end = region.guest_addr.offset() + region.size as u64;
+            if region_end > ram_top {
+                ram_top = region_end;
+            }
             match region.options.purpose {
                 MemoryRegionPurpose::GuestMemoryRegion => {
-                    // Assume first GuestMemoryRegion contains the payload
-                    if !base_set {
-                        base_set = true;
-                        memory_node.set_prop("base-address", region.guest_addr.offset())?;
+                    // Assume the first GuestMemoryRegion contains the payload.
+                    if base_address.is_none() {
+                        base_address = Some(region.guest_addr.offset());
                     }
                 }
                 MemoryRegionPurpose::ProtectedFirmwareRegion => {
@@ -101,6 +124,17 @@ impl VmAArch64 for GunyahVm {
                 _ => {}
             }
         }
+
+        // Keep base-address at the payload region (see comment above). size-max is
+        // the layout *length* from base: cover RAM (ram_top - base) plus >= 2 GiB of
+        // headroom for the high-MMIO window placed just above RAM, rounded up to a
+        // GiB, with a 4 GiB minimum. This guarantees the host-visible GPU BAR (at
+        // ~ram_top + platform_mmio, within ~1 GiB of RAM end) stays inside the layout.
+        let base_address = base_address.unwrap_or(0);
+        let span = ram_top.saturating_sub(base_address) + 2 * GIB;
+        let size_max = core::cmp::max(span.next_multiple_of(GIB), 4 * GIB);
+        memory_node.set_prop("base-address", base_address)?;
+        memory_node.set_prop("size-max", size_max)?;
 
         let interrupts_node = top_node.subnode_mut("interrupts")?;
         interrupts_node.set_prop("config", *phandles.get("intc").unwrap())?;
@@ -129,6 +163,18 @@ impl VmAArch64 for GunyahVm {
             let interrupts = [GIC_FDT_IRQ_TYPE_SPI, irq.irq, interrupt_type];
             bell_node.set_prop("interrupts", &interrupts)?;
         }
+
+        // PROBE: declare an rm-rpc vdevice so RM builds a RM<->guest message-queue
+        // pair and generates /hypervisor/qcom,resource-mgr (compatible
+        // "gunyah-resource-manager") in the guest DT with reg = <tx_capid rx_capid>.
+        // Format mirrors Qualcomm kalama/monaco-vm.dtsi. This validates whether RM
+        // will grant rm-rpc to this protected VM; if VM_START fails here, RM is
+        // rejecting it. (No console-dev, to avoid disturbing the guest console.)
+        let rm_node = vdev_node.subnode_mut("rm-rpc")?;
+        rm_node.set_prop("vdevice-type", "rm-rpc")?;
+        rm_node.set_prop("generate", "/hypervisor/qcom,resource-mgr")?;
+        rm_node.set_prop("message-size", 0xf0u32)?;
+        rm_node.set_prop("queue-depth", 0x8u32)?;
 
         for region in self.guest_mem.regions() {
             let create_shm_node = match region.options.purpose {

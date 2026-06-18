@@ -36,6 +36,11 @@ pub enum HypervisorKind {
         device: Option<PathBuf>,
         qcom_trusted_vm_id: Option<u16>,
         qcom_trusted_vm_pas_id: Option<u32>,
+        /// How host-visible virtio-gpu blobs are mapped into the guest. `guest-accept` (default)
+        /// SHAREs + has the guest accept; `host-share` uses a plain runtime SHARE (qemu style)
+        /// for host kernels that map it into the running guest themselves.
+        #[serde(default)]
+        blob_mode: hypervisor::gunyah::GunyahBlobMode,
     },
 }
 
@@ -623,6 +628,7 @@ mod tests {
                 device: None,
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
+                blob_mode: hypervisor::gunyah::GunyahBlobMode::GuestAccept,
             })
         );
     }
@@ -644,6 +650,7 @@ mod tests {
                 device: Some(PathBuf::from("/not/default")),
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
+                blob_mode: hypervisor::gunyah::GunyahBlobMode::GuestAccept,
             })
         );
     }
@@ -665,6 +672,29 @@ mod tests {
                 device: Some(PathBuf::from("/not/default")),
                 qcom_trusted_vm_id: Some(0),
                 qcom_trusted_vm_pas_id: Some(0),
+                blob_mode: hypervisor::gunyah::GunyahBlobMode::GuestAccept,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+    fn hypervisor_gunyah_blob_mode() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &["--hypervisor", "gunyah[blob_mode=host-share]", "/dev/null"],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        assert_eq!(
+            config.hypervisor,
+            Some(HypervisorKind::Gunyah {
+                device: None,
+                qcom_trusted_vm_id: None,
+                qcom_trusted_vm_pas_id: None,
+                blob_mode: hypervisor::gunyah::GunyahBlobMode::HostShare,
             })
         );
     }

@@ -586,6 +586,17 @@ pub enum VmMemoryRequest {
         /// Cache attribute for guest memory setting
         cache: MemCacheType,
     },
+    /// Like `RegisterMemory`, but for a host-visible virtio-gpu blob. On a hypervisor that
+    /// supports blob-sharing (Gunyah), this SHARE's the blob and returns the memparcel handle
+    /// for the guest to accept itself (instead of mapping it into the guest's stage-2, which a
+    /// protected guest cannot receive at runtime). On other hypervisors it falls back to a
+    /// normal memory registration and returns no handle.
+    RegisterMemoryForBlob {
+        source: VmMemorySource,
+        dest: VmMemoryDestination,
+        prot: Protection,
+        cache: MemCacheType,
+    },
     #[cfg(any(target_os = "android", target_os = "linux"))]
     /// Call mmap to `shm` and register the memory region as a read-only guest memory.
     /// This request is followed by an array of `VmMemoryFileMapping` with length
@@ -824,6 +835,104 @@ impl VmMemoryRequest {
                     .insert(region_id, RegisteredMemory::DynamicMapping { slot });
                 VmMemoryResponse::RegisterMemory { region_id, slot }
             }
+            RegisterMemoryForBlob {
+                source,
+                dest,
+                prot,
+                cache,
+            } => {
+                if vm.supports_blob_share() {
+                    // Gunyah: SHARE the blob and return the handle for the guest to accept
+                    // itself. We do NOT map it into the guest (a protected guest cannot receive
+                    // a runtime stage-2 mapping from the host -> SIGBUS). The host backing is
+                    // pinned by the hypervisor (SHARE is permanent), so no removable region is
+                    // tracked here. Prepared regions are never used on Gunyah (DynamicPerMapping).
+                    let (mapped_region, size, _descriptor) = match source.map(gralloc, prot) {
+                        Ok(v) => v,
+                        Err(e) => return VmMemoryResponse::Err(e),
+                    };
+                    let guest_addr = match dest.allocate(sys_allocator, size) {
+                        Ok(addr) => addr,
+                        Err(e) => return VmMemoryResponse::Err(e),
+                    };
+                    let region_id = VmMemoryRegionId(guest_addr);
+                    return match vm.share_blob(
+                        guest_addr,
+                        mapped_region,
+                        prot == Protection::read(),
+                    ) {
+                        Ok(handle) => VmMemoryResponse::RegisterMemoryForBlob {
+                            region_id,
+                            slot: 0,
+                            gunyah_handle: Some(handle),
+                        },
+                        Err(e) => VmMemoryResponse::Err(e),
+                    };
+                }
+
+                // Other hypervisors: behave exactly like RegisterMemory, just in the blob
+                // response shape (no handle).
+                if let Some(resp) =
+                    try_map_to_prepared_region(vm, region_state, &source, &dest, &prot)
+                {
+                    return match resp {
+                        VmMemoryResponse::RegisterMemory { region_id, slot } => {
+                            VmMemoryResponse::RegisterMemoryForBlob {
+                                region_id,
+                                slot,
+                                gunyah_handle: None,
+                            }
+                        }
+                        other => other,
+                    };
+                }
+
+                let (mapped_region, size, descriptor) = match source.map(gralloc, prot) {
+                    Ok(v) => v,
+                    Err(e) => return VmMemoryResponse::Err(e),
+                };
+                let guest_addr = match dest.allocate(sys_allocator, size) {
+                    Ok(addr) => addr,
+                    Err(e) => return VmMemoryResponse::Err(e),
+                };
+                let slot = match vm.add_memory_region(
+                    guest_addr,
+                    mapped_region,
+                    prot == Protection::read(),
+                    false,
+                    cache,
+                ) {
+                    Ok(slot) => slot,
+                    Err(e) => return VmMemoryResponse::Err(e),
+                };
+                let region_id = VmMemoryRegionId(guest_addr);
+                if let (Some(descriptor), Some(iommu_client)) = (descriptor, iommu_client) {
+                    let request =
+                        VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDmabufMap {
+                            region_id,
+                            gpa: guest_addr.0,
+                            size,
+                            dma_buf: descriptor,
+                        });
+                    match virtio_iommu_request(&iommu_client.tube.lock(), &request) {
+                        Ok(VirtioIOMMUResponse::VfioResponse(VirtioIOMMUVfioResult::Ok)) => (),
+                        resp => {
+                            error!("Unexpected message response: {:?}", resp);
+                            let _ = vm.remove_memory_region(slot);
+                            return VmMemoryResponse::Err(SysError::new(EINVAL));
+                        }
+                    };
+                    iommu_client.registered_memory.insert(region_id);
+                }
+                region_state
+                    .registered_memory
+                    .insert(region_id, RegisteredMemory::DynamicMapping { slot });
+                VmMemoryResponse::RegisterMemoryForBlob {
+                    region_id,
+                    slot,
+                    gunyah_handle: None,
+                }
+            }
             #[cfg(any(target_os = "android", target_os = "linux"))]
             MmapAndRegisterMemory {
                 shm,
@@ -1030,6 +1139,14 @@ pub enum VmMemoryResponse {
     RegisterMemory {
         region_id: VmMemoryRegionId,
         slot: u32,
+    },
+    /// Response to `RegisterMemoryForBlob`. `gunyah_handle` is `Some` when the blob was
+    /// SHARE'd via the guest-accept path (Gunyah) and the guest must accept the handle; `None`
+    /// when it was registered normally.
+    RegisterMemoryForBlob {
+        region_id: VmMemoryRegionId,
+        slot: u32,
+        gunyah_handle: Option<u32>,
     },
     Ok,
     Err(SysError),

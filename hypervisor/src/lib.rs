@@ -178,6 +178,24 @@ pub trait Vm: Send {
         cache: MemCacheType,
     ) -> Result<MemSlot>;
 
+    /// Returns true if this hypervisor supports [`Vm::share_blob`] (Gunyah only). Used to route
+    /// host-visible virtio-gpu blobs to the guest-accept path instead of a normal memory region.
+    fn supports_blob_share(&self) -> bool {
+        false
+    }
+
+    /// Runtime-share a host blob to the guest and return a hypervisor-specific memparcel handle
+    /// that the guest accepts itself (to map the blob at `guest_addr` in its own stage-2). Only
+    /// meaningful when [`Vm::supports_blob_share`] is true (Gunyah); the default is unsupported.
+    fn share_blob(
+        &mut self,
+        _guest_addr: GuestAddress,
+        _mem_region: Box<dyn MappedRegion>,
+        _read_only: bool,
+    ) -> Result<u32> {
+        Err(base::Error::new(libc::ENOTSUP))
+    }
+
     /// Does a synchronous msync of the memory mapped at `slot`, syncing `size` bytes starting at
     /// `offset` from the start of the region.  `offset` must be page aligned.
     fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()>;

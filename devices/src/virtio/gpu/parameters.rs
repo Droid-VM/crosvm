@@ -121,6 +121,11 @@ impl Default for GpuParameters {
             // TODO(b/324649619): not yet fully compatible with other platforms (windows)
             // TODO(b/246334944): gfxstream may map vulkan opaque blobs directly (without vulkano),
             // so set the default to disabled when built with the gfxstream feature.
+            //
+            // Gunyah note: the SingleMappingOnFirst ("persistent BAR") path does NOT work — it
+            // SHAREs a BAR-sized PROT_NONE arena, which Gunyah rejects (no backing to pin). Keep
+            // DynamicPerMapping (per-blob SHARE), matching qemu-android-gunyah; each blob must be
+            // backed by an exportable memfd (see AcquireGunyahRingBlob -> CreateWithShmem).
             fixed_blob_mapping: cfg!(target_os = "linux") && !cfg!(feature = "gfxstream"),
             allow_implicit_render_server_exec: false,
             renderer_features: None,

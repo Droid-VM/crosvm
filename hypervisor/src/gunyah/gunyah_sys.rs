@@ -10,6 +10,7 @@
 
 use base::ioctl_io_nr;
 use base::ioctl_iow_nr;
+use base::ioctl_iowr_nr;
 
 // generated with gunyah_sys/bindgen.sh
 pub mod bindings;
@@ -53,6 +54,18 @@ ioctl_iow_nr!(
     0x12,
     gh_vm_firmware_config
 );
+// Runtime-share a host blob to the running guest and return the RM memparcel
+// handle. 0x14 (0x13 is GH_VM_RECLAIM_REGION below).
+ioctl_iowr_nr!(
+    GH_VM_ANDROID_SHARE_BLOB,
+    GH_ANDROID_IOCTL_TYPE,
+    0x14,
+    gh_vm_share_blob
+);
+// Out-of-tree `gunyah_share_mod` module ABI: GHSM_SHARE_BLOB on /dev/gunyah_share.
+// type 'G' (0x47), nr 0x14, struct ghsm_share_blob. See uapi_gunyah_share.h.
+pub const GHSM_IOCTL_TYPE: u8 = 0x47;
+ioctl_iowr_nr!(GHSM_SHARE_BLOB, GHSM_IOCTL_TYPE, 0x14, ghsm_share_blob);
 ioctl_iow_nr!(
     GH_VM_RECLAIM_REGION,
     GH_ANDROID_IOCTL_TYPE,

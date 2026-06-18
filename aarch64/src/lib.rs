@@ -580,17 +580,39 @@ impl arch::LinuxArch for AArch64 {
         // The platform MMIO region is immediately past the end of RAM.
         let plat_mmio_base = vm.get_memory().end_addr().offset();
         let plat_mmio_size = AARCH64_PLATFORM_MMIO_SIZE;
-        // Place the 64-bit PCI MMIO window above 4GiB so firmware does not see a
-        // single aperture that straddles the 32-bit boundary.
-        let high_mmio_base = (plat_mmio_base + plat_mmio_size).max(1u64 << 32);
-        let high_mmio_size = guest_phys_end
-            .checked_sub(high_mmio_base)
-            .unwrap_or_else(|| {
-                panic!(
-                    "guest_phys_end {:#x} < high_mmio_base {:#x}",
-                    guest_phys_end, high_mmio_base,
-                );
-            });
+
+        let (high_mmio_base, high_mmio_size) = if matches!(
+            vm.hypervisor_kind(),
+            HypervisorKind::Gunyah
+        ) {
+            // Gunyah only establishes guest stage-2 mappings for IPAs within the VM's IPA
+            // layout [base-address, base-address + size-max) declared in gunyah-vm-config
+            // (see GunyahVm::create_fdt). base-address is PHYS_MEM_START (it also locates the
+            // guest kernel), so the host-visible virtio-gpu BAR must sit ABOVE RAM and below
+            // the layout top — not in the normal >4GiB high-MMIO window (outside the layout)
+            // nor below PHYS_MEM_START. A BAR outside the layout is accepted by the SHARE
+            // ioctl but never gets a working stage-2 entry, so the guest SIGBUSes on access.
+            //
+            // Place the 64-bit PCI MMIO window immediately above the platform MMIO region
+            // (i.e. just above guest RAM). 1 GiB is ample for the gfxstream host-visible BAR
+            // plus other 64-bit BARs and stays well within size-max (which has >= 2 GiB of
+            // headroom above RAM).
+            let base = plat_mmio_base + plat_mmio_size;
+            (base, 1u64 << 30)
+        } else {
+            // Place the 64-bit PCI MMIO window above 4GiB so firmware does not see a
+            // single aperture that straddles the 32-bit boundary.
+            let high_mmio_base = (plat_mmio_base + plat_mmio_size).max(1u64 << 32);
+            let high_mmio_size = guest_phys_end
+                .checked_sub(high_mmio_base)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "guest_phys_end {:#x} < high_mmio_base {:#x}",
+                        guest_phys_end, high_mmio_base,
+                    );
+                });
+            (high_mmio_base, high_mmio_size)
+        };
         SystemAllocatorConfig {
             io: None,
             low_mmio: arch_memory_layout.pci_mem,

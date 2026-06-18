@@ -1930,6 +1930,7 @@ fn run_gunyah(
     device_path: Option<&Path>,
     qcom_trusted_vm_id: Option<u16>,
     qcom_trusted_vm_pas_id: Option<u32>,
+    blob_mode: hypervisor::gunyah::GunyahBlobMode,
     cfg: Config,
     components: VmComponents,
 ) -> Result<ExitState> {
@@ -1937,6 +1938,14 @@ fn run_gunyah(
     use hypervisor::gunyah::Gunyah;
     use hypervisor::gunyah::GunyahVcpu;
     use hypervisor::gunyah::GunyahVm;
+
+    // Gunyah workaround: tell the in-process gfxstream backend to permanently pin
+    // RingBlob backing memory so host-visible virtio-gpu blob pages stay stable
+    // across unmap/remap. Gunyah SHARE mappings are permanent and cannot be
+    // re-pointed at different physical pages for the same GPA, so the backing must
+    // never be freed/recycled. Set here, before any GPU/jail process is forked, so
+    // child processes inherit it (and before gfxstream reads it on first blob create).
+    std::env::set_var("GFXSTREAM_GUNYAH_PIN_RINGBLOB", "1");
 
     let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
     let gunyah = Gunyah::new_with_path(device_path)
@@ -1956,7 +1965,7 @@ fn run_gunyah(
         None
     };
 
-    let vm = GunyahVm::new(&gunyah, qcom_trusted_vm_id, qcom_trusted_vm_pas_id, guest_mem, components.hv_cfg).context("failed to create vm")?;
+    let vm = GunyahVm::new(&gunyah, qcom_trusted_vm_id, qcom_trusted_vm_pas_id, guest_mem, components.hv_cfg, blob_mode).context("failed to create vm")?;
 
     // Check that the VM was actually created in protected mode as expected.
     if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
@@ -2009,6 +2018,7 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
                 device: Some(gunyah_path.to_path_buf()),
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
+                blob_mode: hypervisor::gunyah::GunyahBlobMode::default(),
             });
         }
     }
@@ -2039,11 +2049,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         ))]
         HypervisorKind::Gunyah { device,
                                  qcom_trusted_vm_id,
-                                 qcom_trusted_vm_pas_id
+                                 qcom_trusted_vm_pas_id,
+                                 blob_mode,
                                } => run_gunyah(
                                         device.as_deref(),
                                         qcom_trusted_vm_id,
                                         qcom_trusted_vm_pas_id,
+                                        blob_mode,
                                         cfg, components),
     }
 }

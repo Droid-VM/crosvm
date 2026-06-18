@@ -50,6 +50,21 @@ pub trait SharedMemoryMapper: Send {
         cache: MemCacheType,
     ) -> Result<()>;
 
+    /// Maps a host-visible virtio-gpu blob into the shared memory region at |offset|. On a
+    /// blob-sharing hypervisor (Gunyah) this SHARE's the blob and returns the memparcel handle
+    /// the guest must accept to map it itself (returned `Some`). Otherwise it behaves like
+    /// `add_mapping` and returns `None`. The default falls back to `add_mapping`.
+    fn add_mapping_blob(
+        &mut self,
+        source: VmMemorySource,
+        offset: u64,
+        prot: Protection,
+        cache: MemCacheType,
+    ) -> Result<Option<u32>> {
+        self.add_mapping(source, offset, prot, cache)?;
+        Ok(None)
+    }
+
     /// Removes the mapping beginning at |offset|.
     fn remove_mapping(&mut self, offset: u64) -> Result<()>;
 

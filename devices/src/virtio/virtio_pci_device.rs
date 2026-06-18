@@ -1521,6 +1521,41 @@ impl SharedMemoryMapper for VmRequester {
         Ok(())
     }
 
+    fn add_mapping_blob(
+        &mut self,
+        source: VmMemorySource,
+        offset: u64,
+        prot: Protection,
+        cache: MemCacheType,
+    ) -> anyhow::Result<Option<u32>> {
+        if !self.prepared {
+            if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
+                self.prepare_type
+            {
+                self.vm_memory_client
+                    .prepare_shared_memory_region(self.alloc, prepare_cache_type)
+                    .context("lazy prepare_shared_memory_region failed")?;
+            }
+            self.prepared = true;
+        }
+
+        let (id, gunyah_handle) = self
+            .vm_memory_client
+            .register_memory_for_blob(
+                source,
+                VmMemoryDestination::ExistingAllocation {
+                    allocation: self.alloc,
+                    offset,
+                },
+                prot,
+                cache,
+            )
+            .context("register_memory_for_blob failed")?;
+
+        self.mappings.insert(offset, id);
+        Ok(gunyah_handle)
+    }
+
     fn remove_mapping(&mut self, offset: u64) -> anyhow::Result<()> {
         let id = self.mappings.remove(&offset).context("invalid offset")?;
         self.vm_memory_client

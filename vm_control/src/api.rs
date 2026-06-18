@@ -94,6 +94,32 @@ impl VmMemoryClient {
         }
     }
 
+    /// Register a host-visible virtio-gpu blob. Returns the region id plus, on a blob-sharing
+    /// hypervisor (Gunyah), the memparcel handle the guest must accept to map the blob itself.
+    pub fn register_memory_for_blob(
+        &self,
+        source: VmMemorySource,
+        dest: VmMemoryDestination,
+        prot: Protection,
+        cache: MemCacheType,
+    ) -> Result<(VmMemoryRegionId, Option<u32>)> {
+        let request = VmMemoryRequest::RegisterMemoryForBlob {
+            source,
+            dest,
+            prot,
+            cache,
+        };
+        match self.request(&request)? {
+            VmMemoryResponse::Err(e) => Err(ApiClientError::RequestFailed(e)),
+            VmMemoryResponse::RegisterMemoryForBlob {
+                region_id,
+                gunyah_handle,
+                ..
+            } => Ok((region_id, gunyah_handle)),
+            _other => Err(ApiClientError::UnexpectedResponse),
+        }
+    }
+
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub fn mmap_and_register_memory(
         &self,
