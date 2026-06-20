@@ -66,6 +66,8 @@ ioctl_iowr_nr!(
 // type 'G' (0x47), nr 0x14, struct ghsm_share_blob. See uapi_gunyah_share.h.
 pub const GHSM_IOCTL_TYPE: u8 = 0x47;
 ioctl_iowr_nr!(GHSM_SHARE_BLOB, GHSM_IOCTL_TYPE, 0x14, ghsm_share_blob);
+// GHSM_UNSHARE_BLOB on /dev/gunyah_share: reclaim a shared blob by label. nr 0x15.
+ioctl_iow_nr!(GHSM_UNSHARE_BLOB, GHSM_IOCTL_TYPE, 0x15, ghsm_unshare_blob);
 ioctl_iow_nr!(
     GH_VM_RECLAIM_REGION,
     GH_ANDROID_IOCTL_TYPE,

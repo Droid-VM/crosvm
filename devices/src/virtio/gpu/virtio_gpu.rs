@@ -1133,20 +1133,43 @@ impl VirtioGpu {
             }
         }
 
-        // fallback to ExternalMapping via rutabaga if sandboxing (hence external_blob) and fixed
-        // mapping are both disabled as neither is currently compatible.
+        // qemu-android-gunyah parity: when export_blob yields no usable OS handle (e.g. a
+        // ColorBuffer whose Vulkan memory this Adreno can't export as AHB/dmabuf), fall back to
+        // rutabaga's host-pointer mapping — exactly what qemu does for every blob
+        // (rutabaga_resource_map -> memory_region_init_ram_ptr(mapping.ptr)). This avoids the
+        // InvalidRutabagaHandle dead-end. ExternalMapping (a raw host VA) is only unsafe when the
+        // GPU device is sandboxed; this VM runs --disable-sandbox, so the pointer is valid in-proc.
+        // NOTE: the original gate returned ErrUnspec here when external_blob/fixed_blob_mapping
+        // were set; we deliberately relax it for the Gunyah + disable-sandbox configuration.
         if source.is_none() {
-            if self.external_blob || self.fixed_blob_mapping {
+            if self.fixed_blob_mapping {
                 return Err(ErrUnspec);
             }
 
-            let mapping = self.rutabaga.map(resource_id)?;
-            // resources mapped via rutabaga must also be marked for unmap via rutabaga.
-            resource.rutabaga_external_mapping = true;
-            source = Some(VmMemorySource::ExternalMapping {
-                ptr: mapping.ptr,
-                size: mapping.size,
-            });
+            match self.rutabaga.map(resource_id) {
+                Ok(mapping) => {
+                    base::warn!(
+                        "GPU-MAPBLOB: res={} export failed, fallback rutabaga.map() OK ptr=0x{:x} size={} (qemu host-ptr path)",
+                        resource_id,
+                        mapping.ptr,
+                        mapping.size,
+                    );
+                    // resources mapped via rutabaga must also be marked for unmap via rutabaga.
+                    resource.rutabaga_external_mapping = true;
+                    source = Some(VmMemorySource::ExternalMapping {
+                        ptr: mapping.ptr,
+                        size: mapping.size,
+                    });
+                }
+                Err(e) => {
+                    base::warn!(
+                        "GPU-MAPBLOB: res={} export failed AND rutabaga.map() ERR {:?} (not host-mappable)",
+                        resource_id,
+                        e,
+                    );
+                    return Err(ErrUnspec);
+                }
+            }
         };
 
         let prot = match map_info & RUTABAGA_MAP_ACCESS_MASK {
@@ -1183,15 +1206,12 @@ impl VirtioGpu {
 
     /// Uses the hypervisor to unmap the blob resource.
     pub fn resource_unmap_blob(&mut self, resource_id: u32) -> VirtioGpuResult {
-        // Gunyah workaround (mirrors qemu-android-gunyah rutabaga_cmd_resource_unmap_blob):
-        // a Gunyah SHARE is permanent and cannot be re-pointed, so do NOT tear down the mapping.
-        // Keep the blob SHARE'd and the BAR offset occupied forever; the guest kernel still
-        // processes the UNMAP response and frees the GPA on its side. gfxstream keeps the
-        // RingBlob memory pinned (GFXSTREAM_GUNYAH_PIN_RINGBLOB).
-        if std::env::var_os("GFXSTREAM_GUNYAH_PIN_RINGBLOB").is_some() {
-            return Ok(OkNoData);
-        }
-
+        // Gunyah: actually reclaim the SHARE'd blob now (instead of the old PIN no-op that left it
+        // shared forever). remove_mapping -> UnregisterMemory -> Vm::unshare_blob does the
+        // gh_rm_mem_reclaim. The guest's virtio-gpu driver releases its own stage-2 acceptance
+        // (gunyah_guest_mem_release) BEFORE sending this UNMAP, so the host-side reclaim here is
+        // safe and keeps the BAR offset free for clean reuse -- fixing the offset-0 mem_share
+        // EINVAL that the lazy overlap-reclaim caused by orphaning still-live parcels.
         let resource = self
             .resources
             .get_mut(&resource_id)

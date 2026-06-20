@@ -789,6 +789,35 @@ impl Vm for GunyahVm {
         Ok(blob.mem_handle)
     }
 
+    fn unshare_blob(&mut self, label: u32) -> Result<()> {
+        // The guest has unmapped this host-visible blob and (per the virtio-gpu guest driver)
+        // already released its own stage-2 acceptance, so it is now safe to reclaim the SHARE on
+        // the host side: the GHSM module does gh_rm_mem_reclaim + unpin and drops it from the VM's
+        // memory_mappings list. This keeps host and guest in sync so the BAR offset can be reused
+        // without colliding with a stale parcel (the old PIN no-op left it shared forever, forcing
+        // an unsafe lazy overlap-reclaim that orphaned still-live parcels -> mem_share EINVAL).
+        let share_dev = File::open("/dev/gunyah_share")
+            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+
+        let unshare = ghsm_unshare_blob {
+            vm_fd: self.vm.as_raw_descriptor(),
+            label,
+        };
+
+        // SAFETY: the ioctl only reads the request; the return value is checked.
+        let ret = unsafe { ioctl_with_ref(&share_dev, GHSM_UNSHARE_BLOB, &unshare) };
+        if ret != 0 {
+            // ENOENT just means it was already reclaimed (e.g. by a prior overlap) -- not fatal.
+            warn!("GUNYAH-UNSHARE-BLOB: label={} ioctl ret={}", label, ret);
+        } else {
+            warn!("GUNYAH-UNSHARE-BLOB: label={} reclaimed", label);
+        }
+
+        // Drop the host backing mapping we kept alive while shared.
+        self.blob_regions.lock().remove(&label);
+        Ok(())
+    }
+
     fn add_memory_region(
         &mut self,
         guest_addr: GuestAddress,

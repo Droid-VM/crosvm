@@ -847,13 +847,29 @@ impl VmMemoryRequest {
                     // a runtime stage-2 mapping from the host -> SIGBUS). The host backing is
                     // pinned by the hypervisor (SHARE is permanent), so no removable region is
                     // tracked here. Prepared regions are never used on Gunyah (DynamicPerMapping).
+                    let dbg_off = match &dest {
+                        VmMemoryDestination::ExistingAllocation { offset, .. } => *offset,
+                        VmMemoryDestination::GuestPhysicalAddress(gpa) => *gpa,
+                    };
                     let (mapped_region, size, _descriptor) = match source.map(gralloc, prot) {
                         Ok(v) => v,
-                        Err(e) => return VmMemoryResponse::Err(e),
+                        Err(e) => {
+                            warn!(
+                                "GUNYAH-BLOB-FAIL: source.map() ERR={:?} dest_off=0x{:x}",
+                                e, dbg_off,
+                            );
+                            return VmMemoryResponse::Err(e);
+                        }
                     };
                     let guest_addr = match dest.allocate(sys_allocator, size) {
                         Ok(addr) => addr,
-                        Err(e) => return VmMemoryResponse::Err(e),
+                        Err(e) => {
+                            warn!(
+                                "GUNYAH-BLOB-FAIL: dest.allocate() ERR={:?} dest_off=0x{:x} size=0x{:x}",
+                                e, dbg_off, size,
+                            );
+                            return VmMemoryResponse::Err(e);
+                        }
                     };
                     let region_id = VmMemoryRegionId(guest_addr);
                     return match vm.share_blob(
@@ -866,7 +882,15 @@ impl VmMemoryRequest {
                             slot: 0,
                             gunyah_handle: Some(handle),
                         },
-                        Err(e) => VmMemoryResponse::Err(e),
+                        Err(e) => {
+                            warn!(
+                                "GUNYAH-BLOB-FAIL: share_blob() ERR={:?} gpa=0x{:x} size=0x{:x}",
+                                e,
+                                guest_addr.offset(),
+                                size,
+                            );
+                            VmMemoryResponse::Err(e)
+                        }
                     };
                 }
 
@@ -1029,6 +1053,17 @@ impl VmMemoryRequest {
                     .insert(region_id, RegisteredMemory::DynamicMapping { slot });
 
                 VmMemoryResponse::RegisterMemory { region_id, slot }
+            }
+            UnregisterMemory(id) if vm.supports_blob_share() => {
+                // Gunyah: host-visible blobs aren't tracked in region_state (they're SHARE'd, not
+                // mapped as removable regions). The guest has unmapped this blob and released its
+                // stage-2 acceptance, so reclaim the SHARE by its deterministic label (gpa >> 12),
+                // freeing the BAR offset for clean reuse.
+                let label = (id.0.offset() >> 12) as u32;
+                match vm.unshare_blob(label) {
+                    Ok(()) => VmMemoryResponse::Ok,
+                    Err(e) => VmMemoryResponse::Err(e),
+                }
             }
             UnregisterMemory(id) => match region_state.registered_memory.remove(&id) {
                 Some(RegisteredMemory::DynamicMapping { slot }) => match vm

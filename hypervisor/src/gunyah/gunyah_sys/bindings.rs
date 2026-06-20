@@ -99,6 +99,14 @@ pub struct ghsm_share_blob {
     pub memory_size: u64,
     pub userspace_addr: u64,
 }
+/// Reclaim a blob previously shared via `GHSM_SHARE_BLOB`, by its label.
+/// Layout must match `struct ghsm_unshare_blob` in `uapi_gunyah_share.h` byte-for-byte.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct ghsm_unshare_blob {
+    pub vm_fd: i32,
+    pub label: u32,
+}
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct gh_vm_dtb_config {

@@ -196,6 +196,14 @@ pub trait Vm: Send {
         Err(base::Error::new(libc::ENOTSUP))
     }
 
+    /// Reclaim a blob previously shared with [`Vm::share_blob`], identified by its deterministic
+    /// label (`gpa >> 12`). Called when the guest unmaps a host-visible virtio-gpu blob, after it
+    /// has released its own stage-2 acceptance, so the host can drop the SHARE and free the BAR
+    /// offset for reuse. Only meaningful when [`Vm::supports_blob_share`] is true (Gunyah).
+    fn unshare_blob(&mut self, _label: u32) -> Result<()> {
+        Err(base::Error::new(libc::ENOTSUP))
+    }
+
     /// Does a synchronous msync of the memory mapped at `slot`, syncing `size` bytes starting at
     /// `offset` from the start of the region.  `offset` must be page aligned.
     fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()>;
