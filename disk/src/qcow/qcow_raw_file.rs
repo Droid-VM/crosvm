@@ -17,6 +17,12 @@ use base::VolatileSlice;
 use base::WriteZeroesAt;
 use zerocopy::IntoBytes;
 
+// Compressed-cluster and copied flags live in the parent `qcow` module. They are
+// needed here so `write_pointer_table` can avoid setting `OFLAG_COPIED` on
+// compressed L2 entries (which the qcow2 spec forbids).
+use super::CLUSTER_USED_FLAG;
+use super::COMPRESSED_FLAG;
+
 /// A qcow file. Allows reading/writing clusters and appending clusters.
 #[derive(Debug)]
 pub struct QcowRawFile {
@@ -66,7 +72,13 @@ impl QcowRawFile {
 
     /// Writes `table` of u64 pointers to `offset` in the file.
     /// `non_zero_flags` will be ORed with all non-zero values in `table`.
-    /// writing.
+    ///
+    /// Compressed cluster entries (bit 62 set) are written back verbatim: the
+    /// qcow2 spec forbids `OFLAG_COPIED` (bit 63) on compressed clusters, so
+    /// `non_zero_flags` (which carries `CLUSTER_USED_FLAG` = bit 63 at the L2
+    /// call sites) must not be applied to them. Their refcount semantics differ
+    /// from plain clusters and several compressed clusters may share one host
+    /// cluster, so the "copied" optimization does not apply.
     pub fn write_pointer_table(
         &mut self,
         offset: u64,
@@ -78,6 +90,11 @@ impl QcowRawFile {
         for addr in table {
             let val = if *addr == 0 {
                 0
+            } else if *addr & COMPRESSED_FLAG != 0 {
+                // Compressed entry: write the raw descriptor as-is. Strip any
+                // stray bit 63 that may have been ORed in by a prior buggy
+                // write, so we don't perpetuate the corruption.
+                *addr & !CLUSTER_USED_FLAG
             } else {
                 *addr | non_zero_flags
             };
