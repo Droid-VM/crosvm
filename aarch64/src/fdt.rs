@@ -774,6 +774,7 @@ pub fn create_fdt(
     use_pmu: bool,
     psci_version: PsciVersion,
     swiotlb: Option<(Option<GuestAddress>, u64)>,
+    gpu_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
     simplefb_cfg: Option<SimplefbDtConfig>,
@@ -830,6 +831,31 @@ pub fn create_fdt(
             None
         }
     };
+
+    // gfxstream host-visible blob arena: emit an (unattached) reserved-memory node covering the
+    // shmem BAR window. The Gunyah RM matches this node (by reg) to the lend=false memparcel
+    // registered before start (prepare_blob_arena) and blesses the range, so host-visible blobs
+    // aliased into the arena are reachable by the protected guest.
+    if let Some((gpa, size)) = gpu_resv {
+        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+        // Set parent props in case the swiotlb path did not create them (it normally does).
+        resv.set_prop("#address-cells", 0x2u32)?;
+        resv.set_prop("#size-cells", 0x2u32)?;
+        resv.set_prop("ranges", ())?;
+        let node = resv.subnode_mut(&format!("gpu_blob_reserved@{:x}", gpa))?;
+        node.set_prop("reg", &[gpa, size])?;
+        // The Gunyah RM blesses this range by matching THIS node's `reg` to the lend=false
+        // memparcel (vm_creation.c find_memparcel_for_resmem_node_by_address); it does NOT look at
+        // `compatible`. So emit a plain `no-map` reservation, NOT `restricted-dma-pool`:
+        // dynamic tracing of gunyah_gup_demand_page (2026-06-19) showed that with
+        // `restricted-dma-pool` the guest kernel EAGERLY initializes a DMA bounce pool here —
+        // zeroing the whole BAR GPA range during early boot — and then PSCI-resets, before it ever
+        // probes virtio/PCI (zero MMIO exits observed). `no-map` keeps the region out of the
+        // kernel's RAM/linear map (no eager init, no crash) while still letting the virtio-gpu
+        // driver ioremap the BAR on demand. The RM bless is preserved via `reg`.
+        node.set_prop("no-map", ())?;
+    }
+
     create_cpu_nodes(
         &mut fdt,
         num_cpus,

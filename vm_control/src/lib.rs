@@ -841,6 +841,45 @@ impl VmMemoryRequest {
                 prot,
                 cache,
             } => {
+                // Gunyah fixed-bless arena: if a boot-blessed host-visible blob arena exists,
+                // alias the blob's backing fd into it (host-local add_fd_mapping; NO runtime
+                // SHARE). The guest reaches it through the shmem BAR at the already-blessed GPA,
+                // so a protected guest's stage-2 accepts it (no SIGBUS).
+                if vm.blob_arena_gpa().is_some() {
+                    match &source {
+                        VmMemorySource::Descriptor {
+                            descriptor,
+                            offset,
+                            size,
+                        } => {
+                            let guest_addr = match dest.allocate(sys_allocator, *size) {
+                                Ok(a) => a,
+                                Err(e) => return VmMemoryResponse::Err(e),
+                            };
+                            return match vm.blob_fixed_map(
+                                guest_addr,
+                                descriptor,
+                                *offset,
+                                *size as usize,
+                                prot,
+                            ) {
+                                Ok(()) => VmMemoryResponse::RegisterMemoryForBlob {
+                                    region_id: VmMemoryRegionId(guest_addr),
+                                    slot: 0,
+                                    gunyah_handle: None,
+                                },
+                                Err(e) => VmMemoryResponse::Err(e),
+                            };
+                        }
+                        other => {
+                            error!(
+                                "blob_arena: source {} not supported for fixed-bless map",
+                                other
+                            );
+                            return VmMemoryResponse::Err(SysError::new(EINVAL));
+                        }
+                    }
+                }
                 if vm.supports_blob_share() {
                     // Gunyah: SHARE the blob and return the handle for the guest to accept
                     // itself. We do NOT map it into the guest (a protected guest cannot receive

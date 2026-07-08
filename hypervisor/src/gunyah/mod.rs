@@ -33,6 +33,7 @@ use base::warn;
 use base::Error;
 use base::FromRawDescriptor;
 use base::MemoryMapping;
+use base::MemoryMappingArena;
 use base::MemoryMappingBuilder;
 use base::MmapError;
 use base::RawDescriptor;
@@ -268,6 +269,11 @@ pub struct GunyahVm {
     hv_cfg: crate::Config,
     /// How host-visible virtio-gpu blobs are mapped into the guest (see [`GunyahBlobMode`]).
     blob_mode: GunyahBlobMode,
+    /// Boot-time "blessed" host-visible blob arena: (mem slot, base GPA). Registered before VM
+    /// start via `prepare_blob_arena` (SHARE + no-map reserved-memory node => the RM blesses the
+    /// range). Per-blob backing is aliased in later via `blob_fixed_map` (host-local
+    /// add_fd_mapping, no runtime SHARE). When set, this supersedes the share_blob path.
+    blob_arena: Arc<Mutex<Option<(MemSlot, u64)>>>,
 }
 
 impl AsRawDescriptor for GunyahVm {
@@ -433,6 +439,7 @@ impl GunyahVm {
             routes: Arc::new(Mutex::new(HashSet::new())),
             hv_cfg: cfg,
             blob_mode,
+            blob_arena: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -570,6 +577,7 @@ impl GunyahVm {
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
             blob_mode: self.blob_mode,
+            blob_arena: self.blob_arena.clone(),
         })
     }
 
@@ -682,6 +690,7 @@ impl Vm for GunyahVm {
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
             blob_mode: self.blob_mode,
+            blob_arena: self.blob_arena.clone(),
         })
     }
 
@@ -815,6 +824,71 @@ impl Vm for GunyahVm {
 
         // Drop the host backing mapping we kept alive while shared.
         self.blob_regions.lock().remove(&label);
+        Ok(())
+    }
+
+    fn blob_arena_gpa(&self) -> Option<u64> {
+        self.blob_arena.lock().as_ref().map(|&(_, gpa)| gpa)
+    }
+
+    fn prepare_blob_arena(&mut self, guest_addr: GuestAddress, size: u64) -> Result<()> {
+        if self.blob_arena.lock().is_some() {
+            return Ok(());
+        }
+        let pgsz = pagesize() as u64;
+        let size = (size + pgsz - 1) / pgsz * pgsz;
+        // Reserve a host VA arena for the whole BAR window and back it with anonymous pages.
+        // Gunyah refuses to SHARE a PROT_NONE region (the guest then hangs at start with no
+        // backing to map), so the arena must have real backing at SHARE time. Per-blob fds
+        // override sub-ranges later via blob_fixed_map -> add_fd_mapping (MAP_FIXED).
+        let mut arena = MemoryMappingArena::new(size as usize).map_err(|e| match e {
+            MmapError::SystemCallFailed(err) => err,
+            _ => Error::new(EINVAL),
+        })?;
+        arena.add_anon(0, size as usize).map_err(|e| match e {
+            MmapError::SystemCallFailed(err) => err,
+            _ => Error::new(EINVAL),
+        })?;
+        // lend=false (SHARE), no exec; established before GH_VM_START so the RM blesses the range.
+        let slot = self.add_memory_region(
+            guest_addr,
+            Box::new(arena),
+            false,
+            false,
+            MemCacheType::CacheCoherent,
+        )?;
+        *self.blob_arena.lock() = Some((slot, guest_addr.offset()));
+        warn!(
+            "GUNYAH-BLOB-ARENA: prepared slot={} gpa=0x{:x} size=0x{:x}",
+            slot,
+            guest_addr.offset(),
+            size,
+        );
+        Ok(())
+    }
+
+    fn blob_fixed_map(
+        &mut self,
+        guest_addr: GuestAddress,
+        fd: &dyn AsRawDescriptor,
+        fd_offset: u64,
+        size: usize,
+        prot: Protection,
+    ) -> Result<()> {
+        let (slot, base) = match *self.blob_arena.lock() {
+            Some(v) => v,
+            None => return Err(Error::new(EINVAL)),
+        };
+        let gpa = guest_addr.offset();
+        if gpa < base {
+            return Err(Error::new(EINVAL));
+        }
+        let offset = (gpa - base) as usize;
+        self.add_fd_mapping(slot, offset, size, fd, fd_offset, prot)?;
+        warn!(
+            "GUNYAH-BLOB-MAP: slot={} gpa=0x{:x} off=0x{:x} size=0x{:x}",
+            slot, gpa, offset, size,
+        );
         Ok(())
     }
 

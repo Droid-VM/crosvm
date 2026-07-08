@@ -366,6 +366,8 @@ pub enum Error {
     LoadElfKernel(kernel_loader::Error),
     #[error("failed to map arm pvtime memory: {0}")]
     MapPvtimeError(base::Error),
+    #[error("failed to prepare gpu blob arena: {0}")]
+    PrepareBlobArena(base::Error),
     #[error("pVM firmware could not be loaded: {0}")]
     PvmFwLoadFailure(base::Error),
     #[error("ramoops address is different from high_mmio_base: {0} vs {1}")]
@@ -1102,6 +1104,39 @@ impl arch::LinuxArch for AArch64 {
             timeout_sec: VMWDT_DEFAULT_TIMEOUT_SEC,
         };
 
+        // Locate the gfxstream host-visible shmem BAR (virtio shmem BAR index == 2), allocated
+        // during generate_pci_root. On Gunyah, register it as a boot-time blessed arena BEFORE the
+        // VM is started (create_fdt issues GH_VM_START) and emit a no-map reserved-memory node for
+        // it (gpu_resv). This lets a protected guest map host-visible blobs (the gfxstream ASG
+        // ring) at the BAR via host-local add_fd_mapping into the blessed arena, instead of a
+        // runtime SHARE whose stage-2 fault is never forwarded to the host (SIGBUS).
+        const VIRTIO_SHMEM_BAR_NUM: u8 = 2;
+        let gpu_resv: Option<(u64, u64)> = if vm
+            .get_hypervisor()
+            .check_capability(HypervisorCap::StaticSwiotlbAllocationRequired)
+        {
+            match system_allocator
+                .mmio_allocator_any()
+                .find_pci_bar(VIRTIO_SHMEM_BAR_NUM)
+            {
+                Some((_alloc, range)) => {
+                    let gpa = range.start;
+                    let size = range.len().unwrap_or(0);
+                    if size != 0 {
+                        vm.prepare_blob_arena(GuestAddress(gpa), size)
+                            .map_err(Error::PrepareBlobArena)?;
+                        base::warn!("GPU-RESV: blessed blob arena gpa={:#x} size={:#x}", gpa, size);
+                        Some((gpa, size))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+
         fdt::create_fdt(
             AARCH64_FDT_MAX_SIZE as usize,
             &mem,
@@ -1130,6 +1165,7 @@ impl arch::LinuxArch for AArch64 {
                     size,
                 )
             }),
+            gpu_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,
             components.simplefb.as_ref().map(|sfb| {

@@ -204,6 +204,35 @@ pub trait Vm: Send {
         Err(base::Error::new(libc::ENOTSUP))
     }
 
+    /// If a boot-time "blessed" host-visible blob arena was registered (Gunyah), returns its base
+    /// GPA. Host-visible virtio-gpu blob maps are then aliased into it via [`Vm::blob_fixed_map`]
+    /// instead of a runtime SHARE (which a protected guest's stage-2 rejects -> SIGBUS).
+    fn blob_arena_gpa(&self) -> Option<u64> {
+        None
+    }
+
+    /// Register a host-visible blob arena covering `[guest_addr, guest_addr+size)` BEFORE VM start,
+    /// as a `lend=false` (SHARE) memory region so the Gunyah RM blesses it (paired with a `no-map`
+    /// /reserved-memory node in the guest DTB). The arena starts as anonymous backing; per-blob
+    /// backing is filled in later by [`Vm::blob_fixed_map`]. Default: unsupported.
+    fn prepare_blob_arena(&mut self, _guest_addr: GuestAddress, _size: u64) -> Result<()> {
+        Err(base::Error::new(libc::ENOTSUP))
+    }
+
+    /// Alias a host-visible blob's backing fd into the blessed arena at `guest_addr` (a host-local
+    /// mmap; NO new hypervisor SHARE). The guest reaches it via the shmem BAR at the already-blessed
+    /// GPA. Only valid after [`Vm::prepare_blob_arena`]. Default: unsupported.
+    fn blob_fixed_map(
+        &mut self,
+        _guest_addr: GuestAddress,
+        _fd: &dyn AsRawDescriptor,
+        _fd_offset: u64,
+        _size: usize,
+        _prot: Protection,
+    ) -> Result<()> {
+        Err(base::Error::new(libc::ENOTSUP))
+    }
+
     /// Does a synchronous msync of the memory mapped at `slot`, syncing `size` bytes starting at
     /// `offset` from the start of the region.  `offset` must be page aligned.
     fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()>;
