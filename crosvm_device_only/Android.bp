@@ -1,0 +1,142 @@
+// Standalone device-only crosvm binary.
+//
+// Same source, same features and rustlibs as the main "crosvm" module, but
+// NOT apex_available (com.android.virt), so building it never pulls the
+// com.android.virt APEX (microdroid kernel/initrd/pvmfw/bootloader).
+//   build:    m crosvm_device_only_bin
+//   collect:  out/soong/.intermediates/external/crosvm/crosvm_device_only/
+//                        crosvm_device_only_bin/*/crosvm   (stem = "crosvm")
+package {
+    default_applicable_licenses: ["external_crosvm_license"],
+}
+
+rust_defaults {
+    name: "crosvm_device_defaults",
+    enabled: false,
+    target: {
+        android64: {
+            compile_multilib: "64",
+            enabled: true,
+        },
+    },
+    visibility: ["//external/crosvm/crosvm_device_only:__pkg__"],
+}
+
+rust_binary {
+    name: "crosvm_device_only_bin",
+    defaults: ["crosvm_device_defaults"],
+    host_supported: false,
+    installable: false,
+    prefer_rlib: true,
+    stem: "crosvm",
+    crate_name: "crosvm",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    crate_root: "//external/crosvm:crosvm_main_rs",
+    edition: "2021",
+    features: [
+        "android-sparse",
+        "android_display",
+        "android_display_stub",
+        "audio",
+        "audio_aaudio",
+        "balloon",
+        "config-file",
+        "fs_runtime_ugid_map",
+        "gdb",
+        "gdbstub",
+        "gdbstub_arch",
+        "geniezone",
+        "gfxstream",
+        "gpu",
+        "gpu_display",
+        "gunyah",
+        "libaaudio_stub",
+        "media",
+        "net",
+        "qcow",
+        "usb",
+        "virgl_renderer",
+        "vnc",
+    ],
+    rustlibs: [
+        "libacpi_tables",
+        "libandroid_audio",
+        "libanyhow",
+        "libarch",
+        "libargh",
+        "libaudio_streams",
+        "libbase_rust",
+        "libbit_field_crosvm",
+        "libbroker_ipc",
+        "libcfg_if",
+        "libcros_async",
+        "libcros_tracing",
+        "libcrosvm_cli",
+        "libdevices",
+        "libdisk",
+        "libext2",
+        "libgdbstub",
+        "libgdbstub_arch",
+        "libgpu_display",
+        "libhypervisor",
+        "libjail",
+        "libkernel_cmdline",
+        "libkernel_loader",
+        "liblibc",
+        "liblibcras",
+        "liblog_rust",
+        "libmerge",
+        "libmetrics",
+        "libmetrics_events",
+        "libminijail_rust",
+        "libnet_util",
+        "libonce_cell",
+        "libp9",
+        "libresources",
+        "librutabaga_gfx",
+        "libserde",
+        "libserde_json",
+        "libserde_keyvalue",
+        "libsmallvec",
+        "libsnapshot_crosvm",
+        "libstatic_assertions",
+        "libswap",
+        "libsync_rust",
+        "libthiserror",
+        "libuuid",
+        "libvhost",
+        "libvm_control",
+        "libvm_memory",
+        "libvmm_vhost",
+        "libzerocopy",
+    ],
+    proc_macros: [
+        "libargh_helpers",
+        "libenumn",
+        "libremain",
+    ],
+    visibility: ["//visibility:public"],
+    arch: {
+        x86_64: {
+            rustlibs: ["libx86_64_rust"],
+        },
+        arm64: {
+            rustlibs: ["libaarch64"],
+        },
+        riscv64: {
+            rustlibs: ["libriscv64"],
+        },
+    },
+    target: {
+        android: {
+            shared_libs: [
+                "libprocessgroup",
+            ],
+        },
+    },
+    ld_flags: [
+        "-Wl,--rpath,\\$$ORIGIN",
+        "-Wl,--rpath,\\$$ORIGIN/../../lib64",
+    ],
+}
