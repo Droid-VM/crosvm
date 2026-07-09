@@ -347,6 +347,34 @@ fn create_virtio_devices(
                     jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
                 });
                 event_devices.push(EventDevice::touchscreen(event_device_socket));
+
+                // Added tablet mode: an absolute-coordinate pointer (qemu usb-tablet
+                // equivalent) created only when the VNC server opts in with
+                // `input=tablet`, so the default device set stays unchanged. The VNC
+                // backend then emits Mouse-kind events with ABS coordinates, giving a
+                // 1:1 cursor mapping with hover/right-click/wheel.
+                #[cfg(feature = "vnc")]
+                if matches!(
+                    cfg.vnc_server.as_ref().and_then(|v| v.input.as_deref()),
+                    Some("tablet") | Some("mouse")
+                ) {
+                    let (event_device_socket, virtio_dev_socket) =
+                        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                            .context("failed to create socket")?;
+                    let dev = virtio::input::new_absolute_mouse(
+                        u32::MAX,
+                        virtio_dev_socket,
+                        multi_touch_width,
+                        multi_touch_height,
+                        virtio::base_features(cfg.protection_type),
+                    )
+                    .context("failed to set up absolute mouse device")?;
+                    devs.push(VirtioDeviceStub {
+                        dev: Box::new(dev),
+                        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+                    });
+                    event_devices.push(EventDevice::mouse(event_device_socket));
+                }
             }
             if cfg.display_window_keyboard {
                 let (event_device_socket, virtio_dev_socket) =

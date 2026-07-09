@@ -1344,8 +1344,10 @@ pub enum DisplayBackend {
     Android(String),
     #[cfg(feature = "vnc")]
     /// Start a VNC server for remote display access.
-    /// VncTcp(addr, width, height, password) listens on a TCP address.
-    VncTcp(String, u32, u32, Option<String>),
+    /// VncTcp(addr, width, height, password, touch_input) listens on a TCP address.
+    /// touch_input=false (default) injects pointer events as an absolute mouse;
+    /// touch_input=true keeps the older multi-touch touchscreen behavior.
+    VncTcp(String, u32, u32, Option<String>, bool),
 }
 
 impl DisplayBackend {
@@ -1376,8 +1378,8 @@ impl DisplayBackend {
             #[cfg(feature = "android_display")]
             DisplayBackend::Android(service_name) => GpuDisplay::open_android(service_name),
             #[cfg(feature = "vnc")]
-            DisplayBackend::VncTcp(addr, width, height, password) => {
-                GpuDisplay::open_vnc_tcp(addr, *width, *height, password.clone())
+            DisplayBackend::VncTcp(addr, width, height, password, touch_input) => {
+                GpuDisplay::open_vnc_tcp(addr, *width, *height, password.clone(), *touch_input)
             }
         }
     }

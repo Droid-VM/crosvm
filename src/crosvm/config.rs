@@ -157,6 +157,10 @@ pub struct VncConfig {
     pub port: Option<u32>,
     #[serde(default)]
     pub password: Option<String>,
+    /// Pointer input mode: "mouse" (default; absolute mouse with hover/right-click/wheel)
+    /// or "touch" (multi-touch touchscreen events, tap/drag only).
+    #[serde(default)]
+    pub input: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, FromKeyValues)]

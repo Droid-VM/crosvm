@@ -144,9 +144,23 @@ pub fn create_gpu_device(
                 .display_input_width
                 .zip(cfg.display_input_height)
                 .unwrap_or((1280, 720));
+            // Pointer input mode: default is an absolute mouse (hover/right-click/wheel);
+            // "touch" keeps the older multi-touch touchscreen behavior.
+            // Pointer input mode. Default (no `input=` given) keeps the original
+            // multi-touch behavior. `input=tablet` (alias `mouse`) opts into the added
+            // absolute-coordinate pointer with mouse button/wheel semantics (qemu
+            // usb-tablet equivalent).
+            let touch_input = match vnc_cfg.input.as_deref() {
+                Some("tablet") | Some("mouse") => false,
+                None | Some("touch") => true,
+                Some(other) => {
+                    warn!("invalid vnc-server input mode {other:?}; keeping \"touch\"");
+                    true
+                }
+            };
             display_backends.insert(
                 0,
-                virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone()),
+                virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone(), touch_input),
             );
         }
     }

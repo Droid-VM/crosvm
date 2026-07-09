@@ -154,6 +154,8 @@ pub struct DisplayVnc {
     input_queue: VecDeque<VncInputEvent>,
     next_tracking_id: i32,
     prev_button_mask: u8,
+    /// Inject pointer events as multi-touch (legacy) instead of the absolute mouse.
+    touch_input: bool,
 }
 
 impl DisplayVnc {
@@ -162,6 +164,7 @@ impl DisplayVnc {
         width: u32,
         height: u32,
         password: Option<String>,
+        touch_input: bool,
     ) -> GpuDisplayResult<DisplayVnc> {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
 
@@ -207,6 +210,7 @@ impl DisplayVnc {
             input_queue: VecDeque::new(),
             next_tracking_id: 0,
             prev_button_mask: 0,
+            touch_input,
         })
     }
 
@@ -232,6 +236,40 @@ impl DisplayVnc {
         self.next_tracking_id.wrapping_sub(1)
     }
 
+    /// Mouse mode (qemu usb-tablet equivalent): absolute position on every event (hover
+    /// works), button transitions from the RFB mask, wheel as REL_WHEEL.
+    /// RFB button mask: bit0=left, bit1=middle, bit2=right, bit3/4=wheel up/down.
+    fn pointer_to_mouse_events(&mut self, ev: &VncInputEvent) -> Option<GpuDisplayEvents> {
+        let cur_mask = ev.button_mask;
+        let prev_mask = self.prev_button_mask;
+        self.prev_button_mask = cur_mask;
+        let changed = cur_mask ^ prev_mask;
+
+        let mut events = vec![
+            virtio_input_event::absolute_x(ev.x),
+            virtio_input_event::absolute_y(ev.y),
+        ];
+        if changed & 0x01 != 0 {
+            events.push(virtio_input_event::left_click(cur_mask & 0x01 != 0));
+        }
+        if changed & 0x02 != 0 {
+            events.push(virtio_input_event::middle_click(cur_mask & 0x02 != 0));
+        }
+        if changed & 0x04 != 0 {
+            events.push(virtio_input_event::right_click(cur_mask & 0x04 != 0));
+        }
+        if changed & 0x08 != 0 && cur_mask & 0x08 != 0 {
+            events.push(virtio_input_event::wheel(1));
+        }
+        if changed & 0x10 != 0 && cur_mask & 0x10 != 0 {
+            events.push(virtio_input_event::wheel(-1));
+        }
+        Some(GpuDisplayEvents {
+            events,
+            device_type: EventDeviceKind::Mouse,
+        })
+    }
+
     fn convert_next_event(&mut self) -> Option<GpuDisplayEvents> {
         let ev = self.input_queue.pop_front()?;
 
@@ -249,6 +287,13 @@ impl DisplayVnc {
                 })
             }
             VNC_INPUT_POINTER => {
+                // Absolute-mouse (qemu usb-tablet) mode, selected via --vnc-server
+                // input=mouse (the default). input=touch keeps the multi-touch
+                // handling below.
+                if !self.touch_input {
+                    return self.pointer_to_mouse_events(&ev);
+                }
+
                 let cur_mask = ev.button_mask;
                 let prev_mask = self.prev_button_mask;
                 self.prev_button_mask = cur_mask;

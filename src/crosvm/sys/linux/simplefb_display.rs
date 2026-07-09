@@ -48,6 +48,9 @@ pub fn start_simplefb_display_thread(
                 params.width,
                 params.height,
                 target.password.clone(),
+                // simplefb mode only wires touchscreen+keyboard event devices, so keep the
+                // legacy touch input behavior here.
+                /* touch_input= */ true,
             );
             let mut display = match display_result {
                 Ok(d) => d,

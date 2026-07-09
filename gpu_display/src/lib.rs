@@ -504,8 +504,10 @@ impl GpuDisplay {
         width: u32,
         height: u32,
         password: Option<String>,
+        touch_input: bool,
     ) -> GpuDisplayResult<GpuDisplay> {
-        let display = gpu_display_vnc::DisplayVnc::new_tcp(addr, width, height, password)?;
+        let display =
+            gpu_display_vnc::DisplayVnc::new_tcp(addr, width, height, password, touch_input)?;
 
         let wait_ctx = WaitContext::new()?;
         wait_ctx.add(&display, DisplayEventToken::Display)?;
