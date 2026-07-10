@@ -752,7 +752,18 @@ impl Vm for GunyahVm {
         // mapped/freed at the same host-visible BAR offsets) maps to the same label, so the
         // host kernel reclaims the stale parcel before re-sharing the new backing. Distinct
         // concurrent blobs sit at distinct GPAs -> distinct labels (no false collision).
-        let label = (guest_addr.offset() >> 12) as u32;
+        //
+        // GH_NO_UNSHARE (diagnostic): parcels are never reclaimed, so a reused BAR offset
+        // would collide with its still-shared predecessor (module returns EBUSY). Use a
+        // monotonic label instead; every SHARE is a fresh parcel and nothing is ever
+        // reclaimed (bounded leak, test-only).
+        let label = if std::env::var_os("GH_NO_UNSHARE").is_some() {
+            static NEXT_LABEL: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0x4000_0000);
+            NEXT_LABEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            (guest_addr.offset() >> 12) as u32
+        };
 
         // Host-visible blobs are data-only: READ|WRITE, never EXEC.
         let mut flags = GH_MEM_ALLOW_READ;
@@ -799,6 +810,16 @@ impl Vm for GunyahVm {
     }
 
     fn unshare_blob(&mut self, label: u32) -> Result<()> {
+        // GH_NO_UNSHARE (diagnostic): skip the RM reclaim entirely. Every rm_mem_reclaim does a
+        // platform unprotect (SCM assign) over the parcel's scattered 4K phys ranges; this flag
+        // exists to A/B-test whether that churn is what transiently kills stage-2 of neighboring
+        // lent guest RAM (SEA/BUS_OBJERR page deaths). Parcels and pinned pages leak (bounded,
+        // test-only); share_blob uses monotonic labels under this flag so BAR-offset reuse
+        // cannot EBUSY against the leaked parcels. Keep the backing region alive too.
+        if std::env::var_os("GH_NO_UNSHARE").is_some() {
+            warn!("GUNYAH-UNSHARE-BLOB: label={} SKIPPED (GH_NO_UNSHARE leak-test)", label);
+            return Ok(());
+        }
         // The guest has unmapped this host-visible blob and (per the virtio-gpu guest driver)
         // already released its own stage-2 acceptance, so it is now safe to reclaim the SHARE on
         // the host side: the GHSM module does gh_rm_mem_reclaim + unpin and drops it from the VM's
