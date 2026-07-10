@@ -261,6 +261,12 @@ impl GfxstreamContext {
         ret_to_res(ret)?;
 
         let raw_descriptor = stream_handle.os_handle as RawDescriptor;
+        // gfxstream can report success but hand back -1 when the host allocation
+        // failed (e.g. host-visible space exhausted). OwnedFd::from_raw_fd(-1)
+        // asserts and would take down the whole VMM, so fail the call instead.
+        if raw_descriptor < 0 {
+            return Err(RutabagaError::InvalidRutabagaHandle);
+        }
         // SAFETY:
         // Safe because the handle was just returned by a successful gfxstream call so it must
         // be valid and owned by us.
@@ -503,6 +509,12 @@ impl Gfxstream {
         ret_to_res(ret)?;
 
         let raw_descriptor = stream_handle.os_handle as RawDescriptor;
+        // gfxstream can report success but hand back -1 when the host allocation
+        // failed (e.g. host-visible space exhausted). OwnedFd::from_raw_fd(-1)
+        // asserts and would take down the whole VMM, so fail the export instead.
+        if raw_descriptor < 0 {
+            return Err(RutabagaError::InvalidRutabagaHandle);
+        }
         // SAFETY:
         // Safe because the handle was just returned by a successful gfxstream call so it must be
         // valid and owned by us.
