@@ -126,12 +126,14 @@ impl VmAArch64 for GunyahVm {
         }
 
         // Keep base-address at the payload region (see comment above). size-max is
-        // the layout *length* from base: cover RAM (ram_top - base) plus >= 2 GiB of
-        // headroom for the high-MMIO window placed just above RAM, rounded up to a
-        // GiB, with a 4 GiB minimum. This guarantees the host-visible GPU BAR (at
-        // ~ram_top + platform_mmio, within ~1 GiB of RAM end) stays inside the layout.
+        // the layout *length* from base: cover RAM (ram_top - base) plus headroom for
+        // the high-MMIO window placed just above RAM, rounded up to a GiB, with a
+        // 4 GiB minimum. The window is sized for a 2 GiB host-visible BAR (see aarch64
+        // get_system_allocator_config): worst case it spans alignment padding up to
+        // the next 2 GiB boundary (< 2 GiB) + 2 GiB BAR + 0.5 GiB slack, so 6 GiB of
+        // headroom keeps the whole window inside the layout.
         let base_address = base_address.unwrap_or(0);
-        let span = ram_top.saturating_sub(base_address) + 2 * GIB;
+        let span = ram_top.saturating_sub(base_address) + 6 * GIB;
         let size_max = core::cmp::max(span.next_multiple_of(GIB), 4 * GIB);
         memory_node.set_prop("base-address", base_address)?;
         memory_node.set_prop("size-max", size_max)?;

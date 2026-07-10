@@ -596,11 +596,19 @@ impl arch::LinuxArch for AArch64 {
             // ioctl but never gets a working stage-2 entry, so the guest SIGBUSes on access.
             //
             // Place the 64-bit PCI MMIO window immediately above the platform MMIO region
-            // (i.e. just above guest RAM). 1 GiB is ample for the gfxstream host-visible BAR
-            // plus other 64-bit BARs and stays well within size-max (which has >= 2 GiB of
-            // headroom above RAM).
+            // (i.e. just above guest RAM). Size the window for a 2 GiB host-visible BAR:
+            // PCI requires size-aligned BAR placement, so the window must reach the next
+            // 2 GiB boundary above its base plus the BAR itself, plus slack for the other
+            // 64-bit BARs. gunyah size-max headroom is raised to match (see
+            // hypervisor/src/gunyah/aarch64.rs create_fdt).
             let base = plat_mmio_base + plat_mmio_size;
-            (base, 1u64 << 30)
+            const BAR_TARGET: u64 = 2u64 << 30; // keep in sync with size-max headroom
+            let window_top = base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29);
+            base::warn!(
+                "GUNYAH-HIGHMMIO: base={:#x} top={:#x} size={:#x} (plat_mmio_base={:#x})",
+                base, window_top, window_top - base, plat_mmio_base
+            );
+            (base, window_top - base)
         } else {
             // Place the 64-bit PCI MMIO window above 4GiB so firmware does not see a
             // single aperture that straddles the 32-bit boundary.
@@ -1110,10 +1118,15 @@ impl arch::LinuxArch for AArch64 {
         // it (gpu_resv). This lets a protected guest map host-visible blobs (the gfxstream ASG
         // ring) at the BAR via host-local add_fd_mapping into the blessed arena, instead of a
         // runtime SHARE whose stage-2 fault is never forwarded to the host (SIGBUS).
+        // The blessed blob arena (+ its reserved-memory node + the dtb_shim it needs) is ONLY for
+        // the HostShare path. In GuestAccept mode the guest accepts each blob as its own memparcel
+        // via mem_accept (vm.supports_blob_share()==true), so there is no eager arena, no
+        // reserved-memory node, and no dtb_shim required.
         const VIRTIO_SHMEM_BAR_NUM: u8 = 2;
-        let gpu_resv: Option<(u64, u64)> = if vm
-            .get_hypervisor()
-            .check_capability(HypervisorCap::StaticSwiotlbAllocationRequired)
+        let gpu_resv: Option<(u64, u64)> = if !vm.supports_blob_share()
+            && vm
+                .get_hypervisor()
+                .check_capability(HypervisorCap::StaticSwiotlbAllocationRequired)
         {
             match system_allocator
                 .mmio_allocator_any()
