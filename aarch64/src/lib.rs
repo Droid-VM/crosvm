@@ -596,13 +596,13 @@ impl arch::LinuxArch for AArch64 {
             // ioctl but never gets a working stage-2 entry, so the guest SIGBUSes on access.
             //
             // Place the 64-bit PCI MMIO window immediately above the platform MMIO region
-            // (i.e. just above guest RAM). Size the window for a 2 GiB host-visible BAR:
+            // (i.e. just above guest RAM). Size the window for a 4 GiB host-visible BAR:
             // PCI requires size-aligned BAR placement, so the window must reach the next
-            // 2 GiB boundary above its base plus the BAR itself, plus slack for the other
+            // 4 GiB boundary above its base plus the BAR itself, plus slack for the other
             // 64-bit BARs. gunyah size-max headroom is raised to match (see
             // hypervisor/src/gunyah/aarch64.rs create_fdt).
             let base = plat_mmio_base + plat_mmio_size;
-            const BAR_TARGET: u64 = 2u64 << 30; // keep in sync with size-max headroom
+            const BAR_TARGET: u64 = 4u64 << 30; // keep in sync with size-max headroom
             let window_top = base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29);
             base::warn!(
                 "GUNYAH-HIGHMMIO: base={:#x} top={:#x} size={:#x} (plat_mmio_base={:#x})",
