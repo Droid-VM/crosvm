@@ -266,7 +266,9 @@ impl DisplayVnc {
         }
         Some(GpuDisplayEvents {
             events,
-            device_type: EventDeviceKind::Mouse,
+            // Absolute pointer -> the Tablet device, not the relative Mouse device, so both
+            // can coexist as separate guest input devices.
+            device_type: EventDeviceKind::Tablet,
         })
     }
 

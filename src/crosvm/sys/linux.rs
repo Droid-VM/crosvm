@@ -348,6 +348,27 @@ fn create_virtio_devices(
                 });
                 event_devices.push(EventDevice::touchscreen(event_device_socket));
 
+                // Relative-motion mouse (EventDeviceKind::Mouse), a distinct device from the
+                // absolute Tablet created below, so the guest exposes both a relative and an
+                // absolute pointer at once. VNC (RFB is absolute) only drives the Tablet; this
+                // relative mouse is left for the Android app / games that want relative motion.
+                {
+                    let (event_device_socket, virtio_dev_socket) =
+                        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                            .context("failed to create socket")?;
+                    let dev = virtio::input::new_mouse(
+                        u32::MAX,
+                        virtio_dev_socket,
+                        virtio::base_features(cfg.protection_type),
+                    )
+                    .context("failed to set up relative mouse device")?;
+                    devs.push(VirtioDeviceStub {
+                        dev: Box::new(dev),
+                        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+                    });
+                    event_devices.push(EventDevice::mouse(event_device_socket));
+                }
+
                 // Added tablet mode: an absolute-coordinate pointer (qemu usb-tablet
                 // equivalent) created only when the VNC server opts in with
                 // `input=tablet`, so the default device set stays unchanged. The VNC
@@ -373,7 +394,9 @@ fn create_virtio_devices(
                         dev: Box::new(dev),
                         jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
                     });
-                    event_devices.push(EventDevice::mouse(event_device_socket));
+                    // Route the absolute pointer to the dedicated Tablet kind (not Mouse), so it
+                    // is independent of the relative mouse created above.
+                    event_devices.push(EventDevice::tablet(event_device_socket));
                 }
             }
             if cfg.display_window_keyboard {

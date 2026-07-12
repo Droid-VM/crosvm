@@ -27,6 +27,10 @@ const EVENT_BUFFER_LEN_MAX: usize = 64 * EVENT_SIZE;
 pub enum EventDeviceKind {
     /// Produces relative mouse motions, wheel, and button clicks while the real mouse is captured.
     Mouse,
+    /// Produces absolute pointer motion (qemu usb-tablet equivalent): a 1:1 cursor with hover,
+    /// buttons and wheel. Kept distinct from `Mouse` so a relative mouse and an absolute tablet
+    /// can be two independent, separately-routed devices at once (the dispatch is by-kind).
+    Tablet,
     /// Produces absolute motion and touch events from the display window's events.
     Touchscreen,
     /// Produces key events while the display window has focus.
@@ -54,6 +58,11 @@ impl EventDevice {
     #[inline]
     pub fn mouse(event_socket: StreamChannel) -> EventDevice {
         Self::new(EventDeviceKind::Mouse, event_socket)
+    }
+
+    #[inline]
+    pub fn tablet(event_socket: StreamChannel) -> EventDevice {
+        Self::new(EventDeviceKind::Tablet, event_socket)
     }
 
     #[inline]
