@@ -748,6 +748,14 @@ impl Frontend {
             let mut ctx_id = 0;
             let mut flags = 0;
             let mut ring_idx = 0;
+            // Whether a fence was actually created in rutabaga. We only defer the
+            // descriptor to wait for a fence if one truly exists. A failed
+            // create_fence (e.g. a context-specific fence targeting a context that
+            // was invalidated/detached during churn -> ErrRutabaga(InvalidContextId))
+            // must NOT leave the guest blocked on a fence that will never complete:
+            // that strands the descriptor forever and hard-hangs the whole VM
+            // (all vCPUs idle waiting on a GPU fence). Respond with the error instead.
+            let mut fence_created = false;
             if let Some(cmd) = gpu_cmd {
                 let ctrl_hdr = cmd.ctrl_hdr();
                 if ctrl_hdr.flags.to_native() & VIRTIO_GPU_FLAG_FENCE != 0 {
@@ -763,7 +771,10 @@ impl Frontend {
                         ring_idx,
                     };
                     gpu_response = match self.virtio_gpu.create_fence(fence) {
-                        Ok(_) => gpu_response,
+                        Ok(_) => {
+                            fence_created = true;
+                            gpu_response
+                        }
                         Err(fence_resp) => {
                             warn!("create_fence {} -> {:?}", fence_id, fence_resp);
                             fence_resp
@@ -779,7 +790,7 @@ impl Frontend {
                 Err(e) => debug!("ctrl queue response encode error: {}", e),
             }
 
-            if flags & VIRTIO_GPU_FLAG_FENCE != 0 {
+            if fence_created {
                 let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
                     0 => VirtioGpuRing::Global,
                     _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
