@@ -627,6 +627,7 @@ fn create_virtio_devices(
 
     let mut keyboard_idx = 0;
     let mut mouse_idx = 0;
+    let mut absolute_mouse_idx = 0;
     let mut rotary_idx = 0;
     let mut switches_idx = 0;
     let mut multi_touch_idx = 0;
@@ -659,6 +660,32 @@ fn create_virtio_devices(
                     mouse_idx,
                 )?;
                 mouse_idx += 1;
+                dev
+            }
+            InputDeviceOption::AbsoluteMouse {
+                path,
+                width,
+                height,
+            } => {
+                let mut width = *width;
+                let mut height = *height;
+                if absolute_mouse_idx == 0 {
+                    if width.is_none() {
+                        width = cfg.display_input_width;
+                    }
+                    if height.is_none() {
+                        height = cfg.display_input_height;
+                    }
+                }
+                let dev = create_absolute_mouse_device(
+                    cfg.protection_type,
+                    cfg.jail_config.as_ref(),
+                    path.as_path(),
+                    width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
+                    height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
+                    absolute_mouse_idx,
+                )?;
+                absolute_mouse_idx += 1;
                 dev
             }
             InputDeviceOption::MultiTouch {

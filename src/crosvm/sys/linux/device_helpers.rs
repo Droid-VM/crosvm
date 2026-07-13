@@ -633,6 +633,32 @@ pub fn create_single_touch_device<T: IntoUnixStream>(
     })
 }
 
+pub fn create_absolute_mouse_device<T: IntoUnixStream>(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    absolute_mouse_socket: T,
+    width: u32,
+    height: u32,
+    idx: u32,
+) -> DeviceResult {
+    let socket = absolute_mouse_socket
+        .into_unix_stream()
+        .context("failed configuring virtio absolute mouse")?;
+
+    let dev = virtio::input::new_absolute_mouse(
+        idx,
+        socket,
+        width,
+        height,
+        virtio::base_features(protection_type),
+    )
+    .context("failed to set up input device")?;
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
 pub fn create_multi_touch_device<T: IntoUnixStream>(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,

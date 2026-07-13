@@ -367,6 +367,15 @@ pub enum InputDeviceOption {
     Mouse {
         path: PathBuf,
     },
+    // Absolute-pointing mouse (qemu usb-tablet profile): ABS_X/ABS_Y + buttons + wheel. Unlike
+    // SingleTouch (a BTN_TOUCH touchscreen) it reports a position continuously, so the guest gets
+    // pointer hover, right-click and scroll -- what the app's "tablet" input mode maps a host
+    // mouse/stylus onto.
+    AbsoluteMouse {
+        path: PathBuf,
+        width: Option<u32>,
+        height: Option<u32>,
+    },
     MultiTouch {
         path: PathBuf,
         width: Option<u32>,
