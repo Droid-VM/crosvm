@@ -27,6 +27,7 @@ use base::info;
 use base::ioctl;
 use base::ioctl_with_mut_ref;
 use base::ioctl_with_ref;
+use base::debug;
 use base::ioctl_with_val;
 use base::pagesize;
 use base::warn;
@@ -799,7 +800,7 @@ impl Vm for GunyahVm {
         // old crosvm mapping here is safe and bounds RSS under blob map/unmap churn.
         let old = self.blob_regions.lock().insert(label, mem_region);
         drop(old);
-        warn!(
+        debug!(
             "GUNYAH-SHARE-BLOB: gpa=0x{:x} size=0x{:x} label={} handle=0x{:x}",
             guest_addr.offset(),
             size,
@@ -840,7 +841,7 @@ impl Vm for GunyahVm {
             // ENOENT just means it was already reclaimed (e.g. by a prior overlap) -- not fatal.
             warn!("GUNYAH-UNSHARE-BLOB: label={} ioctl ret={}", label, ret);
         } else {
-            warn!("GUNYAH-UNSHARE-BLOB: label={} reclaimed", label);
+            debug!("GUNYAH-UNSHARE-BLOB: label={} reclaimed", label);
         }
 
         // Drop the host backing mapping we kept alive while shared.

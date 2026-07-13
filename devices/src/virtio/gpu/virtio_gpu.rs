@@ -1099,7 +1099,7 @@ impl VirtioGpu {
         match self.rutabaga.export_blob(resource_id) {
             Ok(export) => {
                 let has_vk = self.rutabaga.vulkan_info(resource_id).is_ok();
-                base::warn!(
+                base::debug!(
                     "GPU-MAPBLOB: res={} export OK handle_type=0x{:x} vulkan_info={} offset={}",
                     resource_id,
                     export.handle_type,
@@ -1124,7 +1124,9 @@ impl VirtioGpu {
                 }
             }
             Err(e) => {
-                base::warn!(
+                // Not an error: expected for ColorBuffers whose Vulkan memory this Adreno can't
+                // export as AHB/dmabuf; falls through to the rutabaga host-ptr map below.
+                base::debug!(
                     "GPU-MAPBLOB: res={} export_blob ERR {:?} offset={}",
                     resource_id,
                     e,
@@ -1148,7 +1150,7 @@ impl VirtioGpu {
 
             match self.rutabaga.map(resource_id) {
                 Ok(mapping) => {
-                    base::warn!(
+                    base::debug!(
                         "GPU-MAPBLOB: res={} export failed, fallback rutabaga.map() OK ptr=0x{:x} size={} (qemu host-ptr path)",
                         resource_id,
                         mapping.ptr,
