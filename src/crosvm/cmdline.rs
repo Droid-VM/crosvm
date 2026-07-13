@@ -28,7 +28,6 @@ use arch::FdtPosition;
 use arch::MemoryRegionConfig;
 use arch::PciConfig;
 use arch::Pstore;
-#[cfg(target_arch = "x86_64")]
 use arch::SmbiosOptions;
 use arch::VcpuAffinity;
 use argh::FromArgs;
@@ -2401,7 +2400,6 @@ pub struct RunCommand {
     /// as `slirp_capture_packets.pcap`
     pub slirp_capture_file: Option<String>,
 
-    #[cfg(target_arch = "x86_64")]
     #[argh(option, arg_name = "key=val,...")]
     #[serde(default)]
     #[merge(strategy = overwrite_option)]
@@ -2414,6 +2412,9 @@ pub struct RunCommand {
     ///     product-name=STRING - System product name.
     ///     serial-number=STRING - System serial number.
     ///     uuid=UUID - System UUID.
+    ///     processor-version=STRING - Processor version (marketing CPU name).
+    ///         On aarch64 this is forwarded to the guest firmware via the FDT
+    ///         /chosen node for its SMBIOS Type 4 table.
     ///     oem-strings=[...] - Free-form OEM strings (SMBIOS type 11).
     pub smbios: Option<SmbiosOptions>,
 
@@ -3746,6 +3747,8 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         cfg.pci_config = cmd.pci.unwrap_or_default();
 
+        cfg.smbios = cmd.smbios.unwrap_or_default();
+
         #[cfg(target_arch = "x86_64")]
         {
             cfg.break_linux_pci_config_io = cmd.break_linux_pci_config_io.unwrap_or_default();
@@ -3753,7 +3756,6 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.force_s2idle = cmd.s2idle.unwrap_or_default();
             cfg.no_i8042 = cmd.no_i8042.unwrap_or_default();
             cfg.no_rtc = cmd.no_rtc.unwrap_or_default();
-            cfg.smbios = cmd.smbios.unwrap_or_default();
 
             if let Some(pci_start) = cmd.pci_start {
                 if cfg.pci_config.mem.is_some() {

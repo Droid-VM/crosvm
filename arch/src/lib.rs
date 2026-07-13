@@ -420,7 +420,6 @@ pub struct VmComponents {
     pub pvm_fw: Option<File>,
     pub rt_cpus: CpuSet,
     pub simplefb: Option<SimplefbParams>,
-    #[cfg(target_arch = "x86_64")]
     pub smbios: SmbiosOptions,
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     pub sve_config: SveConfig,
@@ -1386,6 +1385,12 @@ pub struct SmbiosOptions {
 
     /// System UUID.
     pub uuid: Option<Uuid>,
+
+    /// Processor version (marketing CPU name, e.g. "Snapdragon 8 Elite"). On aarch64 this is
+    /// forwarded to the guest firmware via the FDT /chosen node
+    /// ("droidvm,smbios-processor-version") so EDK2 publishes it in SMBIOS Type 4, which guests
+    /// like Windows display as the CPU name.
+    pub processor_version: Option<String>,
 
     /// Additional OEM strings to add to SMBIOS table.
     #[serde(default)]

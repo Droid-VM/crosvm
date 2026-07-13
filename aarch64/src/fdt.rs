@@ -15,6 +15,7 @@ use arch::CpuSet;
 use arch::DtbOverlay;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use arch::PlatformBusResources;
+use arch::SmbiosOptions;
 use base::open_file_or_duplicate;
 use cros_fdt::Error;
 use cros_fdt::Fdt;
@@ -362,6 +363,7 @@ fn create_chosen_node(
     cmdline: &str,
     initrd: Option<(GuestAddress, usize)>,
     stdout_path: Option<&str>,
+    smbios: &SmbiosOptions,
 ) -> Result<()> {
     let chosen_node = fdt.root_mut().subnode_mut("chosen")?;
     chosen_node.set_prop("linux,pci-probe-only", 1u32)?;
@@ -369,6 +371,19 @@ fn create_chosen_node(
     if let Some(stdout_path) = stdout_path {
         // Used by android bootloader for boot console output
         chosen_node.set_prop("stdout-path", stdout_path)?;
+    }
+
+    // DroidVM: forward SMBIOS identity strings (from `--smbios`) to the guest firmware. EDK2's
+    // SmbiosPlatformDxe reads these /chosen properties and publishes them in its SMBIOS tables
+    // (Type 4 processor version = the CPU name Windows displays). Linux kernels ignore them.
+    if let Some(v) = &smbios.processor_version {
+        chosen_node.set_prop("droidvm,smbios-processor-version", v.as_str())?;
+    }
+    if let Some(v) = &smbios.product_name {
+        chosen_node.set_prop("droidvm,smbios-product-name", v.as_str())?;
+    }
+    if let Some(v) = &smbios.manufacturer {
+        chosen_node.set_prop("droidvm,smbios-manufacturer", v.as_str())?;
     }
 
     let mut kaslr_seed_bytes = [0u8; 8];
@@ -785,6 +800,7 @@ pub fn create_fdt(
     serial_devices: &[SerialDeviceInfo],
     virt_cpufreq_v2: bool,
     is_kvm: bool,
+    smbios: &SmbiosOptions,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -803,7 +819,7 @@ pub fn create_fdt(
     let stdout_path = serial_devices
         .first()
         .map(|first_serial| format!("/U6_16550A@{:x}", first_serial.address));
-    create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref())?;
+    create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref(), smbios)?;
     create_config_node(&mut fdt, kernel_region)?;
     create_memory_node(&mut fdt, guest_mem)?;
     let dma_pool_phandle = match swiotlb {

@@ -1207,6 +1207,7 @@ impl arch::LinuxArch for AArch64 {
             &serial_devices,
             components.virt_cpufreq_v2,
             matches!(vm.hypervisor_kind(), HypervisorKind::Kvm),
+            &components.smbios,
         )
         .map_err(Error::CreateFdt)?;
 
