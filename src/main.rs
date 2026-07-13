@@ -760,6 +760,14 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
     #[cfg(not(feature = "crash-report"))]
     sys::set_panic_hook();
 
+    // DroidVM: also catch raw fatal signals (SIGSEGV/SIGBUS/... e.g. a null deref in the native
+    // display glue or gfxstream backend, or during device teardown on VM stop) with an in-process
+    // handler that prints a backtrace to stderr. Android debuggerd's tombstone path forks a helper
+    // via clone() which fails ("second clone failed") under teardown pressure, so without this a
+    // shutdown-time SIGSEGV leaves no diagnostic at all.
+    #[cfg(all(not(feature = "crash-report"), any(target_os = "android", target_os = "linux")))]
+    sys::install_crash_handler();
+
     // Ensure all processes detach from metrics on exit.
     #[cfg(windows)]
     let _metrics_destructor = metrics::get_destructor();

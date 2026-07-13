@@ -7,4 +7,6 @@ pub(crate) mod main;
 mod panic_hook;
 
 #[cfg(not(feature = "crash-report"))]
+pub(crate) use panic_hook::install_crash_handler;
+#[cfg(not(feature = "crash-report"))]
 pub(crate) use panic_hook::set_panic_hook;
