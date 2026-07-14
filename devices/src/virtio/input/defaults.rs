@@ -330,7 +330,11 @@ fn default_absolute_mouse_events() -> BTreeMap<u16, virtio_input_bitmap> {
         virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]),
     );
     supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y]));
-    supported_events.insert(EV_REL, virtio_input_bitmap::from_bits(&[REL_WHEEL]));
+    // Advertise the horizontal wheel too so the guest keeps our REL_HWHEEL events (2D scrolling).
+    supported_events.insert(
+        EV_REL,
+        virtio_input_bitmap::from_bits(&[REL_WHEEL, REL_HWHEEL]),
+    );
     supported_events
 }
 
@@ -340,9 +344,11 @@ fn default_mouse_events() -> BTreeMap<u16, virtio_input_bitmap> {
         EV_KEY,
         virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]),
     );
+    // REL_HWHEEL: without it the guest drops horizontal-scroll events, so 2D/side scrolling
+    // (two-finger pan sideways, tilt wheel) never reaches apps.
     supported_events.insert(
         EV_REL,
-        virtio_input_bitmap::from_bits(&[REL_X, REL_Y, REL_WHEEL]),
+        virtio_input_bitmap::from_bits(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]),
     );
     supported_events
 }

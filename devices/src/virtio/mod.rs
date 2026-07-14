@@ -67,6 +67,7 @@ pub use self::gpu::GpuMode;
 pub use self::gpu::GpuMouseMode;
 #[cfg(feature = "gpu")]
 pub use self::gpu::GpuParameters;
+pub use self::gpu::VramExceedPolicy;
 #[cfg(feature = "gpu")]
 pub use self::gpu::GpuWsi;
 pub use self::interrupt::Interrupt;

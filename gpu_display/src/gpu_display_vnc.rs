@@ -158,6 +158,21 @@ pub struct DisplayVnc {
     touch_input: bool,
 }
 
+/// The VNC pointer/touch devices advertise this fixed absolute-axis maximum. Every injected
+/// coordinate is scaled to it against the *current* framebuffer size, so the guest cursor stays
+/// 1:1 with the pointer at any resolution -- including after the guest auto-resizes the display --
+/// without pinning the axis range to a static config value. MUST match the ABS_X/ABS_Y max the
+/// VNC tablet/touchscreen advertise in `create_display_window_input_devices()`
+/// (src/crosvm/sys/linux.rs).
+const VNC_ABS_MAX: i32 = 0x7FFF;
+
+/// Scale a VNC framebuffer coordinate in `0..extent` (where `extent` is the live framebuffer
+/// width/height, updated on guest resize) to `0..=VNC_ABS_MAX`.
+fn vnc_norm_abs(v: i32, extent: u32) -> i32 {
+    let extent = extent.max(1) as i64;
+    (((v.max(0) as i64) * (VNC_ABS_MAX as i64)) / extent).clamp(0, VNC_ABS_MAX as i64) as i32
+}
+
 impl DisplayVnc {
     pub fn new_tcp(
         addr: &str,
@@ -246,8 +261,8 @@ impl DisplayVnc {
         let changed = cur_mask ^ prev_mask;
 
         let mut events = vec![
-            virtio_input_event::absolute_x(ev.x),
-            virtio_input_event::absolute_y(ev.y),
+            virtio_input_event::absolute_x(vnc_norm_abs(ev.x, self.width)),
+            virtio_input_event::absolute_y(vnc_norm_abs(ev.y, self.height)),
         ];
         if changed & 0x01 != 0 {
             events.push(virtio_input_event::left_click(cur_mask & 0x01 != 0));
@@ -308,8 +323,8 @@ impl DisplayVnc {
                     let events = vec![
                         virtio_input_event::multitouch_slot(0),
                         virtio_input_event::multitouch_tracking_id(tid),
-                        virtio_input_event::multitouch_absolute_x(ev.x),
-                        virtio_input_event::multitouch_absolute_y(ev.y),
+                        virtio_input_event::multitouch_absolute_x(vnc_norm_abs(ev.x, self.width)),
+                        virtio_input_event::multitouch_absolute_y(vnc_norm_abs(ev.y, self.height)),
                         virtio_input_event::touch(true),
                     ];
                     Some(GpuDisplayEvents {
@@ -321,8 +336,8 @@ impl DisplayVnc {
                     let events = vec![
                         virtio_input_event::multitouch_slot(0),
                         virtio_input_event::multitouch_tracking_id(tid),
-                        virtio_input_event::multitouch_absolute_x(ev.x),
-                        virtio_input_event::multitouch_absolute_y(ev.y),
+                        virtio_input_event::multitouch_absolute_x(vnc_norm_abs(ev.x, self.width)),
+                        virtio_input_event::multitouch_absolute_y(vnc_norm_abs(ev.y, self.height)),
                         virtio_input_event::touch(true),
                     ];
                     Some(GpuDisplayEvents {

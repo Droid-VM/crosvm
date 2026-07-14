@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use base::error;
+use base::info;
 use base::FromRawDescriptor;
 use base::IntoRawDescriptor;
 use base::Protection;
@@ -172,6 +173,8 @@ struct VirtioGpuScanout {
 
     resource_id: Option<NonZeroU32>,
     position: Option<(u32, u32)>,
+    // Reused packed staging buffer for flushes into padded-stride window buffers.
+    flush_staging: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -206,6 +209,7 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_staging: Vec::new(),
         }
     }
 
@@ -223,6 +227,7 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_staging: Vec::new(),
         }
     }
 
@@ -412,14 +417,39 @@ impl VirtioGpuScanout {
             .framebuffer_region(surface_id, 0, 0, self.width, self.height)
             .ok_or(ErrUnspec)?;
 
-        let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
-        transfer.stride = fb.stride();
-        let fb_slice = fb.as_volatile_slice();
-        let buf = IoSliceMut::new(
-            // SAFETY: trivially safe
-            unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
-        );
-        rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
+        let packed_stride = self.width as usize * 4;
+        let fb_stride = fb.stride() as usize;
+        if fb_stride == packed_stride {
+            let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
+            transfer.stride = fb.stride();
+            let fb_slice = fb.as_volatile_slice();
+            let buf = IoSliceMut::new(
+                // SAFETY: trivially safe
+                unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
+            );
+            rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
+        } else {
+            // The window buffer rows are padded (gralloc stride alignment), and the readback
+            // backend writes tightly-packed rows no matter what Transfer3D::stride says (observed
+            // with gfxstream at widths whose row size isn't aligned, e.g. 1440x900) -- every row
+            // lands progressively shifted and the image smears. Read into a packed staging buffer
+            // and re-stride into the window buffer by row.
+            let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
+            transfer.stride = packed_stride as u32;
+            let size = packed_stride * self.height as usize;
+            if self.flush_staging.len() < size {
+                self.flush_staging.resize(size, 0);
+            }
+            let staging = &mut self.flush_staging[..size];
+            rutabaga.transfer_read(0, resource.resource_id, transfer, Some(IoSliceMut::new(staging)))?;
+            let fb_slice = fb.as_volatile_slice();
+            for row in 0..self.height as usize {
+                fb_slice
+                    .sub_slice(row * fb_stride, packed_stride)
+                    .map_err(|_| ErrUnspec)?
+                    .copy_from(&staging[row * packed_stride..][..packed_stride]);
+            }
+        }
 
         display.flip(surface_id);
         Ok(OkNoData)
@@ -1391,6 +1421,43 @@ impl VirtioGpu {
         self.rutabaga
             .suspend()
             .context("failed to suspend rutabaga")
+    }
+
+    /// Reset the device to a clean state on a guest-initiated device reset: forget each scanout's
+    /// resource association and drop every resource/context (ours and rutabaga's), while keeping
+    /// the rutabaga render server alive so re-init is instant. Lets a guest that takes the device
+    /// over from another one (UEFI firmware -> OS) recreate resource ids from scratch -- rutabaga
+    /// rejects a duplicate resource id otherwise.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
+        for scanout in self.scanouts.values_mut() {
+            scanout.resource_id = None;
+            // Drop the previous guest's surface: update_scanout_resource() only recreates a
+            // surface when the modeset size differs from scanout.width/height, so after the
+            // restore below, an OS modeset to the configured size would otherwise keep using a
+            // stale firmware-geometry surface (its content posted top-left into a larger frame).
+            scanout.release_surface(&self.display);
+            // Also restore the configured boot resolution. set_scanout() tracks the guest's
+            // modesets in scanout.width/height, which GET_DISPLAY_INFO then reports; a device
+            // reset means a NEW guest is taking over, and the previous guest's last modeset
+            // (e.g. the UEFI firmware console at 800x600) must not leak into it. The guest
+            // virtio-gpu driver prunes any EDID *preferred* mode that mismatches display info
+            // by >16px, so a leaked firmware resolution permanently locks the OS out of the
+            // configured mode and it falls back to an arbitrary (wrong-aspect) one.
+            if let Some(params) = &scanout.display_params {
+                let (width, height) = params.get_virtual_display_size();
+                info!(
+                    "gpu reset: scanout {:?} restored {}x{} -> {}x{}, surface dropped",
+                    scanout.scanout_id, scanout.width, scanout.height, width, height
+                );
+                scanout.width = width;
+                scanout.height = height;
+            }
+        }
+        self.cursor_scanout.resource_id = None;
+        self.cursor_scanout.release_surface(&self.display);
+        self.resources.clear();
+        self.rutabaga.reset().context("failed to reset rutabaga")?;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> anyhow::Result<VirtioGpuSnapshot> {

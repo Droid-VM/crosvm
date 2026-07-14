@@ -98,6 +98,30 @@ pub fn create_gpu_device(
         gpu_params.snapshot_scratch_path = Some(Path::new("/tmpfs-gpu-snapshot").to_path_buf());
     }
 
+    // DroidVM: plumb the host-visible folio (reserved-hugepage) + Gunyah-pVM knobs to the
+    // in-process gfxstream backend as env, set here before the GPU/jail process forks so they are
+    // inherited and read on the first blob create. See gfxstream HostVisibleFolio.h.
+    if let Some(mb) = gpu_params.vram_limit {
+        env::set_var("GFXSTREAM_VRAM_LIMIT_MB", mb.to_string());
+    }
+    if let Some(kb) = gpu_params.vram_folio_threshold {
+        env::set_var("GFXSTREAM_VRAM_FOLIO_THRESHOLD_KB", kb.to_string());
+    }
+    if let Some(policy) = gpu_params.vram_exceed_policy {
+        env::set_var(
+            "GFXSTREAM_VRAM_EXCEED_POLICY",
+            match policy {
+                virtio::VramExceedPolicy::Oom => "oom",
+                virtio::VramExceedPolicy::Fallback => "fallback",
+            },
+        );
+    }
+    if gpu_params.gunyah_pvm == Some(true) {
+        // Gunyah SHARE mappings are permanent and cannot be re-pointed, so the RingBlob backing
+        // must be pinned (never freed/recycled). Only Qualcomm/Gunyah needs this.
+        env::set_var("GFXSTREAM_GUNYAH_PIN_RINGBLOB", "1");
+    }
+
     if gpu_params.fixed_blob_mapping {
         if has_vfio_gfx_device {
             // TODO(b/323368701): make fixed_blob_mapping compatible with vfio dma_buf mapping for
@@ -144,20 +168,11 @@ pub fn create_gpu_device(
                 .display_input_width
                 .zip(cfg.display_input_height)
                 .unwrap_or((1280, 720));
-            // Pointer input mode: default is an absolute mouse (hover/right-click/wheel);
-            // "touch" keeps the older multi-touch touchscreen behavior.
             // Pointer input mode. Default (no `input=` given) keeps the original
             // multi-touch behavior. `input=tablet` (alias `mouse`) opts into the added
             // absolute-coordinate pointer with mouse button/wheel semantics (qemu
             // usb-tablet equivalent).
-            let touch_input = match vnc_cfg.input.as_deref() {
-                Some("tablet") | Some("mouse") => false,
-                None | Some("touch") => true,
-                Some(other) => {
-                    warn!("invalid vnc-server input mode {other:?}; keeping \"touch\"");
-                    true
-                }
-            };
+            let touch_input = super::vnc_touch_input(vnc_cfg.input.as_deref());
             display_backends.insert(
                 0,
                 virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone(), touch_input),

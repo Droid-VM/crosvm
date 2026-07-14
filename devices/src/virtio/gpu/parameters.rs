@@ -46,6 +46,14 @@ pub enum AudioDeviceMode {
     OneGlobal,
 }
 
+// What gfxstream does when the host-visible folio (reserved-hugepage) budget is exhausted.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VramExceedPolicy {
+    Fallback,
+    Oom,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct GpuParameters {
@@ -93,6 +101,18 @@ pub struct GpuParameters {
     // When running with device sandboxing, the path of a directory available for
     // scratch space.
     pub snapshot_scratch_path: Option<PathBuf>,
+    // DroidVM host-visible folio (reserved-hugepage) backing knobs, plumbed to gfxstream as
+    // GFXSTREAM_VRAM_* env before the GPU process forks. None => let gfxstream use its default.
+    //   vram-limit=<MB>: folio budget; 0 disables folio backing (all allocs share 4K pages).
+    //   vram-folio-threshold=<KB>: allocs >= this take a reserved 2MB folio; smaller share 4K.
+    //   vram-exceed-policy=fallback|oom: on budget exhaustion, drop to 4K or fail the alloc.
+    pub vram_limit: Option<u64>,
+    pub vram_folio_threshold: Option<u64>,
+    pub vram_exceed_policy: Option<VramExceedPolicy>,
+    // gunyah-pvm: gate the Gunyah pVM-specific gfxstream behavior (pin RingBlob backing so the
+    // permanent Gunyah SHARE mapping stays stable). Only Qualcomm/Gunyah needs it; leave off on
+    // other SoCs (MediaTek, Tensor, ...). Plumbed to GFXSTREAM_GUNYAH_PIN_RINGBLOB.
+    pub gunyah_pvm: Option<bool>,
 }
 
 impl Default for GpuParameters {
@@ -130,6 +150,10 @@ impl Default for GpuParameters {
             allow_implicit_render_server_exec: false,
             renderer_features: None,
             snapshot_scratch_path: None,
+            vram_limit: None,
+            vram_folio_threshold: None,
+            vram_exceed_policy: None,
+            gunyah_pvm: None,
         }
     }
 }

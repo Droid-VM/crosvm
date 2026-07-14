@@ -200,6 +200,7 @@ use crate::crosvm::config::InputDeviceOption;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_HEIGHT;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_WIDTH;
+use crate::crosvm::config::NORMALIZED_ABS_MAX;
 #[cfg(feature = "gdb")]
 use crate::crosvm::gdb::gdb_thread;
 #[cfg(feature = "gdb")]
@@ -217,6 +218,156 @@ const KVM_PATH: &str = "/dev/kvm";
 const GENIEZONE_PATH: &str = "/dev/gzvm";
 #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
 static GUNYAH_PATH: &str = "/dev/gunyah";
+
+/// Pointer input mode for a VNC session: true injects RFB pointer events as the legacy
+/// multi-touch touchscreen, false as the absolute-mouse tablet (`input=tablet`, alias
+/// `mouse`). Shared by the virtio-gpu and simplefb display paths so both interpret the
+/// `--vnc-server input=` option identically.
+#[cfg(feature = "vnc")]
+pub(crate) fn vnc_touch_input(input: Option<&str>) -> bool {
+    match input {
+        Some("tablet") | Some("mouse") => false,
+        None | Some("touch") => true,
+        Some(other) => {
+            warn!("invalid vnc-server input mode {other:?}; keeping \"touch\"");
+            true
+        }
+    }
+}
+
+/// Creates the display-window input devices and returns their event-device ends: a
+/// multi-touch touchscreen, a relative mouse, an absolute-mouse tablet (only when the VNC
+/// server opts in with `input=tablet`) and a keyboard. Shared by the virtio-gpu and
+/// simplefb+VNC display paths so a VNC session exposes the same guest input devices
+/// regardless of the display backend. The absolute devices span `default_width` x
+/// `default_height` unless a `--input multi-touch` option overrides the dimensions.
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+fn create_display_window_input_devices(
+    cfg: &Config,
+    default_width: u32,
+    default_height: u32,
+    devs: &mut Vec<VirtioDeviceStub>,
+) -> DeviceResult<Vec<EventDevice>> {
+    let mut event_devices = Vec::new();
+    if cfg.display_window_mouse {
+        let (event_device_socket, virtio_dev_socket) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .context("failed to create socket")?;
+        let mut multi_touch_width = default_width;
+        let mut multi_touch_height = default_height;
+        let mut multi_touch_name = None;
+        for input in &cfg.virtio_input {
+            if let InputDeviceOption::MultiTouch {
+                width,
+                height,
+                name,
+                ..
+            } = input
+            {
+                if let Some(width) = width {
+                    multi_touch_width = *width;
+                }
+                if let Some(height) = height {
+                    multi_touch_height = *height;
+                }
+                if let Some(name) = name {
+                    multi_touch_name = Some(name.as_str());
+                }
+                break;
+            }
+        }
+        // The VNC backend normalizes injected pointer/touch coords to a fixed absolute range
+        // against the *current* framebuffer size (VNC_ABS_MAX in gpu_display_vnc.rs), keeping the
+        // mapping 1:1 across guest auto-resize -- so its touch + tablet advertise that fixed range
+        // instead of a pixel size. Non-VNC (X11) display windows keep pixel dimensions.
+        #[cfg(feature = "vnc")]
+        let (multi_touch_width, multi_touch_height) = if cfg.vnc_server.is_some() {
+            (0x7FFF_u32, 0x7FFF_u32)
+        } else {
+            (multi_touch_width, multi_touch_height)
+        };
+        let dev = virtio::input::new_multi_touch(
+            // u32::MAX is the least likely to collide with the indices generated above for
+            // the multi_touch options, which begin at 0.
+            u32::MAX,
+            virtio_dev_socket,
+            multi_touch_width,
+            multi_touch_height,
+            multi_touch_name,
+            virtio::base_features(cfg.protection_type),
+        )
+        .context("failed to set up multi-touch device")?;
+        devs.push(VirtioDeviceStub {
+            dev: Box::new(dev),
+            jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+        });
+        event_devices.push(EventDevice::touchscreen(event_device_socket));
+
+        // Relative-motion mouse (EventDeviceKind::Mouse), a distinct device from the
+        // absolute Tablet created below, so the guest exposes both a relative and an
+        // absolute pointer at once. VNC (RFB is absolute) only drives the Tablet; this
+        // relative mouse is left for the Android app / games that want relative motion.
+        {
+            let (event_device_socket, virtio_dev_socket) =
+                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                    .context("failed to create socket")?;
+            let dev = virtio::input::new_mouse(
+                u32::MAX,
+                virtio_dev_socket,
+                virtio::base_features(cfg.protection_type),
+            )
+            .context("failed to set up relative mouse device")?;
+            devs.push(VirtioDeviceStub {
+                dev: Box::new(dev),
+                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+            });
+            event_devices.push(EventDevice::mouse(event_device_socket));
+        }
+
+        // Tablet mode: an absolute-coordinate pointer (qemu usb-tablet equivalent) created
+        // only when the VNC server opts in with `input=tablet`, so the default device set
+        // stays unchanged. The VNC backend then emits Tablet-kind events with ABS
+        // coordinates, giving a 1:1 cursor mapping with hover/right-click/wheel.
+        #[cfg(feature = "vnc")]
+        if !vnc_touch_input(cfg.vnc_server.as_ref().and_then(|v| v.input.as_deref())) {
+            let (event_device_socket, virtio_dev_socket) =
+                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                    .context("failed to create socket")?;
+            let dev = virtio::input::new_absolute_mouse(
+                u32::MAX,
+                virtio_dev_socket,
+                multi_touch_width,
+                multi_touch_height,
+                virtio::base_features(cfg.protection_type),
+            )
+            .context("failed to set up absolute mouse device")?;
+            devs.push(VirtioDeviceStub {
+                dev: Box::new(dev),
+                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+            });
+            // Route the absolute pointer to the dedicated Tablet kind (not Mouse), so it
+            // is independent of the relative mouse created above.
+            event_devices.push(EventDevice::tablet(event_device_socket));
+        }
+    }
+    if cfg.display_window_keyboard {
+        let (event_device_socket, virtio_dev_socket) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .context("failed to create socket")?;
+        let dev = virtio::input::new_keyboard(
+            u32::MAX,
+            virtio_dev_socket,
+            virtio::base_features(cfg.protection_type),
+        )
+        .context("failed to set up keyboard device")?;
+        devs.push(VirtioDeviceStub {
+            dev: Box::new(dev),
+            jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+        });
+        event_devices.push(EventDevice::keyboard(event_device_socket));
+    }
+    Ok(event_devices)
+}
 
 fn create_virtio_devices(
     cfg: &Config,
@@ -296,127 +447,14 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")]
     {
         if let Some(gpu_parameters) = &cfg.gpu_parameters {
-            let mut event_devices = Vec::new();
-            if cfg.display_window_mouse {
-                let display_param = if gpu_parameters.display_params.is_empty() {
-                    Default::default()
-                } else {
-                    gpu_parameters.display_params[0].clone()
-                };
-                let (gpu_display_w, gpu_display_h) = display_param.get_virtual_display_size();
-
-                let (event_device_socket, virtio_dev_socket) =
-                    StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                        .context("failed to create socket")?;
-                let mut multi_touch_width = gpu_display_w;
-                let mut multi_touch_height = gpu_display_h;
-                let mut multi_touch_name = None;
-                for input in &cfg.virtio_input {
-                    if let InputDeviceOption::MultiTouch {
-                        width,
-                        height,
-                        name,
-                        ..
-                    } = input
-                    {
-                        if let Some(width) = width {
-                            multi_touch_width = *width;
-                        }
-                        if let Some(height) = height {
-                            multi_touch_height = *height;
-                        }
-                        if let Some(name) = name {
-                            multi_touch_name = Some(name.as_str());
-                        }
-                        break;
-                    }
-                }
-                let dev = virtio::input::new_multi_touch(
-                    // u32::MAX is the least likely to collide with the indices generated above for
-                    // the multi_touch options, which begin at 0.
-                    u32::MAX,
-                    virtio_dev_socket,
-                    multi_touch_width,
-                    multi_touch_height,
-                    multi_touch_name,
-                    virtio::base_features(cfg.protection_type),
-                )
-                .context("failed to set up mouse device")?;
-                devs.push(VirtioDeviceStub {
-                    dev: Box::new(dev),
-                    jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                });
-                event_devices.push(EventDevice::touchscreen(event_device_socket));
-
-                // Relative-motion mouse (EventDeviceKind::Mouse), a distinct device from the
-                // absolute Tablet created below, so the guest exposes both a relative and an
-                // absolute pointer at once. VNC (RFB is absolute) only drives the Tablet; this
-                // relative mouse is left for the Android app / games that want relative motion.
-                {
-                    let (event_device_socket, virtio_dev_socket) =
-                        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                            .context("failed to create socket")?;
-                    let dev = virtio::input::new_mouse(
-                        u32::MAX,
-                        virtio_dev_socket,
-                        virtio::base_features(cfg.protection_type),
-                    )
-                    .context("failed to set up relative mouse device")?;
-                    devs.push(VirtioDeviceStub {
-                        dev: Box::new(dev),
-                        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                    });
-                    event_devices.push(EventDevice::mouse(event_device_socket));
-                }
-
-                // Added tablet mode: an absolute-coordinate pointer (qemu usb-tablet
-                // equivalent) created only when the VNC server opts in with
-                // `input=tablet`, so the default device set stays unchanged. The VNC
-                // backend then emits Mouse-kind events with ABS coordinates, giving a
-                // 1:1 cursor mapping with hover/right-click/wheel.
-                #[cfg(feature = "vnc")]
-                if matches!(
-                    cfg.vnc_server.as_ref().and_then(|v| v.input.as_deref()),
-                    Some("tablet") | Some("mouse")
-                ) {
-                    let (event_device_socket, virtio_dev_socket) =
-                        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                            .context("failed to create socket")?;
-                    let dev = virtio::input::new_absolute_mouse(
-                        u32::MAX,
-                        virtio_dev_socket,
-                        multi_touch_width,
-                        multi_touch_height,
-                        virtio::base_features(cfg.protection_type),
-                    )
-                    .context("failed to set up absolute mouse device")?;
-                    devs.push(VirtioDeviceStub {
-                        dev: Box::new(dev),
-                        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                    });
-                    // Route the absolute pointer to the dedicated Tablet kind (not Mouse), so it
-                    // is independent of the relative mouse created above.
-                    event_devices.push(EventDevice::tablet(event_device_socket));
-                }
-            }
-            if cfg.display_window_keyboard {
-                let (event_device_socket, virtio_dev_socket) =
-                    StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                        .context("failed to create socket")?;
-                let dev = virtio::input::new_keyboard(
-                    // u32::MAX is the least likely to collide with the indices generated above for
-                    // the multi_touch options, which begin at 0.
-                    u32::MAX,
-                    virtio_dev_socket,
-                    virtio::base_features(cfg.protection_type),
-                )
-                .context("failed to set up keyboard device")?;
-                devs.push(VirtioDeviceStub {
-                    dev: Box::new(dev),
-                    jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                });
-                event_devices.push(EventDevice::keyboard(event_device_socket));
-            }
+            let display_param = if gpu_parameters.display_params.is_empty() {
+                Default::default()
+            } else {
+                gpu_parameters.display_params[0].clone()
+            };
+            let (gpu_display_w, gpu_display_h) = display_param.get_virtual_display_size();
+            let event_devices =
+                create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
 
             #[cfg(feature = "vnc")]
             let event_devices = if cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
@@ -444,48 +482,16 @@ fn create_virtio_devices(
 
     #[cfg(feature = "vnc")]
     if cfg.gpu_parameters.is_none() && cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
+        // Same device set as the virtio-gpu display path above, so a VNC session gets
+        // identical guest input devices (including the `input=tablet` absolute mouse)
+        // regardless of which display backend serves it.
         let simplefb_cfg = cfg.simplefb.as_ref().unwrap();
-        let mut event_devices = Vec::new();
-
-        if cfg.display_window_mouse {
-            let (event_device_socket, virtio_dev_socket) =
-                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                    .context("failed to create socket")?;
-            let dev = virtio::input::new_multi_touch(
-                u32::MAX,
-                virtio_dev_socket,
-                simplefb_cfg.width,
-                simplefb_cfg.height,
-                None,
-                virtio::base_features(cfg.protection_type),
-            )
-            .context("failed to set up multi-touch device for simplefb")?;
-            devs.push(VirtioDeviceStub {
-                dev: Box::new(dev),
-                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-            });
-            event_devices.push(EventDevice::touchscreen(event_device_socket));
-            log::info!("simplefb: created multi-touch event device ({}x{})", simplefb_cfg.width, simplefb_cfg.height);
-        }
-
-        if cfg.display_window_keyboard {
-            let (event_device_socket, virtio_dev_socket) =
-                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                    .context("failed to create socket")?;
-            let dev = virtio::input::new_keyboard(
-                u32::MAX,
-                virtio_dev_socket,
-                virtio::base_features(cfg.protection_type),
-            )
-            .context("failed to set up keyboard device for simplefb")?;
-            devs.push(VirtioDeviceStub {
-                dev: Box::new(dev),
-                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-            });
-            event_devices.push(EventDevice::keyboard(event_device_socket));
-            log::info!("simplefb: created keyboard event device");
-        }
-
+        let event_devices = create_display_window_input_devices(
+            cfg,
+            simplefb_cfg.width,
+            simplefb_cfg.height,
+            &mut devs,
+        )?;
         log::info!("simplefb: total event_devices={}", event_devices.len());
         *simplefb_event_devices_out = event_devices;
     }
@@ -667,22 +673,19 @@ fn create_virtio_devices(
                 width,
                 height,
             } => {
-                let mut width = *width;
-                let mut height = *height;
-                if absolute_mouse_idx == 0 {
-                    if width.is_none() {
-                        width = cfg.display_input_width;
-                    }
-                    if height.is_none() {
-                        height = cfg.display_input_height;
-                    }
-                }
+                let width = *width;
+                let height = *height;
+                // Omitted width/height => resolution-independent normalized mode: advertise a
+                // fixed ABS range (NORMALIZED_ABS_MAX) and let the feeder scale coordinates to it
+                // against the live display size, so the mapping stays 1:1 across guest auto-resize
+                // (matches the VNC pointer path). An explicit width/height keeps the legacy
+                // pixel-sized range for backward compatibility.
                 let dev = create_absolute_mouse_device(
                     cfg.protection_type,
                     cfg.jail_config.as_ref(),
                     path.as_path(),
-                    width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
-                    height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
+                    width.unwrap_or(NORMALIZED_ABS_MAX),
+                    height.unwrap_or(NORMALIZED_ABS_MAX),
                     absolute_mouse_idx,
                 )?;
                 absolute_mouse_idx += 1;
@@ -694,22 +697,17 @@ fn create_virtio_devices(
                 height,
                 name,
             } => {
-                let mut width = *width;
-                let mut height = *height;
-                if multi_touch_idx == 0 {
-                    if width.is_none() {
-                        width = cfg.display_input_width;
-                    }
-                    if height.is_none() {
-                        height = cfg.display_input_height;
-                    }
-                }
+                let width = *width;
+                let height = *height;
+                // Omitted width/height => resolution-independent normalized mode (see AbsoluteMouse
+                // above): fixed ABS range + feeder-side scaling to the live display size, correct
+                // across guest auto-resize. Explicit width/height keeps the legacy pixel range.
                 let dev = create_multi_touch_device(
                     cfg.protection_type,
                     cfg.jail_config.as_ref(),
                     path.as_path(),
-                    width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
-                    height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
+                    width.unwrap_or(NORMALIZED_ABS_MAX),
+                    height.unwrap_or(NORMALIZED_ABS_MAX),
                     name.as_deref(),
                     multi_touch_idx,
                 )?;
@@ -2016,13 +2014,9 @@ fn run_gunyah(
     use hypervisor::gunyah::GunyahVcpu;
     use hypervisor::gunyah::GunyahVm;
 
-    // Gunyah workaround: tell the in-process gfxstream backend to permanently pin
-    // RingBlob backing memory so host-visible virtio-gpu blob pages stay stable
-    // across unmap/remap. Gunyah SHARE mappings are permanent and cannot be
-    // re-pointed at different physical pages for the same GPA, so the backing must
-    // never be freed/recycled. Set here, before any GPU/jail process is forked, so
-    // child processes inherit it (and before gfxstream reads it on first blob create).
-    std::env::set_var("GFXSTREAM_GUNYAH_PIN_RINGBLOB", "1");
+    // The Gunyah RingBlob-pin workaround (GFXSTREAM_GUNYAH_PIN_RINGBLOB) is now driven by the
+    // `--gpu gunyah-pvm=true` sub-option, plumbed in create_gpu_device(), so it can be turned
+    // off on non-Gunyah SoCs.
 
     let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
     let gunyah = Gunyah::new_with_path(device_path)
@@ -3885,7 +3879,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             password: vnc_cfg.password.clone(),
         };
 
-        match simplefb_display::start_simplefb_display_thread(guest_mem, params, target, simplefb_event_devices) {
+        let touch_input = vnc_touch_input(vnc_cfg.input.as_deref());
+        match simplefb_display::start_simplefb_display_thread(
+            guest_mem,
+            params,
+            target,
+            simplefb_event_devices,
+            touch_input,
+        ) {
             Ok(handle) => {
                 info!("simplefb display bridge started");
                 Some(handle)

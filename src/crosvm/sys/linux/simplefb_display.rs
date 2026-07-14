@@ -39,6 +39,9 @@ pub fn start_simplefb_display_thread(
     params: SimplefbDisplayParams,
     target: VncDisplayTarget,
     event_devices: Vec<EventDevice>,
+    // Same `--vnc-server input=` interpretation as the virtio-gpu display path (see
+    // vnc_touch_input): true = legacy multi-touch, false = absolute-mouse tablet.
+    touch_input: bool,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("simplefb_display".into())
@@ -48,9 +51,7 @@ pub fn start_simplefb_display_thread(
                 params.width,
                 params.height,
                 target.password.clone(),
-                // simplefb mode only wires touchscreen+keyboard event devices, so keep the
-                // legacy touch input behavior here.
-                /* touch_input= */ true,
+                touch_input,
             );
             let mut display = match display_result {
                 Ok(d) => d,

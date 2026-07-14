@@ -158,8 +158,15 @@ const AARCH64_GPIO_ADDR: u64 = 0x4000;
 // The GPIO controller gets one 4k page
 const AARCH64_GPIO_SIZE: u64 = 0x1000;
 // The GPIO controller uses a fixed high SPI (like the vmwdt) so it does not
-// collide with the dynamically allocated virtio interrupts.
-const AARCH64_GPIO_IRQ: u32 = 14;
+// collide with the dynamically allocated virtio interrupts. It must stay at the
+// very top of the SPI range (NR_SPIS-2): a VNC + gfxstream VM with the app's
+// evdev bridge already spins up ~11 virtio-pci devices (gpu + block + net + the
+// gpu display-window inputs + the daemon --input devices), and the PCI IRQ
+// allocator hands those out from AARCH64_IRQ_BASE upward. At the old value 14 the
+// 11th device's IRQ collided here, and GH_VM_ADD_FUNCTION(GH_FN_IRQFD) failed
+// with EEXIST ("failed to register irq fd: File exists"). The PCI pool below
+// reserves the top two SPIs for GPIO/VMWDT.
+const AARCH64_GPIO_IRQ: u32 = 30;
 
 // Default PCI MMIO configuration region base address.
 const AARCH64_PCI_CAM_BASE_DEFAULT: u64 = 0x10000;
@@ -182,8 +189,8 @@ const AARCH64_VIRTFREQ_V2_SIZE: u64 = 0x1000;
 // PMU PPI interrupt, same as qemu
 const AARCH64_PMU_IRQ: u32 = 7;
 
-// VCPU stall detector interrupt
-const AARCH64_VMWDT_IRQ: u32 = 15;
+// VCPU stall detector interrupt. Fixed high SPI (NR_SPIS-1); see AARCH64_GPIO_IRQ.
+const AARCH64_VMWDT_IRQ: u32 = 31;
 
 const AARCH64_SIMPLEFB_FIXED_ADDR: u64 = 0x50000000;
 
@@ -859,7 +866,10 @@ impl arch::LinuxArch for AArch64 {
                 io_bus.clone(),
                 system_allocator,
                 &mut vm,
-                (devices::AARCH64_GIC_NR_SPIS - AARCH64_IRQ_BASE) as usize,
+                // Reserve the top two SPIs for the fixed GPIO/VMWDT interrupts
+                // (AARCH64_GPIO_IRQ / AARCH64_VMWDT_IRQ) so the dynamically
+                // allocated virtio-pci IRQs can't collide with them.
+                (devices::AARCH64_GIC_NR_SPIS - AARCH64_IRQ_BASE - 2) as usize,
                 None,
                 #[cfg(feature = "swap")]
                 swap_controller,
