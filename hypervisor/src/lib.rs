@@ -211,6 +211,12 @@ pub trait Vm: Send {
         None
     }
 
+    /// Returns true when the VM requested a memfd-backed, boot-time pre-shared blob arena. This
+    /// differs from the legacy fixed-map arena: runtime blob mappings must not replace its pages.
+    fn preshared_blob_arena_enabled(&self) -> bool {
+        false
+    }
+
     /// Register a host-visible blob arena covering `[guest_addr, guest_addr+size)` BEFORE VM start,
     /// as a `lend=false` (SHARE) memory region so the Gunyah RM blesses it (paired with a `no-map`
     /// /reserved-memory node in the guest DTB). The arena starts as anonymous backing; per-blob

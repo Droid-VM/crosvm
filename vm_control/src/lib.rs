@@ -845,7 +845,7 @@ impl VmMemoryRequest {
                 // alias the blob's backing fd into it (host-local add_fd_mapping; NO runtime
                 // SHARE). The guest reaches it through the shmem BAR at the already-blessed GPA,
                 // so a protected guest's stage-2 accepts it (no SIGBUS).
-                if vm.blob_arena_gpa().is_some() {
+                if vm.blob_arena_gpa().is_some() && !vm.preshared_blob_arena_enabled() {
                     match &source {
                         VmMemorySource::Descriptor {
                             descriptor,

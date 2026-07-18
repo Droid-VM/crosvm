@@ -1128,12 +1128,12 @@ impl arch::LinuxArch for AArch64 {
         // it (gpu_resv). This lets a protected guest map host-visible blobs (the gfxstream ASG
         // ring) at the BAR via host-local add_fd_mapping into the blessed arena, instead of a
         // runtime SHARE whose stage-2 fault is never forwarded to the host (SIGBUS).
-        // The blessed blob arena (+ its reserved-memory node + the dtb_shim it needs) is ONLY for
-        // the HostShare path. In GuestAccept mode the guest accepts each blob as its own memparcel
-        // via mem_accept (vm.supports_blob_share()==true), so there is no eager arena, no
-        // reserved-memory node, and no dtb_shim required.
+        // The legacy fixed-map arena is used by HostShare. GuestAccept can additionally request a
+        // memfd-backed pre-shared arena; arena-aware guests send the MAP_BLOB sentinel and never
+        // replace the boot-pinned pages.
         const VIRTIO_SHMEM_BAR_NUM: u8 = 2;
-        let gpu_resv: Option<(u64, u64)> = if !vm.supports_blob_share()
+        let gpu_resv: Option<(u64, u64)> = if (!vm.supports_blob_share()
+            || vm.preshared_blob_arena_enabled())
             && vm
                 .get_hypervisor()
                 .check_capability(HypervisorCap::StaticSwiotlbAllocationRequired)

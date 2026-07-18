@@ -535,6 +535,14 @@ pub struct virtio_gpu_resp_map_info {
 
 #[derive(Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
 #[repr(C)]
+pub struct virtio_gpu_resp_map_info_arena {
+    pub base: virtio_gpu_resp_map_info,
+    /// Byte offset within the boot-time pre-shared arena.
+    pub arena_offset: Le64,
+}
+
+#[derive(Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
 pub struct virtio_gpu_resource_assign_uuid {
     pub hdr: virtio_gpu_ctrl_hdr,
     pub resource_id: Le32,
@@ -757,6 +765,9 @@ pub enum GpuResponse {
         map_info: u32,
         /// Gunyah memparcel handle for the guest to accept (0/None when not applicable).
         gunyah_handle: Option<u32>,
+        /// Present only for an arena-sentinel request. Keeping legacy responses short preserves
+        /// compatibility with guests whose response descriptor has the original structure size.
+        arena_offset: Option<u64>,
     },
     ErrUnspec,
     ErrTube(TubeError),
@@ -964,15 +975,25 @@ impl GpuResponse {
             GpuResponse::OkMapInfo {
                 map_info,
                 gunyah_handle,
+                arena_offset,
             } => {
-                let resp_info = virtio_gpu_resp_map_info {
+                let base = virtio_gpu_resp_map_info {
                     hdr,
                     map_info: Le32::from(map_info),
                     gunyah_handle: Le32::from(gunyah_handle.unwrap_or(0)),
                 };
 
-                resp.write_obj(resp_info)?;
-                size_of_val(&resp_info)
+                if let Some(arena_offset) = arena_offset {
+                    let resp_info = virtio_gpu_resp_map_info_arena {
+                        base,
+                        arena_offset: Le64::from(arena_offset),
+                    };
+                    resp.write_obj(resp_info)?;
+                    size_of_val(&resp_info)
+                } else {
+                    resp.write_obj(base)?;
+                    size_of_val(&base)
+                }
             }
             _ => {
                 resp.write_obj(hdr)?;

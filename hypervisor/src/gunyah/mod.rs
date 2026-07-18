@@ -29,6 +29,8 @@ use base::ioctl_with_mut_ref;
 use base::ioctl_with_ref;
 use base::debug;
 use base::ioctl_with_val;
+use base::linux::MemfdSeals;
+use base::linux::SharedMemoryLinux;
 use base::pagesize;
 use base::warn;
 use base::Error;
@@ -38,6 +40,7 @@ use base::MemoryMappingArena;
 use base::MemoryMappingBuilder;
 use base::MmapError;
 use base::RawDescriptor;
+use base::SharedMemory;
 use gunyah_sys::*;
 use libc::open;
 use libc::EFAULT;
@@ -247,6 +250,20 @@ pub enum GunyahBlobMode {
     HostShare,
 }
 
+enum BlobArena {
+    /// Legacy HostShare arena whose backing may be replaced with MAP_FIXED mappings.
+    Fixed { slot: MemSlot, gpa: u64 },
+    /// GuestAccept arena whose memfd pages are permanently shared at VM start.
+    /// `slot` is the SET_USER_MEM_REGION label; the gunyah-vm-config shm vdevice
+    /// node emitted for the arena must carry the same label or the RM rejects
+    /// VM_START with NORESOURCE (same rule as the swiotlb memparcel).
+    Preshared {
+        slot: MemSlot,
+        gpa: u64,
+        _shm: SharedMemory,
+    },
+}
+
 pub struct GunyahVm {
     gh: Gunyah,
     vm: SafeDescriptor,
@@ -270,11 +287,11 @@ pub struct GunyahVm {
     hv_cfg: crate::Config,
     /// How host-visible virtio-gpu blobs are mapped into the guest (see [`GunyahBlobMode`]).
     blob_mode: GunyahBlobMode,
-    /// Boot-time "blessed" host-visible blob arena: (mem slot, base GPA). Registered before VM
-    /// start via `prepare_blob_arena` (SHARE + no-map reserved-memory node => the RM blesses the
-    /// range). Per-blob backing is aliased in later via `blob_fixed_map` (host-local
-    /// add_fd_mapping, no runtime SHARE). When set, this supersedes the share_blob path.
-    blob_arena: Arc<Mutex<Option<(MemSlot, u64)>>>,
+    /// Whether to create the GuestAccept memfd-backed pre-shared arena.
+    preshared_blob_arena: bool,
+    /// Boot-time blessed host-visible blob arena. The legacy HostShare variant supports fixed
+    /// mappings; the GuestAccept variant keeps one immutable memfd backing for the VM lifetime.
+    blob_arena: Arc<Mutex<Option<BlobArena>>>,
 }
 
 impl AsRawDescriptor for GunyahVm {
@@ -284,7 +301,7 @@ impl AsRawDescriptor for GunyahVm {
 }
 
 impl GunyahVm {
-    pub fn new(gh: &Gunyah, vm_id: Option<u16>, pas_id: Option<u32>, guest_mem: GuestMemory, cfg: Config, blob_mode: GunyahBlobMode) -> Result<GunyahVm> {
+    pub fn new(gh: &Gunyah, vm_id: Option<u16>, pas_id: Option<u32>, guest_mem: GuestMemory, cfg: Config, blob_mode: GunyahBlobMode, preshared_blob_arena: bool) -> Result<GunyahVm> {
         // SAFETY:
         // Safe because we know gunyah is a real gunyah fd as this module is the only one that can
         // make Gunyah objects.
@@ -440,6 +457,7 @@ impl GunyahVm {
             routes: Arc::new(Mutex::new(HashSet::new())),
             hv_cfg: cfg,
             blob_mode,
+            preshared_blob_arena,
             blob_arena: Arc::new(Mutex::new(None)),
         })
     }
@@ -578,6 +596,7 @@ impl GunyahVm {
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
             blob_mode: self.blob_mode,
+            preshared_blob_arena: self.preshared_blob_arena,
             blob_arena: self.blob_arena.clone(),
         })
     }
@@ -673,6 +692,78 @@ impl GunyahVm {
     }
 }
 
+const BLOB_ARENA_HUGEPAGE_SIZE: usize = 2 * 1024 * 1024;
+const MADV_COLLAPSE: libc::c_int = 25;
+
+#[cfg(target_arch = "aarch64")]
+fn clean_blob_arena_cache(host_addr: *mut u8, size: usize) {
+    let ctr: u64;
+    // SAFETY: Reading CTR_EL0 and cleaning cache lines by VA are permitted at EL0 when Linux
+    // enables SCTLR_EL1.UCI. `host_addr..host_addr+size` is a live writable mapping.
+    unsafe {
+        core::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr);
+        let line_size = 4usize << ((ctr >> 16) & 0xf);
+        let mut addr = (host_addr as usize) & !(line_size - 1);
+        let end = host_addr as usize + size;
+        while addr < end {
+            core::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack));
+            addr += line_size;
+        }
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn clean_blob_arena_cache(_host_addr: *mut u8, _size: usize) {}
+
+fn prepare_preshared_blob_mapping(size: usize) -> Result<(SharedMemory, MemoryMapping)> {
+    if size == 0 || size % BLOB_ARENA_HUGEPAGE_SIZE != 0 {
+        return Err(Error::new(EINVAL));
+    }
+
+    let mut shm = SharedMemory::new("crosvm-kgsl-blob-arena", size as u64)?;
+    let mut seals = MemfdSeals::new();
+    seals.set_shrink_seal();
+    shm.add_seals(seals)?;
+
+    let mapping = MemoryMappingBuilder::new(size)
+        .from_shared_memory(&shm)
+        .align(BLOB_ARENA_HUGEPAGE_SIZE as u64)
+        .build()
+        .map_err(|e| match e {
+            MmapError::SystemCallFailed(err) => err,
+            _ => Error::new(EINVAL),
+        })?;
+    let host_addr = mapping.as_ptr();
+
+    // SAFETY: `mapping` owns a writable `size`-byte mapping. madvise only changes VM policy, and
+    // write_bytes faults and zeroes every page before each 2 MiB range is collapsed.
+    unsafe {
+        if libc::madvise(host_addr.cast(), size, libc::MADV_HUGEPAGE) != 0 {
+            return errno_result();
+        }
+        std::ptr::write_bytes(host_addr, 0, size);
+        for offset in (0..size).step_by(BLOB_ARENA_HUGEPAGE_SIZE) {
+            if libc::madvise(
+                host_addr.add(offset).cast(),
+                BLOB_ARENA_HUGEPAGE_SIZE,
+                MADV_COLLAPSE,
+            ) != 0
+            {
+                warn!(
+                    "GUNYAH-BLOB-ARENA: MADV_COLLAPSE failed at offset=0x{:x}: {}",
+                    offset,
+                    std::io::Error::last_os_error()
+                );
+                return errno_result();
+            }
+        }
+    }
+    clean_blob_arena_cache(host_addr, size);
+
+    Ok((shm, mapping))
+}
+
 impl Vm for GunyahVm {
     fn try_clone(&self) -> Result<Self>
     where
@@ -691,6 +782,7 @@ impl Vm for GunyahVm {
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
             blob_mode: self.blob_mode,
+            preshared_blob_arena: self.preshared_blob_arena,
             blob_arena: self.blob_arena.clone(),
         })
     }
@@ -850,7 +942,13 @@ impl Vm for GunyahVm {
     }
 
     fn blob_arena_gpa(&self) -> Option<u64> {
-        self.blob_arena.lock().as_ref().map(|&(_, gpa)| gpa)
+        self.blob_arena.lock().as_ref().map(|arena| match arena {
+            BlobArena::Fixed { gpa, .. } | BlobArena::Preshared { gpa, .. } => *gpa,
+        })
+    }
+
+    fn preshared_blob_arena_enabled(&self) -> bool {
+        self.preshared_blob_arena
     }
 
     fn prepare_blob_arena(&mut self, guest_addr: GuestAddress, size: u64) -> Result<()> {
@@ -859,6 +957,42 @@ impl Vm for GunyahVm {
         }
         let pgsz = pagesize() as u64;
         let size = (size + pgsz - 1) / pgsz * pgsz;
+
+        if self.preshared_blob_arena {
+            let (shm, mapping) = prepare_preshared_blob_mapping(size as usize)?;
+            let host_va = mapping.as_ptr() as u64;
+            let arena_fd = shm.as_raw_descriptor();
+            let slot = self.add_memory_region(
+                guest_addr,
+                Box::new(mapping),
+                false,
+                false,
+                MemCacheType::CacheCoherent,
+            )?;
+
+            // This environment handoff relies on prepare_blob_arena running during VM
+            // construction, before GPU worker threads can initialize the renderer and call
+            // getenv. Do not move these mutations into the running, multithreaded VM phase.
+            std::env::set_var("CROSVM_KGSL_ARENA_FD", arena_fd.to_string());
+            std::env::set_var("CROSVM_KGSL_ARENA_HOST_VA", format!("{host_va:#x}"));
+            std::env::set_var("CROSVM_KGSL_ARENA_SIZE", size.to_string());
+
+            *self.blob_arena.lock() = Some(BlobArena::Preshared {
+                slot,
+                gpa: guest_addr.offset(),
+                _shm: shm,
+            });
+            warn!(
+                "GUNYAH-BLOB-ARENA: pre-shared slot={} gpa=0x{:x} host_va=0x{:x} size=0x{:x} fd={}",
+                slot,
+                guest_addr.offset(),
+                host_va,
+                size,
+                arena_fd,
+            );
+            return Ok(());
+        }
+
         // Reserve a host VA arena for the whole BAR window and back it with anonymous pages.
         // Gunyah refuses to SHARE a PROT_NONE region (the guest then hangs at start with no
         // backing to map), so the arena must have real backing at SHARE time. Per-blob fds
@@ -879,7 +1013,10 @@ impl Vm for GunyahVm {
             false,
             MemCacheType::CacheCoherent,
         )?;
-        *self.blob_arena.lock() = Some((slot, guest_addr.offset()));
+        *self.blob_arena.lock() = Some(BlobArena::Fixed {
+            slot,
+            gpa: guest_addr.offset(),
+        });
         warn!(
             "GUNYAH-BLOB-ARENA: prepared slot={} gpa=0x{:x} size=0x{:x}",
             slot,
@@ -897,9 +1034,9 @@ impl Vm for GunyahVm {
         size: usize,
         prot: Protection,
     ) -> Result<()> {
-        let (slot, base) = match *self.blob_arena.lock() {
-            Some(v) => v,
-            None => return Err(Error::new(EINVAL)),
+        let (slot, base) = match self.blob_arena.lock().as_ref() {
+            Some(BlobArena::Fixed { slot, gpa }) => (*slot, *gpa),
+            Some(BlobArena::Preshared { .. }) | None => return Err(Error::new(EINVAL)),
         };
         let gpa = guest_addr.offset();
         if gpa < base {

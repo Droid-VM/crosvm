@@ -80,6 +80,29 @@ use crate::virtio::resource_bridge::ResourceInfo;
 use crate::virtio::resource_bridge::ResourceResponse;
 use crate::virtio::SharedMemoryMapper;
 
+const KGSL_ARENA_SENTINEL: u64 = 0xffff_ffff_ffff_f000;
+
+#[derive(Copy, Clone)]
+struct KgslHostVisibleArena {
+    host_va: u64,
+    size: u64,
+}
+
+fn parse_arena_env_u64(name: &str) -> Option<u64> {
+    let value = std::env::var(name).ok()?;
+    if let Some(hex) = value.strip_prefix("0x") {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn kgsl_host_visible_arena() -> Option<KgslHostVisibleArena> {
+    let host_va = parse_arena_env_u64("CROSVM_KGSL_ARENA_HOST_VA")?;
+    let size = parse_arena_env_u64("CROSVM_KGSL_ARENA_SIZE")?;
+    (host_va != 0 && size != 0).then_some(KgslHostVisibleArena { host_va, size })
+}
+
 pub fn to_rutabaga_descriptor(s: SafeDescriptor) -> RutabagaDescriptor {
     // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
@@ -101,6 +124,7 @@ struct VirtioGpuResource {
     scanout_data: Option<VirtioScanoutBlobData>,
     display_import: Option<u32>,
     rutabaga_external_mapping: bool,
+    arena_mapped: bool,
 
     // Only saved for snapshotting, so that we can re-attach backing iovecs with the correct new
     // host addresses.
@@ -131,6 +155,7 @@ impl VirtioGpuResource {
             scanout_data: None,
             display_import: None,
             rutabaga_external_mapping: false,
+            arena_mapped: false,
             backing_iovecs: None,
         }
     }
@@ -1118,12 +1143,79 @@ impl VirtioGpu {
     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
     pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> VirtioGpuResult {
+        let configured_arena = kgsl_host_visible_arena();
+        let arena = if offset == KGSL_ARENA_SENTINEL {
+            configured_arena.ok_or(ErrUnspec)?
+        } else {
+            KgslHostVisibleArena {
+                host_va: 0,
+                size: 0,
+            }
+        };
         let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
         let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+
+        if offset != KGSL_ARENA_SENTINEL {
+            if let Some(arena) = configured_arena {
+                if let Ok(mapping) = self.rutabaga.map(resource_id) {
+                    let arena_end = arena.host_va.checked_add(arena.size).ok_or(ErrUnspec)?;
+                    let mapping_end = mapping.ptr.checked_add(resource.size).ok_or(ErrUnspec)?;
+                    let overlaps_arena = mapping.ptr < arena_end && mapping_end > arena.host_va;
+                    self.rutabaga.unmap(resource_id).map_err(|_| ErrUnspec)?;
+
+                    if overlaps_arena {
+                        base::warn!(
+                            "GPU-MAPBLOB: rejecting legacy offset 0x{:x} for arena-backed res={}",
+                            offset,
+                            resource_id,
+                        );
+                        return Err(ErrUnspec);
+                    }
+                }
+            }
+        }
+
+        if offset == KGSL_ARENA_SENTINEL {
+            let mapping = self.rutabaga.map(resource_id).map_err(|_| ErrUnspec)?;
+            let arena_end = arena.host_va.checked_add(arena.size).ok_or(ErrUnspec)?;
+            let mapping_end = mapping.ptr.checked_add(resource.size).ok_or(ErrUnspec)?;
+            if mapping.ptr < arena.host_va
+                || mapping_end > arena_end
+                || mapping.size < resource.size
+            {
+                let _ = self.rutabaga.unmap(resource_id);
+                base::warn!(
+                    "GPU-MAPBLOB: res={} returned non-arena mapping ptr=0x{:x} size=0x{:x}",
+                    resource_id,
+                    mapping.ptr,
+                    mapping.size,
+                );
+                return Err(ErrUnspec);
+            }
+
+            let arena_offset = mapping.ptr - arena.host_va;
+            if arena_offset % base::pagesize() as u64 != 0 {
+                let _ = self.rutabaga.unmap(resource_id);
+                base::warn!(
+                    "GPU-MAPBLOB: res={} returned unaligned arena offset 0x{:x}",
+                    resource_id,
+                    arena_offset,
+                );
+                return Err(ErrUnspec);
+            }
+            resource.shmem_offset = Some(arena_offset);
+            resource.rutabaga_external_mapping = true;
+            resource.arena_mapped = true;
+            return Ok(OkMapInfo {
+                map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+                gunyah_handle: None,
+                arena_offset: Some(arena_offset),
+            });
+        }
 
         let mut source: Option<VmMemorySource> = None;
         match self.rutabaga.export_blob(resource_id) {
@@ -1233,6 +1325,7 @@ impl VirtioGpu {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
             // On Gunyah, the guest must accept this memparcel handle to map the blob itself.
             gunyah_handle,
+            arena_offset: None,
         })
     }
 
@@ -1250,6 +1343,17 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+
+        if resource.arena_mapped {
+            if resource.rutabaga_external_mapping {
+                self.rutabaga.unmap(resource_id)?;
+                resource.rutabaga_external_mapping = false;
+            }
+            resource.shmem_offset = None;
+            resource.arena_mapped = false;
+            return Ok(OkNoData);
+        }
+
         self.mapper
             .lock()
             .as_mut()

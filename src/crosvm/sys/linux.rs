@@ -2006,6 +2006,7 @@ fn run_gunyah(
     qcom_trusted_vm_id: Option<u16>,
     qcom_trusted_vm_pas_id: Option<u32>,
     blob_mode: hypervisor::gunyah::GunyahBlobMode,
+    blob_arena: bool,
     cfg: Config,
     components: VmComponents,
 ) -> Result<ExitState> {
@@ -2036,7 +2037,11 @@ fn run_gunyah(
         None
     };
 
-    let vm = GunyahVm::new(&gunyah, qcom_trusted_vm_id, qcom_trusted_vm_pas_id, guest_mem, components.hv_cfg, blob_mode).context("failed to create vm")?;
+    if blob_arena && blob_mode != hypervisor::gunyah::GunyahBlobMode::GuestAccept {
+        bail!("gunyah blob_arena requires blob_mode=guest-accept");
+    }
+
+    let vm = GunyahVm::new(&gunyah, qcom_trusted_vm_id, qcom_trusted_vm_pas_id, guest_mem, components.hv_cfg, blob_mode, blob_arena).context("failed to create vm")?;
 
     // Check that the VM was actually created in protected mode as expected.
     if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
@@ -2090,6 +2095,7 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
                 blob_mode: hypervisor::gunyah::GunyahBlobMode::default(),
+                blob_arena: false,
             });
         }
     }
@@ -2122,11 +2128,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                                  qcom_trusted_vm_id,
                                  qcom_trusted_vm_pas_id,
                                  blob_mode,
+                                 blob_arena,
                                } => run_gunyah(
                                         device.as_deref(),
                                         qcom_trusted_vm_id,
                                         qcom_trusted_vm_pas_id,
                                         blob_mode,
+                                        blob_arena,
                                         cfg, components),
     }
 }

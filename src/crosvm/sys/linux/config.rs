@@ -41,6 +41,10 @@ pub enum HypervisorKind {
         /// for host kernels that map it into the running guest themselves.
         #[serde(default)]
         blob_mode: hypervisor::gunyah::GunyahBlobMode,
+        /// Pre-share the virtio-gpu host-visible window as one boot-time arena. This is only
+        /// supported with `blob-mode=guest-accept` and requires an arena-aware guest.
+        #[serde(default)]
+        blob_arena: bool,
     },
 }
 
@@ -629,6 +633,7 @@ mod tests {
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
                 blob_mode: hypervisor::gunyah::GunyahBlobMode::GuestAccept,
+                blob_arena: false,
             })
         );
     }
@@ -651,6 +656,7 @@ mod tests {
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
                 blob_mode: hypervisor::gunyah::GunyahBlobMode::GuestAccept,
+                blob_arena: false,
             })
         );
     }
@@ -673,6 +679,7 @@ mod tests {
                 qcom_trusted_vm_id: Some(0),
                 qcom_trusted_vm_pas_id: Some(0),
                 blob_mode: hypervisor::gunyah::GunyahBlobMode::GuestAccept,
+                blob_arena: false,
             })
         );
     }
@@ -695,6 +702,34 @@ mod tests {
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
                 blob_mode: hypervisor::gunyah::GunyahBlobMode::HostShare,
+                blob_arena: false,
+            })
+        );
+    }
+
+    #[test]
+    #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+    fn hypervisor_gunyah_blob_arena() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &[
+                "--hypervisor",
+                "gunyah[blob_mode=guest-accept,blob_arena=true]",
+                "/dev/null",
+            ],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+
+        assert_eq!(
+            config.hypervisor,
+            Some(HypervisorKind::Gunyah {
+                device: None,
+                qcom_trusted_vm_id: None,
+                qcom_trusted_vm_pas_id: None,
+                blob_mode: hypervisor::gunyah::GunyahBlobMode::GuestAccept,
+                blob_arena: true,
             })
         );
     }

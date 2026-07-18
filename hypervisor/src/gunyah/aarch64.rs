@@ -199,6 +199,17 @@ impl VmAArch64 for GunyahVm {
             }
         }
 
+        // The pre-shared blob arena is registered directly via add_memory_region (it is not a
+        // guest_mem region), so the loop above never emits its shm vdevice node. The android14-6.1
+        // RM refuses VM_START (NORESOURCE) for any boot-time share parcel without a matching shm
+        // node, exactly like the swiotlb one. The node's label must equal the parcel label, which
+        // set_user_memory_region derives from the memory slot.
+        if let Some(super::BlobArena::Preshared { slot, gpa, .. }) =
+            &*self.blob_arena.lock()
+        {
+            fdt_create_shm_device(vdev_node, *slot, GuestAddress(*gpa))?;
+        }
+
         Ok(())
     }
 
