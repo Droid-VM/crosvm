@@ -220,6 +220,9 @@ pub type virgl_log_callback_type = ::std::option::Option<
     ),
 >;
 extern "C" {
+    pub fn virgl_set_log_level(log_level: virgl_log_level_flags);
+}
+extern "C" {
     pub fn virgl_renderer_resource_create(
         args: *mut virgl_renderer_resource_create_args,
         iov: *mut iovec,
