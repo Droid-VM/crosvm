@@ -7,7 +7,7 @@
 
 #![cfg(feature = "virgl_renderer")]
 
-use std::cmp::min;
+use std::ffi::CStr;
 use std::io::Error as SysError;
 use std::io::IoSliceMut;
 use std::mem::size_of;
@@ -25,9 +25,9 @@ use std::sync::Arc;
 
 use log::debug;
 use log::error;
+use log::info;
 use log::warn;
 
-use crate::generated::virgl_debug_callback_bindings::*;
 use crate::generated::virgl_renderer_bindings::*;
 use crate::renderer_utils::*;
 use crate::rutabaga_core::RutabagaComponent;
@@ -203,36 +203,26 @@ impl Drop for VirglRendererContext {
     }
 }
 
-extern "C" fn debug_callback(fmt: *const ::std::os::raw::c_char, ap: stdio::va_list) {
-    const BUF_LEN: usize = 256;
-    let mut v = [b' '; BUF_LEN];
+extern "C" fn log_callback(
+    level: virgl_log_level_flags,
+    message: *const c_char,
+    _user_data: *mut c_void,
+) {
+    if message.is_null() {
+        return;
+    }
 
-    // TODO(b/315870313): Add safety comment
-    #[allow(clippy::undocumented_unsafe_blocks)]
-    let printed_len = unsafe {
-        let ptr = v.as_mut_ptr() as *mut ::std::os::raw::c_char;
-        #[cfg(any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "aarch64",
-            target_arch = "riscv64"
-        ))]
-        let size = BUF_LEN as ::std::os::raw::c_ulong;
-        #[cfg(target_arch = "arm")]
-        let size = BUF_LEN as ::std::os::raw::c_uint;
-
-        stdio::vsnprintf(ptr, size, fmt, ap)
-    };
-
-    if printed_len < 0 {
-        debug!(
-            "rutabaga_gfx::virgl_renderer::debug_callback: vsnprintf returned {}",
-            printed_len
-        );
-    } else {
-        // vsnprintf returns the number of chars that *would* have been printed
-        let len = min(printed_len as usize, BUF_LEN - 1);
-        debug!("{}", String::from_utf8_lossy(&v[..len]));
+    // The C side formats each message once and preserves its level.  Keep the
+    // CStr borrowed so disabled Rust log levels do not require another buffer.
+    // SAFETY: virglrenderer passes a valid NUL-terminated string that remains
+    // alive for the duration of this synchronous callback.
+    let message = unsafe { CStr::from_ptr(message) };
+    match level {
+        VIRGL_LOG_LEVEL_DEBUG => debug!("{}", message.to_string_lossy()),
+        VIRGL_LOG_LEVEL_INFO => info!("{}", message.to_string_lossy()),
+        VIRGL_LOG_LEVEL_WARNING => warn!("{}", message.to_string_lossy()),
+        VIRGL_LOG_LEVEL_ERROR => error!("{}", message.to_string_lossy()),
+        _ => {}
     }
 }
 
@@ -357,11 +347,28 @@ impl VirglRenderer {
             return Err(RutabagaError::AlreadyInUse);
         }
 
-        // TODO(b/315870313): Add safety comment
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            virgl_set_debug_callback(Some(debug_callback))
+        // max_level() only exposes the global upper bound.  Crosvm commonly
+        // keeps that bound at TRACE while its logger filters individual
+        // targets, so query this module's actual target before choosing the C
+        // threshold.  This prevents vasprintf() for records Rust would drop.
+        let log_level = if log::log_enabled!(target: module_path!(), log::Level::Debug) {
+            VIRGL_LOG_LEVEL_DEBUG
+        } else if log::log_enabled!(target: module_path!(), log::Level::Info) {
+            VIRGL_LOG_LEVEL_INFO
+        } else if log::log_enabled!(target: module_path!(), log::Level::Warn) {
+            VIRGL_LOG_LEVEL_WARNING
+        } else if log::log_enabled!(target: module_path!(), log::Level::Error) {
+            VIRGL_LOG_LEVEL_ERROR
+        } else {
+            VIRGL_LOG_LEVEL_SILENT
         };
+
+        // Keep virgl's C-side filtering in sync with crosvm's logger so a
+        // disabled debug message is rejected before vasprintf().
+        unsafe {
+            virgl_set_log_level(log_level);
+            virgl_set_log_callback(Some(log_callback), null_mut(), None);
+        }
 
         // Cookie is intentionally never freed because virglrenderer never gets uninitialized.
         // Otherwise, Resource and Context would become invalid because their lifetime is not tied
