@@ -560,6 +560,7 @@ impl RutabagaComponent for VirglRenderer {
             component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
             size: 0,
             mapping: None,
+            pool_offset: None,
         })
     }
 
@@ -735,6 +736,7 @@ impl RutabagaComponent for VirglRenderer {
             component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
             size: resource_create_blob.size,
             mapping: None,
+            pool_offset: None,
         })
     }
 

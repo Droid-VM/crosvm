@@ -42,6 +42,11 @@ pub use crate::rutabaga_os::OwnedDescriptor as RutabagaDescriptor;
 pub use crate::rutabaga_os::RawDescriptor as RutabagaRawDescriptor;
 pub use crate::rutabaga_utils::*;
 
+// DroidVM: register host-visible blob-backing (folio) handlers that gfxstream's prepare/release
+// callbacks bridge to the crosvm GPU backend.
+#[cfg(feature = "gfxstream")]
+pub use crate::gfxstream::register_blob_backing_handlers;
+
 pub mod kumquat_support {
     pub use crate::bytestream::Reader as RutabagaReader;
     pub use crate::bytestream::Writer as RutabagaWriter;

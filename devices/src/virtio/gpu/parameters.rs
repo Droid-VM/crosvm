@@ -46,14 +46,6 @@ pub enum AudioDeviceMode {
     OneGlobal,
 }
 
-// What gfxstream does when the host-visible folio (reserved-hugepage) budget is exhausted.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum VramExceedPolicy {
-    Fallback,
-    Oom,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct GpuParameters {
@@ -101,18 +93,53 @@ pub struct GpuParameters {
     // When running with device sandboxing, the path of a directory available for
     // scratch space.
     pub snapshot_scratch_path: Option<PathBuf>,
-    // DroidVM host-visible folio (reserved-hugepage) backing knobs, plumbed to gfxstream as
-    // GFXSTREAM_VRAM_* env before the GPU process forks. None => let gfxstream use its default.
-    //   vram-limit=<MB>: folio budget; 0 disables folio backing (all allocs share 4K pages).
-    //   vram-folio-threshold=<KB>: allocs >= this take a reserved 2MB folio; smaller share 4K.
-    //   vram-exceed-policy=fallback|oom: on budget exhaustion, drop to 4K or fail the alloc.
-    pub vram_limit: Option<u64>,
-    pub vram_folio_threshold: Option<u64>,
-    pub vram_exceed_policy: Option<VramExceedPolicy>,
+    // DroidVM host-visible VRAM *quota* (GPU-side cap so the GPU can't monopolise host-visible
+    // memory and starve peer devices). Metering ONLY -- the folio *policy* is VMM-owned
+    // (`--runtime-share hugepage-threshold-kb=,exceed-policy=`) and applied regardless.
+    //   vram-limit=<MB>: N>0 = cap; 0 = unmetered; -1 = explicitly unlimited (still counts as
+    //   "defined", which enables fusion routing together with a --pre-alloc gfx pool).
+    // Ignored (forced 0) when udmabuf=true: in guest-alloc mode the pool itself is the cap.
+    pub vram_limit: Option<i64>,
+    // CMDLINE_V2 v3 fusion size gate: host-visible allocations <= this (KB) try the pre-alloc
+    // pool first; larger ones go straight to the runtime-SHARE path. Only effective when fusion
+    // routing is enabled (udmabuf=false AND vram-limit defined AND a --pre-alloc gfx pool exists);
+    // otherwise forced 0 (= no gate). Plumbed to gfxstream as GFXSTREAM_POOL_BLOB_MAX_KB.
+    pub pool_blob_max_kb: Option<u64>,
+    // Guest-alloc (udmabuf=true) pool partition: the host-owned slice (MB) of the gfx pre-alloc
+    // pool that serves ALL gfx host-alloc requests (ASG rings, stray HOST3D blobs); exhausted =>
+    // runtime-share fallback (module present) or clean per-client failure. The remainder is the
+    // guest slice (announced to the guest driver via capset). gfx- prefix = per-proxy namespace
+    // (other proxy variants may follow). Ignored when udmabuf=false (whole pool is host-owned).
+    // Plumbed to gfxstream as GFXSTREAM_POOL_HOST_MB.
+    pub gfx_host_pre_alloc_mb: Option<u64>,
     // gunyah-pvm: gate the Gunyah pVM-specific gfxstream behavior (pin RingBlob backing so the
     // permanent Gunyah SHARE mapping stays stable). Only Qualcomm/Gunyah needs it; leave off on
     // other SoCs (MediaTek, Tensor, ...). Plumbed to GFXSTREAM_GUNYAH_PIN_RINGBLOB.
     pub gunyah_pvm: Option<bool>,
+    // vm-accept: who drives the guest-side memparcel accept for host-visible blobs on protected
+    // Gunyah. `off` (default) = the guest virtio-gpu driver accepts the handle returned in the
+    // map_blob response (low-latency, current behavior); `sync` = the generic in-VM accept
+    // module does it over the virtio-gunyah-accept transport before map_blob returns.
+    pub vm_accept: GpuVmAccept,
+}
+
+/// GPU flavor of [`hypervisor::VmAccept`]; a separate enum so the CLI default stays `off`
+/// (the hypervisor-level default is `Sync`, meant for components with upstream semantics).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuVmAccept {
+    #[default]
+    Off,
+    Sync,
+}
+
+impl From<GpuVmAccept> for hypervisor::VmAccept {
+    fn from(v: GpuVmAccept) -> Self {
+        match v {
+            GpuVmAccept::Off => hypervisor::VmAccept::Off,
+            GpuVmAccept::Sync => hypervisor::VmAccept::Sync,
+        }
+    }
 }
 
 impl Default for GpuParameters {
@@ -151,9 +178,10 @@ impl Default for GpuParameters {
             renderer_features: None,
             snapshot_scratch_path: None,
             vram_limit: None,
-            vram_folio_threshold: None,
-            vram_exceed_policy: None,
+            pool_blob_max_kb: None,
+            gfx_host_pre_alloc_mb: None,
             gunyah_pvm: None,
+            vm_accept: GpuVmAccept::default(),
         }
     }
 }

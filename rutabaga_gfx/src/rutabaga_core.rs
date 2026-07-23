@@ -58,6 +58,10 @@ pub struct RutabagaResource {
     pub component_mask: u8,
     pub size: u64,
     pub mapping: Option<MemoryMapping>,
+    /// DroidVM gfxstream pre-alloc: byte offset within the boot-blessed GpuPool when this blob's
+    /// host-visible memory was sub-allocated from it (the VMM maps the pool GPA directly, no
+    /// runtime SHARE). `None` for every ordinary resource.
+    pub pool_offset: Option<u64>,
 }
 
 /// The preserved fields of `RutabagaResource` that are saved and loaded across snapshot and
@@ -134,6 +138,7 @@ impl TryFrom<RutabagaResourceSnapshot> for RutabagaResource {
             size: snapshot.size,
             component_mask: snapshot.component_mask,
             mapping: None,
+            pool_offset: None,
         })
     }
 }
@@ -198,6 +203,7 @@ pub trait RutabagaComponent {
             component_mask: 0,
             size: 0,
             mapping: None,
+            pool_offset: None,
         })
     }
 
@@ -1014,6 +1020,13 @@ impl Rutabaga {
         resource
             .map_info
             .ok_or(RutabagaError::SpecViolation("no map info available"))
+    }
+
+    /// DroidVM gfxstream pre-alloc: the GpuPool byte offset of a pool-resident blob's
+    /// host-visible memory, or `None` if this resource is not pool-backed (ordinary
+    /// runtime-SHARE / host-ptr blob). The VMM maps `pool_gpa + offset` directly.
+    pub fn resource_pool_offset(&self, resource_id: u32) -> Option<u64> {
+        self.resources.get(&resource_id).and_then(|r| r.pool_offset)
     }
 
     /// Returns the `vulkan_info` of the blob resource, which consists of the physical device

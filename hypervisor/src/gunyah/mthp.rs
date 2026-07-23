@@ -32,6 +32,7 @@ pub const LEND_CHUNK_SIZE: u64 = 256 * 1024 * 1024; // 256 MB
 const MADV_POPULATE_WRITE: i32 = 23;
 #[allow(dead_code)]
 const MADV_COLLAPSE: i32 = 25;
+const MADV_POPULATE_READ: i32 = 22;
 
 // ── mTHP sizes to enable ────────────────────────────────────────────────────
 
@@ -81,6 +82,14 @@ pub struct LendPrepResult {
     pub need_small: Vec<bool>,
     /// Total bytes that were successfully collapsed to ≥ 64 KB folios.
     pub large_page_bytes: u64,
+    /// Hard verification that every page in the region is genuinely resolvable
+    /// (`MADV_POPULATE_READ` over the whole range succeeded). Phase 2's
+    /// MADV_POPULATE_WRITE / manual-touch fallback can both report success while a
+    /// custom reserve-pool fault hook silently hands back an unbacked mapping (e.g.
+    /// CMA reservoir exhausted); this is the only phase that treats that as fatal so
+    /// the caller can fail VM creation instead of the guest SIGBUS-ing minutes later
+    /// deep inside its GPU stack (host-alloc must fail loudly, not silently).
+    pub populated: bool,
 }
 
 /// Prepare a lend region for Gunyah by maximising large-page backing.
@@ -295,10 +304,114 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
         need_small[ci] = !is_thp;
     }
 
+    // ── Hard verification: every page must genuinely be resolvable ──
+    //
+    // MADV_POPULATE_READ forces the kernel to resolve (not just request) every page
+    // in the range; a custom fault hook (e.g. the reserve-pool supply hook) that
+    // cannot serve a page returns an error here instead of silently leaving a hole
+    // that only surfaces as a SIGBUS on first guest/host touch. Safe (no crash risk)
+    // unlike a manual read/write touch of memory that might not be backed.
+    let verify_ret =
+        libc::madvise(host_addr as *mut libc::c_void, size as usize, MADV_POPULATE_READ);
+    let populated = verify_ret == 0;
+    if populated {
+        info!("GH: verify (MADV_POPULATE_READ): OK, region fully backed");
+    } else {
+        warn!(
+            "GH: verify (MADV_POPULATE_READ) FAILED: errno={} -- region is NOT fully backed \
+             (reserve pool likely exhausted); caller must treat this as fatal",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        );
+    }
+
     LendPrepResult {
         need_small,
         large_page_bytes,
+        populated,
     }
+}
+
+/// Round `v` up to the next multiple of the 2MB folio size.
+pub fn round_up_2mb(v: u64) -> u64 {
+    (v + THP_SIZE - 1) & !(THP_SIZE - 1)
+}
+
+/// Back a host-visible blob's shmem `fd` with 2MB order-9 folios (Task B, backend side).
+///
+/// Grows the memfd to `rounded` (a 2MB multiple) so a whole huge folio can be allocated for the
+/// blob, then drives `MADV_COLLAPSE` over a fresh 2MB-*aligned* view of the fd. The collapse
+/// migrates the file's page-cache pages into 2MB-aligned huge folios; every other mapping of the
+/// same offsets (gfxstream's, and the later runtime-SHARE view) is repointed to those folios by
+/// rmap, so the eventual SHARE pins one contiguous 2MB run per folio and its SCM-assign never
+/// splits a hyp block shared with LENT guest RAM (the exec-strip). Growing the file is safe for
+/// gfxstream's existing mapping at the original size, and this must run BEFORE gfxstream creates
+/// the udmabuf (whose pin would block the collapse) -- which is exactly when the
+/// prepare-blob-backing callback fires.
+///
+/// # Safety
+/// `fd` must be a live, growable (unsealed) shmem/memfd descriptor.
+pub unsafe fn folio_back_fd(fd: i32, rounded: u64) -> std::io::Result<()> {
+    let err = || std::io::Error::last_os_error();
+    if libc::ftruncate(fd, rounded as libc::off_t) != 0 {
+        return Err(err());
+    }
+    let len = rounded as usize;
+    let thp = THP_SIZE as usize;
+
+    // Reserve len+2MB anonymously, carve a 2MB-aligned window, MAP_FIXED the fd there so the
+    // collapse's PMD boundaries line up with the file's huge-page boundaries (file offset 0 at a
+    // 2MB-aligned VA). Trim the head/tail slack.
+    let base = libc::mmap(
+        std::ptr::null_mut(),
+        len + thp,
+        libc::PROT_NONE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        -1,
+        0,
+    );
+    if base == libc::MAP_FAILED {
+        return Err(err());
+    }
+    let base_u = base as usize;
+    let aligned = (base_u + thp - 1) & !(thp - 1);
+    let mapped = libc::mmap(
+        aligned as *mut libc::c_void,
+        len,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED | libc::MAP_FIXED,
+        fd,
+        0,
+    );
+    if mapped == libc::MAP_FAILED {
+        let e = err();
+        libc::munmap(base, len + thp);
+        return Err(e);
+    }
+    // Trim slack around the fixed mapping.
+    if aligned > base_u {
+        libc::munmap(base, aligned - base_u);
+    }
+    let tail_start = aligned + len;
+    let tail_end = base_u + len + thp;
+    if tail_end > tail_start {
+        libc::munmap(tail_start as *mut libc::c_void, tail_end - tail_start);
+    }
+
+    let _ = libc::madvise(mapped, len, libc::MADV_HUGEPAGE);
+    let windows = rounded / THP_SIZE;
+    for w in 0..windows {
+        let ptr = (mapped as *mut u8).add((w * THP_SIZE) as usize) as *mut libc::c_void;
+        if libc::madvise(ptr, THP_SIZE as usize, MADV_POPULATE_WRITE) != 0 {
+            let npages = THP_SIZE / 4096;
+            for pg in 0..npages {
+                let p = (ptr as *mut u8).add((pg * 4096) as usize);
+                std::ptr::write_volatile(p, std::ptr::read_volatile(p));
+            }
+        }
+        let _ = libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE);
+    }
+    libc::munmap(mapped, len);
+    Ok(())
 }
 
 /// An individual chunk to LEND, produced by [`compute_lend_chunks`].
@@ -386,5 +499,37 @@ pub fn compute_lend_chunks(total_size: u64, prep: Option<&LendPrepResult>) -> Ve
         }
     }
 
+    chunks
+}
+
+/// Split a SHARE'd region (the GpuPool, or any other region prepared via
+/// `prepare_lend_region` but registered with a single always-physically-contiguous-VA
+/// `set_user_memory_region` call) into per-2MB chunks, WITHOUT coalescing adjacent
+/// THP-backed chunks the way [`compute_lend_chunks`] does.
+///
+/// Why not reuse `compute_lend_chunks`: that function assumes two adjacent 2MB units
+/// that both ended up THP-backed are also *physically* adjacent -- true for LEND'd guest
+/// RAM, where MADV_COLLAPSE replaces a virtually-contiguous range with genuinely
+/// contiguous physical memory. It's false for the GpuPool: each 2MB unit's backing page
+/// comes from the reserve module's `page_pool[]`, filled by a loop of *independent*
+/// `alloc_pages(order=9)` calls at module load -- consecutive pool entries are whatever
+/// the buddy allocator happened to have free at that moment, with no adjacency guarantee
+/// between them. `set_user_memory_region` (unlike the custom SHARE_BLOB module, which
+/// explicitly coalesces contiguous runs into multi-entry mem_entries) issues a single
+/// hypercall assuming one contiguous physical run; feeding it >=2 independently-sourced
+/// 2MB folios in one call empirically fails on this RM (confirmed: a pool needing only
+/// one 2MB reserve folio works, one needing two or more does not -- pool size 3 MB vs
+/// 4 MB, the exact one-vs-two-2MB-chunk boundary, is the reproducible cutoff).
+///
+/// Every chunk here is emitted separately, one hypercall each, regardless of THP-backing
+/// status -- safe by construction, since it makes no physical-adjacency assumption at all.
+pub fn compute_share_chunks(total_size: u64) -> Vec<LendChunk> {
+    let mut chunks = Vec::new();
+    let mut offset: u64 = 0;
+    while offset < total_size {
+        let chunk_sz = std::cmp::min(total_size - offset, THP_SIZE);
+        chunks.push(LendChunk { offset, size: chunk_sz });
+        offset += chunk_sz;
+    }
     chunks
 }

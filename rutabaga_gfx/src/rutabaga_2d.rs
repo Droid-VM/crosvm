@@ -187,6 +187,7 @@ impl RutabagaComponent for Rutabaga2D {
             component_mask: 1 << (RutabagaComponentType::Rutabaga2D as u8),
             size: resource_size as u64,
             mapping: None,
+            pool_offset: None,
         })
     }
 

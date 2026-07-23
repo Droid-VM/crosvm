@@ -516,6 +516,53 @@ pub struct BatteryConfig {
     pub type_: BatteryType,
 }
 
+/// Behaviour when the reserved-hugepage (`gh_hugepage_reserve`) supply is exhausted while backing a
+/// runtime-shared region. `--runtime-share exceed-policy=...`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RuntimeShareExceedPolicy {
+    /// Silently drop the allocation to the plain 4K path.
+    Fallback,
+    /// Fail the allocation with ENOMEM.
+    Oom,
+}
+
+/// VMM-side runtime dynamic-memory backing policy (the `add_memory_region` / runtime-SHARE path).
+/// This is a general VMM-layer feature, not tied to any one backend: only backends whose runtime
+/// attach needs 2MB-clean stage-2 folios (Gunyah protected) act on it; the rest treat it as a
+/// no-op. Kept separate from the boot-time LEND knob (`--prepare-lend-mthp-mode`).
+/// `--runtime-share "hugepage-threshold-kb=512,exceed-policy=fallback"`.
+#[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct RuntimeShareConfig {
+    /// Allocations `>= hugepage-threshold-kb` (KB) fold into a 2MB order-9 folio so their runtime
+    /// SHARE is stage-2/exec clean; smaller ones stay 4K. Absent => 0 (every allocation
+    /// folio-backed).
+    pub hugepage_threshold_kb: Option<u64>,
+    /// Behaviour when the folio (reserved-hugepage) supply is exhausted. Absent => fallback.
+    pub exceed_policy: Option<RuntimeShareExceedPolicy>,
+}
+
+/// Host-owned pre-allocated GPU pool sizes (MB). These are boot-blessed regions (SHARE'd once,
+/// folio-backed) that the in-process renderer sub-allocates host-visible blobs from -- no runtime
+/// per-blob SHARE. `gfx-host-mb` backs the gfxstream host-visible pool; `gfx-guest-mb` backs the
+/// gfxstream guest-alloc pool. Needed very early (guest memory layout), so crosvm exports these to
+/// the renderer as `NCTX_GFX_POOL_MB` env before the GPU process forks -- the user no longer
+/// hand-exports them.
+/// `--pre-alloc "gfx-host-mb=256,gfx-guest-mb=1024"`.
+#[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct PreAllocConfig {
+    /// gfxstream HOST-visible pool size (MB): the host-alloc pool the gfxstream HostVisiblePool
+    /// sub-allocates from (ASG rings + host-visible blobs). Absent => 0 (host pre-alloc off ->
+    /// runtime-share). Its own SHARE-blessed GpuPool region + `gpu_blob_reserved` DT node.
+    pub gfx_host_mb: Option<u64>,
+    /// gfxstream GUEST-alloc pool size (MB): a separate SHARE-blessed region the guest virtio-gpu
+    /// driver owns and sub-allocates BLOB_MEM_GUEST from in guest-alloc (udmabuf=true) mode. Absent
+    /// => 0 (no guest-alloc pool). Its own GpuPoolGuest region + `gpu_guest_reserved` DT node.
+    pub gfx_guest_mb: Option<u64>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SimplefbConfig {
@@ -804,6 +851,9 @@ pub struct Config {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub pmem_ext2: Vec<crate::crosvm::sys::config::PmemExt2Option>,
     pub pmems: Vec<PmemOption>,
+    /// Host-owned pre-allocated GPU pool sizes (`--pre-alloc`; gfx host / guest). Exported to the
+    /// renderer as NCTX_GFX_POOL_MB env at startup.
+    pub pre_alloc: Option<PreAllocConfig>,
     pub prepare_lend_mthp: Option<LendMthpMode>,
     #[cfg(feature = "process-invariants")]
     pub process_invariants_data_handle: Option<u64>,
@@ -824,6 +874,9 @@ pub struct Config {
     pub restore_path: Option<PathBuf>,
     pub rng: bool,
     pub rt_cpus: CpuSet,
+    /// VMM-side runtime dynamic-memory (SHARE) backing policy (`--runtime-share`). General VMM
+    /// feature; only Gunyah protected acts on it.
+    pub runtime_share: Option<RuntimeShareConfig>,
     pub scsis: Vec<ScsiOption>,
     #[serde(with = "serde_serial_params")]
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
@@ -1051,6 +1104,7 @@ impl Default for Config {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             pmem_ext2: Vec::new(),
             pmems: Vec::new(),
+            pre_alloc: None,
             #[cfg(feature = "process-invariants")]
             process_invariants_data_handle: None,
             #[cfg(feature = "process-invariants")]
@@ -1065,6 +1119,7 @@ impl Default for Config {
             restore_path: None,
             rng: true,
             rt_cpus: Default::default(),
+            runtime_share: None,
             serial_parameters: BTreeMap::new(),
             scsis: Vec::new(),
             #[cfg(windows)]

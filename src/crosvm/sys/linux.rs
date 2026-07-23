@@ -196,6 +196,7 @@ use x86_64::X8664arch as Arch;
 use crate::crosvm::config::Config;
 use crate::crosvm::config::Executable;
 use crate::crosvm::config::HypervisorKind;
+use crate::crosvm::config::RuntimeShareExceedPolicy;
 use crate::crosvm::config::InputDeviceOption;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_HEIGHT;
@@ -1044,6 +1045,23 @@ fn create_virtio_devices(
         )?);
     }
 
+    // virtio-gunyah-accept: transport for VmAccept::Sync runtime attaches. Only meaningful when
+    // the guest must accept memparcels itself (protected VMs); harmless if the guest lacks the
+    // driver — Sync attaches then just time out. Pushed LAST so existing devices keep their PCI
+    // slots (guest /dev/vdX names, BAR layout). GUNYAH_ACCEPT_DEVICE_OFF=1 skips it (debug).
+    if cfg.protection_type.isolates_memory()
+        && std::env::var_os("GUNYAH_ACCEPT_DEVICE_OFF").is_none()
+    {
+        let (accept_host_tube, accept_device_tube) =
+            Tube::pair().context("failed to create tube")?;
+        add_control_tube(DeviceControlTube::GunyahAccept(accept_host_tube).into());
+        devs.push(create_gunyah_accept_device(
+            cfg.protection_type,
+            cfg.jail_config.as_ref(),
+            accept_device_tube,
+        )?);
+    }
+
     Ok(devs)
 }
 
@@ -1611,6 +1629,17 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         }
     }
 
+    // VMM-owned runtime dynamic-memory (SHARE) backing policy from `--runtime-share`. General VMM
+    // feature; only Gunyah protected acts on it (prepare_runtime_blob_backing), other backends leave
+    // it at (0, fallback).
+    let (folio_threshold_bytes, folio_oom_on_exceed) = match &cfg.runtime_share {
+        Some(rs) => (
+            rs.hugepage_threshold_kb.unwrap_or(0) << 10,
+            matches!(rs.exceed_policy, Some(RuntimeShareExceedPolicy::Oom)),
+        ),
+        None => (0, false),
+    };
+
     Ok(VmComponents {
         #[cfg(target_arch = "x86_64")]
         ac_adapter: cfg.ac_adapter,
@@ -1644,6 +1673,8 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             mte: cfg.mte,
             protection_type: cfg.protection_type,
             prepare_lend_mthp: cfg.prepare_lend_mthp,
+            folio_threshold_bytes,
+            folio_oom_on_exceed,
         },
         vm_image,
         android_fstab: cfg
@@ -2005,7 +2036,6 @@ fn run_gunyah(
     device_path: Option<&Path>,
     qcom_trusted_vm_id: Option<u16>,
     qcom_trusted_vm_pas_id: Option<u32>,
-    blob_mode: hypervisor::gunyah::GunyahBlobMode,
     cfg: Config,
     components: VmComponents,
 ) -> Result<ExitState> {
@@ -2036,7 +2066,7 @@ fn run_gunyah(
         None
     };
 
-    let vm = GunyahVm::new(&gunyah, qcom_trusted_vm_id, qcom_trusted_vm_pas_id, guest_mem, components.hv_cfg, blob_mode).context("failed to create vm")?;
+    let vm = GunyahVm::new(&gunyah, qcom_trusted_vm_id, qcom_trusted_vm_pas_id, guest_mem, components.hv_cfg).context("failed to create vm")?;
 
     // Check that the VM was actually created in protected mode as expected.
     if cfg.protection_type.isolates_memory() && !vm.check_capability(VmCap::Protected) {
@@ -2089,7 +2119,6 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
                 device: Some(gunyah_path.to_path_buf()),
                 qcom_trusted_vm_id: None,
                 qcom_trusted_vm_pas_id: None,
-                blob_mode: hypervisor::gunyah::GunyahBlobMode::default(),
             });
         }
     }
@@ -2098,6 +2127,19 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
+    // Bridge the `--pre-alloc` GPU pool sizes to the env the in-process renderer + early memory
+    // setup expect (NCTX_GFX_POOL_MB), BEFORE any of guest_memory_layout, the gpu device, or the
+    // gunyah size-max reads them. The user sets `--pre-alloc`; crosvm no longer requires a
+    // hand-exported NCTX_*. Absent keys keep the renderer's built-in defaults.
+    if let Some(pa) = &cfg.pre_alloc {
+        if let Some(mb) = pa.gfx_host_mb {
+            std::env::set_var("NCTX_GFX_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.gfx_guest_mb {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_MB", mb.to_string());
+        }
+    }
+
     let components = setup_vm_components(&cfg)?;
 
     let hypervisor = cfg
@@ -2121,12 +2163,10 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         HypervisorKind::Gunyah { device,
                                  qcom_trusted_vm_id,
                                  qcom_trusted_vm_pas_id,
-                                 blob_mode,
                                } => run_gunyah(
                                         device.as_deref(),
                                         qcom_trusted_vm_id,
                                         qcom_trusted_vm_pas_id,
-                                        blob_mode,
                                         cfg, components),
     }
 }
@@ -2625,6 +2665,7 @@ fn start_pci_root_worker(
                     dest: VmMemoryDestination::GuestPhysicalAddress(addr.0),
                     prot: Protection::read(),
                     cache: MemCacheType::CacheCoherent,
+                    vm_accept: hypervisor::VmAccept::default(),
                 })
                 .context("failed to send request")?;
             match self.vm_control_tube.recv::<VmMemoryResponse>() {
@@ -3708,6 +3749,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let mut pvclock_host_tube = None;
     #[cfg(feature = "audio")]
     let mut snd_host_tubes = Vec::new();
+    let mut gunyah_accept_host_tube = None;
     let mut irq_control_tubes = Vec::new();
     let mut vm_memory_control_tubes = Vec::new();
     let mut control_tubes = Vec::new();
@@ -3734,6 +3776,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             #[cfg(feature = "audio")]
             AnyControlTube::DeviceControlTube(DeviceControlTube::Snd(t)) => {
                 snd_host_tubes.push(t);
+            }
+            AnyControlTube::DeviceControlTube(DeviceControlTube::GunyahAccept(t)) => {
+                assert!(gunyah_accept_host_tube.is_none());
+                gunyah_accept_host_tube = Some(t)
             }
             AnyControlTube::IrqTube(t) => irq_control_tubes.push(t),
             AnyControlTube::TaggedControlTube(t) => control_tubes.push(t),
@@ -4169,6 +4215,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     gralloc,
                     iommu_client,
                     vm_memory_handler_control_for_thread,
+                    gunyah_accept_host_tube,
                 )
             }
         })
@@ -4861,6 +4908,7 @@ fn vm_memory_handler_thread(
     mut gralloc: RutabagaGralloc,
     mut iommu_client: Option<VmMemoryRequestIommuClient>,
     handler_control: Tube,
+    gunyah_accept_tube: Option<Tube>,
 ) -> anyhow::Result<()> {
     #[derive(EventToken)]
     enum Token {
@@ -4938,6 +4986,7 @@ fn vm_memory_handler_thread(
                                         None
                                     },
                                     &mut region_state,
+                                    gunyah_accept_tube.as_ref(),
                                 );
                                 if let Err(e) = tube.send(&response) {
                                     error!("failed to send VmMemoryControlResponse: {}", e);

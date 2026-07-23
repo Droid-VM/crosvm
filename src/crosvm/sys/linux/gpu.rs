@@ -98,22 +98,39 @@ pub fn create_gpu_device(
         gpu_params.snapshot_scratch_path = Some(Path::new("/tmpfs-gpu-snapshot").to_path_buf());
     }
 
-    // DroidVM: plumb the host-visible folio (reserved-hugepage) + Gunyah-pVM knobs to the
-    // in-process gfxstream backend as env, set here before the GPU/jail process forks so they are
-    // inherited and read on the first blob create. See gfxstream HostVisibleFolio.h.
-    if let Some(mb) = gpu_params.vram_limit {
-        env::set_var("GFXSTREAM_VRAM_LIMIT_MB", mb.to_string());
-    }
-    if let Some(kb) = gpu_params.vram_folio_threshold {
-        env::set_var("GFXSTREAM_VRAM_FOLIO_THRESHOLD_KB", kb.to_string());
-    }
-    if let Some(policy) = gpu_params.vram_exceed_policy {
+    // DroidVM: plumb the gfxstream-consumed knobs to the in-process backend as env, set here
+    // before the GPU/jail process forks so they are inherited and read on the first blob create.
+    // (The folio *policy* lives on `--runtime-share` / hv_cfg and is applied VMM-side in
+    // prepare_runtime_blob_backing; the VRAM quota is metered GPU-side. gfxstream no longer reads
+    // any GFXSTREAM_VRAM_* env.)
+    //
+    // Fusion size gate (CMDLINE_V2 v3): exported only when fusion routing is enabled
+    // (udmabuf=false + vram-limit defined and != 0); the pool's own existence is signalled
+    // separately via GFXSTREAM_POOL_FD (--pre-alloc gfx-mb). Absent/0 => no gate.
+    if !gpu_params.udmabuf && gpu_params.vram_limit.map_or(false, |n| n != 0) {
         env::set_var(
-            "GFXSTREAM_VRAM_EXCEED_POLICY",
-            match policy {
-                virtio::VramExceedPolicy::Oom => "oom",
-                virtio::VramExceedPolicy::Fallback => "fallback",
-            },
+            "GFXSTREAM_POOL_BLOB_MAX_KB",
+            gpu_params.pool_blob_max_kb.unwrap_or(4096).to_string(),
+        );
+    }
+    // Runtime-share budget capacity for gfxstream's host-side VK_EXT_memory_budget fill
+    // (read from this env in on_vkGetPhysicalDeviceMemoryProperties2): the runtime-share
+    // side of the host-visible heap is capped by vram-limit. -1 (unlimited-but-defined)
+    // exports a sentinel above any heap size so gfxstream's own clamp to the emulated
+    // host-visible heap governs. Unset (0 / guest-alloc) => gfxstream leaves the driver
+    // budget untouched.
+    match gpu_params.vram_limit {
+        Some(n) if n > 0 => env::set_var("GFXSTREAM_VRAM_BUDGET_MB", n.to_string()),
+        Some(-1) => env::set_var("GFXSTREAM_VRAM_BUDGET_MB", "1048576"), // 1 TiB sentinel
+        _ => {}
+    }
+    // Guest-alloc pool partition: the host-owned slice serving all gfx host-alloc requests
+    // (ASG rings etc.). Only meaningful with udmabuf=true; consumed by gfxstream in the
+    // pVM guest-alloc mode (stage 2).
+    if gpu_params.udmabuf {
+        env::set_var(
+            "GFXSTREAM_POOL_HOST_MB",
+            gpu_params.gfx_host_pre_alloc_mb.unwrap_or(64).to_string(),
         );
     }
     if gpu_params.gunyah_pvm == Some(true) {

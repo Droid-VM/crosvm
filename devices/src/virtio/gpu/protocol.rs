@@ -85,6 +85,11 @@ pub const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
 pub const VIRTIO_GPU_RESP_OK_RESOURCE_UUID: u32 = 0x1105;
 pub const VIRTIO_GPU_RESP_OK_MAP_INFO: u32 = 0x1106;
 
+// DroidVM gfxstream pre-alloc: set in `virtio_gpu_resp_map_info.map_info` when the blob is
+// GpuPool-resident. The `gunyah_handle` field then carries the pool BYTE OFFSET (not a memparcel
+// handle); the guest maps pool_base + offset out of its already-blessed RAM and never accepts.
+pub const VIRTIO_GPU_MAP_INFO_POOL: u32 = 1 << 31;
+
 /* CHROMIUM(b/277982577): success responses */
 pub const VIRTIO_GPU_RESP_OK_RESOURCE_PLANE_INFO: u32 = 0x11FF;
 

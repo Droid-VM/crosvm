@@ -26,6 +26,7 @@ use arch::SveConfig;
 use arch::VcpuAffinity;
 use arch::VmComponents;
 use arch::VmImage;
+use base::AsRawDescriptor;
 use base::MemoryMappingBuilder;
 use base::SendTube;
 use base::Tube;
@@ -193,6 +194,18 @@ const AARCH64_PMU_IRQ: u32 = 7;
 const AARCH64_VMWDT_IRQ: u32 = 31;
 
 const AARCH64_SIMPLEFB_FIXED_ADDR: u64 = 0x50000000;
+
+/// Exclusive top of the Gunyah 64-bit PCI MMIO window, a deterministic function of the
+/// end of guest RAM (`plat_mmio_base`). This is the single source of truth for the
+/// window top: `get_system_allocator_config` sizes the window with it, and the GPU pool
+/// region is placed immediately ABOVE it (a reserved-memory node INSIDE the window makes
+/// the guest's pci-host-generic bridge fail its window claim and kills virtio-blk).
+/// `gunyah/aarch64.rs` derives `size-max` from the same formula (kept in sync there).
+fn gunyah_high_mmio_window_top(plat_mmio_base: u64) -> u64 {
+    let base = plat_mmio_base + AARCH64_PLATFORM_MMIO_SIZE;
+    const BAR_TARGET: u64 = 4u64 << 30; // 4 GiB host-visible BAR headroom
+    base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29)
+}
 
 /// Compute the page-aligned framebuffer data size for simplefb.
 fn simplefb_data_size(sfb: &arch::SimplefbParams) -> u64 {
@@ -560,6 +573,48 @@ impl arch::LinuxArch for AArch64 {
             }
         }
 
+        // DroidVM GPU pre-alloc pool: a swiotlb-style purpose region appended immediately
+        // AFTER guest RAM (the platform-MMIO + PCI windows stack above end_addr(), so they
+        // move up past the pool automatically — no window overlap, no special GPA formula).
+        // GunyahVm::new SHARE-blesses it (lend=false) and hugepage-prepares it; build_vm
+        // hands its memfd view to the gfxstream renderer (NCTX_GFX_POOL_MB) and emits the
+        // no-map reserved-memory node the Gunyah RM matches by `reg`. The guest learns the
+        // pool GPA dynamically (map_blob response), so moving it is transparent. Sized by
+        // NCTX_GFX_POOL_MB until CMDLINE_V2 moves this to a --gpu sub-option.
+        let gpu_pool_mb: u64 = std::env::var("NCTX_GFX_POOL_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        // Guest-alloc pool (gfx-guest-mb): a second SHARE'd region the guest virtio-gpu driver owns.
+        // Stacked immediately above the host pool; the platform-MMIO + PCI windows sit above
+        // end_addr() so they move up past both automatically.
+        let gpu_guest_pool_mb: u64 = std::env::var("NCTX_GFX_GUEST_POOL_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let mut pool_top = AARCH64_PHYS_MEM_START + components.memory_size;
+        if gpu_pool_mb != 0 {
+            memory_regions.push((
+                GuestAddress(pool_top),
+                gpu_pool_mb << 20,
+                MemoryRegionOptions::new()
+                    .purpose(MemoryRegionPurpose::GpuPool)
+                    .align(2 << 20),
+            ));
+            pool_top += gpu_pool_mb << 20;
+        }
+        if gpu_guest_pool_mb != 0 {
+            // 2 MiB-align the base (matches the pool align) so it never overlaps the host pool.
+            let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
+            memory_regions.push((
+                GuestAddress(base),
+                gpu_guest_pool_mb << 20,
+                MemoryRegionOptions::new()
+                    .purpose(MemoryRegionPurpose::GpuPoolGuest)
+                    .align(2 << 20),
+            ));
+        }
+
         // Add simplefb region as SharedFramebuffer.
         // For Gunyah (StaticSwiotlbAllocationRequired), the region is placed at
         // end of RAM (before swiotlb) and follows the swiotlb sharing path:
@@ -609,8 +664,7 @@ impl arch::LinuxArch for AArch64 {
             // 64-bit BARs. gunyah size-max headroom is raised to match (see
             // hypervisor/src/gunyah/aarch64.rs create_fdt).
             let base = plat_mmio_base + plat_mmio_size;
-            const BAR_TARGET: u64 = 4u64 << 30; // keep in sync with size-max headroom
-            let window_top = base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29);
+            let window_top = gunyah_high_mmio_window_top(plat_mmio_base);
             base::warn!(
                 "GUNYAH-HIGHMMIO: base={:#x} top={:#x} size={:#x} (plat_mmio_base={:#x})",
                 base, window_top, window_top - base, plat_mmio_base
@@ -1122,42 +1176,60 @@ impl arch::LinuxArch for AArch64 {
             timeout_sec: VMWDT_DEFAULT_TIMEOUT_SEC,
         };
 
-        // Locate the gfxstream host-visible shmem BAR (virtio shmem BAR index == 2), allocated
-        // during generate_pci_root. On Gunyah, register it as a boot-time blessed arena BEFORE the
-        // VM is started (create_fdt issues GH_VM_START) and emit a no-map reserved-memory node for
-        // it (gpu_resv). This lets a protected guest map host-visible blobs (the gfxstream ASG
-        // ring) at the BAR via host-local add_fd_mapping into the blessed arena, instead of a
-        // runtime SHARE whose stage-2 fault is never forwarded to the host (SIGBUS).
-        // The blessed blob arena (+ its reserved-memory node + the dtb_shim it needs) is ONLY for
-        // the HostShare path. In GuestAccept mode the guest accepts each blob as its own memparcel
-        // via mem_accept (vm.supports_blob_share()==true), so there is no eager arena, no
-        // reserved-memory node, and no dtb_shim required.
-        const VIRTIO_SHMEM_BAR_NUM: u8 = 2;
-        let gpu_resv: Option<(u64, u64)> = if !vm.supports_blob_share()
-            && vm
-                .get_hypervisor()
-                .check_capability(HypervisorCap::StaticSwiotlbAllocationRequired)
-        {
-            match system_allocator
-                .mmio_allocator_any()
-                .find_pci_bar(VIRTIO_SHMEM_BAR_NUM)
-            {
-                Some((_alloc, range)) => {
-                    let gpa = range.start;
-                    let size = range.len().unwrap_or(0);
-                    if size != 0 {
-                        vm.prepare_blob_arena(GuestAddress(gpa), size)
-                            .map_err(Error::PrepareBlobArena)?;
-                        base::warn!("GPU-RESV: blessed blob arena gpa={:#x} size={:#x}", gpa, size);
-                        Some((gpa, size))
-                    } else {
-                        None
-                    }
+        // GPU pre-alloc pool: a first-class GpuPool guest_mem region (swiotlb-style: appended
+        // after RAM in guest_memory_layout, SHARE-blessed + hugepage-prepared by GunyahVm::new
+        // before GH_VM_START). Here we only (a) hand its memfd view to the gfxstream renderer via
+        // env (GFXSTREAM_POOL_*; the region is a slice of the guest_mem memfd, so both fd and byte
+        // offset are exported) and (b) collect the (gpa, size) for the no-map reserved-memory node
+        // (gpu_resv) that the Gunyah RM matches by `reg` to bless the range. In gfxstream pre-alloc
+        // mode the host-visible blobs sub-allocate from this pool (no runtime SHARE); without
+        // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
+        // pool region emitted).
+        let mut gpu_guest_resv: Option<(u64, u64)> = None;
+        let gpu_resv: Option<(u64, u64)> = {
+            let mut found = None;
+            for region in vm.get_memory().regions() {
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::GpuPool {
+                    let fd = region.shm.as_raw_descriptor();
+                    let gpa = region.guest_addr.offset();
+                    // gfxstream consumer (host-visible sub-allocator, when in gfx pre-alloc mode).
+                    std::env::set_var("GFXSTREAM_POOL_FD", fd.to_string());
+                    std::env::set_var(
+                        "GFXSTREAM_POOL_FD_OFFSET",
+                        region.shm_offset.to_string(),
+                    );
+                    std::env::set_var("GFXSTREAM_POOL_GPA", format!("{:#x}", gpa));
+                    std::env::set_var(
+                        "GFXSTREAM_POOL_SIZE",
+                        (region.size as u64).to_string(),
+                    );
+                    base::warn!(
+                        "GPU-POOL: GpuPool region gpa={:#x} size={:#x} fd={} off={:#x} \
+                         (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        fd,
+                        region.shm_offset,
+                    );
+                    found = Some((gpa, region.size as u64));
                 }
-                None => None,
+                // Guest-alloc pool: only collect its (gpa, size) for the `gpu_guest_reserved`
+                // no-map node. The host gfxstream HostVisiblePool must NOT see it (no
+                // GFXSTREAM_POOL_* env); the guest driver finds it via that DT node and owns the
+                // allocator. The host resolves guest-blob mem-entries into it via get_slice_at_addr.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::GpuPoolGuest {
+                    let gpa = region.guest_addr.offset();
+                    base::warn!(
+                        "GPU-POOL: GpuPoolGuest region gpa={:#x} size={:#x} (blessed, guest-owned)",
+                        gpa,
+                        region.size,
+                    );
+                    gpu_guest_resv = Some((gpa, region.size as u64));
+                }
             }
-        } else {
-            None
+            found
         };
 
         fdt::create_fdt(
@@ -1189,6 +1261,7 @@ impl arch::LinuxArch for AArch64 {
                 )
             }),
             gpu_resv,
+            gpu_guest_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,
             components.simplefb.as_ref().map(|sfb| {

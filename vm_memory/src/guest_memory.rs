@@ -131,6 +131,19 @@ pub enum MemoryRegionPurpose {
     /// BIOS/firmware ROM
     Bios,
 
+    /// DroidVM: GPU pre-alloc pool (gfxstream HOST-visible pool). Appended after
+    /// guest RAM, SHARE'd (not lent) at boot on protected Gunyah so the host renderer and the guest
+    /// reach the same pages, hugepage-prepared, and announced as a no-map reserved-memory node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    GpuPool,
+
+    /// DroidVM: gfxstream GUEST-alloc pool. A second SHARE-blessed region (treated exactly like
+    /// GpuPool for access/bless/hugepage) that the guest virtio-gpu driver owns and sub-allocates
+    /// BLOB_MEM_GUEST from in guest-alloc mode. Distinct so it gets its own `gpu_guest_reserved`
+    /// DT node and is NOT handed to the host gfxstream HostVisiblePool (which sees only GpuPool).
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    GpuPoolGuest,
+
     /// General purpose guest memory
     #[default]
     GuestMemoryRegion,
@@ -497,6 +510,14 @@ impl GuestMemory {
             .find(|r| r.contains(guest_addr))
             .ok_or(Error::InvalidGuestAddress(guest_addr))?;
         match region.options.purpose {
+            // The GPU pool is SHARE'd (never lent), so the host keeps access — same as the
+            // framebuffer/swiotlb regions (crosvm reads scanout data straight from the pool).
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::GpuPool => Ok(()),
+            // Guest-alloc pool: SHARE'd like GpuPool; the host resolves guest-blob mem-entries
+            // that point into it via get_slice_at_addr (the whole point of guest-alloc).
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::GpuPoolGuest => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::SharedFramebuffer => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

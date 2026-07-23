@@ -790,6 +790,7 @@ pub fn create_fdt(
     psci_version: PsciVersion,
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
+    gpu_guest_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
     simplefb_cfg: Option<SimplefbDtConfig>,
@@ -848,10 +849,9 @@ pub fn create_fdt(
         }
     };
 
-    // gfxstream host-visible blob arena: emit an (unattached) reserved-memory node covering the
-    // shmem BAR window. The Gunyah RM matches this node (by reg) to the lend=false memparcel
-    // registered before start (prepare_blob_arena) and blesses the range, so host-visible blobs
-    // aliased into the arena are reachable by the protected guest.
+    // GPU pool: emit an (unattached) reserved-memory node covering the blessed pool region. The
+    // Gunyah RM matches this node (by reg) to the lend=false memparcel registered before start
+    // and blesses the range, so the pool is reachable by the protected guest.
     if let Some((gpa, size)) = gpu_resv {
         let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
         // Set parent props in case the swiotlb path did not create them (it normally does).
@@ -869,6 +869,20 @@ pub fn create_fdt(
         // probes virtio/PCI (zero MMIO exits observed). `no-map` keeps the region out of the
         // kernel's RAM/linear map (no eager init, no crash) while still letting the virtio-gpu
         // driver ioremap the BAR on demand. The RM bless is preserved via `reg`.
+        node.set_prop("no-map", ())?;
+    }
+
+    // Guest-alloc pool: a second no-map reserved-memory node the guest virtio-gpu driver matches
+    // by the distinct name prefix `gpu_guest_reserved` (vs the host pool's `gpu_blob_reserved`).
+    // Same bless/no-map rationale as above; the guest driver owns a page allocator over this
+    // range and sub-allocates BLOB_MEM_GUEST from it in guest-alloc mode.
+    if let Some((gpa, size)) = gpu_guest_resv {
+        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+        resv.set_prop("#address-cells", 0x2u32)?;
+        resv.set_prop("#size-cells", 0x2u32)?;
+        resv.set_prop("ranges", ())?;
+        let node = resv.subnode_mut(&format!("gpu_guest_reserved@{:x}", gpa))?;
+        node.set_prop("reg", &[gpa, size])?;
         node.set_prop("no-map", ())?;
     }
 

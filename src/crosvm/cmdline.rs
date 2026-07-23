@@ -95,6 +95,8 @@ use crate::crosvm::config::parse_serial_options;
 use crate::crosvm::config::parse_touch_device_option;
 use crate::crosvm::config::parse_vhost_user_fs_option;
 use crate::crosvm::config::BatteryConfig;
+use crate::crosvm::config::PreAllocConfig;
+use crate::crosvm::config::RuntimeShareConfig;
 use crate::crosvm::config::CpuOptions;
 use crate::crosvm::config::DtboOption;
 use crate::crosvm::config::Executable;
@@ -2017,6 +2019,16 @@ pub struct RunCommand {
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
+    #[argh(option, arg_name = "gfx-host-mb=MB,gfx-guest-mb=MB")]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// host-owned pre-allocated GPU pool sizes (MB). Boot-blessed regions the in-process renderer
+    /// sub-allocates host-visible blobs from (no runtime per-blob SHARE). crosvm exports these to
+    /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
+    ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
+    ///     gfx-guest-mb=<MB> - gfxstream guest-alloc pool size (default 0 = guest-alloc pool off)
+    pub pre_alloc: Option<PreAllocConfig>,
+
     #[argh(switch)]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
@@ -2138,6 +2150,18 @@ pub struct RunCommand {
     #[merge(strategy = overwrite_option)]
     /// comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)
     pub rt_cpus: Option<CpuSet>,
+
+    #[argh(option, arg_name = "hugepage-threshold-kb=KB,exceed-policy=fallback|oom")]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// VMM-side runtime dynamic-memory (SHARE) backing policy. General VMM feature; only Gunyah
+    /// protected acts on it (others no-op). Kept separate from `--prepare-lend-mthp-mode` (the
+    /// boot-time LEND knob). Possible keys:
+    ///     hugepage-threshold-kb=<KB> - allocations >= this fold into a 2MB order-9 folio so their
+    ///       runtime SHARE is stage-2/exec clean; smaller stay 4K (default 0 = all folio-backed)
+    ///     exceed-policy=fallback|oom - when the reserved-hugepage supply is exhausted: drop to 4K
+    ///       (fallback, default) or fail with ENOMEM (oom)
+    pub runtime_share: Option<RuntimeShareConfig>,
 
     #[argh(option, arg_name = "PATH")]
     #[serde(skip)] // TODO(b/255223604)
@@ -3117,6 +3141,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.scsis = cmd.scsi_block;
 
         cfg.pmems = cmd.pmem;
+        cfg.pre_alloc = cmd.pre_alloc;
 
         if !cmd.pmem_device.is_empty() || !cmd.rw_pmem_device.is_empty() {
             log::warn!(
@@ -3732,6 +3757,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         cfg.battery_config = cmd.battery;
+        cfg.runtime_share = cmd.runtime_share;
         cfg.simplefb = cmd.simplefb;
         #[cfg(all(target_arch = "x86_64", unix))]
         {

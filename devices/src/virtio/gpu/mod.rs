@@ -14,6 +14,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use base::ReadNotifier;
 #[cfg(windows)]
 use base::RecvTube;
 use base::Result;
+use base::FromRawDescriptor;
 use base::SafeDescriptor;
 use base::SendTube;
 use base::Tube;
@@ -47,9 +49,9 @@ use data_model::*;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
+use hypervisor::VmAccept;
 pub use parameters::AudioDeviceMode;
 pub use parameters::GpuParameters;
-pub use parameters::VramExceedPolicy;
 use rutabaga_gfx::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -257,6 +259,7 @@ fn build(
     mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
     external_blob: bool,
     fixed_blob_mapping: bool,
+    vm_accept: VmAccept,
     #[cfg(windows)] wndproc_thread: &mut Option<WindowProcedureThread>,
     udmabuf: bool,
     #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
@@ -296,6 +299,7 @@ fn build(
         mapper,
         external_blob,
         fixed_blob_mapping,
+        vm_accept,
         udmabuf,
         snapshot_scratch_directory,
     )
@@ -954,6 +958,7 @@ impl Worker {
         event_devices: Vec<EventDevice>,
         external_blob: bool,
         fixed_blob_mapping: bool,
+        vm_accept: VmAccept,
         udmabuf: bool,
         request_receiver: mpsc::Receiver<WorkerRequest>,
         response_sender: mpsc::Sender<anyhow::Result<WorkerResponse>>,
@@ -980,6 +985,7 @@ impl Worker {
             mapper,
             external_blob,
             fixed_blob_mapping,
+            vm_accept,
             #[cfg(windows)]
             &mut wndproc_thread,
             udmabuf,
@@ -1440,6 +1446,7 @@ pub struct Gpu {
     pci_bar_size: u64,
     external_blob: bool,
     fixed_blob_mapping: bool,
+    vm_accept: VmAccept,
     rutabaga_component: RutabagaComponentType,
     #[cfg(windows)]
     wndproc_thread: Option<WindowProcedureThread>,
@@ -1535,10 +1542,103 @@ impl Gpu {
         let (gpu_display_wait_descriptor_ctrl_wr, gpu_display_wait_descriptor_ctrl_rd) =
             Tube::directional_pair().expect("failed to create wait descriptor control pair.");
 
+        // DroidVM: host-visible blob folio backing lives in the crosvm GPU backend (not gfxstream).
+        // Split of concerns: the *folio mechanism* + `threshold` / `exceed-policy` are VMM policy
+        // (Vm::prepare_runtime_blob_backing over the mapper Tube -- Gunyah folds each blob into 2MB
+        // order-9 folios so its later SHARE is stage-2/exec clean; KVM/gzvm no-op). The
+        // host-visible VRAM *quota* is metered HERE, GPU-side, so the GPU cannot monopolise
+        // host-visible memory and starve peer devices (e.g. virtio-fs). gfxstream's prepare/release
+        // callbacks bridge to this via the process-global handlers.
+        let mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>> = Arc::new(Mutex::new(None));
+        #[cfg(feature = "gfxstream")]
+        {
+            // CMDLINE_V2 v3 decoupling: the prepare callback is ALWAYS registered -- it is a pure
+            // bridge (dup the blob's shmem fd to the VMM, which applies its own folio policy per
+            // `--runtime-share`; KVM/gzvm no-op). `vram-limit` only decides quota *metering*:
+            // None/0 => unmetered; -1 => explicitly unlimited (unmetered, but "defined" so it can
+            // enable fusion routing); N>0 => cap of N MB. udmabuf=true (guest-alloc) => unmetered:
+            // the pre-alloc pool itself is the VRAM cap there.
+            let quota: Option<u64> = if gpu_parameters.udmabuf {
+                None
+            } else {
+                match gpu_parameters.vram_limit {
+                    Some(n) if n > 0 => Some((n as u64) << 20),
+                    _ => None,
+                }
+            };
+            const THP: u64 = 2 * 1024 * 1024;
+            let used = Arc::new(AtomicU64::new(0));
+            let used_p = Arc::clone(&used);
+            let used_r = Arc::clone(&used);
+            let mapper_p = Arc::clone(&mapper);
+            rutabaga_gfx::register_blob_backing_handlers(
+                Box::new(move |memfd: i32, size: u64| -> i64 {
+                    let rounded = (size + THP - 1) & !(THP - 1);
+                    if let Some(quota) = quota {
+                        // Reserve the worst case (a full 2MB folio) against the GPU's quota first,
+                        // so we never overshoot and starve peer devices. If it doesn't fit, decline
+                        // to folio -- the blob stays 4K rather than eating another device's memory.
+                        let mut cur = used_p.load(Ordering::Relaxed);
+                        loop {
+                            if cur + rounded > quota {
+                                return 0;
+                            }
+                            match used_p.compare_exchange_weak(
+                                cur,
+                                cur + rounded,
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => cur = actual,
+                            }
+                        }
+                    }
+                    // SAFETY: dup a private copy of the blob's shmem fd for the VM backend;
+                    // gfxstream keeps the original. from_raw_descriptor owns the dup.
+                    let dup = unsafe { libc::dup(memfd) };
+                    let backed = if dup < 0 {
+                        Ok(0)
+                    } else {
+                        let sd = unsafe { SafeDescriptor::from_raw_descriptor(dup) };
+                        match mapper_p.lock().as_mut() {
+                            Some(m) => m.prepare_blob_backing(sd, size),
+                            None => Ok(0),
+                        }
+                    };
+                    match backed {
+                        Ok(backed) => {
+                            // Correct the reservation to what was actually folio-backed (<= rounded;
+                            // 0 when below threshold, fell back, or no folio backend).
+                            if quota.is_some() && backed < rounded {
+                                used_p.fetch_sub(rounded - backed, Ordering::Relaxed);
+                            }
+                            backed as i64
+                        }
+                        Err(e) => {
+                            // The VMM refused the backing (--runtime-share exceed-policy=oom with
+                            // the reserve exhausted): fail the allocation -- gfxstream turns a
+                            // negative return into VK_ERROR_OUT_OF_DEVICE_MEMORY.
+                            base::warn!("VMM refused blob backing (exceed-policy=oom?): {:#}", e);
+                            if quota.is_some() {
+                                used_p.fetch_sub(rounded, Ordering::Relaxed);
+                            }
+                            -1
+                        }
+                    }
+                }),
+                Box::new(move |charged: u64| {
+                    if charged != 0 {
+                        used_r.fetch_sub(charged, Ordering::Relaxed);
+                    }
+                }),
+            );
+        }
+
         Gpu {
             exit_evt_wrtube,
             gpu_control_tube: Some(gpu_control_tube),
-            mapper: Arc::new(Mutex::new(None)),
+            mapper,
             resource_bridges: Some(ResourceBridges::new(resource_bridges)),
             event_devices: Some(event_devices),
             worker_request_sender: None,
@@ -1554,6 +1654,7 @@ impl Gpu {
             pci_bar_size: gpu_parameters.pci_bar_size,
             external_blob: gpu_parameters.external_blob,
             fixed_blob_mapping: gpu_parameters.fixed_blob_mapping,
+            vm_accept: gpu_parameters.vm_accept.into(),
             rutabaga_component: component,
             #[cfg(windows)]
             wndproc_thread: Some(wndproc_thread),
@@ -1598,6 +1699,7 @@ impl Gpu {
             mapper,
             self.external_blob,
             self.fixed_blob_mapping,
+            self.vm_accept,
             #[cfg(windows)]
             &mut self.wndproc_thread,
             self.udmabuf,
@@ -1650,6 +1752,7 @@ impl Gpu {
         let event_devices = self.event_devices.take().expect("missing event_devices");
         let external_blob = self.external_blob;
         let fixed_blob_mapping = self.fixed_blob_mapping;
+        let vm_accept = self.vm_accept;
         let udmabuf = self.udmabuf;
         let snapshot_scratch_directory = self.snapshot_scratch_directory.clone();
 
@@ -1700,6 +1803,7 @@ impl Gpu {
                 event_devices,
                 external_blob,
                 fixed_blob_mapping,
+                vm_accept,
                 udmabuf,
                 worker_request_receiver,
                 worker_response_sender,
