@@ -24,6 +24,7 @@ use anyhow::Context;
 use base::errno_result;
 use base::error;
 use base::info;
+use base::AsRawDescriptor;
 use base::ioctl;
 use base::ioctl_with_mut_ref;
 use base::ioctl_with_ref;
@@ -38,6 +39,8 @@ use base::MemoryMappingArena;
 use base::MemoryMappingBuilder;
 use base::MmapError;
 use base::RawDescriptor;
+use base::Protection;
+use base::SharedMemory;
 use gunyah_sys::*;
 use libc::open;
 use libc::EFAULT;
@@ -229,24 +232,6 @@ pub struct GunyahIrqRoute {
     level: bool,
 }
 
-/// Selects how host-visible virtio-gpu blobs (gfxstream RingBlob / ASG rings) are mapped into
-/// the guest. Set via `--hypervisor "gunyah[blob_mode=...]"`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GunyahBlobMode {
-    /// Host SHAREs the blob and returns the RM memparcel handle; the guest accepts it into its
-    /// own stage-2 with `gh_rm_mem_accept`. Required on host kernels that do NOT push a runtime
-    /// SHARE into a *protected* guest's stage-2 (the device's 6.1 mainline gunyah). Needs the
-    /// host `GH_VM_ANDROID_SHARE_BLOB` ioctl + the guest-side accept path.
-    #[default]
-    GuestAccept,
-    /// Plain `add_memory_region`: a runtime `GH_VM_SET_USER_MEM_REGION` SHARE with EEXIST-reuse —
-    /// the qemu-android-gunyah path. The guest never accepts (handle is `None`); it relies on the
-    /// host kernel itself mapping the runtime SHARE into the running guest's stage-2 (6.6 vendor
-    /// kernels with addrspace_map/memextent_donate). No custom ioctl, no guest-kernel change.
-    HostShare,
-}
-
 pub struct GunyahVm {
     gh: Gunyah,
     vm: SafeDescriptor,
@@ -268,13 +253,6 @@ pub struct GunyahVm {
     blob_regions: Arc<Mutex<BTreeMap<u32, Box<dyn MappedRegion>>>>,
     routes: Arc<Mutex<HashSet<GunyahIrqRoute>>>,
     hv_cfg: crate::Config,
-    /// How host-visible virtio-gpu blobs are mapped into the guest (see [`GunyahBlobMode`]).
-    blob_mode: GunyahBlobMode,
-    /// Boot-time "blessed" host-visible blob arena: (mem slot, base GPA). Registered before VM
-    /// start via `prepare_blob_arena` (SHARE + no-map reserved-memory node => the RM blesses the
-    /// range). Per-blob backing is aliased in later via `blob_fixed_map` (host-local
-    /// add_fd_mapping, no runtime SHARE). When set, this supersedes the share_blob path.
-    blob_arena: Arc<Mutex<Option<(MemSlot, u64)>>>,
 }
 
 impl AsRawDescriptor for GunyahVm {
@@ -284,7 +262,7 @@ impl AsRawDescriptor for GunyahVm {
 }
 
 impl GunyahVm {
-    pub fn new(gh: &Gunyah, vm_id: Option<u16>, pas_id: Option<u32>, guest_mem: GuestMemory, cfg: Config, blob_mode: GunyahBlobMode) -> Result<GunyahVm> {
+    pub fn new(gh: &Gunyah, vm_id: Option<u16>, pas_id: Option<u32>, guest_mem: GuestMemory, cfg: Config) -> Result<GunyahVm> {
         // SAFETY:
         // Safe because we know gunyah is a real gunyah fd as this module is the only one that can
         // make Gunyah objects.
@@ -302,6 +280,13 @@ impl GunyahVm {
             let lend = if cfg.protection_type.isolates_memory() {
                 match region.options.purpose {
                     MemoryRegionPurpose::Bios => true,
+                    // GPU pre-alloc pool: SHARE'd like swiotlb (host keeps access), never lent.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::GpuPool => false,
+                    // Guest-alloc pool: SHARE'd like the host pool (host resolves guest-blob
+                    // mem-entries into it), never lent.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::GpuPoolGuest => false,
                     MemoryRegionPurpose::GuestMemoryRegion => true,
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::ProtectedFirmwareRegion => true,
@@ -335,6 +320,14 @@ impl GunyahVm {
                     // populate in batches, cascading MADV_COLLAPSE, mlock.
                     // SAFETY: host_ptr is a valid mapping of region_size bytes.
                     let prep = unsafe { mthp::prepare_lend_region(host_ptr, region_size) };
+                    if !prep.populated {
+                        error!(
+                            "GH: guest RAM region gpa={:#x} size={:#x} failed to populate \
+                             (reserve pool exhausted?) -- refusing to LEND unbacked memory",
+                            guest_base, region_size
+                        );
+                        return Err(Error::new(libc::ENOMEM));
+                    }
 
                     let chunks = match mthp_mode {
                         // Single-parcel: keep the whole prepared region in one
@@ -400,32 +393,105 @@ impl GunyahVm {
                     }
                 }
             } else {
-                // SAFETY:
-                // Safe because the guest regions are guarnteed not to overlap.
-                unsafe {
-                    set_user_memory_region(
-                        &vm_descriptor,
-                        region.index as MemSlot,
-                        false,
-                        // SHARE'd memory is executable only in non-protected VMs (where guest RAM
-                        // itself is SHARE'd). In protected VMs these are data-only regions.
-                        !cfg.protection_type.isolates_memory(),
-                        region.guest_addr.offset(),
-                        region.size.try_into().unwrap(),
-                        region.host_addr as *mut u8,
-                    )?;
+                // GPU pre-alloc pool: force order-9 backing (MADV_HUGEPAGE + populate +
+                // cascading COLLAPSE + mlock) BEFORE the SHARE so the gh_hugepage_reserve
+                // supply hook serves the pool from reserved 2MB folios, exactly like the
+                // mTHP-prepared LEND'd guest RAM.
+                // Same gate as the guest-RAM LEND path below: this whole mechanism only
+                // exists for the Qualcomm reserve-pool hook, so it's opt-in via
+                // --prepare-lend-mthp-mode, not unconditional for every arm/aarch64 host.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if cfg.prepare_lend_mthp.is_some()
+                    && matches!(
+                        region.options.purpose,
+                        MemoryRegionPurpose::GpuPool | MemoryRegionPurpose::GpuPoolGuest
+                    )
+                {
+                    // SAFETY: host_addr is a valid mapping of region.size bytes.
+                    let prep = unsafe {
+                        mthp::prepare_lend_region(
+                            region.host_addr as *mut u8,
+                            region.size.try_into().unwrap(),
+                        )
+                    };
+                    if !prep.populated {
+                        // Host-alloc must fail loudly: proceeding to SHARE an unbacked
+                        // pool means the guest eventually SIGBUSes deep inside its GPU
+                        // stack (e.g. gnome-shell's ASG ring init) instead of crosvm
+                        // failing cleanly at boot with a clear cause.
+                        error!(
+                            "GH: {:?} region gpa={:#x} size={:#x} failed to populate \
+                             (reserve pool exhausted?) -- refusing to share unbacked memory",
+                            region.options.purpose,
+                            region.guest_addr.offset(),
+                            region.size
+                        );
+                        return Err(Error::new(libc::ENOMEM));
+                    }
+                }
+                // The GpuPool's 2MB chunks each come from an independent
+                // alloc_pages(order=9) call in the reserve module (see
+                // compute_share_chunks's doc comment) -- never assume two are
+                // physically adjacent. A single SHARE hypercall for the whole
+                // region works only while it needs <=1 such chunk; feeding it
+                // >=2 independently-sourced folios in one call fails on this RM.
+                // Emit one SET_USER_MEM_REGION call per 2MB chunk instead.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let share_chunks = if matches!(
+                    region.options.purpose,
+                    MemoryRegionPurpose::GpuPool | MemoryRegionPurpose::GpuPoolGuest
+                ) {
+                    mthp::compute_share_chunks(region.size.try_into().unwrap())
+                } else {
+                    Vec::new()
+                };
+                #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+                let share_chunks: Vec<mthp::LendChunk> = Vec::new();
+
+                if share_chunks.is_empty() {
+                    // SAFETY:
+                    // Safe because the guest regions are guarnteed not to overlap.
+                    unsafe {
+                        set_user_memory_region(
+                            &vm_descriptor,
+                            region.index as MemSlot,
+                            false,
+                            // SHARE'd memory is executable only in non-protected VMs (where
+                            // guest RAM itself is SHARE'd). In protected VMs these are
+                            // data-only regions.
+                            !cfg.protection_type.isolates_memory(),
+                            region.guest_addr.offset(),
+                            region.size.try_into().unwrap(),
+                            region.host_addr as *mut u8,
+                        )?;
+                    }
+                } else {
+                    for (i, chunk) in share_chunks.iter().enumerate() {
+                        let slot = if i == 0 {
+                            region.index as MemSlot
+                        } else {
+                            next_lend_slot as MemSlot
+                        };
+                        if i != 0 {
+                            next_lend_slot += 1;
+                        }
+                        // SAFETY: chunks are non-overlapping sub-ranges of a region the
+                        // caller already guaranteed doesn't overlap any other region.
+                        unsafe {
+                            set_user_memory_region(
+                                &vm_descriptor,
+                                slot,
+                                false,
+                                !cfg.protection_type.isolates_memory(),
+                                region.guest_addr.offset() + chunk.offset,
+                                chunk.size,
+                                (region.host_addr as *mut u8).add(chunk.offset as usize),
+                            )?;
+                        }
+                    }
                 }
             }
         }
-
-        warn!(
-            "GUNYAH-BLOB-MODE: {}",
-            match blob_mode {
-                GunyahBlobMode::GuestAccept => "guest-accept (host SHARE + guest mem_accept)",
-                GunyahBlobMode::HostShare =>
-                    "host-share (qemu-style runtime SET_USER_MEM_REGION SHARE)",
-            }
-        );
 
         Ok(GunyahVm {
             gh: gh.try_clone()?,
@@ -439,8 +505,6 @@ impl GunyahVm {
             blob_regions: Arc::new(Mutex::new(BTreeMap::new())),
             routes: Arc::new(Mutex::new(HashSet::new())),
             hv_cfg: cfg,
-            blob_mode,
-            blob_arena: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -577,8 +641,6 @@ impl GunyahVm {
             blob_regions: self.blob_regions.clone(),
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
-            blob_mode: self.blob_mode,
-            blob_arena: self.blob_arena.clone(),
         })
     }
 
@@ -673,68 +735,8 @@ impl GunyahVm {
     }
 }
 
-impl Vm for GunyahVm {
-    fn try_clone(&self) -> Result<Self>
-    where
-        Self: Sized,
-    {
-        Ok(GunyahVm {
-            gh: self.gh.try_clone()?,
-            vm: self.vm.try_clone()?,
-            vm_id: self.vm_id,
-            pas_id: self.pas_id,
-            guest_mem: self.guest_mem.clone(),
-            mem_regions: self.mem_regions.clone(),
-            mem_slot_gaps: self.mem_slot_gaps.clone(),
-            pinned_regions: self.pinned_regions.clone(),
-            blob_regions: self.blob_regions.clone(),
-            routes: self.routes.clone(),
-            hv_cfg: self.hv_cfg,
-            blob_mode: self.blob_mode,
-            blob_arena: self.blob_arena.clone(),
-        })
-    }
-
-    fn try_clone_descriptor(&self) -> Result<SafeDescriptor> {
-        error!("try_clone_descriptor hasn't been tested on gunyah, returning -ENOTSUP");
-        Err(Error::new(ENOTSUP))
-    }
-
-    fn hypervisor_kind(&self) -> HypervisorKind {
-        HypervisorKind::Gunyah
-    }
-
-    fn check_capability(&self, c: VmCap) -> bool {
-        match c {
-            VmCap::DirtyLog => false,
-            // Strictly speaking, Gunyah supports pvclock, but Gunyah takes care
-            // of it and crosvm doesn't need to do anything for it
-            VmCap::PvClock => false,
-            VmCap::Protected => true,
-            VmCap::EarlyInitCpuid => false,
-            #[cfg(target_arch = "x86_64")]
-            VmCap::BusLockDetect => false,
-            VmCap::ReadOnlyMemoryRegion => false,
-            VmCap::MemNoncoherentDma => false,
-            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            VmCap::Sve => false,
-        }
-    }
-
-    fn get_guest_phys_addr_bits(&self) -> u8 {
-        40
-    }
-
-    fn get_memory(&self) -> &GuestMemory {
-        &self.guest_mem
-    }
-
-    fn supports_blob_share(&self) -> bool {
-        // `guest-accept` routes blobs through `share_blob` (host SHARE + guest mem_accept);
-        // `host-share` falls back to `add_memory_region` (qemu-style runtime SHARE, no accept).
-        self.blob_mode == GunyahBlobMode::GuestAccept
-    }
-
+/// Gunyah-specific runtime blob SHARE helpers, driven by `runtime_share`/`runtime_unshare`.
+impl GunyahVm {
     /// Runtime-SHARE a host blob to the running guest and return the resource-manager memparcel
     /// handle. Unlike `add_memory_region` (which SHARE's but never reaches a protected guest's
     /// stage-2 -> SIGBUS), this exposes the handle so the guest can `gh_rm_mem_accept` it itself
@@ -848,70 +850,120 @@ impl Vm for GunyahVm {
         self.blob_regions.lock().remove(&label);
         Ok(())
     }
+}
 
-    fn blob_arena_gpa(&self) -> Option<u64> {
-        self.blob_arena.lock().as_ref().map(|&(_, gpa)| gpa)
+impl Vm for GunyahVm {
+    fn try_clone(&self) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Ok(GunyahVm {
+            gh: self.gh.try_clone()?,
+            vm: self.vm.try_clone()?,
+            vm_id: self.vm_id,
+            pas_id: self.pas_id,
+            guest_mem: self.guest_mem.clone(),
+            mem_regions: self.mem_regions.clone(),
+            mem_slot_gaps: self.mem_slot_gaps.clone(),
+            pinned_regions: self.pinned_regions.clone(),
+            blob_regions: self.blob_regions.clone(),
+            routes: self.routes.clone(),
+            hv_cfg: self.hv_cfg,
+        })
     }
 
-    fn prepare_blob_arena(&mut self, guest_addr: GuestAddress, size: u64) -> Result<()> {
-        if self.blob_arena.lock().is_some() {
-            return Ok(());
+    fn try_clone_descriptor(&self) -> Result<SafeDescriptor> {
+        error!("try_clone_descriptor hasn't been tested on gunyah, returning -ENOTSUP");
+        Err(Error::new(ENOTSUP))
+    }
+
+    fn hypervisor_kind(&self) -> HypervisorKind {
+        HypervisorKind::Gunyah
+    }
+
+    fn check_capability(&self, c: VmCap) -> bool {
+        match c {
+            VmCap::DirtyLog => false,
+            // Strictly speaking, Gunyah supports pvclock, but Gunyah takes care
+            // of it and crosvm doesn't need to do anything for it
+            VmCap::PvClock => false,
+            VmCap::Protected => true,
+            VmCap::EarlyInitCpuid => false,
+            #[cfg(target_arch = "x86_64")]
+            VmCap::BusLockDetect => false,
+            VmCap::ReadOnlyMemoryRegion => false,
+            VmCap::MemNoncoherentDma => false,
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            VmCap::Sve => false,
         }
-        let pgsz = pagesize() as u64;
-        let size = (size + pgsz - 1) / pgsz * pgsz;
-        // Reserve a host VA arena for the whole BAR window and back it with anonymous pages.
-        // Gunyah refuses to SHARE a PROT_NONE region (the guest then hangs at start with no
-        // backing to map), so the arena must have real backing at SHARE time. Per-blob fds
-        // override sub-ranges later via blob_fixed_map -> add_fd_mapping (MAP_FIXED).
-        let mut arena = MemoryMappingArena::new(size as usize).map_err(|e| match e {
-            MmapError::SystemCallFailed(err) => err,
-            _ => Error::new(EINVAL),
-        })?;
-        arena.add_anon(0, size as usize).map_err(|e| match e {
-            MmapError::SystemCallFailed(err) => err,
-            _ => Error::new(EINVAL),
-        })?;
-        // lend=false (SHARE), no exec; established before GH_VM_START so the RM blesses the range.
-        let slot = self.add_memory_region(
-            guest_addr,
-            Box::new(arena),
-            false,
-            false,
-            MemCacheType::CacheCoherent,
-        )?;
-        *self.blob_arena.lock() = Some((slot, guest_addr.offset()));
-        warn!(
-            "GUNYAH-BLOB-ARENA: prepared slot={} gpa=0x{:x} size=0x{:x}",
-            slot,
-            guest_addr.offset(),
-            size,
-        );
-        Ok(())
     }
 
-    fn blob_fixed_map(
+    fn get_guest_phys_addr_bits(&self) -> u8 {
+        40
+    }
+
+    fn get_memory(&self) -> &GuestMemory {
+        &self.guest_mem
+    }
+
+    fn runtime_share(
         &mut self,
         guest_addr: GuestAddress,
-        fd: &dyn AsRawDescriptor,
-        fd_offset: u64,
-        size: usize,
-        prot: Protection,
+        mem_region: Box<dyn MappedRegion>,
+        read_only: bool,
+        _cache: MemCacheType,
+        _accept: crate::VmAccept,
+    ) -> Result<(MemSlot, Option<u32>)> {
+        // Gunyah is a protected guest: runtime attach is always a SHARE whose RM memparcel handle
+        // the guest must `gh_rm_mem_accept` itself. Return the handle; the slot is a don't-care
+        // (the SHARE is reclaimed by label = gpa>>12, not a slot). `vm_accept` selects WHO drives
+        // the guest accept (Off -> caller/virtio-gpu; Sync/Async -> in-VM module via transport);
+        // that routing happens above this layer, so nothing to branch on here.
+        let handle = self.share_blob(guest_addr, mem_region, read_only)?;
+        Ok((0, Some(handle)))
+    }
+
+    fn runtime_unshare(
+        &mut self,
+        guest_addr: GuestAddress,
+        _slot: MemSlot,
+        _accept: crate::VmAccept,
     ) -> Result<()> {
-        let (slot, base) = match *self.blob_arena.lock() {
-            Some(v) => v,
-            None => return Err(Error::new(EINVAL)),
-        };
-        let gpa = guest_addr.offset();
-        if gpa < base {
-            return Err(Error::new(EINVAL));
+        // Reclaim by deterministic label (gpa>>12). The guest already released its acceptance
+        // (driven per vm_accept, symmetric with the attach) before this runs.
+        let label = (guest_addr.offset() >> 12) as u32;
+        self.unshare_blob(label)
+    }
+
+    // Host-visible blob backing: fold each blob's shmem into a 2MB order-9 folio *before* it is
+    // pinned (formerly gfxstream's HostVisibleFolio; moved here so the GPU backend is
+    // backend-agnostic and gzvm/etc. reuse it). A 2MB-clean blob's later SHARE (share_blob) never
+    // splits a hyp stage-2 block shared with LENT guest RAM -> no EXEC strip. `threshold` /
+    // `exceed-policy` are VMM policy (here); the host-visible VRAM quota is metered on the GPU side.
+    fn prepare_runtime_blob_backing(
+        &mut self,
+        fd: &dyn base::AsRawDescriptor,
+        size: u64,
+    ) -> Result<u64> {
+        // Folio policy is VMM-owned (--runtime-share hugepage-threshold-kb=,exceed-policy=),
+        // read from hv_cfg -- no per-blob arg from the GPU side.
+        if size < self.hv_cfg.folio_threshold_bytes {
+            return Ok(0); // below threshold -> 4K direct-supply path
         }
-        let offset = (gpa - base) as usize;
-        self.add_fd_mapping(slot, offset, size, fd, fd_offset, prot)?;
-        warn!(
-            "GUNYAH-BLOB-MAP: slot={} gpa=0x{:x} off=0x{:x} size=0x{:x}",
-            slot, gpa, offset, size,
-        );
-        Ok(())
+        let rounded = mthp::round_up_2mb(size);
+
+        // SAFETY: fd is a live growable shmem descriptor for this blob (owned by the GPU backend
+        // for the blob's lifetime); folio_back_fd only grows + collapses it.
+        if let Err(e) = unsafe { mthp::folio_back_fd(fd.as_raw_descriptor(), rounded) } {
+            // Reserve/CMA exhausted (or collapse failed): honour the exceed-policy.
+            warn!("GH-FOLIO: folio_back_fd failed ({}); size=0x{:x}", e, size);
+            if self.hv_cfg.folio_oom_on_exceed {
+                return Err(Error::new(e.raw_os_error().unwrap_or(EINVAL)));
+            }
+            return Ok(0); // fallback: leave it on the 4K path
+        }
+        debug!("GH-FOLIO: blob size=0x{:x} -> 2MB folios rounded=0x{:x}", size, rounded);
+        Ok(rounded)
     }
 
     fn add_memory_region(

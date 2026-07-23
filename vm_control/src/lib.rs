@@ -50,6 +50,7 @@ use std::result::Result as StdResult;
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::bail;
@@ -78,12 +79,14 @@ use hypervisor::IrqRoute;
 use hypervisor::IrqSource;
 pub use hypervisor::MemSlot;
 use hypervisor::Vm;
+use hypervisor::VmAccept;
 use hypervisor::VmCap;
 use libc::EINVAL;
 use libc::EIO;
 use libc::ENODEV;
 use libc::ENOTSUP;
 use libc::ERANGE;
+use libc::ETIMEDOUT;
 #[cfg(feature = "registered_events")]
 use protos::registered_events;
 use remain::sorted;
@@ -570,6 +573,97 @@ pub struct VmMemoryFileMapping {
     pub file_offset: u64,
 }
 
+/// Operation for the virtio-gunyah-accept transport (VmAccept::Sync): the in-VM accept module
+/// performs the guest-side RM accept/release for a runtime-SHARE'd memparcel.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GunyahAcceptOp {
+    Accept,
+    Release,
+}
+
+/// Request sent from vm_control to the virtio-gunyah-accept device worker, which forwards it to
+/// the guest module over the device's requestq.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GunyahAcceptRequest {
+    /// Round-trip matching tag; the response echoes it (lets the requester drain stale
+    /// responses left over from a timed-out earlier request).
+    pub seq: u64,
+    pub op: GunyahAcceptOp,
+    /// RM memparcel handle (Accept only; Release is gpa-keyed on the guest side).
+    pub handle: u32,
+    pub gpa: u64,
+    pub size: u64,
+}
+
+/// Completion for a [`GunyahAcceptRequest`], relayed from the guest module's completionq.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct GunyahAcceptResponse {
+    pub seq: u64,
+    /// 0 on success, negative errno from the guest module.
+    pub ret: i32,
+}
+
+/// Monotonic tag for GunyahAcceptRequest round trips.
+static GUNYAH_ACCEPT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How long a Sync attach may wait for the guest module to accept. The RM RPC itself is a
+/// sub-millisecond HVC; the budget covers irq delivery + workqueue scheduling with a wide margin.
+const GUNYAH_ACCEPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Drive one synchronous accept/release round trip through the virtio-gunyah-accept device.
+/// Blocks the calling thread (the vm_memory handler) for up to [`GUNYAH_ACCEPT_TIMEOUT`].
+fn drive_guest_accept(
+    tube: &Tube,
+    op: GunyahAcceptOp,
+    handle: u32,
+    gpa: u64,
+    size: u64,
+) -> std::result::Result<(), SysError> {
+    let seq = GUNYAH_ACCEPT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let req = GunyahAcceptRequest {
+        seq,
+        op,
+        handle,
+        gpa,
+        size,
+    };
+    tube.send(&req).map_err(|e| {
+        error!("gunyah-accept transport send failed: {}", e);
+        SysError::new(EIO)
+    })?;
+    let deadline = Instant::now() + GUNYAH_ACCEPT_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            error!("gunyah-accept {:?} gpa={:#x} timed out", op, gpa);
+            return Err(SysError::new(ETIMEDOUT));
+        }
+        if let Err(e) = tube.set_recv_timeout(Some(remaining)) {
+            error!("gunyah-accept set_recv_timeout failed: {}", e);
+            return Err(SysError::new(EIO));
+        }
+        match tube.recv::<GunyahAcceptResponse>() {
+            Ok(resp) if resp.seq == seq => {
+                return if resp.ret == 0 {
+                    Ok(())
+                } else {
+                    error!(
+                        "guest module failed gunyah-accept {:?} gpa={:#x}: {}",
+                        op, gpa, resp.ret
+                    );
+                    Err(SysError::new(-resp.ret))
+                };
+            }
+            // Stale response from an earlier timed-out round trip; drain and keep waiting.
+            Ok(_) => continue,
+            Err(e) => {
+                error!("gunyah-accept transport recv failed: {}", e);
+                return Err(SysError::new(ETIMEDOUT));
+            }
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub enum VmMemoryRequest {
     /// Prepare a shared memory region to make later operations more efficient. This
@@ -585,17 +679,9 @@ pub enum VmMemoryRequest {
         prot: Protection,
         /// Cache attribute for guest memory setting
         cache: MemCacheType,
-    },
-    /// Like `RegisterMemory`, but for a host-visible virtio-gpu blob. On a hypervisor that
-    /// supports blob-sharing (Gunyah), this SHARE's the blob and returns the memparcel handle
-    /// for the guest to accept itself (instead of mapping it into the guest's stage-2, which a
-    /// protected guest cannot receive at runtime). On other hypervisors it falls back to a
-    /// normal memory registration and returns no handle.
-    RegisterMemoryForBlob {
-        source: VmMemorySource,
-        dest: VmMemoryDestination,
-        prot: Protection,
-        cache: MemCacheType,
+        /// Per-operation policy for how the runtime attach is accepted into a protected guest's
+        /// stage-2 (Gunyah). A no-op on hypervisors whose runtime attach is a normal memslot.
+        vm_accept: VmAccept,
     },
     #[cfg(any(target_os = "android", target_os = "linux"))]
     /// Call mmap to `shm` and register the memory region as a read-only guest memory.
@@ -619,6 +705,15 @@ pub enum VmMemoryRequest {
     UnregisterMemory(VmMemoryRegionId),
     /// Register an eventfd with raw guest memory address.
     IoEventRaw(IoEventUpdateRequest),
+    /// Prepare a host-visible virtio-gpu blob's backing per the backend's folio policy, BEFORE the
+    /// GPU backend pins/exports it (the gfxstream prepare-blob-backing callback). `descriptor` is
+    /// the blob's growable shmem fd; Gunyah protected folds it into 2MB order-9 folios per its
+    /// VMM-owned folio policy (`--runtime-share hugepage-threshold-kb=,exceed-policy=`).
+    /// Answered with `VmMemoryResponse::PreparedBlobBacking { charged }`.
+    PrepareBlobBacking {
+        descriptor: SafeDescriptor,
+        size: u64,
+    },
 }
 
 /// Struct for managing `VmMemoryRequest`s IOMMU related state.
@@ -645,6 +740,9 @@ enum RegisteredMemory {
     },
     DynamicMapping {
         slot: MemSlot,
+        /// True when the attach was accepted by the in-VM module via the Sync transport; the
+        /// detach must then drive the symmetric guest-side release before unsharing.
+        guest_synced: bool,
     },
 }
 
@@ -726,6 +824,7 @@ fn try_map_to_prepared_region(
     Some(VmMemoryResponse::RegisterMemory {
         region_id,
         slot: *slot,
+        accept_handle: None,
     })
 }
 
@@ -747,6 +846,7 @@ impl VmMemoryRequest {
         gralloc: &mut RutabagaGralloc,
         iommu_client: Option<&mut VmMemoryRequestIommuClient>,
         region_state: &mut VmMemoryRegionState,
+        gunyah_accept_tube: Option<&Tube>,
     ) -> VmMemoryResponse {
         use self::VmMemoryRequest::*;
         match self {
@@ -777,6 +877,7 @@ impl VmMemoryRequest {
                 dest,
                 prot,
                 cache,
+                vm_accept,
             } => {
                 if let Some(resp) =
                     try_map_to_prepared_region(vm, region_state, &source, &dest, &prot)
@@ -786,25 +887,86 @@ impl VmMemoryRequest {
 
                 // Correct on Windows because callers of this IPC guarantee descriptor is a mapping
                 // handle.
+                // Failure logging on each stage: a RegisterMemory failure reaches the guest as a
+                // bare map_blob error (VK_ERROR_OUT_OF_DEVICE_MEMORY), so without these logs the
+                // failing stage (host mmap vs BAR allocation vs hypervisor share) is
+                // indistinguishable. Error path only.
                 let (mapped_region, size, descriptor) = match source.map(gralloc, prot) {
                     Ok((region, size, descriptor)) => (region, size, descriptor),
-                    Err(e) => return VmMemoryResponse::Err(e),
+                    Err(e) => {
+                        error!("RegisterMemory: source.map failed: {:?}", e);
+                        return VmMemoryResponse::Err(e);
+                    }
                 };
 
                 let guest_addr = match dest.allocate(sys_allocator, size) {
                     Ok(addr) => addr,
-                    Err(e) => return VmMemoryResponse::Err(e),
+                    Err(e) => {
+                        error!(
+                            "RegisterMemory: dest.allocate(size={:#x}) failed: {:?}",
+                            size, e
+                        );
+                        return VmMemoryResponse::Err(e);
+                    }
                 };
 
-                let slot = match vm.add_memory_region(
+                // Universal runtime attach. Default (KVM / geniezone / Gunyah unprotected) is a
+                // plain removable memslot returning `(slot, None)`; Gunyah protected transparently
+                // SHAREs the region and returns the RM memparcel handle for the guest to accept.
+                let (slot, accept_handle) = match vm.runtime_share(
                     guest_addr,
                     mapped_region,
                     prot == Protection::read(),
-                    false,
                     cache,
+                    vm_accept,
                 ) {
-                    Ok(slot) => slot,
-                    Err(e) => return VmMemoryResponse::Err(e),
+                    Ok(v) => v,
+                    Err(e) => {
+                        error!(
+                            "RegisterMemory: runtime_share(gpa={:#x} size={:#x}) failed: {:?}",
+                            guest_addr.offset(),
+                            size,
+                            e
+                        );
+                        return VmMemoryResponse::Err(e);
+                    }
+                };
+
+                // VmAccept routing: `Off` hands the handle back to the caller (e.g. virtio-gpu),
+                // which drives the guest accept itself. `Sync` consumes the handle HERE: the
+                // in-VM accept module performs the accept over the virtio-gunyah-accept
+                // transport before we return, so the caller sees plain upstream semantics.
+                let (accept_handle, guest_synced) = match (vm_accept, accept_handle) {
+                    (VmAccept::Sync, Some(handle)) => {
+                        let Some(accept_tube) = gunyah_accept_tube else {
+                            error!(
+                                "VmAccept::Sync attach at {:#x} but no virtio-gunyah-accept \
+                                 transport is wired up; failing",
+                                guest_addr.offset()
+                            );
+                            let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                            return VmMemoryResponse::Err(SysError::new(ENODEV));
+                        };
+                        if let Err(e) = drive_guest_accept(
+                            accept_tube,
+                            GunyahAcceptOp::Accept,
+                            handle,
+                            guest_addr.offset(),
+                            size,
+                        ) {
+                            // The guest never accepted; reclaim the SHARE and fail the attach.
+                            let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                            return VmMemoryResponse::Err(e);
+                        }
+                        (None, true)
+                    }
+                    (VmAccept::Async, Some(_)) => {
+                        error!("VmAccept::Async transport not implemented");
+                        let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
+                        return VmMemoryResponse::Err(SysError::new(ENOTSUP));
+                    }
+                    // Off (caller-driven), or no handle needed (plain memslot hypervisors).
+                    (_, handle) => (handle, false),
                 };
 
                 let region_id = VmMemoryRegionId(guest_addr);
@@ -830,170 +992,14 @@ impl VmMemoryRequest {
                     iommu_client.registered_memory.insert(region_id);
                 }
 
-                region_state
-                    .registered_memory
-                    .insert(region_id, RegisteredMemory::DynamicMapping { slot });
-                VmMemoryResponse::RegisterMemory { region_id, slot }
-            }
-            RegisterMemoryForBlob {
-                source,
-                dest,
-                prot,
-                cache,
-            } => {
-                // Gunyah fixed-bless arena: if a boot-blessed host-visible blob arena exists,
-                // alias the blob's backing fd into it (host-local add_fd_mapping; NO runtime
-                // SHARE). The guest reaches it through the shmem BAR at the already-blessed GPA,
-                // so a protected guest's stage-2 accepts it (no SIGBUS).
-                if vm.blob_arena_gpa().is_some() {
-                    match &source {
-                        VmMemorySource::Descriptor {
-                            descriptor,
-                            offset,
-                            size,
-                        } => {
-                            let guest_addr = match dest.allocate(sys_allocator, *size) {
-                                Ok(a) => a,
-                                Err(e) => return VmMemoryResponse::Err(e),
-                            };
-                            return match vm.blob_fixed_map(
-                                guest_addr,
-                                descriptor,
-                                *offset,
-                                *size as usize,
-                                prot,
-                            ) {
-                                Ok(()) => VmMemoryResponse::RegisterMemoryForBlob {
-                                    region_id: VmMemoryRegionId(guest_addr),
-                                    slot: 0,
-                                    gunyah_handle: None,
-                                },
-                                Err(e) => VmMemoryResponse::Err(e),
-                            };
-                        }
-                        other => {
-                            error!(
-                                "blob_arena: source {} not supported for fixed-bless map",
-                                other
-                            );
-                            return VmMemoryResponse::Err(SysError::new(EINVAL));
-                        }
-                    }
-                }
-                if vm.supports_blob_share() {
-                    // Gunyah: SHARE the blob and return the handle for the guest to accept
-                    // itself. We do NOT map it into the guest (a protected guest cannot receive
-                    // a runtime stage-2 mapping from the host -> SIGBUS). The host backing is
-                    // pinned by the hypervisor (SHARE is permanent), so no removable region is
-                    // tracked here. Prepared regions are never used on Gunyah (DynamicPerMapping).
-                    let dbg_off = match &dest {
-                        VmMemoryDestination::ExistingAllocation { offset, .. } => *offset,
-                        VmMemoryDestination::GuestPhysicalAddress(gpa) => *gpa,
-                    };
-                    let (mapped_region, size, _descriptor) = match source.map(gralloc, prot) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(
-                                "GUNYAH-BLOB-FAIL: source.map() ERR={:?} dest_off=0x{:x}",
-                                e, dbg_off,
-                            );
-                            return VmMemoryResponse::Err(e);
-                        }
-                    };
-                    let guest_addr = match dest.allocate(sys_allocator, size) {
-                        Ok(addr) => addr,
-                        Err(e) => {
-                            warn!(
-                                "GUNYAH-BLOB-FAIL: dest.allocate() ERR={:?} dest_off=0x{:x} size=0x{:x}",
-                                e, dbg_off, size,
-                            );
-                            return VmMemoryResponse::Err(e);
-                        }
-                    };
-                    let region_id = VmMemoryRegionId(guest_addr);
-                    return match vm.share_blob(
-                        guest_addr,
-                        mapped_region,
-                        prot == Protection::read(),
-                    ) {
-                        Ok(handle) => VmMemoryResponse::RegisterMemoryForBlob {
-                            region_id,
-                            slot: 0,
-                            gunyah_handle: Some(handle),
-                        },
-                        Err(e) => {
-                            warn!(
-                                "GUNYAH-BLOB-FAIL: share_blob() ERR={:?} gpa=0x{:x} size=0x{:x}",
-                                e,
-                                guest_addr.offset(),
-                                size,
-                            );
-                            VmMemoryResponse::Err(e)
-                        }
-                    };
-                }
-
-                // Other hypervisors: behave exactly like RegisterMemory, just in the blob
-                // response shape (no handle).
-                if let Some(resp) =
-                    try_map_to_prepared_region(vm, region_state, &source, &dest, &prot)
-                {
-                    return match resp {
-                        VmMemoryResponse::RegisterMemory { region_id, slot } => {
-                            VmMemoryResponse::RegisterMemoryForBlob {
-                                region_id,
-                                slot,
-                                gunyah_handle: None,
-                            }
-                        }
-                        other => other,
-                    };
-                }
-
-                let (mapped_region, size, descriptor) = match source.map(gralloc, prot) {
-                    Ok(v) => v,
-                    Err(e) => return VmMemoryResponse::Err(e),
-                };
-                let guest_addr = match dest.allocate(sys_allocator, size) {
-                    Ok(addr) => addr,
-                    Err(e) => return VmMemoryResponse::Err(e),
-                };
-                let slot = match vm.add_memory_region(
-                    guest_addr,
-                    mapped_region,
-                    prot == Protection::read(),
-                    false,
-                    cache,
-                ) {
-                    Ok(slot) => slot,
-                    Err(e) => return VmMemoryResponse::Err(e),
-                };
-                let region_id = VmMemoryRegionId(guest_addr);
-                if let (Some(descriptor), Some(iommu_client)) = (descriptor, iommu_client) {
-                    let request =
-                        VirtioIOMMURequest::VfioCommand(VirtioIOMMUVfioCommand::VfioDmabufMap {
-                            region_id,
-                            gpa: guest_addr.0,
-                            size,
-                            dma_buf: descriptor,
-                        });
-                    match virtio_iommu_request(&iommu_client.tube.lock(), &request) {
-                        Ok(VirtioIOMMUResponse::VfioResponse(VirtioIOMMUVfioResult::Ok)) => (),
-                        resp => {
-                            error!("Unexpected message response: {:?}", resp);
-                            let _ = vm.remove_memory_region(slot);
-                            return VmMemoryResponse::Err(SysError::new(EINVAL));
-                        }
-                    };
-                    iommu_client.registered_memory.insert(region_id);
-                }
-                region_state
-                    .registered_memory
-                    .insert(region_id, RegisteredMemory::DynamicMapping { slot });
-                VmMemoryResponse::RegisterMemoryForBlob {
+                region_state.registered_memory.insert(
+                    region_id,
+                    RegisteredMemory::DynamicMapping { slot, guest_synced },
+                );
+                VmMemoryResponse::RegisterMemory {
                     region_id,
                     slot,
-                    gunyah_handle: None,
+                    accept_handle,
                 }
             }
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1087,27 +1093,57 @@ impl VmMemoryRequest {
 
                 let region_id = VmMemoryRegionId(guest_addr);
 
-                region_state
-                    .registered_memory
-                    .insert(region_id, RegisteredMemory::DynamicMapping { slot });
+                region_state.registered_memory.insert(
+                    region_id,
+                    RegisteredMemory::DynamicMapping {
+                        slot,
+                        guest_synced: false,
+                    },
+                );
 
-                VmMemoryResponse::RegisterMemory { region_id, slot }
-            }
-            UnregisterMemory(id) if vm.supports_blob_share() => {
-                // Gunyah: host-visible blobs aren't tracked in region_state (they're SHARE'd, not
-                // mapped as removable regions). The guest has unmapped this blob and released its
-                // stage-2 acceptance, so reclaim the SHARE by its deterministic label (gpa >> 12),
-                // freeing the BAR offset for clean reuse.
-                let label = (id.0.offset() >> 12) as u32;
-                match vm.unshare_blob(label) {
-                    Ok(()) => VmMemoryResponse::Ok,
-                    Err(e) => VmMemoryResponse::Err(e),
+                VmMemoryResponse::RegisterMemory {
+                    region_id,
+                    slot,
+                    accept_handle: None,
                 }
             }
             UnregisterMemory(id) => match region_state.registered_memory.remove(&id) {
-                Some(RegisteredMemory::DynamicMapping { slot }) => match vm
-                    .remove_memory_region(slot)
-                {
+                Some(RegisteredMemory::DynamicMapping { slot, guest_synced }) => {
+                    // Sync-attached regions: the in-VM module owns the acceptance, so drive the
+                    // symmetric guest-side release BEFORE the host unshare (same ordering
+                    // invariant as the virtio-gpu Off path: release first, reclaim second).
+                    if guest_synced {
+                        if let Some(accept_tube) = gunyah_accept_tube {
+                            if let Err(e) = drive_guest_accept(
+                                accept_tube,
+                                GunyahAcceptOp::Release,
+                                0,
+                                id.0.offset(),
+                                0,
+                            ) {
+                                error!(
+                                    "guest-side release for {:#x} failed ({}); proceeding \
+                                     with host unshare",
+                                    id.0.offset(),
+                                    e
+                                );
+                            }
+                        } else {
+                            error!(
+                                "Sync-attached region {:#x} but no accept transport at detach",
+                                id.0.offset()
+                            );
+                        }
+                    }
+                    match vm.runtime_unshare(
+                        id.0,
+                        slot,
+                        if guest_synced {
+                            VmAccept::Sync
+                        } else {
+                            VmAccept::Off
+                        },
+                    ) {
                     Ok(_) => {
                         if let Some(iommu_client) = iommu_client {
                             if iommu_client.registered_memory.remove(&id) {
@@ -1132,7 +1168,8 @@ impl VmMemoryRequest {
                         }
                     }
                     Err(e) => VmMemoryResponse::Err(e),
-                },
+                    }
+                }
                 Some(RegisteredMemory::FixedMapping { slot, offset, size }) => {
                     match vm.remove_mapping(slot, offset, size) {
                         Ok(()) => VmMemoryResponse::Ok,
@@ -1198,6 +1235,12 @@ impl VmMemoryRequest {
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
+            PrepareBlobBacking { descriptor, size } => {
+                match vm.prepare_runtime_blob_backing(&descriptor, size) {
+                    Ok(charged) => VmMemoryResponse::PreparedBlobBacking { charged },
+                    Err(e) => VmMemoryResponse::Err(e),
+                }
+            }
         }
     }
 }
@@ -1213,14 +1256,15 @@ pub enum VmMemoryResponse {
     RegisterMemory {
         region_id: VmMemoryRegionId,
         slot: u32,
+        /// `Some` when a runtime SHARE (Gunyah protected) needs a guest-side `gh_rm_mem_accept`
+        /// and the RM memparcel handle is handed back to the caller (`vm_accept = Off`); `None`
+        /// when the region was registered as a plain memslot (KVM / geniezone / Gunyah unprotected).
+        accept_handle: Option<u32>,
     },
-    /// Response to `RegisterMemoryForBlob`. `gunyah_handle` is `Some` when the blob was
-    /// SHARE'd via the guest-accept path (Gunyah) and the guest must accept the handle; `None`
-    /// when it was registered normally.
-    RegisterMemoryForBlob {
-        region_id: VmMemoryRegionId,
-        slot: u32,
-        gunyah_handle: Option<u32>,
+    /// Bytes actually folio-backed by `PrepareBlobBacking` (2MB-rounded, or 0 if the blob stayed on
+    /// the 4K path). The GPU device meters this against its host-visible VRAM quota.
+    PreparedBlobBacking {
+        charged: u64,
     },
     Ok,
     Err(SysError),

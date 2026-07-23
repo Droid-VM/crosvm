@@ -8,10 +8,12 @@ use base::AsRawDescriptor;
 use base::Event;
 use base::Protection;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use base::Tube;
 use base::TubeError;
 use hypervisor::Datamatch;
 use hypervisor::MemCacheType;
+use hypervisor::VmAccept;
 use remain::sorted;
 use resources::Alloc;
 use serde::Deserialize;
@@ -86,6 +88,7 @@ impl VmMemoryClient {
             dest,
             prot,
             cache,
+            vm_accept: VmAccept::default(),
         };
         match self.request(&request)? {
             VmMemoryResponse::Err(e) => Err(ApiClientError::RequestFailed(e)),
@@ -94,29 +97,45 @@ impl VmMemoryClient {
         }
     }
 
-    /// Register a host-visible virtio-gpu blob. Returns the region id plus, on a blob-sharing
-    /// hypervisor (Gunyah), the memparcel handle the guest must accept to map the blob itself.
+    /// Register a host-visible virtio-gpu blob via a plain `RegisterMemory` with `vm_accept = Off`.
+    /// Returns the region id plus, on a protected Gunyah guest, the RM memparcel handle the guest
+    /// must `gh_rm_mem_accept` to map the blob itself (`None` on other hypervisors).
     pub fn register_memory_for_blob(
         &self,
         source: VmMemorySource,
         dest: VmMemoryDestination,
         prot: Protection,
         cache: MemCacheType,
+        vm_accept: VmAccept,
     ) -> Result<(VmMemoryRegionId, Option<u32>)> {
-        let request = VmMemoryRequest::RegisterMemoryForBlob {
+        let request = VmMemoryRequest::RegisterMemory {
             source,
             dest,
             prot,
             cache,
+            vm_accept,
         };
         match self.request(&request)? {
             VmMemoryResponse::Err(e) => Err(ApiClientError::RequestFailed(e)),
-            VmMemoryResponse::RegisterMemoryForBlob {
+            VmMemoryResponse::RegisterMemory {
                 region_id,
-                gunyah_handle,
+                accept_handle,
                 ..
-            } => Ok((region_id, gunyah_handle)),
+            } => Ok((region_id, accept_handle)),
             _other => Err(ApiClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Prepare a host-visible virtio-gpu blob's backing per the backend's folio policy before it
+    /// is pinned (the gfxstream prepare-blob-backing callback). `descriptor` is the blob's growable
+    /// shmem fd. Returns the bytes actually folio-backed (2MB-rounded, or 0 if it stayed 4K), which
+    /// the GPU side meters against its host-visible VRAM quota.
+    pub fn prepare_blob_backing(&self, descriptor: SafeDescriptor, size: u64) -> Result<u64> {
+        let request = VmMemoryRequest::PrepareBlobBacking { descriptor, size };
+        match self.request(&request)? {
+            VmMemoryResponse::PreparedBlobBacking { charged } => Ok(charged),
+            VmMemoryResponse::Err(e) => Err(ApiClientError::RequestFailed(e)),
+            _ => Err(ApiClientError::UnexpectedResponse),
         }
     }
 

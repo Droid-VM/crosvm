@@ -10,7 +10,9 @@ use anyhow::anyhow;
 use anyhow::Result;
 use base::Protection;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use hypervisor::MemCacheType;
+use hypervisor::VmAccept;
 use resources::AddressRange;
 use snapshot::AnySnapshot;
 use vm_control::VmMemorySource;
@@ -51,8 +53,10 @@ pub trait SharedMemoryMapper: Send {
     ) -> Result<()>;
 
     /// Maps a host-visible virtio-gpu blob into the shared memory region at |offset|. On a
-    /// blob-sharing hypervisor (Gunyah) this SHARE's the blob and returns the memparcel handle
-    /// the guest must accept to map it itself (returned `Some`). Otherwise it behaves like
+    /// blob-sharing hypervisor (Gunyah) this SHARE's the blob; `vm_accept` selects who drives
+    /// the guest-side accept: `Off` returns the memparcel handle for the caller (virtio-gpu ->
+    /// guest driver) to accept itself (returned `Some`); `Sync` has the in-VM accept module do
+    /// it before this returns (returned `None`). On plain-memslot hypervisors it behaves like
     /// `add_mapping` and returns `None`. The default falls back to `add_mapping`.
     fn add_mapping_blob(
         &mut self,
@@ -60,9 +64,23 @@ pub trait SharedMemoryMapper: Send {
         offset: u64,
         prot: Protection,
         cache: MemCacheType,
+        vm_accept: VmAccept,
     ) -> Result<Option<u32>> {
+        let _ = vm_accept;
         self.add_mapping(source, offset, prot, cache)?;
         Ok(None)
+    }
+
+    /// Prepare a host-visible virtio-gpu blob's backing per the backend's folio policy, before the
+    /// GPU backend pins/exports it. `fd` is the blob's growable shmem descriptor. On a folio
+    /// backend (Gunyah protected) this folds it into 2MB order-9 folios (per the VMM-owned
+    /// `--runtime-share hugepage-threshold-kb=,exceed-policy=` policy) so the later SHARE is
+    /// stage-2/exec clean; elsewhere it is a no-op. Returns the bytes actually folio-backed
+    /// (2MB-rounded, or 0 if it stayed 4K); the GPU device meters this against its own host-visible
+    /// VRAM quota. Default: no-op (0).
+    fn prepare_blob_backing(&mut self, fd: SafeDescriptor, size: u64) -> Result<u64> {
+        let _ = (fd, size);
+        Ok(0)
     }
 
     /// Removes the mapping beginning at |offset|.

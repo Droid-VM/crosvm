@@ -11,6 +11,7 @@ mod descriptor_chain;
 mod descriptor_utils;
 pub mod device_constants;
 pub mod input;
+mod gunyah_accept;
 mod interrupt;
 mod iommu;
 #[cfg(feature = "net")]
@@ -67,7 +68,6 @@ pub use self::gpu::GpuMode;
 pub use self::gpu::GpuMouseMode;
 #[cfg(feature = "gpu")]
 pub use self::gpu::GpuParameters;
-pub use self::gpu::VramExceedPolicy;
 #[cfg(feature = "gpu")]
 pub use self::gpu::GpuWsi;
 pub use self::interrupt::Interrupt;
@@ -89,6 +89,7 @@ pub use self::queue::split_descriptor_chain::SplitDescriptorChain;
 pub use self::queue::PeekedDescriptorChain;
 pub use self::queue::Queue;
 pub use self::queue::QueueConfig;
+pub use self::gunyah_accept::GunyahAccept;
 pub use self::rng::Rng;
 pub use self::scsi::Controller as ScsiController;
 pub use self::scsi::DiskConfig as ScsiDiskConfig;
@@ -185,6 +186,7 @@ pub enum DeviceType {
     Tpm = virtio_ids::VIRTIO_ID_TPM,
     Pvclock = virtio_ids::VIRTIO_ID_PVCLOCK,
     Media = virtio_ids::VIRTIO_ID_MEDIA,
+    GunyahAccept = virtio_ids::VIRTIO_ID_GUNYAH_ACCEPT,
 }
 
 impl DeviceType {
@@ -216,6 +218,7 @@ impl DeviceType {
             DeviceType::Tpm => 1,           // request queue
             DeviceType::Pvclock => 1,       // request queue
             DeviceType::Media => 2,         // commandq, eventq
+            DeviceType::GunyahAccept => 2,  // requestq, completionq
         }
     }
 }
@@ -246,6 +249,7 @@ impl std::fmt::Display for DeviceType {
             DeviceType::Mac80211HwSim => write!(f, "mac80211-hwsim"),
             DeviceType::Scmi => write!(f, "scmi"),
             DeviceType::Media => write!(f, "media"),
+            DeviceType::GunyahAccept => write!(f, "gunyah-accept"),
         }
     }
 }

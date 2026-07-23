@@ -29,6 +29,7 @@ pub mod x86_64;
 pub mod geniezone;
 
 use base::AsRawDescriptor;
+use base::RawDescriptor;
 use base::Event;
 use base::MappedRegion;
 use base::Protection;
@@ -50,11 +51,29 @@ pub use crate::x86_64::*;
 /// An index in the list of guest-mapped memory regions.
 pub type MemSlot = u32;
 
+/// Per-operation policy for how a runtime-attached host region is accepted into a *protected*
+/// guest's stage-2 (Gunyah). Ignored (a plain no-op) by hypervisors whose runtime attach is a
+/// normal memslot (KVM / geniezone / Gunyah unprotected). CLI value `vm_accept=sync|false|async`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VmAccept {
+    /// Transparent: notify the in-VM accept module over the transport and WAIT for it to
+    /// `gh_rm_mem_accept` before returning. Any component uses add/remove exactly like upstream;
+    /// the RM handle is delivered to the generic guest-accept module (not the caller).
+    #[default]
+    Sync,
+    /// `vm_accept=false`: no transport. Return the RM handle to the caller (e.g. virtio-gpu) so it
+    /// drives the guest accept itself and owns the handle for the symmetric release. Low-latency.
+    Off,
+    /// Notify the transport but return without waiting for the accept to complete. (Future.)
+    Async,
+}
+
 /// Range of GPA space. Starting from `guest_address` up to `size`.
 pub struct MemRegion {
     pub guest_address: GuestAddress,
     pub size: u64,
 }
+
 
 /// Signal to the hypervisor on kernels that support the KVM_CAP_USER_CONFIGURE_NONCOHERENT_DMA (or
 /// equivalent) that during user memory region (memslot) configuration, a guest page's memtype
@@ -178,59 +197,55 @@ pub trait Vm: Send {
         cache: MemCacheType,
     ) -> Result<MemSlot>;
 
-    /// Returns true if this hypervisor supports [`Vm::share_blob`] (Gunyah only). Used to route
-    /// host-visible virtio-gpu blobs to the guest-accept path instead of a normal memory region.
-    fn supports_blob_share(&self) -> bool {
-        false
-    }
-
-    /// Runtime-share a host blob to the guest and return a hypervisor-specific memparcel handle
-    /// that the guest accepts itself (to map the blob at `guest_addr` in its own stage-2). Only
-    /// meaningful when [`Vm::supports_blob_share`] is true (Gunyah); the default is unsupported.
-    fn share_blob(
+    /// Runtime (post-boot) attach of a host-backed region at `guest_addr` into the running guest.
+    /// This is the universal dynamic-memory op the transparent `VmMemoryRequest::RegisterMemory`
+    /// path routes through, so gfxstream (and any component) calls add/remove exactly like upstream.
+    ///
+    /// Default (KVM / geniezone / Gunyah unprotected): a plain removable memslot via
+    /// [`Vm::add_memory_region`]; `accept` is ignored and it returns `None` (no guest-side accept
+    /// needed). Gunyah protected overrides this to SHARE the region and return the RM memparcel
+    /// handle. `Some(handle)` means a guest-side `gh_rm_mem_accept` is still required; who performs
+    /// it depends on `accept` (see [`VmAccept`]): `Off` hands the handle to the caller, `Sync`/`Async`
+    /// route it to the in-VM accept module over the transport.
+    fn runtime_share(
         &mut self,
-        _guest_addr: GuestAddress,
-        _mem_region: Box<dyn MappedRegion>,
-        _read_only: bool,
-    ) -> Result<u32> {
-        Err(base::Error::new(libc::ENOTSUP))
+        guest_addr: GuestAddress,
+        mem_region: Box<dyn MappedRegion>,
+        read_only: bool,
+        cache: MemCacheType,
+        accept: VmAccept,
+    ) -> Result<(MemSlot, Option<u32>)> {
+        let _ = accept;
+        let slot = self.add_memory_region(guest_addr, mem_region, read_only, false, cache)?;
+        Ok((slot, None))
     }
 
-    /// Reclaim a blob previously shared with [`Vm::share_blob`], identified by its deterministic
-    /// label (`gpa >> 12`). Called when the guest unmaps a host-visible virtio-gpu blob, after it
-    /// has released its own stage-2 acceptance, so the host can drop the SHARE and free the BAR
-    /// offset for reuse. Only meaningful when [`Vm::supports_blob_share`] is true (Gunyah).
-    fn unshare_blob(&mut self, _label: u32) -> Result<()> {
-        Err(base::Error::new(libc::ENOTSUP))
-    }
-
-    /// If a boot-time "blessed" host-visible blob arena was registered (Gunyah), returns its base
-    /// GPA. Host-visible virtio-gpu blob maps are then aliased into it via [`Vm::blob_fixed_map`]
-    /// instead of a runtime SHARE (which a protected guest's stage-2 rejects -> SIGBUS).
-    fn blob_arena_gpa(&self) -> Option<u64> {
-        None
-    }
-
-    /// Register a host-visible blob arena covering `[guest_addr, guest_addr+size)` BEFORE VM start,
-    /// as a `lend=false` (SHARE) memory region so the Gunyah RM blesses it (paired with a `no-map`
-    /// /reserved-memory node in the guest DTB). The arena starts as anonymous backing; per-blob
-    /// backing is filled in later by [`Vm::blob_fixed_map`]. Default: unsupported.
-    fn prepare_blob_arena(&mut self, _guest_addr: GuestAddress, _size: u64) -> Result<()> {
-        Err(base::Error::new(libc::ENOTSUP))
-    }
-
-    /// Alias a host-visible blob's backing fd into the blessed arena at `guest_addr` (a host-local
-    /// mmap; NO new hypervisor SHARE). The guest reaches it via the shmem BAR at the already-blessed
-    /// GPA. Only valid after [`Vm::prepare_blob_arena`]. Default: unsupported.
-    fn blob_fixed_map(
+    /// Runtime detach of a region attached with [`Vm::runtime_share`]. Default: remove the memslot.
+    /// Gunyah protected overrides to reclaim the SHARE by label (`gpa >> 12`). The guest-side release
+    /// must already have happened, driven per `accept` symmetrically with the attach.
+    fn runtime_unshare(
         &mut self,
-        _guest_addr: GuestAddress,
-        _fd: &dyn AsRawDescriptor,
-        _fd_offset: u64,
-        _size: usize,
-        _prot: Protection,
+        guest_addr: GuestAddress,
+        slot: MemSlot,
+        accept: VmAccept,
     ) -> Result<()> {
-        Err(base::Error::new(libc::ENOTSUP))
+        let _ = (guest_addr, accept);
+        self.remove_memory_region(slot).map(|_| ())
+    }
+
+    /// Prepare a host-visible blob's *backing* per the backend's own folio policy, before the GPU
+    /// backend pins/exports it (the callback fires inside gfxstream's `VkAllocateMemory`, before the
+    /// udmabuf pin that would otherwise block collapse). Gunyah protected rounds the `fd`-backed
+    /// shmem up to a 2MB order-9 folio (when the VMM-owned `folio_threshold_bytes` in [`Config`]
+    /// allows) so the later [`Vm::runtime_share`] is stage-2/exec clean; other hypervisors are a
+    /// no-op. Returns the number of bytes actually folio-backed (the 2MB-rounded size, or 0 if it
+    /// stayed 4K -- below threshold, or the reserve was exhausted under the fallback exceed-policy).
+    /// The GPU side meters this against its own host-visible VRAM quota. The threshold /
+    /// exceed-policy are VMM policy (set via `--runtime-share hugepage-threshold-kb=,
+    /// exceed-policy=`), so the backend reads them from its own config -- no per-blob arg.
+    fn prepare_runtime_blob_backing(&mut self, fd: &dyn AsRawDescriptor, size: u64) -> Result<u64> {
+        let _ = (fd, size);
+        Ok(0)
     }
 
     /// Does a synchronous msync of the memory mapped at `slot`, syncing `size` bytes starting at
@@ -718,6 +733,16 @@ pub struct Config {
     /// mlock) on lend regions before VM start. The mode selects single-parcel
     /// vs chunked LEND of the prepared region. `None` disables mTHP preparation.
     pub prepare_lend_mthp: Option<LendMthpMode>,
+    /// VMM-owned host-visible virtio-gpu blob folio policy (set from
+    /// `--runtime-share hugepage-threshold-kb=,exceed-policy=`; see
+    /// [`Vm::prepare_runtime_blob_backing`]). Only Gunyah protected acts on it. Allocations
+    /// `>= folio_threshold_bytes` fold into a 2MB order-9 folio so their later runtime SHARE is
+    /// stage-2/exec clean; smaller ones stay 4K (0 => every allocation is folio-backed). When the
+    /// folio backing (reserve/CMA) is exhausted: `folio_oom_on_exceed` true => fail with ENOMEM,
+    /// false => drop to the 4K path. The host-visible VRAM *quota* is metered separately on the GPU
+    /// side; these two fields are purely the folio mechanism's policy.
+    pub folio_threshold_bytes: u64,
+    pub folio_oom_on_exceed: bool,
 }
 
 impl Default for Config {
@@ -727,6 +752,8 @@ impl Default for Config {
             mte: false,
             protection_type: ProtectionType::Unprotected,
             prepare_lend_mthp: None,
+            folio_threshold_bytes: 0,
+            folio_oom_on_exceed: false,
         }
     }
 }

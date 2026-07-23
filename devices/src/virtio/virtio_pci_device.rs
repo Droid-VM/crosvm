@@ -22,8 +22,10 @@ use base::SharedMemory;
 use base::Tube;
 use base::WorkerThread;
 use data_model::Le32;
+use base::SafeDescriptor;
 use hypervisor::Datamatch;
 use hypervisor::MemCacheType;
+use hypervisor::VmAccept;
 use libc::ERANGE;
 #[cfg(target_arch = "x86_64")]
 use metrics::MetricEventType;
@@ -467,6 +469,10 @@ impl VirtioPciDevice {
                 &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
             ),
             DeviceType::Pvclock => (
+                PciClassCode::BaseSystemPeripheral,
+                &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
+            ),
+            DeviceType::GunyahAccept => (
                 PciClassCode::BaseSystemPeripheral,
                 &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
             ),
@@ -1527,6 +1533,7 @@ impl SharedMemoryMapper for VmRequester {
         offset: u64,
         prot: Protection,
         cache: MemCacheType,
+        vm_accept: VmAccept,
     ) -> anyhow::Result<Option<u32>> {
         if !self.prepared {
             if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
@@ -1549,11 +1556,18 @@ impl SharedMemoryMapper for VmRequester {
                 },
                 prot,
                 cache,
+                vm_accept,
             )
             .context("register_memory_for_blob failed")?;
 
         self.mappings.insert(offset, id);
         Ok(gunyah_handle)
+    }
+
+    fn prepare_blob_backing(&mut self, fd: SafeDescriptor, size: u64) -> anyhow::Result<u64> {
+        self.vm_memory_client
+            .prepare_blob_backing(fd, size)
+            .context("prepare_blob_backing failed")
     }
 
     fn remove_mapping(&mut self, offset: u64) -> anyhow::Result<()> {
