@@ -758,6 +758,20 @@ fn prepare_preshared_blob_mapping(size: usize) -> Result<(SharedMemory, MemoryMa
                 return errno_result();
             }
         }
+        // Pin the arena's backing in RAM for the VM's lifetime. This region is SHARE'd (not
+        // LEND'd) into a protected guest before GH_VM_START and blessed by the RM; the pages are
+        // pre-faulted above. Without mlock they remain reclaimable/swappable, so under memory
+        // pressure the kernel can evict or migrate a page out from under the blessed stage-2
+        // mapping -> the guest later faults that arena page out to the host, Gunyah returns
+        // -ENOMEM, and the vcpu is treated as crashed (page-fault exit has no recovery path).
+        // mlock keeps the physical backing stable so the stage-2 mapping stays valid.
+        if libc::mlock(host_addr.cast(), size) != 0 {
+            warn!(
+                "GUNYAH-BLOB-ARENA: mlock failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return errno_result();
+        }
     }
     clean_blob_arena_cache(host_addr, size);
 
