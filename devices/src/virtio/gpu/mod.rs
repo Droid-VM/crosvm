@@ -136,7 +136,7 @@ pub enum GpuWsi {
     Vulkan,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct VirtioScanoutBlobData {
     pub width: u32,
     pub height: u32,

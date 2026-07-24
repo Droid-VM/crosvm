@@ -81,6 +81,25 @@ use crate::virtio::resource_bridge::ResourceResponse;
 use crate::virtio::SharedMemoryMapper;
 
 const KGSL_ARENA_SENTINEL: u64 = 0xffff_ffff_ffff_f000;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+static DISPLAY_IMPORT_LOGGED: AtomicBool = AtomicBool::new(false);
+
+const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+
+const DRM_FORMAT_XRGB8888: u32 = drm_fourcc(b'X', b'R', b'2', b'4');
+const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
+const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
+const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+
+fn is_single_plane_8888_rgb(format: u32) -> bool {
+    matches!(
+        format,
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888
+    )
+}
 
 #[derive(Copy, Clone)]
 struct KgslHostVisibleArena {
@@ -115,6 +134,13 @@ fn to_safe_descriptor(r: RutabagaDescriptor) -> SafeDescriptor {
     unsafe { SafeDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DisplayImportState {
+    Unknown,
+    Imported { import_id: u32, surface_id: u32 },
+    CpuFallback,
+}
+
 struct VirtioGpuResource {
     resource_id: u32,
     width: u32,
@@ -122,7 +148,7 @@ struct VirtioGpuResource {
     size: u64,
     shmem_offset: Option<u64>,
     scanout_data: Option<VirtioScanoutBlobData>,
-    display_import: Option<u32>,
+    display_import_state: DisplayImportState,
     rutabaga_external_mapping: bool,
     arena_mapped: bool,
 
@@ -153,7 +179,7 @@ impl VirtioGpuResource {
             size,
             shmem_offset: None,
             scanout_data: None,
-            display_import: None,
+            display_import_state: DisplayImportState::Unknown,
             rutabaga_external_mapping: false,
             arena_mapped: false,
             backing_iovecs: None,
@@ -163,7 +189,10 @@ impl VirtioGpuResource {
     fn snapshot(&self) -> VirtioGpuResourceSnapshot {
         // Only the 2D backend is fully supported and it doesn't use these fields. 3D is WIP.
         assert!(self.scanout_data.is_none());
-        assert!(self.display_import.is_none());
+        assert!(!matches!(
+            self.display_import_state,
+            DisplayImportState::Imported { .. }
+        ));
 
         VirtioGpuResourceSnapshot {
             resource_id: self.resource_id,
@@ -179,6 +208,16 @@ impl VirtioGpuResource {
         let mut resource = VirtioGpuResource::new(s.resource_id, s.width, s.height, s.size);
         resource.backing_iovecs = s.backing_iovecs;
         resource
+    }
+
+    fn transition_display_import(&mut self, display: &mut GpuDisplay, next: DisplayImportState) {
+        if let DisplayImportState::Imported {
+            import_id,
+            surface_id,
+        } = std::mem::replace(&mut self.display_import_state, next)
+        {
+            display.release_import(import_id, surface_id);
+        }
     }
 }
 
@@ -420,14 +459,22 @@ impl VirtioGpuScanout {
         if let Some(import_id) =
             VirtioGpuScanout::import_resource_to_display(display, surface_id, resource, rutabaga)
         {
-            display
+            let flip_result = display
                 .borrow_mut()
-                .flip_to(surface_id, import_id, None, None, None)
-                .map_err(|e| {
-                    error!("flip_to failed: {:#}", e);
-                    ErrUnspec
-                })?;
-            return Ok(OkNoData);
+                .flip_to(surface_id, import_id, None, None, None);
+            match flip_result {
+                Ok(_) => return Ok(OkNoData),
+                Err(e) => {
+                    error!(
+                        "flip_to failed; switching resource to CPU fallback: {:#}",
+                        e
+                    );
+                    resource.transition_display_import(
+                        &mut display.borrow_mut(),
+                        DisplayImportState::CpuFallback,
+                    );
+                }
+            }
         }
 
         // Import failed, fall back to a copy.
@@ -466,7 +513,12 @@ impl VirtioGpuScanout {
                 self.flush_staging.resize(size, 0);
             }
             let staging = &mut self.flush_staging[..size];
-            rutabaga.transfer_read(0, resource.resource_id, transfer, Some(IoSliceMut::new(staging)))?;
+            rutabaga.transfer_read(
+                0,
+                resource.resource_id,
+                transfer,
+                Some(IoSliceMut::new(staging)),
+            )?;
             let fb_slice = fb.as_volatile_slice();
             for row in 0..self.height as usize {
                 fb_slice
@@ -486,14 +538,77 @@ impl VirtioGpuScanout {
         resource: &mut VirtioGpuResource,
         rutabaga: &mut Rutabaga,
     ) -> Option<u32> {
-        if let Some(import_id) = resource.display_import {
-            return Some(import_id);
+        match resource.display_import_state {
+            DisplayImportState::Imported {
+                import_id,
+                surface_id: import_surface_id,
+            } if import_surface_id == surface_id => {
+                return Some(import_id);
+            }
+            DisplayImportState::Imported { .. } => {
+                resource.transition_display_import(
+                    &mut display.borrow_mut(),
+                    DisplayImportState::Unknown,
+                );
+            }
+            DisplayImportState::CpuFallback => return None,
+            DisplayImportState::Unknown => {}
         }
 
-        let dmabuf = to_safe_descriptor(rutabaga.export_blob(resource.resource_id).ok()?.os_handle);
-        let query = rutabaga.query(resource.resource_id).ok()?;
+        if !display.borrow_mut().is_dmabuf_import_supported() {
+            resource.display_import_state = DisplayImportState::CpuFallback;
+            return None;
+        }
 
-        let (width, height, format, stride, offset) = match resource.scanout_data {
+        let imported =
+            Self::try_import_resource_to_display(display, surface_id, resource, rutabaga);
+        if imported.is_none() {
+            base::warn!(
+                "display resource {} import failed; caching CPU fallback",
+                resource.resource_id
+            );
+            resource.display_import_state = DisplayImportState::CpuFallback;
+        }
+        imported
+    }
+
+    fn try_import_resource_to_display(
+        display: &Rc<RefCell<GpuDisplay>>,
+        surface_id: u32,
+        resource: &mut VirtioGpuResource,
+        rutabaga: &mut Rutabaga,
+    ) -> Option<u32> {
+        // Virgl's normal export for arena-backed resources is a shared-memory
+        // fd. The display-only export creates a UDMABUF window over the exact
+        // resource range while leaving the guest export contract untouched.
+        let display_export = rutabaga.export_display_blob(resource.resource_id);
+        let display_exported = display_export.is_ok();
+        let exported = display_export
+            .or_else(|_| rutabaga.export_blob(resource.resource_id))
+            .ok()?;
+        let handle_type = exported.handle_type;
+        if handle_type != RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+            base::warn!(
+                "display resource {} exported unsupported handle type 0x{:x}",
+                resource.resource_id,
+                handle_type
+            );
+            return None;
+        }
+        let dmabuf = to_safe_descriptor(exported.os_handle);
+        let query = match rutabaga.query(resource.resource_id) {
+            Ok(query) => query,
+            Err(e) => {
+                base::warn!(
+                    "display resource {} query failed: {:#}",
+                    resource.resource_id,
+                    e
+                );
+                return None;
+            }
+        };
+
+        let (width, height, format, stride, source_offset) = match resource.scanout_data {
             Some(data) => (
                 data.width,
                 data.height,
@@ -509,6 +624,46 @@ impl VirtioGpuScanout {
                 query.offsets[0],
             ),
         };
+        // The display-only UDMABUF is a window over this arena resource, so
+        // byte zero of the new fd is already the start of the resource.
+        let offset = if display_exported && resource.arena_mapped {
+            0
+        } else {
+            source_offset
+        };
+        let min_stride = width.checked_mul(4);
+        let image_size = u64::from(stride).checked_mul(u64::from(height));
+        let image_end = image_size.and_then(|size| u64::from(source_offset).checked_add(size));
+        let linear_layout_verified = display_exported
+            && resource.arena_mapped
+            && resource.shmem_offset.is_some()
+            && source_offset == 0
+            && min_stride.is_some_and(|minimum| stride >= minimum)
+            && image_end.is_some_and(|end| end <= resource.size)
+            && is_single_plane_8888_rgb(format)
+            && matches!(
+                query.modifier,
+                DRM_FORMAT_MOD_INVALID | DRM_FORMAT_MOD_LINEAR
+            );
+
+        if !DISPLAY_IMPORT_LOGGED.swap(true, Ordering::Relaxed) {
+            info!(
+                "GPU display import: res={} handle_type=0x{:x} display_export={} arena_mapped={} linear_verified={} arena_offset={:?} source_offset=0x{:x} import_offset=0x{:x} stride={} modifier=0x{:x} size={}x{} fourcc=0x{:x}",
+                resource.resource_id,
+                handle_type,
+                display_exported,
+                resource.arena_mapped,
+                linear_layout_verified,
+                resource.shmem_offset,
+                source_offset,
+                offset,
+                stride,
+                query.modifier,
+                width,
+                height,
+                format,
+            );
+        }
 
         let import_id = display
             .borrow_mut()
@@ -519,13 +674,17 @@ impl VirtioGpuScanout {
                     offset,
                     stride,
                     modifiers: query.modifier,
+                    linear_layout_verified,
                     width,
                     height,
                     fourcc: format,
                 },
             )
             .ok()?;
-        resource.display_import = Some(import_id);
+        resource.display_import_state = DisplayImportState::Imported {
+            import_id,
+            surface_id,
+        };
         Some(import_id)
     }
 }
@@ -1048,10 +1207,13 @@ impl VirtioGpu {
 
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
-        let resource = self
+        let mut resource = self
             .resources
             .remove(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
+
+        resource
+            .transition_display_import(&mut self.display.borrow_mut(), DisplayImportState::Unknown);
 
         if resource.rutabaga_external_mapping {
             self.rutabaga.unmap(resource_id)?;
@@ -1210,6 +1372,10 @@ impl VirtioGpu {
             resource.shmem_offset = Some(arena_offset);
             resource.rutabaga_external_mapping = true;
             resource.arena_mapped = true;
+            resource.transition_display_import(
+                &mut self.display.borrow_mut(),
+                DisplayImportState::Unknown,
+            );
             return Ok(OkMapInfo {
                 map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
                 gunyah_handle: None,
@@ -1320,6 +1486,8 @@ impl VirtioGpu {
             .map_err(|_| ErrUnspec)?;
 
         resource.shmem_offset = Some(offset);
+        resource
+            .transition_display_import(&mut self.display.borrow_mut(), DisplayImportState::Unknown);
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
@@ -1343,6 +1511,8 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
+        resource
+            .transition_display_import(&mut self.display.borrow_mut(), DisplayImportState::Unknown);
 
         if resource.arena_mapped {
             if resource.rutabaga_external_mapping {
@@ -1494,6 +1664,7 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         // Ensure scanout has a display surface.
+        let previous_surface_id = scanout.surface_id;
         match scanout_type {
             SurfaceType::Cursor => {
                 if let Some(scanout_parent_surface_id) = scanout_parent_surface_id {
@@ -1509,6 +1680,12 @@ impl VirtioGpu {
             }
         }
 
+        if resource.scanout_data != scanout_data || scanout.surface_id != previous_surface_id {
+            resource.transition_display_import(
+                &mut self.display.borrow_mut(),
+                DisplayImportState::Unknown,
+            );
+        }
         resource.scanout_data = scanout_data;
 
         // `resource_id` has already been verified to be non-zero
@@ -1559,6 +1736,12 @@ impl VirtioGpu {
         }
         self.cursor_scanout.resource_id = None;
         self.cursor_scanout.release_surface(&self.display);
+        {
+            let mut display = self.display.borrow_mut();
+            for resource in self.resources.values_mut() {
+                resource.transition_display_import(&mut display, DisplayImportState::Unknown);
+            }
+        }
         self.resources.clear();
         self.rutabaga.reset().context("failed to reset rutabaga")?;
         Ok(())

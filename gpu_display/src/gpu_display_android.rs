@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::ffi::CString;
@@ -23,6 +25,7 @@ use crate::GpuDisplayError;
 use crate::GpuDisplayFramebuffer;
 use crate::GpuDisplayResult;
 use crate::GpuDisplaySurface;
+use crate::SemaphoreTimepoint;
 use crate::SurfaceType;
 use crate::SysDisplayT;
 
@@ -110,6 +113,29 @@ extern "C" {
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
     );
+
+    fn android_display_import_dmabuf(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        fd: RawDescriptor,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+        linear_layout_verified: bool,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+    ) -> i64;
+
+    fn android_display_release_import(ctx: *mut AndroidDisplayContext, raw_handle: i64);
+
+    fn android_display_is_vulkan_blit_available(ctx: *mut AndroidDisplayContext) -> bool;
+
+    fn android_display_flip_to(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        raw_handle: i64,
+    ) -> bool;
 }
 
 unsafe extern "C" fn error_callback(message: *const c_char) {
@@ -163,6 +189,7 @@ impl From<ANativeWindow_Buffer> for GpuDisplayFramebuffer<'_> {
 struct AndroidSurface {
     context: Rc<AndroidDisplayContextWrapper>,
     surface: NonNull<AndroidDisplaySurface>,
+    imports: Rc<RefCell<BTreeMap<u32, i64>>>,
 }
 
 impl GpuDisplaySurface for AndroidSurface {
@@ -193,10 +220,38 @@ impl GpuDisplaySurface for AndroidSurface {
         // SAFETY: context is an opaque handle.
         unsafe { set_android_surface_position(self.context.0.as_ptr(), x, y) };
     }
+
+    fn flip_to(
+        &mut self,
+        import_id: u32,
+        _acquire_timepoint: Option<SemaphoreTimepoint>,
+        _release_timepoint: Option<SemaphoreTimepoint>,
+        _extra_info: Option<crate::FlipToExtraInfo>,
+    ) -> anyhow::Result<sync::Waitable> {
+        let raw_handle = self
+            .imports
+            .borrow()
+            .get(&import_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid Android display import id {}", import_id))?;
+        // The native bridge waits for the Turnip queue before handing the AHB to
+        // SurfaceControl, so no separate Vulkan semaphore is needed here.
+        let success = unsafe {
+            android_display_flip_to(self.context.0.as_ptr(), self.surface.as_ptr(), raw_handle)
+        };
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Android display Vulkan blit failed; switching to CPU fallback"
+            ));
+        }
+        Ok(sync::Waitable::signaled())
+    }
 }
 
 pub struct DisplayAndroid {
     context: Rc<AndroidDisplayContextWrapper>,
+    imports: Rc<RefCell<BTreeMap<u32, i64>>>,
+    surfaces: BTreeMap<u32, NonNull<AndroidDisplaySurface>>,
     /// This event is never triggered and is used solely to fulfill AsRawDescriptor.
     event: Event,
 }
@@ -213,16 +268,35 @@ impl DisplayAndroid {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
         Ok(DisplayAndroid {
             context: context.into(),
+            imports: Rc::new(RefCell::new(BTreeMap::new())),
+            surfaces: BTreeMap::new(),
             event,
         })
     }
 }
 
+impl Drop for DisplayAndroid {
+    fn drop(&mut self) {
+        let context = self.context.0.as_ptr();
+        let imports = std::mem::take(&mut *self.imports.borrow_mut());
+        for raw_handle in imports.into_values() {
+            // SAFETY: every handle was created by the matching native import call and is
+            // released before the context is dropped.
+            unsafe { android_display_release_import(context, raw_handle) };
+        }
+    }
+}
+
 impl DisplayT for DisplayAndroid {
+    fn is_dmabuf_import_supported(&mut self) -> bool {
+        // SAFETY: context is a live opaque handle owned by this DisplayAndroid.
+        unsafe { android_display_is_vulkan_blit_available(self.context.0.as_ptr()) }
+    }
+
     fn create_surface(
         &mut self,
         parent_surface_id: Option<u32>,
-        _surface_id: u32,
+        surface_id: u32,
         _scanout_id: Option<u32>,
         display_params: &DisplayParameters,
         _surf_type: SurfaceType,
@@ -238,11 +312,69 @@ impl DisplayT for DisplayAndroid {
             )
         })
         .ok_or(GpuDisplayError::CreateSurface)?;
+        self.surfaces.insert(surface_id, surface);
 
         Ok(Box::new(AndroidSurface {
             context: self.context.clone(),
             surface,
+            imports: self.imports.clone(),
         }))
+    }
+
+    fn import_resource(
+        &mut self,
+        import_id: u32,
+        surface_id: u32,
+        external_display_resource: crate::DisplayExternalResourceImport,
+    ) -> anyhow::Result<()> {
+        let crate::DisplayExternalResourceImport::Dmabuf {
+            descriptor,
+            offset,
+            stride,
+            modifiers,
+            linear_layout_verified,
+            width,
+            height,
+            fourcc,
+        } = external_display_resource
+        else {
+            return Err(anyhow::anyhow!(
+                "Android display only supports DMA-BUF imports"
+            ));
+        };
+
+        let surface = self
+            .surfaces
+            .get(&surface_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid Android display surface {}", surface_id))?;
+        let raw_handle = unsafe {
+            android_display_import_dmabuf(
+                self.context.0.as_ptr(),
+                surface.as_ptr(),
+                descriptor.as_raw_descriptor(),
+                offset,
+                stride,
+                modifiers,
+                linear_layout_verified,
+                width,
+                height,
+                fourcc,
+            )
+        };
+        if raw_handle == 0 {
+            return Err(anyhow::anyhow!("Turnip DMA-BUF import failed"));
+        }
+        self.imports.borrow_mut().insert(import_id, raw_handle);
+        Ok(())
+    }
+
+    fn release_import(&mut self, import_id: u32, _surface_id: u32) {
+        // The common display wrapper owns the import id counter; remove the native
+        // object by id and let the shared map keep surface flips coherent.
+        if let Some((_, raw_handle)) = self.imports.borrow_mut().remove_entry(&import_id) {
+            unsafe { android_display_release_import(self.context.0.as_ptr(), raw_handle) };
+        }
     }
 }
 

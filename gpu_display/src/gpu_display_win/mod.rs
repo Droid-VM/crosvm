@@ -357,7 +357,7 @@ impl DisplayT for DisplayWin {
     }
 
     #[allow(unused_variables)]
-    fn release_import(&mut self, surface_id: u32, import_id: u32) {
+    fn release_import(&mut self, import_id: u32, surface_id: u32) {
         #[cfg(feature = "vulkan_display")]
         if let Some(vulkan_display) = self.vulkan_displays.get(&surface_id) {
             if let VulkanDisplayWrapper::Initialized(ref mut vulkan_display) =
