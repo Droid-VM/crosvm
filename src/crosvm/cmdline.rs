@@ -3533,10 +3533,17 @@ impl TryFrom<RunCommand> for super::config::Config {
 
             #[cfg(feature = "android_display")]
             {
-                if let Some(gpu_parameters) = &cfg.gpu_parameters {
-                    if !gpu_parameters.display_params.is_empty() {
-                        cfg.android_display_service = cmd.android_display_service;
-                    }
+                // Accept the service for any display producer, not just virtio-gpu: simplefb has
+                // no --gpu at all, and dropping the value here silently left it presenting to VNC
+                // instead of the app's Surface.
+                let gpu_has_display = cfg
+                    .gpu_parameters
+                    .as_ref()
+                    .is_some_and(|p| !p.display_params.is_empty());
+                // Read simplefb off `cmd`: cfg.simplefb is only assigned further down this
+                // function, so checking it here would always see None.
+                if gpu_has_display || cmd.simplefb.is_some() {
+                    cfg.android_display_service = cmd.android_display_service;
                 }
             }
 

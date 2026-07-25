@@ -3875,15 +3875,15 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         }
     };
 
-    // If simplefb and a VNC display backend are both configured, spawn a bridge
-    // thread that polls guest memory and pushes frames to the VNC display.
+    // If simplefb and a display backend are configured, spawn a bridge thread that polls guest
+    // memory and pushes frames to that display -- VNC, or the Android Surface from the display
+    // service when one is configured (the bridge itself is backend-agnostic).
     // In protected VM mode, the simplefb region is backed by a DMA-BUF from
     // the DMA heap and shared via map_cma_region (same as MMIO devices).
     // The display bridge reads from the host mmap of the same DMA-BUF.
-    #[cfg(feature = "vnc")]
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
-        let vnc_cfg = cfg.vnc_server.as_ref()?;
         let guest_mem = linux.vm.get_memory().clone();
         let bpp: u32 = match sfb_cfg.format.as_str() {
             "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
@@ -3917,21 +3917,37 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             size: fb_size,
         };
 
-        let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
-        let port = vnc_cfg.port.unwrap_or(5900);
-        let addr = format!("{}:{}", host, port);
-        let target = simplefb_display::VncDisplayTarget {
-            addr,
-            password: vnc_cfg.password.clone(),
+        // The app display path takes precedence when configured: it presents into the Surface the
+        // app owns, which is lower latency than encoding frames for a VNC client.
+        #[cfg(feature = "android_display")]
+        let android_service = cfg.android_display_service.clone();
+        #[cfg(not(feature = "android_display"))]
+        let android_service: Option<String> = None;
+
+        let target = match android_service {
+            Some(service_name) => simplefb_display::SimplefbDisplayTarget::Android { service_name },
+            None => {
+                #[cfg(feature = "vnc")]
+                {
+                    let vnc_cfg = cfg.vnc_server.as_ref()?;
+                    let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
+                    let port = vnc_cfg.port.unwrap_or(5900);
+                    simplefb_display::SimplefbDisplayTarget::Vnc {
+                        addr: format!("{}:{}", host, port),
+                        password: vnc_cfg.password.clone(),
+                        touch_input: vnc_touch_input(vnc_cfg.input.as_deref()),
+                    }
+                }
+                #[cfg(not(feature = "vnc"))]
+                return None;
+            }
         };
 
-        let touch_input = vnc_touch_input(vnc_cfg.input.as_deref());
         match simplefb_display::start_simplefb_display_thread(
             guest_mem,
             params,
             target,
             simplefb_event_devices,
-            touch_input,
         ) {
             Ok(handle) => {
                 info!("simplefb display bridge started");

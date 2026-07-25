@@ -27,9 +27,21 @@ pub struct SimplefbDisplayParams {
     pub size: u64,
 }
 
-pub struct VncDisplayTarget {
-    pub addr: String,
-    pub password: Option<String>,
+/// Where simplefb frames go. Everything past opening the display is
+/// backend-agnostic: the bridge only uses framebuffer()/flip(), so any
+/// GpuDisplay backend works.
+pub enum SimplefbDisplayTarget {
+    Vnc {
+        addr: String,
+        password: Option<String>,
+        /// Same `--vnc-server input=` interpretation as the virtio-gpu display path (see
+        /// vnc_touch_input): true = legacy multi-touch, false = absolute-mouse tablet.
+        touch_input: bool,
+    },
+    /// The Android Surface the app hands over through the display service binder. Input does
+    /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
+    /// the virtio-gpu native-display path.
+    Android { service_name: String },
 }
 
 const DEFAULT_FPS: u32 = 30;
@@ -37,31 +49,38 @@ const DEFAULT_FPS: u32 = 30;
 pub fn start_simplefb_display_thread(
     guest_mem: GuestMemory,
     params: SimplefbDisplayParams,
-    target: VncDisplayTarget,
+    target: SimplefbDisplayTarget,
     event_devices: Vec<EventDevice>,
-    // Same `--vnc-server input=` interpretation as the virtio-gpu display path (see
-    // vnc_touch_input): true = legacy multi-touch, false = absolute-mouse tablet.
-    touch_input: bool,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("simplefb_display".into())
         .spawn(move || {
-            let display_result = GpuDisplay::open_vnc_tcp(
-                &target.addr,
-                params.width,
-                params.height,
-                target.password.clone(),
-                touch_input,
-            );
+            let display_result = match &target {
+                SimplefbDisplayTarget::Vnc {
+                    addr,
+                    password,
+                    touch_input,
+                } => GpuDisplay::open_vnc_tcp(
+                    addr,
+                    params.width,
+                    params.height,
+                    password.clone(),
+                    *touch_input,
+                ),
+                SimplefbDisplayTarget::Android { service_name } => {
+                    GpuDisplay::open_android(service_name)
+                }
+            };
             let mut display = match display_result {
                 Ok(d) => d,
                 Err(e) => {
-                    error!("simplefb: failed to open VNC display: {:?}", e);
+                    error!("simplefb: failed to open display: {:?}", e);
                     return;
                 }
             };
 
-            // Import input event devices so VNC input is routed to guest.
+            // Routes VNC input to the guest. The Android backend has no input of its own (the
+            // app drives the `--input` evdev sockets instead), so this is a no-op there.
             for ed in event_devices {
                 if let Err(e) = display.import_event_device(ed) {
                     error!("simplefb: failed to import event device: {:?}", e);
