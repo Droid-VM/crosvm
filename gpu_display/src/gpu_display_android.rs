@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::HashMap;
 use std::ffi::c_char;
 use std::ffi::CStr;
 use std::ffi::CString;
@@ -11,18 +12,23 @@ use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice;
 
+use anyhow::anyhow;
 use base::error;
 use base::AsRawDescriptor;
 use base::Event;
 use base::RawDescriptor;
 use base::VolatileSlice;
+use sync::Waitable;
 use vm_control::gpu::DisplayParameters;
 
+use crate::DisplayExternalResourceImport;
 use crate::DisplayT;
+use crate::FlipToExtraInfo;
 use crate::GpuDisplayError;
 use crate::GpuDisplayFramebuffer;
 use crate::GpuDisplayResult;
 use crate::GpuDisplaySurface;
+use crate::SemaphoreTimepoint;
 use crate::SurfaceType;
 use crate::SysDisplayT;
 
@@ -110,6 +116,35 @@ extern "C" {
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
     );
+
+    /// GPU one-copy present path: registers the scanout dmabuf under `import_id` for later
+    /// `android_display_flip_import` calls. Returns false when unsupported (missing EGL
+    /// extensions / SurfaceControl), in which case the caller keeps the CPU copy path.
+    fn android_display_import_dmabuf(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        fd: i32,
+        import_id: u32,
+        width: u32,
+        height: u32,
+        stride_bytes: u32,
+        offset: u32,
+        drm_fourcc: u32,
+    ) -> bool;
+
+    fn android_display_release_import(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        import_id: u32,
+    );
+
+    /// GPU-blits the imported dmabuf into an AHardwareBuffer and posts it to the compositor
+    /// zero-copy (ASurfaceTransaction_setBuffer with an acquire fence).
+    fn android_display_flip_import(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        import_id: u32,
+    ) -> bool;
 }
 
 unsafe extern "C" fn error_callback(message: *const c_char) {
@@ -189,6 +224,25 @@ impl GpuDisplaySurface for AndroidSurface {
         unsafe { post_android_surface_buffer(self.context.0.as_ptr(), self.surface.as_ptr()) }
     }
 
+    fn flip_to(
+        &mut self,
+        import_id: u32,
+        _acquire_timepoint: Option<SemaphoreTimepoint>,
+        _release_timepoint: Option<SemaphoreTimepoint>,
+        _extra_info: Option<FlipToExtraInfo>,
+    ) -> anyhow::Result<Waitable> {
+        // SAFETY: context and surface are opaque handles; import_id was registered through
+        // android_display_import_dmabuf.
+        let ok = unsafe {
+            android_display_flip_import(self.context.0.as_ptr(), self.surface.as_ptr(), import_id)
+        };
+        if ok {
+            Ok(Waitable::signaled())
+        } else {
+            Err(anyhow!("android_display_flip_import failed"))
+        }
+    }
+
     fn set_position(&mut self, x: u32, y: u32) {
         // SAFETY: context is an opaque handle.
         unsafe { set_android_surface_position(self.context.0.as_ptr(), x, y) };
@@ -197,6 +251,10 @@ impl GpuDisplaySurface for AndroidSurface {
 
 pub struct DisplayAndroid {
     context: Rc<AndroidDisplayContextWrapper>,
+    /// Surfaces by crosvm surface_id, so DisplayT::import_resource can resolve the target of a
+    /// dmabuf import (the trait only passes ids). Entries are overwritten if a surface_id is
+    /// reused; the pointees are owned by the C++ side for the process lifetime.
+    surfaces: HashMap<u32, NonNull<AndroidDisplaySurface>>,
     /// This event is never triggered and is used solely to fulfill AsRawDescriptor.
     event: Event,
 }
@@ -213,6 +271,7 @@ impl DisplayAndroid {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
         Ok(DisplayAndroid {
             context: context.into(),
+            surfaces: HashMap::new(),
             event,
         })
     }
@@ -239,10 +298,77 @@ impl DisplayT for DisplayAndroid {
         })
         .ok_or(GpuDisplayError::CreateSurface)?;
 
+        self.surfaces.insert(_surface_id, surface);
+
         Ok(Box::new(AndroidSurface {
             context: self.context.clone(),
             surface,
         }))
+    }
+
+    fn import_resource(
+        &mut self,
+        import_id: u32,
+        surface_id: u32,
+        external_display_resource: DisplayExternalResourceImport,
+    ) -> anyhow::Result<()> {
+        let surface = self
+            .surfaces
+            .get(&surface_id)
+            .ok_or_else(|| anyhow!("unknown surface_id {}", surface_id))?;
+        match external_display_resource {
+            DisplayExternalResourceImport::Dmabuf {
+                descriptor,
+                offset,
+                stride,
+                modifiers,
+                width,
+                height,
+                fourcc,
+            } => {
+                // The EGL import below carries no modifier attributes, which is only correct for
+                // linear buffers (crosvm's blob scanouts are converted to LINEAR by gfxstream).
+                if modifiers != 0 {
+                    return Err(anyhow!(
+                        "non-linear modifier {:#x} unsupported (import {}x{} fourcc={:#x})",
+                        modifiers,
+                        width,
+                        height,
+                        fourcc
+                    ));
+                }
+                // SAFETY: context/surface are opaque handles; the descriptor stays owned by the
+                // caller (EGL takes its own reference on the dmabuf during import).
+                let ok = unsafe {
+                    android_display_import_dmabuf(
+                        self.context.0.as_ptr(),
+                        surface.as_ptr(),
+                        descriptor.as_raw_descriptor(),
+                        import_id,
+                        width,
+                        height,
+                        stride,
+                        offset,
+                        fourcc,
+                    )
+                };
+                if ok {
+                    Ok(())
+                } else {
+                    Err(anyhow!("android_display_import_dmabuf failed"))
+                }
+            }
+            _ => Err(anyhow!("import type unsupported by android display")),
+        }
+    }
+
+    fn release_import(&mut self, import_id: u32, surface_id: u32) {
+        if let Some(surface) = self.surfaces.get(&surface_id) {
+            // SAFETY: context/surface are opaque handles.
+            unsafe {
+                android_display_release_import(self.context.0.as_ptr(), surface.as_ptr(), import_id)
+            };
+        }
     }
 }
 

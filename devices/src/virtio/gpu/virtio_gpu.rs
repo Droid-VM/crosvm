@@ -595,7 +595,24 @@ impl VirtioGpuScanout {
             return Some(import_id);
         }
 
-        let dmabuf = to_safe_descriptor(rutabaga.export_blob(resource.resource_id).ok()?.os_handle);
+        // Falling out of this function costs a full-frame CPU copy on every present, and every
+        // way out of it used to be silent. Say why, once, so a display backend that quietly
+        // refuses the import is visible instead of just slow.
+        fn note_no_import(reason: &str) {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                base::warn!("zero-copy display import unavailable ({reason}); using CPU copy");
+            }
+        }
+
+        let export = match rutabaga.export_blob(resource.resource_id) {
+            Ok(handle) => handle,
+            Err(e) => {
+                note_no_import(&format!("export_blob failed: {e:#}"));
+                return None;
+            }
+        };
+        let dmabuf = to_safe_descriptor(export.os_handle);
         // gfxstream blob-backed scanout colorbuffers (host-visible / pre-alloc pool / udmabuf) have
         // a valid exported LINEAR dmabuf but no Resource3DInfo, so rutabaga.query() returns
         // "no 3d info available". Don't treat that as fatal: when the guest supplied scanout
@@ -615,34 +632,43 @@ impl VirtioGpuScanout {
                 // available, else DRM_FORMAT_MOD_LINEAR (0).
                 query_opt.as_ref().map(|q| q.modifier).unwrap_or(0),
             ),
-            None => {
-                let query = query_opt?;
-                (
+            None => match query_opt {
+                Some(query) => (
                     resource.width,
                     resource.height,
                     query.drm_fourcc,
                     query.strides[0],
                     query.offsets[0],
                     query.modifier,
-                )
-            }
+                ),
+                None => {
+                    note_no_import("no scanout geometry and no 3d query");
+                    return None;
+                }
+            },
         };
 
-        let import_id = display
-            .borrow_mut()
-            .import_resource(
-                surface_id,
-                DisplayExternalResourceImport::Dmabuf {
-                    descriptor: &dmabuf,
-                    offset,
-                    stride,
-                    modifiers: modifier,
-                    width,
-                    height,
-                    fourcc: format,
-                },
-            )
-            .ok()?;
+        let import_id = match display.borrow_mut().import_resource(
+            surface_id,
+            DisplayExternalResourceImport::Dmabuf {
+                descriptor: &dmabuf,
+                offset,
+                stride,
+                modifiers: modifier,
+                width,
+                height,
+                fourcc: format,
+            },
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                note_no_import(&format!(
+                    "display backend refused dmabuf {width}x{height} \
+                     fourcc={format:#x} stride={stride} modifier={modifier:#x}: {e:#}"
+                ));
+                return None;
+            }
+        };
         resource.display_import = Some(import_id);
         Some(import_id)
     }
