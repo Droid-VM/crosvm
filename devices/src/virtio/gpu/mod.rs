@@ -17,6 +17,8 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
+use std::thread::JoinHandle;
 
 use ::snapshot::AnySnapshot;
 use anyhow::anyhow;
@@ -47,6 +49,7 @@ use data_model::*;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
+use once_cell::sync::OnceCell;
 pub use parameters::AudioDeviceMode;
 pub use parameters::GpuParameters;
 pub use parameters::VramExceedPolicy;
@@ -54,6 +57,7 @@ use rutabaga_gfx::*;
 use serde::Deserialize;
 use serde::Serialize;
 use sync::Mutex;
+use sync::Waitable;
 pub use vm_control::gpu::DisplayMode as GpuDisplayMode;
 pub use vm_control::gpu::DisplayParameters as GpuDisplayParameters;
 use vm_control::gpu::GpuControlCommand;
@@ -69,8 +73,10 @@ use vm_memory::GuestMemory;
 use zerocopy::IntoBytes;
 
 pub use self::protocol::virtio_gpu_config;
+pub use self::protocol::VIRTIO_GPU_DISPLAY_SOURCE_RELEASE_RING_IDX;
 pub use self::protocol::VIRTIO_GPU_F_CONTEXT_INIT;
 pub use self::protocol::VIRTIO_GPU_F_CREATE_GUEST_HANDLE;
+pub use self::protocol::VIRTIO_GPU_F_DISPLAY_SOURCE_RELEASE;
 pub use self::protocol::VIRTIO_GPU_F_EDID;
 pub use self::protocol::VIRTIO_GPU_F_FENCE_PASSING;
 pub use self::protocol::VIRTIO_GPU_F_RESOURCE_BLOB;
@@ -149,6 +155,73 @@ pub struct VirtioScanoutBlobData {
 enum VirtioGpuRing {
     Global,
     ContextSpecific { ctx_id: u32, ring_idx: u8 },
+}
+
+fn is_display_source_release_fence(cmd: &GpuCommand) -> bool {
+    if !matches!(cmd, GpuCommand::ResourceFlush(_)) {
+        return false;
+    }
+
+    let hdr = cmd.ctrl_hdr();
+    let flags = hdr.flags.to_native();
+    flags & (VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX)
+        == (VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX)
+        && hdr.ctx_id.to_native() == 0
+        && hdr.ring_idx == VIRTIO_GPU_DISPLAY_SOURCE_RELEASE_RING_IDX
+}
+
+static DISPLAY_SOURCE_RELEASE_TRACE_ENABLED: OnceCell<bool> = OnceCell::new();
+static DISPLAY_SOURCE_RELEASE_TRACE_FIRST_FLUSH: AtomicBool = AtomicBool::new(false);
+static DISPLAY_SOURCE_RELEASE_TRACE_RECEIVED: AtomicBool = AtomicBool::new(false);
+static DISPLAY_SOURCE_RELEASE_TRACE_REPLIED: AtomicBool = AtomicBool::new(false);
+
+fn display_source_release_trace_enabled() -> bool {
+    *DISPLAY_SOURCE_RELEASE_TRACE_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CROSVM_DISPLAY_SOURCE_RELEASE_TRACE").as_deref(),
+            Ok("1")
+        )
+    })
+}
+
+fn trace_first_resource_flush(cmd: &GpuCommand) {
+    let GpuCommand::ResourceFlush(_) = cmd else {
+        return;
+    };
+    if display_source_release_trace_enabled()
+        && !DISPLAY_SOURCE_RELEASE_TRACE_FIRST_FLUSH.swap(true, Ordering::Relaxed)
+    {
+        let hdr = cmd.ctrl_hdr();
+        info!(
+            "display source-release trace: first RESOURCE_FLUSH flags=0x{:x} ctx_id={} ring={} fence_id={}",
+            hdr.flags.to_native(),
+            hdr.ctx_id.to_native(),
+            hdr.ring_idx,
+            hdr.fence_id.to_native()
+        );
+    }
+}
+
+fn trace_display_source_release_received(fence_id: u64) {
+    if display_source_release_trace_enabled()
+        && !DISPLAY_SOURCE_RELEASE_TRACE_RECEIVED.swap(true, Ordering::Relaxed)
+    {
+        info!(
+            "display source-release trace: received fenced RESOURCE_FLUSH ring={} fence_id={}",
+            VIRTIO_GPU_DISPLAY_SOURCE_RELEASE_RING_IDX, fence_id
+        );
+    }
+}
+
+fn trace_display_source_release_replied(fence_id: u64) {
+    if display_source_release_trace_enabled()
+        && !DISPLAY_SOURCE_RELEASE_TRACE_REPLIED.swap(true, Ordering::Relaxed)
+    {
+        info!(
+            "display source-release trace: replied to fenced RESOURCE_FLUSH ring={} fence_id={}",
+            VIRTIO_GPU_DISPLAY_SOURCE_RELEASE_RING_IDX, fence_id
+        );
+    }
 }
 
 struct FenceDescriptor {
@@ -320,6 +393,9 @@ where
 {
     RutabagaFenceHandler::new(move |completed_fence: RutabagaFence| {
         let mut signal = false;
+        let display_source_release = completed_fence.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0
+            && completed_fence.ctx_id == 0
+            && completed_fence.ring_idx == VIRTIO_GPU_DISPLAY_SOURCE_RELEASE_RING_IDX;
 
         if let Some(ref fence_handler_resources) = *fence_handler_resources.lock() {
             // Limits the lifetime of `fence_state`:
@@ -357,9 +433,73 @@ where
 
             if signal {
                 fence_handler_resources.ctrl_queue.signal_used();
+                if display_source_release {
+                    trace_display_source_release_replied(completed_fence.fence_id);
+                }
             }
         }
     })
+}
+
+struct DisplayFenceJob {
+    completions: Vec<Waitable>,
+    fence: RutabagaFence,
+}
+
+struct DisplayFenceWorker {
+    sender: Option<mpsc::SyncSender<DisplayFenceJob>>,
+    worker: Option<JoinHandle<()>>,
+    fence_handler: RutabagaFenceHandler,
+}
+
+impl DisplayFenceWorker {
+    const QUEUE_DEPTH: usize = 4;
+
+    fn new(fence_handler: RutabagaFenceHandler) -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<DisplayFenceJob>(Self::QUEUE_DEPTH);
+        let worker_fence_handler = fence_handler.clone();
+        let worker = thread::Builder::new()
+            .name("gpu_display_fence".to_string())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    for completion in job.completions {
+                        completion.wait(None);
+                    }
+                    worker_fence_handler.call(job.fence);
+                }
+            })
+            .expect("failed to create GPU display fence worker");
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+            fence_handler,
+        }
+    }
+
+    fn defer(&self, completions: Vec<Waitable>, fence: RutabagaFence) {
+        let job = DisplayFenceJob { completions, fence };
+        if let Err(err) = self
+            .sender
+            .as_ref()
+            .expect("missing display fence sender")
+            .send(job)
+        {
+            let job = err.0;
+            for completion in job.completions {
+                completion.wait(None);
+            }
+            self.fence_handler.call(job.fence);
+        }
+    }
+}
+
+impl Drop for DisplayFenceWorker {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 pub struct ReturnDescriptor {
@@ -370,13 +510,19 @@ pub struct ReturnDescriptor {
 pub struct Frontend {
     fence_state: Arc<Mutex<FenceState>>,
     virtio_gpu: VirtioGpu,
+    display_fence_worker: DisplayFenceWorker,
 }
 
 impl Frontend {
-    fn new(virtio_gpu: VirtioGpu, fence_state: Arc<Mutex<FenceState>>) -> Frontend {
+    fn new(
+        virtio_gpu: VirtioGpu,
+        fence_state: Arc<Mutex<FenceState>>,
+        fence_handler: RutabagaFenceHandler,
+    ) -> Frontend {
         Frontend {
             fence_state,
             virtio_gpu,
+            display_fence_worker: DisplayFenceWorker::new(fence_handler),
         }
     }
 
@@ -722,10 +868,28 @@ impl Frontend {
         let writer = &mut desc_chain.writer;
         let mut resp = Err(GpuResponse::ErrUnspec);
         let mut gpu_cmd = None;
+        let mut display_completions = Vec::new();
         let mut len = 0;
         match GpuCommand::decode(reader) {
             Ok(cmd) => {
-                resp = self.process_gpu_command(mem, cmd, reader);
+                if is_display_source_release_fence(&cmd) {
+                    let GpuCommand::ResourceFlush(info) = cmd else {
+                        unreachable!("display source-release command must be RESOURCE_FLUSH");
+                    };
+                    self.virtio_gpu.force_ctx_0();
+                    resp = match self
+                        .virtio_gpu
+                        .flush_resource_with_completion(info.resource_id.to_native())
+                    {
+                        Ok(completions) => {
+                            display_completions = completions;
+                            Ok(GpuResponse::OkNoData)
+                        }
+                        Err(response) => Err(response),
+                    };
+                } else {
+                    resp = self.process_gpu_command(mem, cmd, reader);
+                }
                 gpu_cmd = Some(cmd);
             }
             Err(e) => debug!("descriptor decode error: {}", e),
@@ -743,6 +907,18 @@ impl Frontend {
                 gpu_response
             }
         };
+
+        let display_source_release_fence_id = gpu_cmd
+            .as_ref()
+            .filter(|cmd| is_display_source_release_fence(cmd))
+            .map(|cmd| cmd.ctrl_hdr().fence_id.to_native());
+        if let Some(cmd) = gpu_cmd.as_ref() {
+            trace_first_resource_flush(cmd);
+        }
+        if let Some(fence_id) = display_source_release_fence_id {
+            trace_display_source_release_received(fence_id);
+        }
+        let display_source_release_fence = display_source_release_fence_id.is_some();
 
         if writer.available_bytes() != 0 {
             let mut fence_id = 0;
@@ -771,24 +947,55 @@ impl Frontend {
                         ctx_id,
                         ring_idx,
                     };
-                    gpu_response = match self.virtio_gpu.create_fence(fence) {
-                        Ok(_) => {
-                            fence_created = true;
-                            gpu_response
-                        }
-                        Err(fence_resp) => {
-                            warn!("create_fence {} -> {:?}", fence_id, fence_resp);
-                            fence_resp
-                        }
-                    };
+                    // Phase 1 completes display source reads before RESOURCE_FLUSH returns, so
+                    // its dedicated fence bypasses rutabaga's ordered rings. Phase 2 will complete
+                    // the same display ring asynchronously.
+                    if !display_source_release_fence {
+                        gpu_response = match self.virtio_gpu.create_fence(fence) {
+                            Ok(_) => {
+                                fence_created = true;
+                                gpu_response
+                            }
+                            Err(fence_resp) => {
+                                warn!("create_fence {} -> {:?}", fence_id, fence_resp);
+                                fence_resp
+                            }
+                        };
+                    }
                 }
             }
 
             // Prepare the response now, even if it is going to wait until
             // fence is complete.
             match gpu_response.encode(flags, fence_id, ctx_id, ring_idx, writer) {
-                Ok(l) => len = l,
+                Ok(l) => {
+                    len = l;
+                }
                 Err(e) => debug!("ctrl queue response encode error: {}", e),
+            }
+
+            if display_source_release_fence {
+                if display_completions.is_empty() {
+                    trace_display_source_release_replied(fence_id);
+                } else {
+                    let ring = VirtioGpuRing::ContextSpecific { ctx_id, ring_idx };
+                    self.fence_state.lock().descs.push(FenceDescriptor {
+                        ring,
+                        fence_id,
+                        desc_chain,
+                        len,
+                    });
+                    self.display_fence_worker.defer(
+                        display_completions,
+                        RutabagaFence {
+                            flags,
+                            fence_id,
+                            ctx_id,
+                            ring_idx,
+                        },
+                    );
+                    return None;
+                }
             }
 
             if fence_created {
@@ -971,6 +1178,7 @@ impl Worker {
         let fence_handler_resources = Arc::new(Mutex::new(None));
         let fence_handler =
             create_fence_handler(fence_handler_resources.clone(), fence_state.clone());
+        let display_fence_handler = fence_handler.clone();
         let rutabaga = rutabaga_builder.build(fence_handler, rutabaga_server_descriptor)?;
         let mut virtio_gpu = build(
             &display_backends,
@@ -1004,7 +1212,7 @@ impl Worker {
             resource_bridges,
             suspend_evt,
             kill_evt,
-            state: Frontend::new(virtio_gpu, fence_state.clone()),
+            state: Frontend::new(virtio_gpu, fence_state.clone(), display_fence_handler),
             fence_state,
             fence_handler_resources,
             #[cfg(windows)]
@@ -1580,6 +1788,7 @@ impl Gpu {
         fence_handler: RutabagaFenceHandler,
         mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
     ) -> Option<Frontend> {
+        let display_fence_handler = fence_handler.clone();
         let rutabaga_server_descriptor = self.rutabaga_server_descriptor.as_ref().map(|d| {
             to_rutabaga_descriptor(d.try_clone().expect("failed to clone server descriptor"))
         });
@@ -1615,7 +1824,11 @@ impl Gpu {
                 .expect("failed to import event device");
         }
 
-        Some(Frontend::new(virtio_gpu, fence_state))
+        Some(Frontend::new(
+            virtio_gpu,
+            fence_state,
+            display_fence_handler,
+        ))
     }
 
     // This is not invoked when running with vhost-user GPU.
@@ -1864,6 +2077,16 @@ impl VirtioDevice for Gpu {
             // New experimental/unstable feature, not upstreamed.
             // Safe to enable because guest must explicitly opt-in.
             virtio_gpu_features |= 1 << VIRTIO_GPU_F_FENCE_PASSING;
+
+            // This phase-1 contract depends on the Android backend completing source reads before
+            // RESOURCE_FLUSH returns. Other backends need a real display completion primitive.
+            #[cfg(feature = "android_display")]
+            if matches!(
+                self.display_backends.first(),
+                Some(DisplayBackend::Android(_))
+            ) {
+                virtio_gpu_features |= 1 << VIRTIO_GPU_F_DISPLAY_SOURCE_RELEASE;
+            }
         }
 
         self.base_features | virtio_gpu_features

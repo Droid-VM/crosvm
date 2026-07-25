@@ -12,12 +12,21 @@ use std::process::abort;
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::slice;
+use std::sync::mpsc;
+use std::sync::mpsc::SyncSender;
+use std::thread;
+use std::thread::JoinHandle;
 
 use base::error;
 use base::AsRawDescriptor;
 use base::Event;
+use base::FromRawDescriptor;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use base::VolatileSlice;
+use sync::create_promise_and_waitable;
+use sync::Promise;
+use sync::Waitable;
 use vm_control::gpu::DisplayParameters;
 
 use crate::DisplayT;
@@ -135,6 +144,7 @@ extern "C" {
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
         raw_handle: i64,
+        out_completion_fence_fd: *mut RawDescriptor,
     ) -> bool;
 }
 
@@ -190,6 +200,86 @@ struct AndroidSurface {
     context: Rc<AndroidDisplayContextWrapper>,
     surface: NonNull<AndroidDisplaySurface>,
     imports: Rc<RefCell<BTreeMap<u32, i64>>>,
+    fence_waiter: Rc<AndroidFenceWaiter>,
+}
+
+struct AndroidFenceWaitJob {
+    fence: SafeDescriptor,
+    promise: Promise,
+}
+
+struct AndroidFenceWaiter {
+    sender: Option<SyncSender<AndroidFenceWaitJob>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AndroidFenceWaiter {
+    const QUEUE_DEPTH: usize = 4;
+
+    fn new() -> Self {
+        let (sender, receiver) = mpsc::sync_channel::<AndroidFenceWaitJob>(Self::QUEUE_DEPTH);
+        let worker = thread::Builder::new()
+            .name("android_display_fence".to_string())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    if !wait_for_sync_fence(&job.fence) {
+                        error!("Android display completion fence wait failed; stopping waiter");
+                        break;
+                    }
+                    job.promise.signal();
+                }
+            })
+            .expect("failed to create Android display fence waiter");
+        Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        }
+    }
+
+    fn register(&self, fence: SafeDescriptor) -> Waitable {
+        let (promise, waitable) = create_promise_and_waitable();
+        let job = AndroidFenceWaitJob { fence, promise };
+        if let Err(err) = self
+            .sender
+            .as_ref()
+            .expect("missing fence sender")
+            .send(job)
+        {
+            let job = err.0;
+            if wait_for_sync_fence(&job.fence) {
+                job.promise.signal();
+            }
+        }
+        waitable
+    }
+}
+
+impl Drop for AndroidFenceWaiter {
+    fn drop(&mut self) {
+        self.sender.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+fn wait_for_sync_fence(fence: &SafeDescriptor) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: fence.as_raw_descriptor(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: descriptor points to one initialized pollfd for the duration of the call.
+        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if result > 0 {
+            return descriptor.revents & libc::POLLIN != 0;
+        }
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return false;
+    }
 }
 
 impl GpuDisplaySurface for AndroidSurface {
@@ -234,17 +324,26 @@ impl GpuDisplaySurface for AndroidSurface {
             .get(&import_id)
             .copied()
             .ok_or_else(|| anyhow::anyhow!("invalid Android display import id {}", import_id))?;
-        // The native bridge waits for the Turnip queue before handing the AHB to
-        // SurfaceControl, so no separate Vulkan semaphore is needed here.
+        let mut completion_fence_fd = -1;
         let success = unsafe {
-            android_display_flip_to(self.context.0.as_ptr(), self.surface.as_ptr(), raw_handle)
+            android_display_flip_to(
+                self.context.0.as_ptr(),
+                self.surface.as_ptr(),
+                raw_handle,
+                &mut completion_fence_fd,
+            )
         };
         if !success {
             return Err(anyhow::anyhow!(
                 "Android display Vulkan blit failed; switching to CPU fallback"
             ));
         }
-        Ok(sync::Waitable::signaled())
+        if completion_fence_fd < 0 {
+            return Ok(Waitable::signaled());
+        }
+        // SAFETY: a successful native flip transfers sole ownership of this fd to Rust.
+        let fence = unsafe { SafeDescriptor::from_raw_descriptor(completion_fence_fd) };
+        Ok(self.fence_waiter.register(fence))
     }
 }
 
@@ -252,6 +351,7 @@ pub struct DisplayAndroid {
     context: Rc<AndroidDisplayContextWrapper>,
     imports: Rc<RefCell<BTreeMap<u32, i64>>>,
     surfaces: BTreeMap<u32, NonNull<AndroidDisplaySurface>>,
+    fence_waiter: Rc<AndroidFenceWaiter>,
     /// This event is never triggered and is used solely to fulfill AsRawDescriptor.
     event: Event,
 }
@@ -270,6 +370,7 @@ impl DisplayAndroid {
             context: context.into(),
             imports: Rc::new(RefCell::new(BTreeMap::new())),
             surfaces: BTreeMap::new(),
+            fence_waiter: Rc::new(AndroidFenceWaiter::new()),
             event,
         })
     }
@@ -318,6 +419,7 @@ impl DisplayT for DisplayAndroid {
             context: self.context.clone(),
             surface,
             imports: self.imports.clone(),
+            fence_waiter: self.fence_waiter.clone(),
         }))
     }
 

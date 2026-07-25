@@ -31,8 +31,10 @@ use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 
 pub use super::super::device_constants::gpu::virtio_gpu_config;
+pub use super::super::device_constants::gpu::VIRTIO_GPU_DISPLAY_SOURCE_RELEASE_RING_IDX;
 pub use super::super::device_constants::gpu::VIRTIO_GPU_F_CONTEXT_INIT;
 pub use super::super::device_constants::gpu::VIRTIO_GPU_F_CREATE_GUEST_HANDLE;
+pub use super::super::device_constants::gpu::VIRTIO_GPU_F_DISPLAY_SOURCE_RELEASE;
 pub use super::super::device_constants::gpu::VIRTIO_GPU_F_EDID;
 pub use super::super::device_constants::gpu::VIRTIO_GPU_F_FENCE_PASSING;
 pub use super::super::device_constants::gpu::VIRTIO_GPU_F_RESOURCE_BLOB;

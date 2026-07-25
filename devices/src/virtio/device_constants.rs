@@ -120,6 +120,11 @@ pub mod gpu {
     /* The following capabilities are not upstreamed. */
     pub const VIRTIO_GPU_F_FENCE_PASSING: u32 = 5;
     pub const VIRTIO_GPU_F_CREATE_GUEST_HANDLE: u32 = 6;
+    /// RESOURCE_FLUSH fences on the reserved display ring release scanout source reads.
+    pub const VIRTIO_GPU_F_DISPLAY_SOURCE_RELEASE: u32 = 7;
+
+    /// Reserved ring used only by fenced scanout RESOURCE_FLUSH commands.
+    pub const VIRTIO_GPU_DISPLAY_SOURCE_RELEASE_RING_IDX: u8 = 63;
 
     pub const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 0x0001;
 

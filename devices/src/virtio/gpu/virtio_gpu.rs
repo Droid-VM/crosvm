@@ -48,6 +48,7 @@ use rutabaga_gfx::RUTABAGA_MAP_CACHE_MASK;
 use serde::Deserialize;
 use serde::Serialize;
 use sync::Mutex;
+use sync::Waitable;
 use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
 use vm_control::gpu::GpuControlCommand;
@@ -83,7 +84,6 @@ use crate::virtio::SharedMemoryMapper;
 const KGSL_ARENA_SENTINEL: u64 = 0xffff_ffff_ffff_f000;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
-static DISPLAY_IMPORT_LOGGED: AtomicBool = AtomicBool::new(false);
 
 const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
     (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
@@ -450,10 +450,10 @@ impl VirtioGpuScanout {
         display: &Rc<RefCell<GpuDisplay>>,
         resource: &mut VirtioGpuResource,
         rutabaga: &mut Rutabaga,
-    ) -> VirtioGpuResult {
+    ) -> Result<Option<Waitable>, GpuResponse> {
         let surface_id = match self.surface_id {
             Some(id) => id,
-            _ => return Ok(OkNoData),
+            _ => return Ok(None),
         };
 
         if let Some(import_id) =
@@ -463,7 +463,7 @@ impl VirtioGpuScanout {
                 .borrow_mut()
                 .flip_to(surface_id, import_id, None, None, None);
             match flip_result {
-                Ok(_) => return Ok(OkNoData),
+                Ok(completion) => return Ok(Some(completion)),
                 Err(e) => {
                     error!(
                         "flip_to failed; switching resource to CPU fallback: {:#}",
@@ -482,7 +482,7 @@ impl VirtioGpuScanout {
 
         // Prevent overwriting a buffer that is currently being used by the compositor.
         if display.next_buffer_in_use(surface_id) {
-            return Ok(OkNoData);
+            return Ok(None);
         }
 
         let fb = display
@@ -529,7 +529,7 @@ impl VirtioGpuScanout {
         }
 
         display.flip(surface_id);
-        Ok(OkNoData)
+        Ok(None)
     }
 
     fn import_resource_to_display(
@@ -645,25 +645,6 @@ impl VirtioGpuScanout {
                 query.modifier,
                 DRM_FORMAT_MOD_INVALID | DRM_FORMAT_MOD_LINEAR
             );
-
-        if !DISPLAY_IMPORT_LOGGED.swap(true, Ordering::Relaxed) {
-            info!(
-                "GPU display import: res={} handle_type=0x{:x} display_export={} arena_mapped={} linear_verified={} arena_offset={:?} source_offset=0x{:x} import_offset=0x{:x} stride={} modifier=0x{:x} size={}x{} fourcc=0x{:x}",
-                resource.resource_id,
-                handle_type,
-                display_exported,
-                resource.arena_mapped,
-                linear_layout_verified,
-                resource.shmem_offset,
-                source_offset,
-                offset,
-                stride,
-                query.modifier,
-                width,
-                height,
-                format,
-            );
-        }
 
         let import_id = display
             .borrow_mut()
@@ -979,13 +960,26 @@ impl VirtioGpu {
 
     /// If the resource is the scanout resource, flush it to the display.
     pub fn flush_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
+        let completions = self.flush_resource_with_completion(resource_id)?;
+        for completion in completions {
+            completion.wait(None);
+        }
+        Ok(OkNoData)
+    }
+
+    /// Flushes a resource and returns the display completion waitables. Callers that cannot defer
+    /// the virtqueue descriptor must wait for every returned completion before replying.
+    pub fn flush_resource_with_completion(
+        &mut self,
+        resource_id: u32,
+    ) -> Result<Vec<Waitable>, GpuResponse> {
         if resource_id == 0 {
-            return Ok(OkNoData);
+            return Ok(Vec::new());
         }
 
         #[cfg(windows)]
         match self.rutabaga.resource_flush(resource_id) {
-            Ok(_) => return Ok(OkNoData),
+            Ok(_) => return Ok(Vec::new()),
             Err(RutabagaError::Unsupported) => {}
             Err(e) => return Err(ErrRutabaga(e)),
         }
@@ -998,20 +992,29 @@ impl VirtioGpu {
         // `resource_id` has already been verified to be non-zero
         let resource_id = match NonZeroU32::new(resource_id) {
             Some(id) => Some(id),
-            None => return Ok(OkNoData),
+            None => return Ok(Vec::new()),
         };
 
+        let mut completions = Vec::new();
         for scanout in self.scanouts.values_mut() {
             if scanout.resource_id == resource_id {
-                scanout.flush(&self.display, resource, &mut self.rutabaga)?;
+                if let Some(completion) =
+                    scanout.flush(&self.display, resource, &mut self.rutabaga)?
+                {
+                    completions.push(completion);
+                }
             }
         }
         if self.cursor_scanout.resource_id == resource_id {
-            self.cursor_scanout
-                .flush(&self.display, resource, &mut self.rutabaga)?;
+            if let Some(completion) =
+                self.cursor_scanout
+                    .flush(&self.display, resource, &mut self.rutabaga)?
+            {
+                completions.push(completion);
+            }
         }
 
-        Ok(OkNoData)
+        Ok(completions)
     }
 
     /// Updates the cursor's memory to the given resource_id, and sets its position to the given

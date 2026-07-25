@@ -97,6 +97,7 @@ extern "C" fn android_display_flip_to(
     _ctx: *mut AndroidDisplayContext,
     _surface: *mut AndroidDisplaySurface,
     _raw_handle: i64,
+    _out_completion_fence_fd: *mut RawDescriptor,
 ) -> bool {
     false
 }
