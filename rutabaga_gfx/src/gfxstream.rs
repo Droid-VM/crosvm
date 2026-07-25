@@ -581,12 +581,17 @@ impl Gfxstream {
         ret_to_res(ret)?;
 
         // DroidVM gfxstream pre-alloc: remember the pool offset for a MEM_POOL blob so
-        // resource_map_blob can map the pool GPA directly (no runtime SHARE).
-        if stream_handle.handle_type == STREAM_HANDLE_TYPE_MEM_POOL {
-            self.pool_offsets
-                .lock()
-                .unwrap()
-                .insert(resource_id, stream_handle.pool_offset);
+        // resource_map_blob can map the pool GPA directly (no runtime SHARE). Resource ids are
+        // recycled by the guest, so this must also *clear* the entry for anything that is not
+        // pool-resident: inheriting the previous tenant's offset makes crosvm map the wrong pool
+        // GPA into the guest.
+        {
+            let mut offsets = self.pool_offsets.lock().unwrap();
+            if stream_handle.handle_type == STREAM_HANDLE_TYPE_MEM_POOL {
+                offsets.insert(resource_id, stream_handle.pool_offset);
+            } else {
+                offsets.remove(&resource_id);
+            }
         }
 
         let raw_descriptor = stream_handle.os_handle as RawDescriptor;
@@ -786,6 +791,10 @@ impl RutabagaComponent for Gfxstream {
     }
 
     fn unref_resource(&self, resource_id: u32) {
+        // The id becomes available for reuse here, so drop its pool offset with it -- a later
+        // resource that lands on the same id must not look pool-resident because this one was.
+        self.pool_offsets.lock().unwrap().remove(&resource_id);
+
         // SAFETY:
         // The resource is safe to unreference destroy because no user of these bindings can still
         // be holding a reference.
