@@ -685,10 +685,6 @@ pub struct VirtioGpu {
     resources: Map<u32, VirtioGpuResource>,
     external_blob: bool,
     fixed_blob_mapping: bool,
-    /// Who drives the guest-side memparcel accept for host-visible blobs (Gunyah protected):
-    /// `Off` = the guest virtio-gpu driver (handle returned in the map_blob response), `Sync` =
-    /// the in-VM accept module via the virtio-gunyah-accept transport.
-    vm_accept: VmAccept,
     udmabuf_driver: Option<UdmabufDriver>,
     snapshot_scratch_directory: Option<PathBuf>,
     deferred_snapshot_load: Option<VirtioGpuSnapshot>,
@@ -758,7 +754,6 @@ impl VirtioGpu {
         mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
         external_blob: bool,
         fixed_blob_mapping: bool,
-        vm_accept: VmAccept,
         udmabuf: bool,
         snapshot_scratch_directory: Option<PathBuf>,
     ) -> Option<VirtioGpu> {
@@ -793,7 +788,6 @@ impl VirtioGpu {
             resources: Default::default(),
             external_blob,
             fixed_blob_mapping,
-            vm_accept,
             udmabuf_driver,
             deferred_snapshot_load: None,
             snapshot_scratch_directory,
@@ -1328,7 +1322,7 @@ impl VirtioGpu {
         // guest's stage-2 (the GpuPool was SHARE-blessed at boot). Don't runtime-SHARE anything
         // and don't touch the BAR — just tell the guest its pool byte offset. It maps
         // pool_gpa + offset directly (VIRTIO_GPU_MAP_INFO_POOL flag set; the offset rides the
-        // gunyah_handle field, and the guest never accepts a memparcel for it).
+        // spec's padding field, and no runtime SHARE happens at all).
         if let Some(pool_offset) = self.rutabaga.resource_pool_offset(resource_id) {
             let resource = self
                 .resources
@@ -1343,9 +1337,8 @@ impl VirtioGpu {
             );
             return Ok(OkMapInfo {
                 map_info: (map_info & RUTABAGA_MAP_CACHE_MASK) | VIRTIO_GPU_MAP_INFO_POOL,
-                // The guest reads this as the pool byte offset (not a memparcel handle)
-                // because the POOL flag is set; a 2 GiB pool keeps it within u32.
-                gunyah_handle: Some(pool_offset as u32),
+                // A 2 GiB pool keeps the offset within u32.
+                pool_offset: Some(pool_offset as u32),
             });
         }
 
@@ -1451,14 +1444,17 @@ impl VirtioGpu {
         };
 
         let res_size = resource.size;
-        let gunyah_handle = match self
+        // The guest-side memparcel accept is always driven host-side over the
+        // virtio-gunyah-accept transport (VmAccept::Sync), so nothing about it reaches the
+        // virtio-gpu protocol: no handle in the response, no accept in the guest driver.
+        match self
             .mapper
             .lock()
             .as_mut()
             .expect("No backend request connection found")
-            .add_mapping_blob(source.unwrap(), offset, prot, cache, self.vm_accept)
+            .add_mapping_blob(source.unwrap(), offset, prot, cache, VmAccept::Sync)
         {
-            Ok(h) => h,
+            Ok(_) => (),
             Err(e) => {
                 // Surface the real backend error (a runtime-share ENOMEM at the RM memparcel limit,
                 // a source.map mmap failure, a BAR-offset overflow, ...) instead of collapsing every
@@ -1479,8 +1475,7 @@ impl VirtioGpu {
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
-            // On Gunyah, the guest must accept this memparcel handle to map the blob itself.
-            gunyah_handle,
+            pool_offset: None,
         })
     }
 

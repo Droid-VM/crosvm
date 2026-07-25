@@ -49,7 +49,6 @@ use data_model::*;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
-use hypervisor::VmAccept;
 pub use parameters::AudioDeviceMode;
 pub use parameters::GpuParameters;
 use rutabaga_gfx::*;
@@ -259,7 +258,6 @@ fn build(
     mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
     external_blob: bool,
     fixed_blob_mapping: bool,
-    vm_accept: VmAccept,
     #[cfg(windows)] wndproc_thread: &mut Option<WindowProcedureThread>,
     udmabuf: bool,
     #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
@@ -299,7 +297,6 @@ fn build(
         mapper,
         external_blob,
         fixed_blob_mapping,
-        vm_accept,
         udmabuf,
         snapshot_scratch_directory,
     )
@@ -958,7 +955,6 @@ impl Worker {
         event_devices: Vec<EventDevice>,
         external_blob: bool,
         fixed_blob_mapping: bool,
-        vm_accept: VmAccept,
         udmabuf: bool,
         request_receiver: mpsc::Receiver<WorkerRequest>,
         response_sender: mpsc::Sender<anyhow::Result<WorkerResponse>>,
@@ -985,7 +981,6 @@ impl Worker {
             mapper,
             external_blob,
             fixed_blob_mapping,
-            vm_accept,
             #[cfg(windows)]
             &mut wndproc_thread,
             udmabuf,
@@ -1446,7 +1441,6 @@ pub struct Gpu {
     pci_bar_size: u64,
     external_blob: bool,
     fixed_blob_mapping: bool,
-    vm_accept: VmAccept,
     rutabaga_component: RutabagaComponentType,
     #[cfg(windows)]
     wndproc_thread: Option<WindowProcedureThread>,
@@ -1654,7 +1648,6 @@ impl Gpu {
             pci_bar_size: gpu_parameters.pci_bar_size,
             external_blob: gpu_parameters.external_blob,
             fixed_blob_mapping: gpu_parameters.fixed_blob_mapping,
-            vm_accept: gpu_parameters.vm_accept.into(),
             rutabaga_component: component,
             #[cfg(windows)]
             wndproc_thread: Some(wndproc_thread),
@@ -1699,7 +1692,6 @@ impl Gpu {
             mapper,
             self.external_blob,
             self.fixed_blob_mapping,
-            self.vm_accept,
             #[cfg(windows)]
             &mut self.wndproc_thread,
             self.udmabuf,
@@ -1752,7 +1744,6 @@ impl Gpu {
         let event_devices = self.event_devices.take().expect("missing event_devices");
         let external_blob = self.external_blob;
         let fixed_blob_mapping = self.fixed_blob_mapping;
-        let vm_accept = self.vm_accept;
         let udmabuf = self.udmabuf;
         let snapshot_scratch_directory = self.snapshot_scratch_directory.clone();
 
@@ -1803,7 +1794,6 @@ impl Gpu {
                 event_devices,
                 external_blob,
                 fixed_blob_mapping,
-                vm_accept,
                 udmabuf,
                 worker_request_receiver,
                 worker_response_sender,

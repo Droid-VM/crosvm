@@ -86,7 +86,7 @@ pub const VIRTIO_GPU_RESP_OK_RESOURCE_UUID: u32 = 0x1105;
 pub const VIRTIO_GPU_RESP_OK_MAP_INFO: u32 = 0x1106;
 
 // DroidVM gfxstream pre-alloc: set in `virtio_gpu_resp_map_info.map_info` when the blob is
-// GpuPool-resident. The `gunyah_handle` field then carries the pool BYTE OFFSET (not a memparcel
+// GpuPool-resident. The `pool_offset` field then carries the pool BYTE OFFSET (not a memparcel
 // handle); the guest maps pool_base + offset out of its already-blessed RAM and never accepts.
 pub const VIRTIO_GPU_MAP_INFO_POOL: u32 = 1 << 31;
 
@@ -533,9 +533,9 @@ pub struct virtio_gpu_resource_unmap_blob {
 pub struct virtio_gpu_resp_map_info {
     pub hdr: virtio_gpu_ctrl_hdr,
     pub map_info: Le32,
-    // Was `padding`. On Gunyah, carries the resource-manager memparcel handle the guest must
-    // `gh_rm_mem_accept` to map the host-visible blob itself; 0 when not applicable.
-    pub gunyah_handle: Le32,
+    // Was `padding`. Carries the pool byte offset when VIRTIO_GPU_MAP_INFO_POOL is set in
+    // `map_info` (the blob was sub-allocated from the boot-shared pool); 0 otherwise.
+    pub pool_offset: Le32,
 }
 
 #[derive(Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -760,8 +760,8 @@ pub enum GpuResponse {
     },
     OkMapInfo {
         map_info: u32,
-        /// Gunyah memparcel handle for the guest to accept (0/None when not applicable).
-        gunyah_handle: Option<u32>,
+        /// Byte offset within the pre-shared pool, when `map_info` sets VIRTIO_GPU_MAP_INFO_POOL.
+        pool_offset: Option<u32>,
     },
     ErrUnspec,
     ErrTube(TubeError),
@@ -968,12 +968,12 @@ impl GpuResponse {
             }
             GpuResponse::OkMapInfo {
                 map_info,
-                gunyah_handle,
+                pool_offset,
             } => {
                 let resp_info = virtio_gpu_resp_map_info {
                     hdr,
                     map_info: Le32::from(map_info),
-                    gunyah_handle: Le32::from(gunyah_handle.unwrap_or(0)),
+                    pool_offset: Le32::from(pool_offset.unwrap_or(0)),
                 };
 
                 resp.write_obj(resp_info)?;

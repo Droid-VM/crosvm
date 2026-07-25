@@ -116,30 +116,6 @@ pub struct GpuParameters {
     // permanent Gunyah SHARE mapping stays stable). Only Qualcomm/Gunyah needs it; leave off on
     // other SoCs (MediaTek, Tensor, ...). Plumbed to GFXSTREAM_GUNYAH_PIN_RINGBLOB.
     pub gunyah_pvm: Option<bool>,
-    // vm-accept: who drives the guest-side memparcel accept for host-visible blobs on protected
-    // Gunyah. `off` (default) = the guest virtio-gpu driver accepts the handle returned in the
-    // map_blob response (low-latency, current behavior); `sync` = the generic in-VM accept
-    // module does it over the virtio-gunyah-accept transport before map_blob returns.
-    pub vm_accept: GpuVmAccept,
-}
-
-/// GPU flavor of [`hypervisor::VmAccept`]; a separate enum so the CLI default stays `off`
-/// (the hypervisor-level default is `Sync`, meant for components with upstream semantics).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum GpuVmAccept {
-    #[default]
-    Off,
-    Sync,
-}
-
-impl From<GpuVmAccept> for hypervisor::VmAccept {
-    fn from(v: GpuVmAccept) -> Self {
-        match v {
-            GpuVmAccept::Off => hypervisor::VmAccept::Off,
-            GpuVmAccept::Sync => hypervisor::VmAccept::Sync,
-        }
-    }
 }
 
 impl Default for GpuParameters {
@@ -181,7 +157,6 @@ impl Default for GpuParameters {
             pool_blob_max_kb: None,
             gfx_host_pre_alloc_mb: None,
             gunyah_pvm: None,
-            vm_accept: GpuVmAccept::default(),
         }
     }
 }
