@@ -13,6 +13,37 @@ use crate::Error;
 use crate::Event;
 
 /// Wrapper object for creating a worker thread that can be stopped by signaling an event.
+/// Per-thread alternate signal stack, so the fatal-signal handler can run even when this thread's
+/// own stack is exhausted or unusable. Best-effort: a failure just leaves the previous behaviour.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn install_altstack() {
+    thread_local! {
+        static ALTSTACK: std::cell::RefCell<Option<Box<[u8]>>> = const { std::cell::RefCell::new(None) };
+    }
+    const ALTSTACK_SIZE: usize = 128 * 1024;
+    ALTSTACK.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_some() {
+            return;
+        }
+        let mut stack = vec![0u8; ALTSTACK_SIZE].into_boxed_slice();
+        // SAFETY: `stack` outlives the sigaltstack registration -- it is parked in a thread-local
+        // that is dropped only when the thread exits, after which no handler can run on it.
+        unsafe {
+            let ss = libc::stack_t {
+                ss_sp: stack.as_mut_ptr() as *mut libc::c_void,
+                ss_flags: 0,
+                ss_size: ALTSTACK_SIZE,
+            };
+            libc::sigaltstack(&ss, std::ptr::null_mut());
+        }
+        *slot = Some(stack);
+    });
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn install_altstack() {}
+
 pub struct WorkerThread<T: Send + 'static> {
     worker: Option<(Event, JoinHandle<T>)>,
 }
@@ -33,7 +64,15 @@ impl<T: Send + 'static> WorkerThread<T> {
 
         let thread_handle = thread::Builder::new()
             .name(thread_name.into())
-            .spawn(move || thread_func(thread_stop_event))
+            .spawn(move || {
+                // DroidVM: give this thread its own alternate signal stack. sigaltstack is
+                // per-thread and crosvm only sets one on the main thread, so a fatal fault here --
+                // in particular a stack overflow, where the thread's own stack cannot host the
+                // handler -- kills the process with no diagnostic at all. With an altstack the
+                // crash handler still runs and prints the faulting pc.
+                install_altstack();
+                thread_func(thread_stop_event)
+            })
             .expect("thread spawn failed");
 
         WorkerThread {

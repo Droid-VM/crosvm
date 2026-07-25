@@ -457,6 +457,24 @@ impl VirtioGpuScanout {
             if self.flush_staging.len() < total {
                 self.flush_staging.resize(total, 0);
             }
+            // The rows we are about to read must exist in the gathered segments: src_stride and
+            // src_offset come from the guest's SET_SCANOUT_BLOB, and a short blob would otherwise
+            // walk off the end of the staging buffer below.
+            let last_row_end = (self.height as usize)
+                .checked_sub(1)
+                .and_then(|rows| rows.checked_mul(src_stride))
+                .and_then(|span| span.checked_add(src_offset))
+                .and_then(|start| start.checked_add(packed_stride));
+            match last_row_end {
+                Some(end) if end <= total => {}
+                _ => {
+                    error!(
+                        "pool scanout res={} needs {:?} bytes but the blob gathers {}",
+                        resource.resource_id, last_row_end, total
+                    );
+                    return Err(ErrUnspec);
+                }
+            }
             let mut off = 0usize;
             for &(ptr, len) in segs {
                 // SAFETY: (ptr, len) is a subrange of the VM-lifetime pool memory, validated when
@@ -946,6 +964,42 @@ impl VirtioGpu {
         resource_id: u32,
         scanout_data: Option<VirtioScanoutBlobData>,
     ) -> VirtioGpuResult {
+        // The geometry in SET_SCANOUT_BLOB is guest-controlled and `flush` turns it into raw
+        // pointer arithmetic over the resource's mapping. Reject anything that would read past
+        // the resource here: a guest must not be able to fault the VMM (a Vulkan KMS client, for
+        // instance, hands over whatever stride and offset its swapchain image happens to have).
+        if let (Some(data), true) = (scanout_data, resource_id != 0) {
+            let resource = self
+                .resources
+                .get(&resource_id)
+                .ok_or(ErrInvalidResourceId)?;
+            let bytes_needed = (data.height as u64)
+                .checked_sub(1)
+                .and_then(|rows| rows.checked_mul(data.strides[0] as u64))
+                .and_then(|span| span.checked_add(data.offsets[0] as u64))
+                .and_then(|start| start.checked_add((data.width as u64).checked_mul(4)?));
+            let fits = match bytes_needed {
+                Some(needed) => needed <= resource.size,
+                None => false,
+            };
+            if data.width == 0
+                || data.height == 0
+                || (data.strides[0] as u64) < data.width as u64 * 4
+                || !fits
+            {
+                error!(
+                    "SET_SCANOUT_BLOB res={} rejects {}x{} stride={} offset={} against size={}",
+                    resource_id,
+                    data.width,
+                    data.height,
+                    data.strides[0],
+                    data.offsets[0],
+                    resource.size,
+                );
+                return Err(ErrUnspec);
+            }
+        }
+
         self.update_scanout_resource(
             SurfaceType::Scanout,
             Some(scanout_rect),

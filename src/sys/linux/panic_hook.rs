@@ -128,6 +128,47 @@ pub fn set_panic_hook() {
 const CRASH_ALTSTACK_SIZE: usize = 256 * 1024;
 static mut CRASH_ALTSTACK: [u8; CRASH_ALTSTACK_SIZE] = [0u8; CRASH_ALTSTACK_SIZE];
 
+/// Append bytes to a fixed buffer, returning the new length. Allocation-free, so it stays usable
+/// from a signal handler whose fault may have been *inside* the allocator.
+fn append(buf: &mut [u8], mut at: usize, bytes: &[u8]) -> usize {
+    for &b in bytes {
+        if at >= buf.len() {
+            break;
+        }
+        buf[at] = b;
+        at += 1;
+    }
+    at
+}
+
+fn append_hex(buf: &mut [u8], at: usize, mut v: u64) -> usize {
+    let mut digits = [0u8; 16];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b"0123456789abcdef"[(v & 0xf) as usize];
+        v >>= 4;
+        if v == 0 || i == 0 {
+            break;
+        }
+    }
+    append(buf, at, &digits[i..])
+}
+
+fn append_dec(buf: &mut [u8], at: usize, mut v: u64) -> usize {
+    let mut digits = [0u8; 20];
+    let mut i = digits.len();
+    loop {
+        i -= 1;
+        digits[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 || i == 0 {
+            break;
+        }
+    }
+    append(buf, at, &digits[i..])
+}
+
 fn write_all_stderr(bytes: &[u8]) {
     let mut off = 0;
     while off < bytes.len() {
@@ -221,6 +262,26 @@ extern "C" fn crash_signal_handler(
     // kernel ucontext at fixed offsets (the libc crate's ucontext_t omits the 120-byte sigmask
     // padding, so its uc_mcontext offset is wrong).
     let (mc_fault, lr, sp, pc) = unsafe { crash_regs(ucontext) };
+
+    // Everything below allocates, and a fault *inside* the allocator (or while another thread
+    // holds its lock) deadlocks the handler -- the process then dies with no diagnostic at all,
+    // which is exactly the case that leaves us guessing. Emit the registers first through a fixed
+    // stack buffer and a raw write, so the PC always comes out.
+    {
+        let mut line = [0u8; 160];
+        let mut n = append(&mut line, 0, b"\n==== crosvm fatal signal ");
+        n = append_dec(&mut line, n, signum as u64);
+        n = append(&mut line, n, b" tid ");
+        n = append_dec(&mut line, n, tid as u64);
+        n = append(&mut line, n, b" fault 0x");
+        n = append_hex(&mut line, n, fault_addr as u64);
+        n = append(&mut line, n, b" pc 0x");
+        n = append_hex(&mut line, n, pc as u64);
+        n = append(&mut line, n, b" lr 0x");
+        n = append_hex(&mut line, n, lr as u64);
+        n = append(&mut line, n, b" ====\n");
+        write_all_stderr(&line[..n]);
+    }
 
     // Read our own memory map so the raw runtime addresses can be turned into file offsets for
     // addr2line. read_to_string allocates, but for a clean null deref the allocator is intact.
