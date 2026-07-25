@@ -86,6 +86,30 @@ use crate::virtio::resource_bridge::ResourceInfo;
 use crate::virtio::resource_bridge::ResourceResponse;
 use crate::virtio::SharedMemoryMapper;
 
+/// Scanout tracing: `GPU_SCANOUT_TRACE=1` writes one marker per step of the scanout/flush path
+/// straight to fd 2 with `write(2)`. The buffered loggers are useless for this path -- a guest
+/// page flip can take the whole device down with it, and anything still sitting in a log buffer
+/// (or in `tee`) is lost. Off by default; a raw write costs nothing when the flag is unset.
+pub(crate) fn scanout_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GPU_SCANOUT_TRACE").is_ok_and(|v| v != "0"))
+}
+
+pub(crate) fn scanout_trace_write(args: std::fmt::Arguments) {
+    if !scanout_trace_enabled() {
+        return;
+    }
+    let line = format!("MKH {}\n", args);
+    // SAFETY: writing `line.len()` initialized bytes from `line` to fd 2.
+    unsafe {
+        libc::write(2, line.as_ptr() as *const c_void, line.len());
+    }
+}
+
+macro_rules! strace {
+    ($($arg:tt)*) => { crate::virtio::gpu::virtio_gpu::scanout_trace_write(format_args!($($arg)*)) };
+}
+
 pub fn to_rutabaga_descriptor(s: SafeDescriptor) -> RutabagaDescriptor {
     // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
@@ -415,6 +439,15 @@ impl VirtioGpuScanout {
             Some(id) => id,
             _ => return Ok(OkNoData),
         };
+        strace!(
+            "flush.enter res={} surface={} {}x{} scanout_data={:?} pool_iovecs={}",
+            resource.resource_id,
+            surface_id,
+            self.width,
+            self.height,
+            resource.scanout_data.map(|d| (d.width, d.height, d.strides[0], d.offsets[0])),
+            resource.pool_scanout_iovecs.is_some(),
+        );
 
         // Prefer the gfxstream host colorbuffer. For the normal scanout path AND for guest-alloc
         // colorbuffers, the GPU renders into a HOST-side VkImage (optimally tiled), not into the
@@ -422,9 +455,12 @@ impl VirtioGpuScanout {
         // exportable host colorbuffer, let the display import + flip it (gfxstream detiles/posts
         // correctly). Only guest-memory blobs with NO host colorbuffer (real pool scanout,
         // where rutabaga export returns EINVAL) fall through to the pool direct-read below.
-        if let Some(import_id) =
-            VirtioGpuScanout::import_resource_to_display(display, surface_id, resource, rutabaga)
-        {
+        strace!("flush.import.begin res={}", resource.resource_id);
+        let imported =
+            VirtioGpuScanout::import_resource_to_display(display, surface_id, resource, rutabaga);
+        strace!("flush.import.end imported={:?}", imported);
+        if let Some(import_id) = imported {
+            strace!("flush.flip_to.begin import={}", import_id);
             display
                 .borrow_mut()
                 .flip_to(surface_id, import_id, None, None, None)
@@ -432,6 +468,7 @@ impl VirtioGpuScanout {
                     error!("flip_to failed: {:#}", e);
                     ErrUnspec
                 })?;
+            strace!("flush.flip_to.end");
             return Ok(OkNoData);
         }
 
@@ -506,16 +543,22 @@ impl VirtioGpuScanout {
         // leaving the frame black. mmap the exported dmabuf once (it aliases the host colorbuffer
         // the GPU composited into) and copy its LINEAR rows into the display framebuffer.
         if resource.scanout_data.is_some() {
+            strace!("flush.blob.branch res={}", resource.resource_id);
             if resource.scanout_blob_map.is_none() && rutabaga.query(resource.resource_id).is_err() {
-                if let Ok(handle) = rutabaga.export_blob(resource.resource_id) {
+                strace!("flush.blob.export.begin res={}", resource.resource_id);
+                let exported = rutabaga.export_blob(resource.resource_id);
+                strace!("flush.blob.export.end ok={}", exported.is_ok());
+                if let Ok(handle) = exported {
                     let desc = to_safe_descriptor(handle.os_handle);
                     let data = resource.scanout_data.unwrap();
                     let map_size =
                         data.offsets[0] as usize + data.strides[0] as usize * data.height as usize;
-                    if let Ok(m) = MemoryMappingBuilder::new(map_size)
+                    strace!("flush.blob.mmap.begin size={}", map_size);
+                    let mapped = MemoryMappingBuilder::new(map_size)
                         .from_descriptor(&desc)
-                        .build()
-                    {
+                        .build();
+                    strace!("flush.blob.mmap.end ok={}", mapped.is_ok());
+                    if let Ok(m) = mapped {
                         resource.scanout_blob_map = Some(m);
                     }
                 }
@@ -538,6 +581,14 @@ impl VirtioGpuScanout {
                 let src = unsafe {
                     std::slice::from_raw_parts(m.as_ptr() as *const u8, m.size())
                 };
+                strace!(
+                    "flush.blob.copy.begin src_len={} src_stride={} src_off={} fb_stride={} rows={}",
+                    src.len(),
+                    src_stride,
+                    src_offset,
+                    fb_stride,
+                    self.height,
+                );
                 for row in 0..self.height as usize {
                     let s = src_offset + row * src_stride;
                     if s + packed_stride > src.len() {
@@ -548,12 +599,15 @@ impl VirtioGpuScanout {
                         .map_err(|_| ErrUnspec)?
                         .copy_from(&src[s..s + packed_stride]);
                 }
+                strace!("flush.blob.copy.end");
                 display.flip(surface_id);
+                strace!("flush.blob.flip.end");
                 return Ok(OkNoData);
             }
         }
 
         // Import failed, fall back to a copy.
+        strace!("flush.transfer_read.branch res={}", resource.resource_id);
         let mut display = display.borrow_mut();
 
         // Prevent overwriting a buffer that is currently being used by the compositor.
@@ -599,7 +653,9 @@ impl VirtioGpuScanout {
             }
         }
 
+        strace!("flush.transfer_read.copy.end");
         display.flip(surface_id);
+        strace!("flush.transfer_read.flip.end");
         Ok(OkNoData)
     }
 
@@ -964,6 +1020,16 @@ impl VirtioGpu {
         resource_id: u32,
         scanout_data: Option<VirtioScanoutBlobData>,
     ) -> VirtioGpuResult {
+        strace!(
+            "set_scanout.enter scanout={} res={} rect={}x{}+{}+{} blob={:?}",
+            scanout_id,
+            resource_id,
+            scanout_rect.width.to_native(),
+            scanout_rect.height.to_native(),
+            scanout_rect.x.to_native(),
+            scanout_rect.y.to_native(),
+            scanout_data.map(|d| (d.width, d.height, d.strides[0], d.offsets[0])),
+        );
         // The geometry in SET_SCANOUT_BLOB is guest-controlled and `flush` turns it into raw
         // pointer arithmetic over the resource's mapping. Reject anything that would read past
         // the resource here: a guest must not be able to fault the VMM (a Vulkan KMS client, for
@@ -1000,13 +1066,15 @@ impl VirtioGpu {
             }
         }
 
-        self.update_scanout_resource(
+        let r = self.update_scanout_resource(
             SurfaceType::Scanout,
             Some(scanout_rect),
             scanout_id,
             scanout_data,
             resource_id,
-        )
+        );
+        strace!("set_scanout.exit ok={}", r.is_ok());
+        r
     }
 
     /// If the resource is the scanout resource, flush it to the display.
@@ -1014,6 +1082,7 @@ impl VirtioGpu {
         if resource_id == 0 {
             return Ok(OkNoData);
         }
+        strace!("flush_resource.enter res={}", resource_id);
 
         #[cfg(windows)]
         match self.rutabaga.resource_flush(resource_id) {
@@ -1043,6 +1112,7 @@ impl VirtioGpu {
                 .flush(&self.display, resource, &mut self.rutabaga)?;
         }
 
+        strace!("flush_resource.exit res={:?}", resource_id);
         Ok(OkNoData)
     }
 
