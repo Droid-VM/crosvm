@@ -456,28 +456,33 @@ impl VirtioGpuScanout {
             _ => return Ok(None),
         };
 
-        if let Some(import_id) =
-            VirtioGpuScanout::import_resource_to_display(display, surface_id, resource, rutabaga)
-        {
-            let flip_result = display
-                .borrow_mut()
-                .flip_to(surface_id, import_id, None, None, None);
-            match flip_result {
-                Ok(completion) => return Ok(Some(completion)),
-                Err(e) => {
-                    error!(
-                        "flip_to failed; switching resource to CPU fallback: {:#}",
-                        e
-                    );
-                    resource.transition_display_import(
-                        &mut display.borrow_mut(),
-                        DisplayImportState::CpuFallback,
-                    );
+        // Virtio cursors are ordinary 64x64 guest-backed resources, not arena-backed blobs with
+        // verifiable linear DMA-BUF provenance. Keep their small, infrequent image updates on the
+        // established CPU path instead of treating the expected import rejection as a failure.
+        if matches!(self.scanout_type, SurfaceType::Scanout) {
+            if let Some(import_id) = VirtioGpuScanout::import_resource_to_display(
+                display, surface_id, resource, rutabaga,
+            ) {
+                let flip_result = display
+                    .borrow_mut()
+                    .flip_to(surface_id, import_id, None, None, None);
+                match flip_result {
+                    Ok(completion) => return Ok(Some(completion)),
+                    Err(e) => {
+                        error!(
+                            "flip_to failed; switching resource to CPU fallback: {:#}",
+                            e
+                        );
+                        resource.transition_display_import(
+                            &mut display.borrow_mut(),
+                            DisplayImportState::CpuFallback,
+                        );
+                    }
                 }
             }
         }
 
-        // Import failed, fall back to a copy.
+        // No imported display resource is available, so update the surface with a copy.
         let mut display = display.borrow_mut();
 
         // Prevent overwriting a buffer that is currently being used by the compositor.
