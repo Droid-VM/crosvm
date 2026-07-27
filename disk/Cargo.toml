@@ -10,7 +10,7 @@ path = "src/disk.rs"
 [features]
 android-sparse = []
 composite-disk = ["crc32fast", "protos", "protobuf", "uuid"]
-qcow = []
+qcow = ["dep:flate2", "zstd"]
 zstd-disk = ["zstd"]
 
 [dependencies]
@@ -21,6 +21,10 @@ cfg-if = "1.0.0"
 crc32fast = { version = "1.2.1", optional = true }
 cros_async = { path = "../cros_async" }
 data_model = { path = "../common/data_model" }
+# Use the zlib-rs backend: a pure-Rust port of zlib-ng that decompresses qcow2 zlib
+# clusters noticeably faster than the default miniz_oxide backend, with no C toolchain
+# required. This matches the backend AOSP's libflate2 already builds with.
+flate2 = { version = "1", optional = true, default-features = false, features = ["zlib-rs"] }
 libc = "0.2"
 protobuf = { version = "3.2", optional = true }
 protos = { path = "../protos", features = ["composite-disk"], optional = true }

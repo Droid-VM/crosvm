@@ -30,6 +30,7 @@ rust_test {
         "android-sparse",
         "composite-disk", // Added manually
         "qcow",
+        "zstd", // Added manually: C libzstd for qcow2 zstd cluster decompression
     ],
     rustlibs: [
         "libanyhow",
@@ -38,6 +39,7 @@ rust_test {
         "libcrc32fast", // Added manually
         "libcros_async",
         "libdata_model",
+        "libflate2", // Added manually: qcow2 zlib cluster decompression
         "libfutures",
         "liblibc",
         "libprotobuf", // Added manually
@@ -49,6 +51,7 @@ rust_test {
         "libuuid", // Added manually
         "libvm_memory",
         "libzerocopy",
+        "libzstd_rust", // Added manually: qcow2 zstd cluster decompression (C libzstd)
     ],
     proc_macros: [
         "libasync_trait",
@@ -69,6 +72,7 @@ rust_library {
         "android-sparse",
         "composite-disk", // Added manually
         "qcow",
+        "zstd", // Added manually: C libzstd for qcow2 zstd cluster decompression
     ],
     rustlibs: [
         "libanyhow",
@@ -77,6 +81,7 @@ rust_library {
         "libcrc32fast", // Added manually
         "libcros_async",
         "libdata_model",
+        "libflate2", // Added manually: qcow2 zlib cluster decompression
         "libfutures",
         "liblibc",
         "libprotobuf", // Added manually
@@ -87,6 +92,7 @@ rust_library {
         "libuuid", // Added manually
         "libvm_memory",
         "libzerocopy",
+        "libzstd_rust", // Added manually: qcow2 zstd cluster decompression (C libzstd)
     ],
     proc_macros: [
         "libasync_trait",
