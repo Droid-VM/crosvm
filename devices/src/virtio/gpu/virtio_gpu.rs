@@ -108,6 +108,35 @@ fn is_single_plane_8888_rgb(format: u32) -> bool {
     )
 }
 
+/// The KGSL native-context arena, as (host VA, size), or None when there is no KgslPool.
+///
+/// aarch64/src/lib.rs exports this before the GPU device is built, the same way the gfxstream
+/// pool is announced, and virglrenderer's kgsl backend sub-allocates every BO from it. Unlike
+/// gfxstream there is no rutabaga pool_offset to ask for: the kgsl backend reports residency
+/// only through the host mapping, so pool membership has to be decided by where the mapping
+/// lands. Read once -- crosvm sets this before the fork and never changes it.
+fn kgsl_pool_window() -> Option<(u64, u64)> {
+    static WINDOW: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let va: u64 = std::env::var("CROSVM_KGSL_ARENA_HOST_VA").ok()?.parse().ok()?;
+        let size: u64 = std::env::var("CROSVM_KGSL_ARENA_SIZE").ok()?.parse().ok()?;
+        if va == 0 || size == 0 {
+            return None;
+        }
+        // pool_offset rides the map_blob response's reclaimed 4-byte padding, so a pool bigger
+        // than 4 GiB cannot address its own tail. Refuse rather than silently truncate.
+        if size > u32::MAX as u64 {
+            base::error!(
+                "GPU-MAPBLOB: KgslPool is {:#x} bytes; the pool offset wire is 32-bit. \
+                 Ignoring the pool -- lower --pre-alloc kgsl-mb to 4096 or less.",
+                size
+            );
+            return None;
+        }
+        Some((va, size))
+    })
+}
+
 /// Falling back to the CPU copy path costs a full-frame copy on every present, and every way
 /// into it used to be silent. Say why, once, so a display backend that quietly refuses the
 /// import is visible instead of just slow.
@@ -1622,6 +1651,42 @@ impl VirtioGpu {
                 // A 2 GiB pool keeps the offset within u32.
                 pool_offset: Some(pool_offset as u32),
             });
+        }
+
+        // KGSL NATIVE CONTEXT: same contract as gfxstream pre-alloc -- the BO already lives in
+        // the boot-blessed KgslPool, which is in the guest's stage-2, so report a byte offset
+        // and runtime-SHARE nothing. The residency test is different only because the kgsl
+        // backend has no rutabaga pool_offset to report: ask where the resource is mapped and
+        // see whether that lands in the pool. map/unmap is a refcount pair, not a real mmap.
+        if let Some((pool_va, pool_size)) = kgsl_pool_window() {
+            if let Ok(mapping) = self.rutabaga.map(resource_id) {
+                let pool_end = pool_va + pool_size;
+                let inside = mapping.ptr >= pool_va
+                    && mapping
+                        .ptr
+                        .checked_add(mapping.size)
+                        .is_some_and(|end| end <= pool_end);
+                let offset = mapping.ptr.wrapping_sub(pool_va);
+                let _ = self.rutabaga.unmap(resource_id);
+                if inside {
+                    let resource = self
+                        .resources
+                        .get_mut(&resource_id)
+                        .ok_or(ErrInvalidResourceId)?;
+                    resource.pool_offset = Some(offset);
+                    let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+                    base::debug!(
+                        "GPU-MAPBLOB: res={} KGSL-POOL-resident offset={:#x} (no SHARE)",
+                        resource_id,
+                        offset,
+                    );
+                    return Ok(OkMapInfo {
+                        map_info: (map_info & RUTABAGA_MAP_CACHE_MASK) | VIRTIO_GPU_MAP_INFO_POOL,
+                        // kgsl_pool_window() refuses a pool that cannot fit this field.
+                        pool_offset: Some(offset as u32),
+                    });
+                }
+            }
         }
 
         let resource = self
