@@ -507,31 +507,38 @@ impl VirtioGpuScanout {
         // exportable host colorbuffer, let the display import + flip it (gfxstream detiles/posts
         // correctly). Only guest-memory blobs with NO host colorbuffer (real pool scanout,
         // where rutabaga export returns EINVAL) fall through to the pool direct-read below.
-        strace!("flush.import.begin res={}", resource.resource_id);
-        let imported =
-            VirtioGpuScanout::import_resource_to_display(display, surface_id, resource, rutabaga);
-        strace!("flush.import.end imported={:?}", imported);
-        if let Some(import_id) = imported {
-            strace!("flush.flip_to.begin import={}", import_id);
-            match display
-                .borrow_mut()
-                .flip_to(surface_id, import_id, None, None, None)
-            {
-                Ok(_) => {
-                    strace!("flush.flip_to.end");
-                    return Ok(OkNoData);
-                }
-                // A flip that fails once will keep failing for this resource, and retrying it
-                // every frame costs an import attempt per present on top of the copy we end up
-                // doing anyway. Pin the resource to the CPU path instead of erroring out: a
-                // slow desktop beats a dead one.
-                Err(e) => {
-                    error!("flip_to failed; switching resource to CPU fallback: {:#}", e);
-                    strace!("flush.flip_to.fail");
-                    resource.transition_display_import(
-                        &mut display.borrow_mut(),
-                        DisplayImportState::CpuFallback,
-                    );
+        //
+        // Cursors are excluded: a virtio cursor is an ordinary small guest-backed resource with
+        // no dmabuf provenance to import, so attempting it once per cursor move only produces a
+        // rejection to log before doing the 64x64 copy we were always going to do.
+        if matches!(self.scanout_type, SurfaceType::Scanout) {
+            strace!("flush.import.begin res={}", resource.resource_id);
+            let imported = VirtioGpuScanout::import_resource_to_display(
+                display, surface_id, resource, rutabaga,
+            );
+            strace!("flush.import.end imported={:?}", imported);
+            if let Some(import_id) = imported {
+                strace!("flush.flip_to.begin import={}", import_id);
+                match display
+                    .borrow_mut()
+                    .flip_to(surface_id, import_id, None, None, None)
+                {
+                    Ok(_) => {
+                        strace!("flush.flip_to.end");
+                        return Ok(OkNoData);
+                    }
+                    // A flip that fails once will keep failing for this resource, and retrying it
+                    // every frame costs an import attempt per present on top of the copy we end up
+                    // doing anyway. Pin the resource to the CPU path instead of erroring out: a
+                    // slow desktop beats a dead one.
+                    Err(e) => {
+                        error!("flip_to failed; switching resource to CPU fallback: {:#}", e);
+                        strace!("flush.flip_to.fail");
+                        resource.transition_display_import(
+                            &mut display.borrow_mut(),
+                            DisplayImportState::CpuFallback,
+                        );
+                    }
                 }
             }
         }
