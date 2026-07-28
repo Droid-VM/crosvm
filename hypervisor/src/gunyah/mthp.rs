@@ -90,6 +90,12 @@ pub struct LendPrepResult {
     /// the caller can fail VM creation instead of the guest SIGBUS-ing minutes later
     /// deep inside its GPU stack (host-alloc must fail loudly, not silently).
     pub populated: bool,
+    /// Whether Phase 4's `mlock` succeeded. An unpinned page inside a SHARE'd pool can still be
+    /// migrated or reclaimed by the host kernel while the RM's stage-2 mapping keeps pointing at
+    /// the page it was blessed with, and neither side notices -- the guest simply reads and
+    /// writes memory the GPU no longer shares. Reported rather than acted on here so the caller
+    /// can be fatal for the pool purposes and lenient elsewhere.
+    pub mlocked: bool,
 }
 
 /// Prepare a lend region for Gunyah by maximising large-page backing.
@@ -286,10 +292,15 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     // ── Phase 4: mlock ──────────────────────────────────────────────
 
     let ret = libc::mlock(host_addr as *const libc::c_void, size as usize);
-    if ret == 0 {
+    let mlocked = ret == 0;
+    if mlocked {
         info!("GH: mlock: OK");
     } else {
-        warn!("GH: mlock FAILED: errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        warn!(
+            "GH: mlock FAILED: errno={} -- pages in this region can still be migrated or \
+             reclaimed while the RM's stage-2 keeps the old ones (check RLIMIT_MEMLOCK)",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        );
     }
 
     // ── Build need_small bitmap from order_map ──────────────────────
@@ -324,12 +335,52 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
         );
     }
 
+    // ── Phase 5: clean the region out of the caches ─────────────────
+    //
+    // Phases 2-3 wrote every page through the normal cacheable mapping, so those lines are
+    // sitting dirty in this CPU's caches. The GPU then reaches the same physical pages either
+    // non-coherently or through a write-combining guest mapping, so a line that has not reached
+    // the point of coherency can still be written back later, on top of what the guest wrote --
+    // or read back as the zeros we populated with. virglrenderer's kgsl backend attributes a
+    // hard glmark2 DEVICE LOST to exactly this (the CP executing stale zero lines that alias
+    // WC guest writes, giving a type-0 write to register 0 and an AHB error).
+    clean_dcache_to_poc(host_addr, size as usize);
+
     LendPrepResult {
         need_small,
         large_page_bytes,
         populated,
+        mlocked,
     }
 }
+
+/// Clean+invalidate `size` bytes from `host_addr` to the point of coherency.
+#[cfg(target_arch = "aarch64")]
+fn clean_dcache_to_poc(host_addr: *mut u8, size: usize) {
+    if size == 0 {
+        return;
+    }
+    let ctr: u64;
+    // SAFETY: reading CTR_EL0 and cleaning cache lines by VA are permitted at EL0 while Linux
+    // sets SCTLR_EL1.UCI, which it always does on arm64. `host_addr..host_addr+size` is a live
+    // writable mapping, and `dc civac` neither reads nor writes through the pointer.
+    unsafe {
+        std::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr);
+        // CTR_EL0.DminLine is log2 of the line size in words.
+        let line_size = 4usize << ((ctr >> 16) & 0xf);
+        let mut addr = (host_addr as usize) & !(line_size - 1);
+        let end = host_addr as usize + size;
+        while addr < end {
+            std::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack));
+            addr += line_size;
+        }
+        std::arch::asm!("dsb sy", options(nostack));
+    }
+    info!("GH: dcache clean to PoC: {} MB", size >> 20);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn clean_dcache_to_poc(_host_addr: *mut u8, _size: usize) {}
 
 /// Round `v` up to the next multiple of the 2MB folio size.
 pub fn round_up_2mb(v: u64) -> u64 {

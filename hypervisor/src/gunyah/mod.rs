@@ -428,6 +428,20 @@ impl GunyahVm {
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
+                    if !prep.mlocked {
+                        // Same reasoning as populate: an unpinned pool is not a slow pool, it is
+                        // one where the host kernel may move a page out from under a stage-2
+                        // mapping the RM will never update. That corruption is silent and
+                        // arrives much later; refusing to start is the recoverable failure.
+                        error!(
+                            "GH: {:?} region gpa={:#x} size={:#x} could not be mlocked -- \
+                             refusing to share memory the kernel may still migrate",
+                            region.options.purpose,
+                            region.guest_addr.offset(),
+                            region.size
+                        );
+                        return Err(Error::new(libc::ENOMEM));
+                    }
                 }
                 // The GpuPool's 2MB chunks each come from an independent
                 // alloc_pages(order=9) call in the reserve module (see
