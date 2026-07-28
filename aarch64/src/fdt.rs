@@ -791,6 +791,7 @@ pub fn create_fdt(
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64)>,
+    kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
     simplefb_cfg: Option<SimplefbDtConfig>,
@@ -882,6 +883,19 @@ pub fn create_fdt(
         resv.set_prop("#size-cells", 0x2u32)?;
         resv.set_prop("ranges", ())?;
         let node = resv.subnode_mut(&format!("gpu_guest_reserved@{:x}", gpa))?;
+        node.set_prop("reg", &[gpa, size])?;
+        node.set_prop("no-map", ())?;
+    }
+
+    // KGSL native-context arena: a third no-map node on the same terms. The guest never
+    // allocates from it -- the kgsl wire is host-alloc only -- so unlike gpu_guest_reserved
+    // nothing in the guest matches this name; it exists so the RM blesses the range by `reg`.
+    if let Some((gpa, size)) = kgsl_resv {
+        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+        resv.set_prop("#address-cells", 0x2u32)?;
+        resv.set_prop("#size-cells", 0x2u32)?;
+        resv.set_prop("ranges", ())?;
+        let node = resv.subnode_mut(&format!("kgsl_reserved@{:x}", gpa))?;
         node.set_prop("reg", &[gpa, size])?;
         node.set_prop("no-map", ())?;
     }

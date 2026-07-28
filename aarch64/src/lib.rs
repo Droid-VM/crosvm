@@ -613,6 +613,26 @@ impl arch::LinuxArch for AArch64 {
                     .purpose(MemoryRegionPurpose::GpuPoolGuest)
                     .align(2 << 20),
             ));
+            pool_top = base + (gpu_guest_pool_mb << 20);
+        }
+        // KGSL native-context arena (--pre-alloc kgsl-mb): a third SHARE-blessed pool that
+        // virglrenderer's kgsl backend sub-allocates every GPU BO from, stacked above the gfx
+        // pools on the same terms. Separate from GpuPool so a binary carrying both renderers
+        // cannot hand this one to gfxstream's HostVisiblePool, and so the two can be sized
+        // independently in a build that runs either.
+        let kgsl_pool_mb: u64 = std::env::var("NCTX_KGSL_POOL_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if kgsl_pool_mb != 0 {
+            let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
+            memory_regions.push((
+                GuestAddress(base),
+                kgsl_pool_mb << 20,
+                MemoryRegionOptions::new()
+                    .purpose(MemoryRegionPurpose::KgslPool)
+                    .align(2 << 20),
+            ));
         }
 
         // Add simplefb region as SharedFramebuffer.
@@ -1186,6 +1206,7 @@ impl arch::LinuxArch for AArch64 {
         // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
         // pool region emitted).
         let mut gpu_guest_resv: Option<(u64, u64)> = None;
+        let mut kgsl_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
             let mut found = None;
             for region in vm.get_memory().regions() {
@@ -1228,6 +1249,36 @@ impl arch::LinuxArch for AArch64 {
                     );
                     gpu_guest_resv = Some((gpa, region.size as u64));
                 }
+                // KGSL arena: hand virglrenderer's kgsl backend the memfd view. It lives in this
+                // process, so the host VA crosvm already mapped is directly usable and saves the
+                // backend a second mapping of the same pages; the fd + offset are exported too so
+                // it can build per-BO udmabuf windows over the arena.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::KgslPool {
+                    let fd = region.shm.as_raw_descriptor();
+                    let gpa = region.guest_addr.offset();
+                    std::env::set_var("CROSVM_KGSL_ARENA_FD", fd.to_string());
+                    std::env::set_var(
+                        "CROSVM_KGSL_ARENA_FD_OFFSET",
+                        region.shm_offset.to_string(),
+                    );
+                    std::env::set_var(
+                        "CROSVM_KGSL_ARENA_HOST_VA",
+                        (region.host_addr as u64).to_string(),
+                    );
+                    std::env::set_var("CROSVM_KGSL_ARENA_GPA", format!("{:#x}", gpa));
+                    std::env::set_var("CROSVM_KGSL_ARENA_SIZE", (region.size as u64).to_string());
+                    base::warn!(
+                        "GPU-POOL: KgslPool region gpa={:#x} size={:#x} fd={} off={:#x} \
+                         hva={:#x} (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        fd,
+                        region.shm_offset,
+                        region.host_addr,
+                    );
+                    kgsl_resv = Some((gpa, region.size as u64));
+                }
             }
             found
         };
@@ -1262,6 +1313,7 @@ impl arch::LinuxArch for AArch64 {
             }),
             gpu_resv,
             gpu_guest_resv,
+            kgsl_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,
             components.simplefb.as_ref().map(|sfb| {

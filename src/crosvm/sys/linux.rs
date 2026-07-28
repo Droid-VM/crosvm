@@ -2138,6 +2138,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Some(mb) = pa.gfx_guest_mb {
             std::env::set_var("NCTX_GFX_GUEST_POOL_MB", mb.to_string());
         }
+        if let Some(mb) = pa.kgsl_mb {
+            std::env::set_var("NCTX_KGSL_POOL_MB", mb.to_string());
+        }
     }
 
     let components = setup_vm_components(&cfg)?;

@@ -2027,6 +2027,7 @@ pub struct RunCommand {
     /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
     ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
     ///     gfx-guest-mb=<MB> - gfxstream guest-alloc pool size (default 0 = guest-alloc pool off)
+    ///     kgsl-mb=<MB>      - KGSL native-context arena size (default 0 = kgsl runtime-share)
     pub pre_alloc: Option<PreAllocConfig>,
 
     #[argh(switch)]

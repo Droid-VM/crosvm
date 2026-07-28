@@ -608,6 +608,8 @@ impl GeniezoneVm {
                 MemoryRegionPurpose::GpuPool => GZVM_USER_MEM_REGION_GUEST_MEM,
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 MemoryRegionPurpose::GpuPoolGuest => GZVM_USER_MEM_REGION_GUEST_MEM,
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::KgslPool => GZVM_USER_MEM_REGION_GUEST_MEM,
                 MemoryRegionPurpose::GuestMemoryRegion => GZVM_USER_MEM_REGION_GUEST_MEM,
                 MemoryRegionPurpose::ProtectedFirmwareRegion => GZVM_USER_MEM_REGION_PROTECT_FW,
                 MemoryRegionPurpose::ReservedMemory => GZVM_USER_MEM_REGION_GUEST_MEM,

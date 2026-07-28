@@ -561,6 +561,11 @@ pub struct PreAllocConfig {
     /// driver owns and sub-allocates BLOB_MEM_GUEST from in guest-alloc (udmabuf=true) mode. Absent
     /// => 0 (no guest-alloc pool). Its own GpuPoolGuest region + `gpu_guest_reserved` DT node.
     pub gfx_guest_mb: Option<u64>,
+    /// KGSL native-context arena size (MB): the pool virglrenderer's kgsl backend sub-allocates
+    /// every GPU BO from, instead of creating a fresh memfd per BO and runtime-SHARE'ing it.
+    /// Absent => 0 (kgsl runs on the runtime-share path). Its own KgslPool region +
+    /// `kgsl_reserved` DT node. Only meaningful with `--gpu backend=virglrenderer`.
+    pub kgsl_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
