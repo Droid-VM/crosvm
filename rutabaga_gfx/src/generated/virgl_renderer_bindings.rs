@@ -453,6 +453,13 @@ extern "C" {
         fd: *mut ::std::os::raw::c_int,
     ) -> ::std::os::raw::c_int;
 }
+extern "C" {
+    pub fn virgl_renderer_resource_export_display_blob(
+        res_id: u32,
+        fd_type: *mut u32,
+        fd: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct virgl_renderer_resource_import_blob_args {

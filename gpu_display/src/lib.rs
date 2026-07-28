@@ -329,6 +329,12 @@ trait DisplayT: AsRawDescriptor {
         None
     }
 
+    /// Returns whether this backend can import DMA-BUF resources. Backends with a runtime
+    /// capability probe should cache the result for the lifetime of the display.
+    fn is_dmabuf_import_supported(&mut self) -> bool {
+        true
+    }
+
     /// Creates a surface with the given parameters.  The display backend is given a non-zero
     /// `surface_id` as a handle for subsequent operations.
     fn create_surface(
@@ -370,6 +376,9 @@ pub enum DisplayExternalResourceImport<'a> {
         offset: u32,
         stride: u32,
         modifiers: u64,
+        /// True only when the producer has verified that this single-plane
+        /// DMA-BUF contains a linear image with the supplied layout.
+        linear_layout_verified: bool,
         width: u32,
         height: u32,
         fourcc: u32,
@@ -555,9 +564,7 @@ impl GpuDisplay {
             }
 
             if !matched {
-                if let Some(gpu_display_events) =
-                    self.inner.handle_next_event_without_surface()
-                {
+                if let Some(gpu_display_events) = self.inner.handle_next_event_without_surface() {
                     for event_device in self.event_devices.values_mut() {
                         if event_device.kind() != gpu_display_events.device_type {
                             continue;
@@ -722,6 +729,11 @@ impl GpuDisplay {
 
         self.next_id += 1;
         Ok(import_id)
+    }
+
+    /// Returns whether the display backend can import DMA-BUF resources.
+    pub fn is_dmabuf_import_supported(&mut self) -> bool {
+        self.inner.is_dmabuf_import_supported()
     }
 
     /// Releases a previously imported resource identified by the given handle.

@@ -67,3 +67,36 @@ extern "C" fn post_android_surface_buffer(
 ) {
     unimplemented!();
 }
+
+#[no_mangle]
+extern "C" fn android_display_import_dmabuf(
+    _ctx: *mut AndroidDisplayContext,
+    _surface: *mut AndroidDisplaySurface,
+    _fd: base::RawDescriptor,
+    _offset: u32,
+    _stride: u32,
+    _modifier: u64,
+    _linear_layout_verified: bool,
+    _width: u32,
+    _height: u32,
+    _fourcc: u32,
+) -> i64 {
+    0
+}
+
+#[no_mangle]
+extern "C" fn android_display_release_import(_ctx: *mut AndroidDisplayContext, _raw_handle: i64) {}
+
+#[no_mangle]
+extern "C" fn android_display_is_vulkan_blit_available(_ctx: *mut AndroidDisplayContext) -> bool {
+    false
+}
+
+#[no_mangle]
+extern "C" fn android_display_flip_to(
+    _ctx: *mut AndroidDisplayContext,
+    _surface: *mut AndroidDisplaySurface,
+    _raw_handle: i64,
+) -> bool {
+    false
+}
