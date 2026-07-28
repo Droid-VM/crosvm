@@ -318,6 +318,38 @@ fn export_query(resource_id: u32) -> RutabagaResult<Query> {
     Ok(query)
 }
 
+/// The KGSL native-context arena, as (host VA, size), announced by the VMM before the GPU
+/// device is built. `None` when no KgslPool was configured.
+fn kgsl_pool_window() -> Option<(u64, u64)> {
+    static WINDOW: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let va: u64 = std::env::var("CROSVM_KGSL_ARENA_HOST_VA").ok()?.parse().ok()?;
+        let size: u64 = std::env::var("CROSVM_KGSL_ARENA_SIZE").ok()?.parse().ok()?;
+        (va != 0 && size != 0).then_some((va, size))
+    })
+}
+
+/// Byte offset of a resource inside the KGSL pool, or None if it does not live there.
+///
+/// Asked at creation, when the kgsl backend has just recorded the arena pointer on the
+/// resource, and asked through an accessor that only READS it. The obvious alternative --
+/// map() then unmap() -- is not a query: virglrenderer's map records res->mapped and its
+/// unmap munmaps a dmabuf, so probing with the pair tears down mappings the renderer is
+/// still using.
+fn kgsl_pool_offset(resource_id: u32) -> Option<u64> {
+    let (pool_va, pool_size) = kgsl_pool_window()?;
+    let mut ptr: *mut c_void = null_mut();
+    let mut size: u64 = 0;
+    // SAFETY: the accessor only reads virgl_resource fields and writes the two out params.
+    let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut ptr, &mut size) };
+    if ret != 0 {
+        return None;
+    }
+    let addr = ptr as u64;
+    let end = addr.checked_add(size)?;
+    (addr >= pool_va && end <= pool_va.checked_add(pool_size)?).then(|| addr - pool_va)
+}
+
 impl VirglRenderer {
     pub fn init(
         virglrenderer_flags: VirglRendererFlags,
@@ -769,7 +801,7 @@ impl RutabagaComponent for VirglRenderer {
             component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
             size: resource_create_blob.size,
             mapping: None,
-            pool_offset: None,
+            pool_offset: kgsl_pool_offset(resource_id),
         })
     }
 
