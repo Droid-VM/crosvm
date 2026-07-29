@@ -33,6 +33,7 @@ use crate::renderer_utils::*;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
+use crate::rutabaga_os::AsRawDescriptor;
 use crate::rutabaga_os::FromRawDescriptor;
 use crate::rutabaga_os::IntoRawDescriptor;
 use crate::rutabaga_os::OwnedDescriptor;
@@ -760,13 +761,43 @@ impl RutabagaComponent for VirglRenderer {
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
         mut iovec_opt: Option<Vec<RutabagaIovec>>,
-        _handle_opt: Option<RutabagaHandle>,
+        handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         let mut iovec_ptr = null_mut();
         let mut num_iovecs = 0;
         if let Some(ref mut iovecs) = iovec_opt {
             iovec_ptr = iovecs.as_mut_ptr();
             num_iovecs = iovecs.len();
+        }
+
+        // GUEST-ALLOC: the guest allocated these pages and the GPU device turned the blob's
+        // iovecs into a dma-buf. virglrenderer's create_blob has nowhere to put it -- the DRM
+        // backend needs it inside get_blob() -- so park it on the context first. Only the VMM
+        // can build it: it alone holds the guest memfd the pages live in.
+        //
+        // Errors are not fatal here on purpose. -ENOTSUP means this context does not implement
+        // guest-allocated blobs, in which case create_blob below behaves exactly as it did
+        // before and the resource is backed the old way.
+        if let Some(ref handle) = handle_opt {
+            if handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+                // SAFETY: the descriptor is owned by `handle` and stays alive for this call;
+                // virglrenderer dups what it keeps.
+                let ret = unsafe {
+                    virgl_renderer_resource_set_guest_blob_fd(
+                        ctx_id,
+                        resource_create_blob.blob_id,
+                        handle.os_handle.as_raw_descriptor(),
+                    )
+                };
+                if ret != 0 && ret != -(libc::ENOTSUP as i32) {
+                    log::warn!(
+                        "set_guest_blob_fd(ctx={} blob_id={}) failed: {}",
+                        ctx_id,
+                        resource_create_blob.blob_id,
+                        ret
+                    );
+                }
+            }
         }
 
         let resource_create_args = virgl_renderer_resource_create_blob_args {
