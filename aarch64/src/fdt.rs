@@ -887,9 +887,9 @@ pub fn create_fdt(
         node.set_prop("no-map", ())?;
     }
 
-    // KGSL native-context arena: a third no-map node on the same terms. The guest never
-    // allocates from it -- the kgsl wire is host-alloc only -- so unlike gpu_guest_reserved
-    // nothing in the guest matches this name; it exists so the RM blesses the range by `reg`.
+    // DRM native context host-alloc pool: a no-map node on the same terms. The guest allocates
+    // nothing from it -- it holds the host's own msm shmem rings -- so nothing in the guest
+    // matches this name; it exists so the RM blesses the range by `reg`.
     if let Some((gpa, size)) = kgsl_resv {
         let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
         resv.set_prop("#address-cells", 0x2u32)?;

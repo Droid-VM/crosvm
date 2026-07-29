@@ -543,13 +543,20 @@ pub struct RuntimeShareConfig {
     pub exceed_policy: Option<RuntimeShareExceedPolicy>,
 }
 
-/// Host-owned pre-allocated GPU pool sizes (MB). These are boot-blessed regions (SHARE'd once,
-/// folio-backed) that the in-process renderer sub-allocates host-visible blobs from -- no runtime
-/// per-blob SHARE. `gfx-host-mb` backs the gfxstream host-visible pool; `gfx-guest-mb` backs the
-/// gfxstream guest-alloc pool. Needed very early (guest memory layout), so crosvm exports these to
-/// the renderer as `NCTX_GFX_POOL_MB` env before the GPU process forks -- the user no longer
-/// hand-exports them.
-/// `--pre-alloc "gfx-host-mb=256,gfx-guest-mb=1024"`.
+/// Pre-allocated GPU pool sizes (MB). Every one of these is a boot-blessed region -- SHARE'd once,
+/// folio-backed -- that something sub-allocates from, so no blob needs a runtime per-blob SHARE.
+///
+/// The names are `<route>-<who allocates>-mb`. The route prefix is `gfx` for gfxstream and `drm`
+/// for the DRM native context; the middle word says which side owns the allocator inside the pool,
+/// which is the distinction that actually changes behaviour:
+///   host   the renderer sub-allocates, and the guest is handed offsets into the region.
+///   guest  the guest virtio-gpu driver sub-allocates with drm_buddy and hands the host pages.
+///
+/// Sizes are needed very early (they shape the guest memory layout), so crosvm exports them to the
+/// renderer as env before the GPU process forks rather than expecting the user to hand-export them.
+///
+/// `--pre-alloc "gfx-host-mb=256,gfx-guest-mb=1024"`
+/// `--pre-alloc "drm-host-mb=8,drm-guest-mb=1024"`
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PreAllocConfig {
@@ -557,15 +564,25 @@ pub struct PreAllocConfig {
     /// sub-allocates from (ASG rings + host-visible blobs). Absent => 0 (host pre-alloc off ->
     /// runtime-share). Its own SHARE-blessed GpuPool region + `gpu_blob_reserved` DT node.
     pub gfx_host_mb: Option<u64>,
-    /// gfxstream GUEST-alloc pool size (MB): a separate SHARE-blessed region the guest virtio-gpu
-    /// driver owns and sub-allocates BLOB_MEM_GUEST from in guest-alloc (udmabuf=true) mode. Absent
-    /// => 0 (no guest-alloc pool). Its own GpuPoolGuest region + `gpu_guest_reserved` DT node.
-    pub gfx_guest_mb: Option<u64>,
-    /// KGSL native-context arena size (MB): the pool virglrenderer's kgsl backend sub-allocates
-    /// every GPU BO from, instead of creating a fresh memfd per BO and runtime-SHARE'ing it.
-    /// Absent => 0 (kgsl runs on the runtime-share path). Its own KgslPool region +
-    /// `kgsl_reserved` DT node. Only meaningful with `--gpu backend=virglrenderer`.
-    pub kgsl_mb: Option<u64>,
+    /// GUEST-allocated pool size (MB): a SHARE-blessed region the guest virtio-gpu driver owns
+    /// and sub-allocates every guest-alloc blob from with drm_buddy, handing the host dma-bufs
+    /// built over those pages. Absent => 0 (no guest-alloc pool). Its own GpuPoolGuest region +
+    /// `gpu_guest_reserved` DT node.
+    ///
+    /// One knob for both renderers on purpose. The guest driver keeps a single pool and a single
+    /// allocator and cannot tell which renderer is asking -- it takes whichever reserved-memory
+    /// node it finds -- and only one renderer runs in a VM anyway. Two per-route names would be
+    /// two names for one thing, and setting both would silently pin a whole second pool the guest
+    /// never touches.
+    pub gpu_guest_mb: Option<u64>,
+
+    /// DRM native context HOST-allocated pool size (MB): the region virglrenderer's DRM backend
+    /// sub-allocates from. Since BO backing moved to the guest this holds only the per-context msm
+    /// shmem rings -- 16 KiB each -- so single-digit MB is the right size, not the gigabyte the
+    /// BO pool needed. Absent => 0, and the rings fall back to a runtime SHARE apiece, which is
+    /// the round trip this route exists to avoid. Its own KgslPool region + `kgsl_reserved` DT
+    /// node. Only meaningful with `--gpu backend=virglrenderer`.
+    pub drm_host_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]

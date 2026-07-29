@@ -615,11 +615,10 @@ impl arch::LinuxArch for AArch64 {
             ));
             pool_top = base + (gpu_guest_pool_mb << 20);
         }
-        // KGSL native-context arena (--pre-alloc kgsl-mb): a third SHARE-blessed pool that
-        // virglrenderer's kgsl backend sub-allocates every GPU BO from, stacked above the gfx
-        // pools on the same terms. Separate from GpuPool so a binary carrying both renderers
-        // cannot hand this one to gfxstream's HostVisiblePool, and so the two can be sized
-        // independently in a build that runs either.
+        // DRM native context HOST-alloc pool (--pre-alloc drm-host-mb): what virglrenderer's DRM
+        // backend sub-allocates from. Since BO backing moved to the guest pool above, this holds
+        // only the per-context msm shmem rings. Separate from GpuPool so a binary carrying both
+        // renderers cannot hand this one to gfxstream's HostVisiblePool.
         let kgsl_pool_mb: u64 = std::env::var("NCTX_KGSL_POOL_MB")
             .ok()
             .and_then(|s| s.parse().ok())

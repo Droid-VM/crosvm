@@ -780,22 +780,36 @@ impl RutabagaComponent for VirglRenderer {
         // before and the resource is backed the old way.
         if let Some(ref handle) = handle_opt {
             if handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
-                // SAFETY: the descriptor is owned by `handle` and stays alive for this call;
-                // virglrenderer dups what it keeps.
+                // Hand over a DUP, not the descriptor itself. virgl_renderer_resource_set_guest_blob_fd
+                // takes ownership, and `handle` still owns os_handle and closes it when this
+                // function returns -- passing the raw fd makes both sides close the same one.
+                //
+                // The second close lands on whatever inherited that fd number in between, which
+                // is a long-lived socket often enough to matter: it showed up as the VNC server
+                // failing a read with EBADF and dropping its client, a symptom with nothing in it
+                // to suggest a blob descriptor.
+                let dup_fd = handle.os_handle.try_clone()?.into_raw_descriptor();
+                // SAFETY: dup_fd is a fresh descriptor this call gives away; nothing here closes it.
                 let ret = unsafe {
                     virgl_renderer_resource_set_guest_blob_fd(
                         ctx_id,
                         resource_create_blob.blob_id,
-                        handle.os_handle.as_raw_descriptor(),
+                        dup_fd,
                     )
                 };
-                if ret != 0 && ret != -(libc::ENOTSUP as i32) {
-                    log::warn!(
-                        "set_guest_blob_fd(ctx={} blob_id={}) failed: {}",
-                        ctx_id,
-                        resource_create_blob.blob_id,
-                        ret
-                    );
+                if ret != 0 {
+                    // SAFETY: ownership only transfers on success, so the dup is still ours.
+                    unsafe { libc::close(dup_fd) };
+                    // -ENOTSUP just means this context does not implement guest-allocated
+                    // blobs, which is not a problem: create_blob below behaves as before.
+                    if ret != -(libc::ENOTSUP as i32) {
+                        log::warn!(
+                            "set_guest_blob_fd(ctx={} blob_id={}) failed: {}",
+                            ctx_id,
+                            resource_create_blob.blob_id,
+                            ret
+                        );
+                    }
                 }
             }
         }

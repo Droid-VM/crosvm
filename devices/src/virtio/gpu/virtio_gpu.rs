@@ -71,6 +71,7 @@ use super::protocol::GpuResponsePlaneInfo;
 use super::protocol::VirtioGpuResult;
 use super::protocol::VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE;
 use super::protocol::VIRTIO_GPU_BLOB_MEM_HOST3D;
+use super::protocol::VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST;
 use super::protocol::VIRTIO_GPU_MAP_INFO_POOL;
 use super::VirtioScanoutBlobData;
 use crate::virtio::gpu::edid::DisplayInfo;
