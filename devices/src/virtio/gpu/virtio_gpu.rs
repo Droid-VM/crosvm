@@ -1569,6 +1569,17 @@ impl VirtioGpu {
                     pool_iovecs = Some(segs);
                 }
             }
+
+            // HOST3D_GUEST means both storages: the renderer's context produces the host object
+            // AND the guest supplies the pages. virglrenderer enforces the second half -- it
+            // rejects the blob if the iovecs do not cover its size -- so a guest-allocated blob
+            // on that path needs the iovecs as well as the dma-buf, not one or the other. The
+            // udmabuf above is what the GPU ends up bound to; these are what makes the resource
+            // legal to create in the first place.
+            if resource_create_blob.blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST {
+                let iovs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
+                rutabaga_iovecs = Some(iovs);
+            }
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
             let iovs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
             rutabaga_iovecs = Some(iovs);
