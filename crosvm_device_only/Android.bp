@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright DroidVM contributors
+// Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
+
 // Standalone device-only crosvm binary.
 //
 // Same source, same features and rustlibs as the main "crosvm" module, but

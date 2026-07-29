@@ -1,4 +1,7 @@
-// Copyright 2026 DroidVM. GPL-2.0-only, matching the crosvm fork.
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright DroidVM contributors
+// Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
+
 
 //! virtio-gunyah-accept: host->guest transport for VmAccept::Sync.
 //!
