@@ -580,7 +580,7 @@ pub struct PreAllocConfig {
     /// sub-allocates from. Since BO backing moved to the guest this holds only the per-context msm
     /// shmem rings -- 16 KiB each -- so single-digit MB is the right size, not the gigabyte the
     /// BO pool needed. Absent => 0, and the rings fall back to a runtime SHARE apiece, which is
-    /// the round trip this route exists to avoid. Its own KgslPool region + `kgsl_reserved` DT
+    /// the round trip this route exists to avoid. Its own Drm2KgslPool region + `drm2kgsl_reserved` DT
     /// node. Only meaningful with `--gpu backend=virglrenderer`.
     pub drm_host_mb: Option<u64>,
 }

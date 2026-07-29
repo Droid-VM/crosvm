@@ -2026,8 +2026,8 @@ pub struct RunCommand {
     /// sub-allocates host-visible blobs from (no runtime per-blob SHARE). crosvm exports these to
     /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
     ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
-    ///     gfx-guest-mb=<MB> - gfxstream guest-alloc pool size (default 0 = guest-alloc pool off)
-    ///     kgsl-mb=<MB>      - KGSL native-context arena size (default 0 = kgsl runtime-share)
+    ///     gpu-guest-mb=<MB> - guest-alloc pool size, shared by both renderers (0 = off)
+    ///     drm-host-mb=<MB>  - drm2kgsl host arena size (0 = drm2kgsl runtime-share)
     pub pre_alloc: Option<PreAllocConfig>,
 
     #[argh(switch)]

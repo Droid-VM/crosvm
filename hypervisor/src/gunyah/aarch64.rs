@@ -199,8 +199,8 @@ impl VmAArch64 for GunyahVm {
                 // Guest-alloc pool: same — needs the shm vdevice + stage-2 mapping so the
                 // guest driver can allocate from it and the host resolves its mem-entries.
                 MemoryRegionPurpose::GpuPoolGuest => true,
-                // KGSL arena: same -- shm vdevice + stage-2 mapping, no runtime accept.
-                MemoryRegionPurpose::KgslPool => true,
+                // drm2kgsl arena: same -- shm vdevice + stage-2 mapping, no runtime accept.
+                MemoryRegionPurpose::Drm2KgslPool => true,
                 MemoryRegionPurpose::GuestMemoryRegion => false,
                 // Described by the "firmware-address" property
                 MemoryRegionPurpose::ProtectedFirmwareRegion => false,

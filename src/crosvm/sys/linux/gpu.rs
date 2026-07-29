@@ -104,9 +104,9 @@ pub fn create_gpu_device(
     // prepare_runtime_blob_backing; the VRAM quota is metered GPU-side. gfxstream no longer reads
     // any GFXSTREAM_VRAM_* env.)
     //
-    // Only when gfxstream is the renderer. One binary carries both backends and the DRM/KGSL
+    // Only when gfxstream is the renderer. One binary carries both backends and the drm2kgsl
     // native context runs through virglrenderer, where every name below is dead weight -- and
-    // an inherited GFXSTREAM_* in a kgsl process environment reads like a misconfiguration to
+    // an inherited GFXSTREAM_* in a drm2kgsl process environment reads like a misconfiguration to
     // anyone debugging one.
     #[cfg(feature = "gfxstream")]
     if gpu_params.mode == devices::virtio::GpuMode::ModeGfxstream {

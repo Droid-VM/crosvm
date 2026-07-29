@@ -131,6 +131,14 @@ pub enum MemoryRegionPurpose {
     /// BIOS/firmware ROM
     Bios,
 
+    /// DroidVM: drm2kgsl native-context arena. A third SHARE-blessed pool, treated exactly like
+    /// GpuPool for access/bless/hugepage, that virglrenderer's drm2kgsl backend sub-allocates every
+    /// GPU BO from. Distinct from GpuPool so a build carrying both renderers cannot hand the
+    /// drm2kgsl arena to gfxstream's HostVisiblePool (which is handed any GpuPool region), so the
+    /// two can be sized independently, and so it gets its own `drm2kgsl_reserved` DT node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    Drm2KgslPool,
+
     /// DroidVM: GPU pre-alloc pool (gfxstream HOST-visible pool). Appended after
     /// guest RAM, SHARE'd (not lent) at boot on protected Gunyah so the host renderer and the guest
     /// reach the same pages, hugepage-prepared, and announced as a no-map reserved-memory node.
@@ -147,14 +155,6 @@ pub enum MemoryRegionPurpose {
     /// General purpose guest memory
     #[default]
     GuestMemoryRegion,
-
-    /// DroidVM: KGSL native-context arena. A third SHARE-blessed pool, treated exactly like
-    /// GpuPool for access/bless/hugepage, that virglrenderer's kgsl backend sub-allocates every
-    /// GPU BO from. Distinct from GpuPool so a build carrying both renderers cannot hand the
-    /// kgsl arena to gfxstream's HostVisiblePool (which is handed any GpuPool region), so the
-    /// two can be sized independently, and so it gets its own `kgsl_reserved` DT node.
-    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    KgslPool,
 
     /// PVMFW
     ProtectedFirmwareRegion,
@@ -526,10 +526,10 @@ impl GuestMemory {
             // that point into it via get_slice_at_addr (the whole point of guest-alloc).
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::GpuPoolGuest => Ok(()),
-            // KGSL arena: SHARE'd like the gfx pools. virglrenderer's kgsl backend lives in this
+            // drm2kgsl arena: SHARE'd like the gfx pools. that backend lives in this
             // process and sub-allocates BOs out of it, so the host needs access.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            MemoryRegionPurpose::KgslPool => Ok(()),
+            MemoryRegionPurpose::Drm2KgslPool => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::SharedFramebuffer => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

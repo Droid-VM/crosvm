@@ -1617,8 +1617,8 @@ impl VirtioGpu {
         // BAR -- just tell the guest its pool byte offset. It maps pool_gpa + offset directly
         // (VIRTIO_GPU_MAP_INFO_POOL flag set; the offset rides the spec's padding field, and no
         // runtime SHARE happens at all). gfxstream records the offset when it sub-allocates from
-        // the HostVisiblePool; virglrenderer's kgsl backend when it sub-allocates from the
-        // KgslPool. Both arrive here as RutabagaResource::pool_offset.
+        // the HostVisiblePool; virglrenderer's drm2kgsl backend when it sub-allocates from the
+        // Drm2KgslPool. Both arrive here as RutabagaResource::pool_offset.
         if let Some(pool_offset) = self.rutabaga.resource_pool_offset(resource_id) {
             let resource = self
                 .resources

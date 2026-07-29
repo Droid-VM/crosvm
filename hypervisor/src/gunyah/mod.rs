@@ -287,10 +287,10 @@ impl GunyahVm {
                     // mem-entries into it), never lent.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::GpuPoolGuest => false,
-                    // KGSL arena: SHARE'd like the gfx pools; the kgsl backend runs in this
+                    // drm2kgsl arena: SHARE'd like the gfx pools; that backend runs in this
                     // process and must keep reaching it.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                    MemoryRegionPurpose::KgslPool => false,
+                    MemoryRegionPurpose::Drm2KgslPool => false,
                     MemoryRegionPurpose::GuestMemoryRegion => true,
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::ProtectedFirmwareRegion => true,
@@ -410,7 +410,7 @@ impl GunyahVm {
                         region.options.purpose,
                         MemoryRegionPurpose::GpuPool
                             | MemoryRegionPurpose::GpuPoolGuest
-                            | MemoryRegionPurpose::KgslPool
+                            | MemoryRegionPurpose::Drm2KgslPool
                     )
                 {
                     // SAFETY: host_addr is a valid mapping of region.size bytes.
@@ -461,7 +461,7 @@ impl GunyahVm {
                     region.options.purpose,
                     MemoryRegionPurpose::GpuPool
                         | MemoryRegionPurpose::GpuPoolGuest
-                        | MemoryRegionPurpose::KgslPool
+                        | MemoryRegionPurpose::Drm2KgslPool
                 ) {
                     mthp::compute_share_chunks(region.size.try_into().unwrap())
                 } else {
