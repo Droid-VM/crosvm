@@ -40,6 +40,22 @@ ioctl_iow_nr!(
 flexible_array_impl!(udmabuf_create_list, udmabuf_create_item, count, list);
 type UdmabufCreateList = FlexibleArrayWrapper<udmabuf_create_list, udmabuf_create_item>;
 
+/// Most entries this will hand to UDMABUF_CREATE_LIST in one call.
+///
+/// The entry count arrives from the guest -- it is `nr_entries` on the wire, a Le32, and on the
+/// guest side it is bounded only by a writable module parameter. Everything between the two is
+/// pass-through: the list allocated below is sized from `iovecs.len()` with no clamp. So without
+/// this, the only bound on a single call is whatever the host's udmabuf driver happens to enforce,
+/// and a VMM should not be relying on the kernel to sanity-check a number a guest chose.
+///
+/// 16384 matches the guest driver's own `guest_pool_max_nents` and our udmabuf module's
+/// `list_limit`, so this rejects nothing that is expected to work; it exists to make the refusal
+/// happen here, with a legible error, rather than as an ENOMEM out of an ioctl.
+///
+/// This is a PER-CALL bound and deliberately not presented as more than that. It does not limit
+/// the total across concurrent dma-bufs, which is a separate gap.
+const MAX_UDMABUF_ENTRIES: usize = 16384;
+
 // Returns absolute offset within the memory corresponding to a particular guest address.
 // This offset is not relative to a particular mapping.
 
@@ -96,6 +112,13 @@ impl UdmabufDriverTrait for UnixUdmabufDriver {
         iovecs: &[(GuestAddress, usize)],
     ) -> UdmabufResult<SafeDescriptor> {
         let pgsize = pagesize();
+
+        if iovecs.len() > MAX_UDMABUF_ENTRIES {
+            return Err(UdmabufError::TooManyEntries(
+                iovecs.len(),
+                MAX_UDMABUF_ENTRIES,
+            ));
+        }
 
         let mut list = UdmabufCreateList::new(iovecs.len());
         let items = list.mut_entries_slice();
