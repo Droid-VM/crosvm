@@ -685,6 +685,67 @@ impl GuestMemory {
         grants.keys().nth(pool_id as usize).copied().map(GuestAddress)
     }
 
+    /// Take a host-side reference on every growable pool the iovecs touch, after checking that
+    /// all of them are backed.
+    ///
+    /// Two jobs in one pass, because they need the same lookup:
+    ///
+    ///   * REFUSE an import over unbacked pool memory. The udmabuf path resolves guest addresses
+    ///     through `find_region`/`shm_region`, which are not gated by `check_host_access`, so
+    ///     without this a guest could have a dma-buf built over a HOLE in the sparse pool memfd.
+    ///     Reading such a buffer allocates host memory on the spot -- a guest-triggerable,
+    ///     unaccounted, never-reclaimed host allocation.
+    ///
+    ///   * Hold the grant until the import is gone, so a shrink cannot pull memory out from under
+    ///     a live dma-buf. The guest cannot get this right by itself: its RESOURCE_UNREF is
+    ///     fire-and-forget, so it returns a buffer to its own allocator while the host still has
+    ///     it mapped.
+    ///
+    /// All or nothing: if any iovec is unbacked, nothing is referenced. Addresses outside every
+    /// growable pool are ignored, so callers do not have to know which is which.
+    pub fn pool_ref_iovecs(&self, iovecs: &[(GuestAddress, usize)]) -> std::result::Result<(), GrantError> {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        if grants.is_empty() {
+            return Ok(());
+        }
+        // Check everything before touching anything, so a refusal leaves no counts raised.
+        for (addr, len) in iovecs {
+            for (base, pool) in grants.iter() {
+                let a = addr.offset();
+                if a >= *base && a < *base + pool.size() {
+                    if !pool.range_backed(a - *base, *len as u64) {
+                        return Err(GrantError::NotBacked);
+                    }
+                }
+            }
+        }
+        for (addr, len) in iovecs {
+            for (base, pool) in grants.iter_mut() {
+                let a = addr.offset();
+                if a >= *base && a < *base + pool.size() {
+                    let _ = pool.ref_range(a - *base, *len as u64);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop references taken by [`Self::pool_ref_iovecs`]. Must be handed the same iovecs.
+    pub fn pool_unref_iovecs(&self, iovecs: &[(GuestAddress, usize)]) {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        if grants.is_empty() {
+            return;
+        }
+        for (addr, len) in iovecs {
+            for (base, pool) in grants.iter_mut() {
+                let a = addr.offset();
+                if a >= *base && a < *base + pool.size() {
+                    pool.unref_range(a - *base, *len as u64);
+                }
+            }
+        }
+    }
+
     /// Grant granularity of a pool, or `None` if there is no such pool.
     pub fn pool_step(&self, pool_id: u32) -> Option<u64> {
         let grants = self.grants.lock().expect("pool grant table poisoned");

@@ -56,6 +56,14 @@ pub enum GrantError {
     /// it whole, so it can only be released exactly as it was taken. A caller that wants to give
     /// part of it back has to release all of it and re-grow the remainder.
     PartialRelease,
+    /// Some part of the range is not inside a live grant. From the host's own accesses this is
+    /// the silent-zero case -- a read of unbacked pool memory returns zeros rather than faulting
+    /// -- so it has to be refused explicitly.
+    NotBacked,
+    /// The range is still referenced by something on the host: a dma-buf built over it, a GPU
+    /// mapping, a scanout iovec. The guest cannot know this, because its RESOURCE_UNREF is
+    /// fire-and-forget and it drops a buffer from its allocator while the host still holds it.
+    Busy,
     /// Would exceed the pool's own cap on live grants. Each grant is an RM memparcel, and
     /// MAX_MEMPARCEL_PER_VM is 1024 for the whole VM -- shared with Android's own parcels, and
     /// not released by anything short of a reboot for whatever a killed VMM left behind.
@@ -70,6 +78,8 @@ impl GrantError {
             GrantError::AlreadyGranted => libc::EEXIST,
             GrantError::NotGranted => libc::ENOENT,
             GrantError::PartialRelease => libc::ERANGE,
+            GrantError::NotBacked => libc::EFAULT,
+            GrantError::Busy => libc::EBUSY,
             _ => libc::EINVAL,
         }
     }
@@ -88,6 +98,19 @@ impl GrantError {
 /// fine-grained release grows in small requests; one that wants quota efficiency grows in big
 /// ones. That choice is made at grow time and cannot be revised later, which is why a partial
 /// release is refused loudly rather than approximated.
+/// One live grant: one RM memparcel, and how many host-side objects are built over it.
+///
+/// The count is per GRANT rather than per page because the grant is the unit of release -- there
+/// is no way to give back part of a parcel, so finer tracking would answer a question that cannot
+/// be acted on.
+#[derive(Debug)]
+struct Grant {
+    len: u64,
+    handle: u32,
+    /// Host objects referencing any part of this grant: dma-bufs, GPU mappings, scanout iovecs.
+    refs: u32,
+}
+
 #[derive(Debug)]
 pub struct PoolGrants {
     base: u64,
@@ -95,8 +118,8 @@ pub struct PoolGrants {
     pre_alloc: u64,
     step: u64,
     max_grants: u32,
-    /// Offset from the pool base -> (length, RM memparcel handle). Non-overlapping by construction.
-    granted: BTreeMap<u64, (u64, u32)>,
+    /// Offset from the pool base -> the grant there. Non-overlapping by construction.
+    granted: BTreeMap<u64, Grant>,
 }
 
 impl PoolGrants {
@@ -109,6 +132,10 @@ impl PoolGrants {
             max_grants,
             granted: BTreeMap::new(),
         }
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
     }
 
     pub fn step(&self) -> u64 {
@@ -145,12 +172,73 @@ impl PoolGrants {
     /// Does `[offset, offset+len)` touch any live grant?
     fn overlaps(&self, offset: u64, len: u64) -> bool {
         // The grant starting at or before `offset`, plus everything starting inside the range.
-        if let Some((&o, &(l, _))) = self.granted.range(..=offset).next_back() {
-            if o + l > offset {
+        if let Some((&o, g)) = self.granted.range(..=offset).next_back() {
+            if o + g.len > offset {
                 return true;
             }
         }
         self.granted.range(offset..offset + len).next().is_some()
+    }
+
+    /// Offsets of the grants that `[offset, offset+len)` falls inside, or None if any part of the
+    /// range is not backed. The floor counts as backed and contributes no grant, since it is
+    /// never released.
+    fn covering_grants(&self, offset: u64, len: u64) -> Option<Vec<u64>> {
+        let end = offset.checked_add(len)?;
+        if end > self.size {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut at = offset;
+        // The pre-shared floor is permanently backed; skip past whatever part of the range is in
+        // it before looking for grants.
+        if at < self.pre_alloc {
+            at = self.pre_alloc.min(end);
+        }
+        while at < end {
+            let (&o, g) = self.granted.range(..=at).next_back()?;
+            if at >= o + g.len {
+                return None; // a hole
+            }
+            out.push(o);
+            at = o + g.len;
+        }
+        Some(out)
+    }
+
+    /// Is every byte of `[offset, offset+len)` backed right now?
+    pub fn range_backed(&self, offset: u64, len: u64) -> bool {
+        len == 0 || self.covering_grants(offset, len).is_some()
+    }
+
+    /// Take a host-side reference on every grant the range touches. All or nothing: a range that
+    /// is partly unbacked refs nothing, so a caller cannot leave counts raised on a failure.
+    pub fn ref_range(&mut self, offset: u64, len: u64) -> Result<(), GrantError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let grants = self.covering_grants(offset, len).ok_or(GrantError::NotBacked)?;
+        for o in grants {
+            let g = self.granted.get_mut(&o).expect("just found");
+            g.refs = g.refs.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Drop a reference taken by [`ref_range`]. Saturating rather than panicking on underflow:
+    /// losing track of a count is bad, but taking the VM down over it is worse, and the count
+    /// only ever gates a shrink.
+    pub fn unref_range(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let Some(grants) = self.covering_grants(offset, len) else {
+            return;
+        };
+        for o in grants {
+            let g = self.granted.get_mut(&o).expect("just found");
+            g.refs = g.refs.saturating_sub(1);
+        }
     }
 
     /// Check a grow request. Modifies nothing: a refused request must leave no trace, so the guest
@@ -172,7 +260,11 @@ impl PoolGrants {
         self.check_range(offset, len)?;
         match self.granted.get(&offset) {
             None => Err(GrantError::NotGranted),
-            Some(&(l, _)) if l != len => Err(GrantError::PartialRelease),
+            Some(g) if g.len != len => Err(GrantError::PartialRelease),
+            // Refuse while the host still has something built over it. The guest cannot make this
+            // call correctly on its own: it drops a buffer from its allocator the moment it sends
+            // RESOURCE_UNREF, without waiting to hear that the host is done.
+            Some(g) if g.refs != 0 => Err(GrantError::Busy),
             Some(_) => Ok(()),
         }
     }
@@ -180,14 +272,14 @@ impl PoolGrants {
     /// Record a completed grant.
     pub fn mark_granted(&mut self, offset: u64, len: u64, handle: u32) -> Result<(), GrantError> {
         self.validate_share(offset, len)?;
-        self.granted.insert(offset, (len, handle));
+        self.granted.insert(offset, Grant { len, handle, refs: 0 });
         Ok(())
     }
 
     /// Forget a released grant, returning its RM handle.
     pub fn take_granted(&mut self, offset: u64, len: u64) -> Result<u32, GrantError> {
         self.validate_unshare(offset, len)?;
-        Ok(self.granted.remove(&offset).expect("validated above").1)
+        Ok(self.granted.remove(&offset).expect("validated above").handle)
     }
 
     /// Every live grant as (gpa, len, handle), for teardown and for the guest's reconciliation.
@@ -195,7 +287,7 @@ impl PoolGrants {
     pub fn drain_all(&mut self) -> Vec<(u64, u64, u32)> {
         std::mem::take(&mut self.granted)
             .into_iter()
-            .map(|(off, (len, handle))| (self.base + off, len, handle))
+            .map(|(off, g)| (self.base + off, g.len, g.handle))
             .collect()
     }
 
@@ -216,7 +308,7 @@ impl PoolGrants {
         self.granted
             .range(..=off)
             .next_back()
-            .is_some_and(|(&o, &(l, _))| off < o + l)
+            .is_some_and(|(&o, g)| off < o + g.len)
     }
 }
 
@@ -375,6 +467,64 @@ mod tests {
         assert!(!p.is_backed(GuestAddress(0x1_9000_0000 + 64 * MB)));
         // Grantable again: reusing an address is safe, the RM merges the range back.
         assert_eq!(p.validate_share(64 * MB, 64 * MB), Ok(()));
+    }
+
+    #[test]
+    fn a_referenced_grant_cannot_be_released() {
+        let mut p = pool();
+        p.mark_granted(64 * MB, 32 * MB, 7).unwrap();
+        assert_eq!(p.validate_unshare(64 * MB, 32 * MB), Ok(()));
+
+        // A dma-buf gets built over part of it.
+        p.ref_range(64 * MB, 4 * MB).unwrap();
+        assert_eq!(
+            p.validate_unshare(64 * MB, 32 * MB),
+            Err(GrantError::Busy),
+            "the guest cannot know this: its RESOURCE_UNREF does not wait for the host"
+        );
+
+        p.unref_range(64 * MB, 4 * MB);
+        assert_eq!(p.validate_unshare(64 * MB, 32 * MB), Ok(()));
+    }
+
+    #[test]
+    fn a_reference_spanning_two_grants_holds_both() {
+        let mut p = pool();
+        p.mark_granted(64 * MB, 32 * MB, 1).unwrap();
+        p.mark_granted(96 * MB, 32 * MB, 2).unwrap();
+        // One buffer across the join -- legal, because the whole window is one memfd region.
+        p.ref_range(80 * MB, 32 * MB).unwrap();
+        assert_eq!(p.validate_unshare(64 * MB, 32 * MB), Err(GrantError::Busy));
+        assert_eq!(p.validate_unshare(96 * MB, 32 * MB), Err(GrantError::Busy));
+        p.unref_range(80 * MB, 32 * MB);
+        assert_eq!(p.validate_unshare(64 * MB, 32 * MB), Ok(()));
+        assert_eq!(p.validate_unshare(96 * MB, 32 * MB), Ok(()));
+    }
+
+    #[test]
+    fn refusing_a_partly_unbacked_range_refs_nothing() {
+        let mut p = pool();
+        p.mark_granted(64 * MB, 32 * MB, 1).unwrap();
+        // Starts in a grant, runs off the end of it into a hole.
+        assert_eq!(p.ref_range(80 * MB, 32 * MB), Err(GrantError::NotBacked));
+        // The grant it did touch must be releasable, or a rejected import would pin memory.
+        assert_eq!(p.validate_unshare(64 * MB, 32 * MB), Ok(()));
+    }
+
+    #[test]
+    fn range_backed_covers_the_floor_and_spans_adjacent_grants() {
+        let mut p = pool();
+        // The floor is permanently backed and contributes no grant.
+        assert!(p.range_backed(0, 64 * MB));
+        assert!(!p.range_backed(0, 96 * MB));
+        p.mark_granted(64 * MB, 32 * MB, 1).unwrap();
+        // A range straddling the floor and a grant.
+        assert!(p.range_backed(32 * MB, 64 * MB));
+        assert!(!p.range_backed(64 * MB, 64 * MB));
+        p.mark_granted(96 * MB, 32 * MB, 2).unwrap();
+        // Two abutting grants read as one continuous backed range.
+        assert!(p.range_backed(64 * MB, 64 * MB));
+        assert!(!p.range_backed(64 * MB, 96 * MB));
     }
 
     #[test]
