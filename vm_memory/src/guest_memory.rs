@@ -14,7 +14,9 @@ use std::marker::Sync;
 use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -44,6 +46,8 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::guest_address::GuestAddress;
+use crate::pool_grants::GrantError;
+use crate::pool_grants::PoolGrants;
 
 mod sys;
 pub use sys::MemoryPolicy;
@@ -75,6 +79,8 @@ pub enum Error {
     MemoryRegionOverlap,
     #[error("memory region size {0} is too large")]
     MemoryRegionTooLarge(u128),
+    #[error("growable pool at {0}: {1}")]
+    PoolParams(GuestAddress, String),
     #[error("host access to lent memory region at {0} (purpose={1:?}) in protected VM")]
     ProtectedMemoryAccess(GuestAddress, MemoryRegionPurpose),
     #[error("incomplete read of {completed} instead of {expected} bytes")]
@@ -83,6 +89,8 @@ pub enum Error {
     ShortWrite { expected: usize, completed: usize },
     #[error("DescriptorChain split is out of bounds: {0}")]
     SplitOutOfBounds(usize),
+    #[error("host access to an ungranted address {0} in a growable pool")]
+    UngrantedPoolAccess(GuestAddress),
     #[error("{0}")]
     VolatileMemoryAccess(#[source] VolatileMemoryError),
 }
@@ -208,6 +216,37 @@ pub struct MemoryRegionOptions {
     /// Gunyah protected VMs where mixing lend/share operations on the same
     /// memfd causes conflicts.
     pub isolate_backing: bool,
+
+    /// How much of this region is SHARE'd to a protected guest at boot. `None` means all of it,
+    /// which is what every region that is not a growable pool wants.
+    ///
+    /// A growable pool is declared to the guest at its FULL size but backed only in part, with the
+    /// remainder filled in at runtime as the guest asks for it. That works because the region is
+    /// still created whole -- a sparse memfd, so host VA rather than host RAM -- and `size` is
+    /// what feeds `ram_top` and hence the RM's `size-max`, so the RM untags the entire window
+    /// whether or not it is backed. Measured on device: see plans/DYNAMIC_POOL_PLAN.md.
+    ///
+    /// Build the region full and share part of it. Building it small and extending it later is the
+    /// version that fails, with RM_ERROR_MEM_INVALID (0xa) on the first runtime accept.
+    pub pre_alloc_size: Option<u64>,
+
+    /// Granularity of a runtime grant into the unbacked remainder, in bytes.
+    ///
+    /// `0` means this pool does not grow at all: everything is shared before boot, which is what
+    /// the three existing pools do and must keep doing. Non-zero must be at least 2 MiB (the folio
+    /// size the share path is built around) and a power of two (drm_buddy rejects anything else).
+    ///
+    /// Each grant costs one RM memparcel, and MAX_MEMPARCEL_PER_VM is 1024 across the whole VM --
+    /// shared with Android's own parcels, and never released until the phone reboots for anything
+    /// a killed VMM left behind. A 2 MiB step therefore exhausts the quota at 2 GiB and takes the
+    /// phone with it; 32-64 MiB is the range that leaves room.
+    pub step_size: u64,
+
+    /// Cap on this pool's simultaneously live grants. Zero means "as many as the window holds",
+    /// which is only safe for a small window: the real limit is MAX_MEMPARCEL_PER_VM = 1024 for
+    /// the entire VM, and it is shared with Android's own parcels, so several pools each sizing
+    /// themselves against the window can add up past it. Budget it across pools, not per pool.
+    pub max_grants: u32,
 }
 
 impl MemoryRegionOptions {
@@ -233,6 +272,73 @@ impl MemoryRegionOptions {
     pub fn isolate_backing(mut self) -> Self {
         self.isolate_backing = true;
         self
+    }
+
+    /// Declare this region as a growable pool: `pre_alloc` bytes shared at boot, the remainder
+    /// left for runtime grants of `step` bytes each. `step == 0` means the pool never grows and
+    /// `pre_alloc` must be the whole region.
+    pub fn growable_pool(mut self, pre_alloc: u64, step: u64) -> Self {
+        self.pre_alloc_size = Some(pre_alloc);
+        self.step_size = step;
+        self
+    }
+
+    /// Cap on simultaneously live grants for this pool. See `max_grants`.
+    pub fn max_grants(mut self, n: u32) -> Self {
+        self.max_grants = n;
+        self
+    }
+
+    /// Bytes SHARE'd at boot. Regions that never set `pre_alloc_size` get all of `size`, which
+    /// keeps every non-pool region and the three pre-existing pools on exactly the path they are
+    /// on today.
+    pub fn boot_share_len(&self, size: u64) -> u64 {
+        self.pre_alloc_size.map_or(size, |p| p.min(size))
+    }
+
+    /// Validate the pool parameters against a region size. Returns the reason it is not usable, so
+    /// the caller can refuse at configuration time rather than at first grant -- an invalid step
+    /// otherwise surfaces as drm_buddy returning -EINVAL inside the guest, which reads as a guest
+    /// driver bug rather than a command line mistake.
+    pub fn pool_param_error(&self, size: u64) -> Option<String> {
+        const MIN_STEP: u64 = 2 << 20;
+        let pre_alloc = self.pre_alloc_size.unwrap_or(size);
+        if pre_alloc > size {
+            return Some(format!(
+                "pre_alloc_size {:#x} exceeds the region size {:#x}",
+                pre_alloc, size
+            ));
+        }
+        if self.step_size == 0 {
+            // A pool that cannot grow must be fully backed, or the remainder is memory the guest
+            // has been told about and can never obtain -- a read there silently returns zeros.
+            return (pre_alloc != size).then(|| {
+                format!(
+                    "step_size is 0 (pool does not grow) but pre_alloc_size {:#x} != size {:#x}; \
+                     the difference could never be granted",
+                    pre_alloc, size
+                )
+            });
+        }
+        if self.step_size < MIN_STEP {
+            return Some(format!(
+                "step_size {:#x} is below the {:#x} minimum (a grant is shared as 2 MiB folios)",
+                self.step_size, MIN_STEP
+            ));
+        }
+        if !self.step_size.is_power_of_two() {
+            return Some(format!(
+                "step_size {:#x} is not a power of two (drm_buddy in the guest rejects it)",
+                self.step_size
+            ));
+        }
+        if size % self.step_size != 0 || pre_alloc % self.step_size != 0 {
+            return Some(format!(
+                "size {:#x} and pre_alloc_size {:#x} must both be multiples of step_size {:#x}",
+                size, pre_alloc, self.step_size
+            ));
+        }
+        None
     }
 }
 
@@ -318,6 +424,10 @@ pub struct GuestMemory {
     /// When true, host access to lent (non-shared) memory regions is forbidden.
     /// Set after memory is donated to a protected VM (e.g. Gunyah).
     protected: Arc<AtomicBool>,
+    /// Which parts of each growable pool are currently backed, keyed by the pool's base address.
+    /// Empty unless a region declared a non-zero `step_size`, so nothing that exists today pays
+    /// for it. See pool_grants.rs for why the host has to keep this rather than deriving it.
+    grants: Arc<Mutex<BTreeMap<u64, PoolGrants>>>,
 }
 
 impl AsRawDescriptors for GuestMemory {
@@ -365,6 +475,17 @@ impl GuestMemory {
     pub fn new_with_options(
         ranges: &[(GuestAddress, u64, MemoryRegionOptions)],
     ) -> Result<GuestMemory> {
+        // Refuse bad pool parameters here, before a single page is mapped. Left to run, a step
+        // that is not a power of two surfaces as drm_buddy returning -EINVAL inside the guest and
+        // a pre_alloc short of the size on a non-growable pool surfaces as reads of the shortfall
+        // silently returning zeros -- both of which read as guest driver bugs rather than as the
+        // command line mistake they are.
+        for (addr, size, options) in ranges {
+            if let Some(why) = options.pool_param_error(*size) {
+                return Err(Error::PoolParams(*addr, why));
+            }
+        }
+
         // Create shm
         let shm = Arc::new(GuestMemory::create_shm(ranges)?);
 
@@ -443,10 +564,31 @@ impl GuestMemory {
             }
         }
 
+        // One entry per growable pool; regions with step_size == 0 -- which is every region that
+        // exists today -- contribute nothing, so this map stays empty on the existing paths.
+        let grants = regions
+            .iter()
+            .filter(|r| r.options.step_size != 0)
+            .map(|r| {
+                let size = r.mapping.size() as u64;
+                (
+                    r.guest_base.offset(),
+                    PoolGrants::new(
+                        r.guest_base,
+                        size,
+                        r.options.boot_share_len(size),
+                        r.options.step_size,
+                        r.options.max_grants,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
         Ok(GuestMemory {
             regions: Arc::from(regions),
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
+            grants: Arc::new(Mutex::new(grants)),
         })
     }
 
@@ -485,10 +627,31 @@ impl GuestMemory {
             }
         }
 
+        // One entry per growable pool; regions with step_size == 0 -- which is every region that
+        // exists today -- contribute nothing, so this map stays empty on the existing paths.
+        let grants = regions
+            .iter()
+            .filter(|r| r.options.step_size != 0)
+            .map(|r| {
+                let size = r.mapping.size() as u64;
+                (
+                    r.guest_base.offset(),
+                    PoolGrants::new(
+                        r.guest_base,
+                        size,
+                        r.options.boot_share_len(size),
+                        r.options.step_size,
+                        r.options.max_grants,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
         Ok(GuestMemory {
             regions: Arc::from(regions),
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
+            grants: Arc::new(Mutex::new(grants)),
         })
     }
 
@@ -503,6 +666,104 @@ impl GuestMemory {
     /// `Error::ProtectedMemoryAccess` instead of risking a SIGBUS.
     pub fn set_protected(&self) {
         self.protected.store(true, Ordering::Release);
+    }
+
+    /// Base address of the `pool_id`-th growable pool, ordered by address.
+    ///
+    /// The id is an index rather than a name because it has to survive a wire round trip in 32
+    /// bits and be trivially checkable; the guest learns which is which from the device tree node
+    /// order, which is the same ordering.
+    pub fn pool_base(&self, pool_id: u32) -> Option<GuestAddress> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants.keys().nth(pool_id as usize).copied().map(GuestAddress)
+    }
+
+    /// Live grants in a pool, for the guest's reconciliation query.
+    pub fn pool_live_grants(&self, pool_id: u32) -> Option<usize> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants.values().nth(pool_id as usize).map(|p| p.live_grants())
+    }
+
+    /// Check a guest-originated grow request. Does not modify anything.
+    pub fn pool_validate_share(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> std::result::Result<(), GrantError> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .validate_share(offset, len)
+    }
+
+    /// Check a guest-originated shrink request. Does not modify anything.
+    pub fn pool_validate_unshare(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> std::result::Result<(), GrantError> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .validate_unshare(offset, len)
+    }
+
+    /// Record a completed grant.
+    pub fn pool_mark_granted(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+        handles: &[u32],
+    ) -> std::result::Result<(), GrantError> {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values_mut()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .mark_granted(offset, len, handles)
+    }
+
+    /// Forget a released range, returning the RM handles recorded for it.
+    pub fn pool_take_granted(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> std::result::Result<Vec<u32>, GrantError> {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values_mut()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .take_granted(offset, len)
+    }
+
+    /// A pool region is host-accessible, but a GROWABLE one is only accessible where it is
+    /// actually backed.
+    ///
+    /// This is not belt-and-braces. Measured on device: reading an ungranted address inside a
+    /// declared window returns zeros -- no fault, no error, no log, and the VM keeps running --
+    /// while writing it kills the vcpu. The silent-zero direction is the one that matters here,
+    /// because it turns a host-side accounting bug into wrong data with nothing to show for it.
+    /// A region with step_size == 0 is fully pre-shared and answers yes everywhere, which is every
+    /// pool that exists today.
+    fn check_pool_backed(&self, region: &MemoryRegion, guest_addr: GuestAddress) -> Result<()> {
+        if region.options.step_size == 0 {
+            return Ok(());
+        }
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        match grants.get(&region.guest_base.offset()) {
+            Some(p) if p.is_backed(guest_addr) => Ok(()),
+            // Untracked or ungranted both mean "do not touch it".
+            _ => Err(Error::UngrantedPoolAccess(guest_addr)),
+        }
     }
 
     /// Check whether `guest_addr` falls in a host-accessible region.
@@ -521,15 +782,15 @@ impl GuestMemory {
             // The GPU pool is SHARE'd (never lent), so the host keeps access — same as the
             // framebuffer/swiotlb regions (crosvm reads scanout data straight from the pool).
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            MemoryRegionPurpose::GpuPool => Ok(()),
+            MemoryRegionPurpose::GpuPool => self.check_pool_backed(region, guest_addr),
             // Guest-alloc pool: SHARE'd like GpuPool; the host resolves guest-blob mem-entries
             // that point into it via get_slice_at_addr (the whole point of guest-alloc).
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            MemoryRegionPurpose::GpuPoolGuest => Ok(()),
+            MemoryRegionPurpose::GpuPoolGuest => self.check_pool_backed(region, guest_addr),
             // drm2kgsl arena: SHARE'd like the gfx pools. that backend lives in this
             // process and sub-allocates BOs out of it, so the host needs access.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            MemoryRegionPurpose::Drm2KgslPool => Ok(()),
+            MemoryRegionPurpose::Drm2KgslPool => self.check_pool_backed(region, guest_addr),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::SharedFramebuffer => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

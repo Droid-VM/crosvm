@@ -42,7 +42,8 @@ use super::Queue;
 use super::VirtioDevice;
 
 const QUEUE_SIZE: u16 = 16;
-const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE];
+// Queue 0 requestq (host->guest), 1 completionq (guest->host), 2 poolq (guest->host requests).
+const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE, QUEUE_SIZE, QUEUE_SIZE];
 
 // Wire ops, shared with the guest module (virtio_gunyah_accept.c).
 const VGA_OP_ACCEPT: u32 = 1;
@@ -52,6 +53,23 @@ const VGA_OP_RELEASE: u32 = 2;
 const REQ_WIRE_LEN: usize = 32;
 // struct virtio_gunyah_accept_comp, little-endian.
 const COMP_WIRE_LEN: usize = 8;
+
+// Pool ops, guest-initiated, on queue 2.
+//
+// A third queue rather than a new op on the existing pair, for two reasons that are both in the
+// existing wire format: the completion struct is 8 bytes and has nowhere to put an offset and a
+// length, and `req_id` is host-assigned, with the host dropping any completion whose id it did not
+// issue (see `process_completions`). Direction is therefore carried by the queue rather than by a
+// flag -- which is also what makes the validation impossible to forget, since everything arriving
+// on this queue is by construction guest-originated and must be range-checked against the pool.
+const VGP_OP_SHARE: u32 = 1;
+const VGP_OP_UNSHARE: u32 = 2;
+const VGP_OP_QUERY: u32 = 3;
+
+// struct virtio_gunyah_pool_req, little-endian.
+const POOL_REQ_WIRE_LEN: usize = 32;
+// struct virtio_gunyah_pool_resp, little-endian.
+const POOL_RESP_WIRE_LEN: usize = 16;
 
 struct Worker {
     req_queue: Queue,
@@ -194,18 +212,161 @@ impl Worker {
     }
 }
 
+/// Serves guest-initiated pool grow/shrink requests on queue 2.
+///
+/// Deliberately a SEPARATE thread from the accept `Worker`, and this is load-bearing rather than
+/// tidiness. A grow is: guest asks here -> this thread asks the vm_memory handler to
+/// `runtime_share` -> that handler calls `drive_guest_accept`, which hands an ACCEPT to the accept
+/// worker and waits for the guest to complete it. Run the pool queue on the accept worker's thread
+/// and that is a cycle: the accept worker would be blocked waiting for the share it is itself
+/// required to finish. Two threads, and the accept worker stays free to service the ACCEPT while
+/// this one waits.
+///
+/// The same constraint applies on the guest side: whatever thread submits a pool request must not
+/// be the thread that processes the accept requestq.
+struct PoolWorker {
+    pool_queue: Queue,
+    /// To the vm_memory handler, for RegisterMemory. Distinct from the accept worker's tube.
+    vm_memory: Tube,
+    mem: GuestMemory,
+}
+
+impl PoolWorker {
+    /// Decode, validate and answer one request. Returns the response wire bytes.
+    ///
+    /// Validation lives here, on the guest-originated queue, so a request can never reach
+    /// `runtime_share` without having been range-checked. Host-initiated shares (VkDeviceMemory
+    /// into a PCI BAR) do not come through here and are unaffected.
+    fn handle(&mut self, wire: &[u8; POOL_REQ_WIRE_LEN]) -> [u8; POOL_RESP_WIRE_LEN] {
+        let req_id = u32::from_le_bytes(wire[0..4].try_into().unwrap());
+        let op = u32::from_le_bytes(wire[4..8].try_into().unwrap());
+        let pool_id = u32::from_le_bytes(wire[8..12].try_into().unwrap());
+        let offset = u64::from_le_bytes(wire[16..24].try_into().unwrap());
+        let len = u64::from_le_bytes(wire[24..32].try_into().unwrap());
+
+        let (ret, extra) = match op {
+            VGP_OP_SHARE => (self.share(pool_id, offset, len), 0u64),
+            VGP_OP_UNSHARE => (self.unshare(pool_id, offset, len), 0u64),
+            VGP_OP_QUERY => match self.mem.pool_live_grants(pool_id) {
+                Some(n) => (0, n as u64),
+                None => (-libc::ENODEV, 0),
+            },
+            _ => {
+                warn!("gunyah-pool: unknown op {}", op);
+                (-libc::EINVAL, 0)
+            }
+        };
+
+        let mut resp = [0u8; POOL_RESP_WIRE_LEN];
+        resp[0..4].copy_from_slice(&req_id.to_le_bytes());
+        resp[4..8].copy_from_slice(&ret.to_le_bytes());
+        resp[8..16].copy_from_slice(&extra.to_le_bytes());
+        resp
+    }
+
+    fn share(&mut self, pool_id: u32, offset: u64, len: u64) -> i32 {
+        // Check before doing anything: a refused request must leave no trace, so the guest can
+        // pick a different range without having to reconcile with the host first.
+        if let Err(e) = self.mem.pool_validate_share(pool_id, offset, len) {
+            warn!(
+                "gunyah-pool: refusing SHARE pool={} offset={:#x} len={:#x}: {:?}",
+                pool_id, offset, len, e
+            );
+            return -e.as_errno();
+        }
+        // TODO(stage 3b): allocate the backing, send RegisterMemory over self.vm_memory with
+        // dest=GuestPhysicalAddress(base+offset) and vm_accept=Sync, then mem.pool_mark_granted.
+        // The validation above and the transport below are what this commit establishes.
+        -libc::ENOSYS
+    }
+
+    fn unshare(&mut self, pool_id: u32, offset: u64, len: u64) -> i32 {
+        if let Err(e) = self.mem.pool_validate_unshare(pool_id, offset, len) {
+            warn!(
+                "gunyah-pool: refusing UNSHARE pool={} offset={:#x} len={:#x}: {:?}",
+                pool_id, offset, len, e
+            );
+            return -e.as_errno();
+        }
+        // TODO(stage 3b): the host must also confirm nothing of its own still references this
+        // range -- udmabuf, GPU mappings, scanout iovecs. The guest cannot answer that: its
+        // RESOURCE_UNREF is fire-and-forget, so it believes a buffer is released while the host
+        // still holds it.
+        -libc::ENOSYS
+    }
+
+    fn process_requests(&mut self) {
+        while let Some(mut avail_desc) = self.pool_queue.pop() {
+            let mut wire = [0u8; POOL_REQ_WIRE_LEN];
+            let parsed = avail_desc.reader.read_exact(&mut wire).is_ok();
+            let written = if parsed {
+                let resp = self.handle(&wire);
+                match avail_desc.writer.write_all(&resp) {
+                    Ok(()) => avail_desc.writer.bytes_written(),
+                    Err(e) => {
+                        warn!("gunyah-pool: failed writing response: {}", e);
+                        0
+                    }
+                }
+            } else {
+                warn!("gunyah-pool: short request from guest");
+                0
+            };
+            self.pool_queue.add_used(avail_desc, written as u32);
+        }
+        self.pool_queue.trigger_interrupt();
+    }
+
+    fn run(&mut self, kill_evt: Event) -> anyhow::Result<()> {
+        #[derive(EventToken)]
+        enum Token {
+            PoolQueueAvailable,
+            Kill,
+        }
+
+        let wait_ctx = WaitContext::build_with(&[
+            (self.pool_queue.event(), Token::PoolQueueAvailable),
+            (&kill_evt, Token::Kill),
+        ])
+        .context("failed creating pool WaitContext")?;
+
+        let mut exiting = false;
+        while !exiting {
+            for event in wait_ctx.wait()?.iter().filter(|e| e.is_readable) {
+                match event.token {
+                    Token::PoolQueueAvailable => {
+                        self.pool_queue
+                            .event()
+                            .wait()
+                            .context("failed reading pool queue Event")?;
+                        self.process_requests();
+                    }
+                    Token::Kill => exiting = true,
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The virtio-gunyah-accept device.
 pub struct GunyahAccept {
     worker_thread: Option<WorkerThread<Worker>>,
+    pool_worker_thread: Option<WorkerThread<PoolWorker>>,
     tube: Option<Tube>,
+    /// To the vm_memory handler, used only by the pool worker. Separate from `tube` so the two
+    /// round trips cannot serialise behind each other -- see PoolWorker's note on the deadlock.
+    pool_tube: Option<Tube>,
     virtio_features: u64,
 }
 
 impl GunyahAccept {
-    pub fn new(virtio_features: u64, tube: Tube) -> GunyahAccept {
+    pub fn new(virtio_features: u64, tube: Tube, pool_tube: Tube) -> GunyahAccept {
         GunyahAccept {
             worker_thread: None,
+            pool_worker_thread: None,
             tube: Some(tube),
+            pool_tube: Some(pool_tube),
             virtio_features,
         }
     }
@@ -213,9 +374,11 @@ impl GunyahAccept {
 
 impl VirtioDevice for GunyahAccept {
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        match &self.tube {
-            Some(tube) => vec![tube.as_raw_descriptor()],
-            None => Vec::new(),
+        match (&self.tube, &self.pool_tube) {
+            (Some(t), Some(p)) => vec![t.as_raw_descriptor(), p.as_raw_descriptor()],
+            (Some(t), None) => vec![t.as_raw_descriptor()],
+            (None, Some(p)) => vec![p.as_raw_descriptor()],
+            (None, None) => Vec::new(),
         }
     }
 
@@ -233,16 +396,21 @@ impl VirtioDevice for GunyahAccept {
 
     fn activate(
         &mut self,
-        _mem: GuestMemory,
+        mem: GuestMemory,
         _interrupt: Interrupt,
         mut queues: BTreeMap<usize, Queue>,
     ) -> anyhow::Result<()> {
-        if queues.len() != 2 {
-            return Err(anyhow!("expected 2 queues, got {}", queues.len()));
+        if queues.len() != 3 {
+            return Err(anyhow!("expected 3 queues, got {}", queues.len()));
         }
 
         let req_queue = queues.remove(&0).unwrap();
         let comp_queue = queues.remove(&1).unwrap();
+        let pool_queue = queues.remove(&2).unwrap();
+        let pool_tube = self
+            .pool_tube
+            .take()
+            .context("gunyah-accept activated without a pool tube")?;
         let tube = self
             .tube
             .take()
@@ -263,10 +431,25 @@ impl VirtioDevice for GunyahAccept {
             worker
         }));
 
+        self.pool_worker_thread = Some(WorkerThread::start("v_gunyah_pool", move |kill_evt| {
+            let mut worker = PoolWorker {
+                pool_queue,
+                vm_memory: pool_tube,
+                mem,
+            };
+            if let Err(e) = worker.run(kill_evt) {
+                error!("gunyah-pool worker thread failed: {:#}", e);
+            }
+            worker
+        }));
+
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        if let Some(t) = self.pool_worker_thread.take() {
+            self.pool_tube = Some(t.stop().vm_memory);
+        }
         if let Some(worker_thread) = self.worker_thread.take() {
             let worker = worker_thread.stop();
             self.tube = Some(worker.tube);

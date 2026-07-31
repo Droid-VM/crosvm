@@ -599,7 +599,12 @@ impl arch::LinuxArch for AArch64 {
                 gpu_pool_mb << 20,
                 MemoryRegionOptions::new()
                     .purpose(MemoryRegionPurpose::GpuPool)
-                    .align(2 << 20),
+                    .align(2 << 20)
+                    // Fully pre-shared: this pool does not grow. `growable_pool(size, 0)` is
+                    // the same thing the defaults already produce -- it is written out so the
+                    // intent is in the code rather than in an absent field, and so that turning
+                    // one of these into a growable pool is a visible edit here.
+                    .growable_pool(gpu_pool_mb << 20, 0),
             ));
             pool_top += gpu_pool_mb << 20;
         }
@@ -611,7 +616,12 @@ impl arch::LinuxArch for AArch64 {
                 gpu_guest_pool_mb << 20,
                 MemoryRegionOptions::new()
                     .purpose(MemoryRegionPurpose::GpuPoolGuest)
-                    .align(2 << 20),
+                    .align(2 << 20)
+                    // Fully pre-shared: this pool does not grow. `growable_pool(size, 0)` is
+                    // the same thing the defaults already produce -- it is written out so the
+                    // intent is in the code rather than in an absent field, and so that turning
+                    // one of these into a growable pool is a visible edit here.
+                    .growable_pool(gpu_guest_pool_mb << 20, 0),
             ));
             pool_top = base + (gpu_guest_pool_mb << 20);
         }
@@ -630,7 +640,12 @@ impl arch::LinuxArch for AArch64 {
                 drm2kgsl_pool_mb << 20,
                 MemoryRegionOptions::new()
                     .purpose(MemoryRegionPurpose::Drm2KgslPool)
-                    .align(2 << 20),
+                    .align(2 << 20)
+                    // Fully pre-shared: this pool does not grow. `growable_pool(size, 0)` is
+                    // the same thing the defaults already produce -- it is written out so the
+                    // intent is in the code rather than in an absent field, and so that turning
+                    // one of these into a growable pool is a visible edit here.
+                    .growable_pool(drm2kgsl_pool_mb << 20, 0),
             ));
         }
 

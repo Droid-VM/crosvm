@@ -1132,10 +1132,23 @@ fn create_virtio_devices(
         let (accept_host_tube, accept_device_tube) =
             Tube::pair().context("failed to create tube")?;
         add_control_tube(DeviceControlTube::GunyahAccept(accept_host_tube).into());
+        // A second tube, to the vm_memory handler rather than to drive_guest_accept: the pool
+        // worker uses it for RegisterMemory. It has to be its own tube served by its own thread,
+        // or a grow deadlocks against the accept it is waiting on.
+        let (pool_host_tube, pool_device_tube) =
+            Tube::pair().context("failed to create pool tube")?;
+        add_control_tube(
+            VmMemoryTube {
+                tube: pool_host_tube,
+                expose_with_viommu: false,
+            }
+            .into(),
+        );
         devs.push(create_gunyah_accept_device(
             cfg.protection_type,
             cfg.jail_config.as_ref(),
             accept_device_tube,
+            pool_device_tube,
         )?);
     }
 

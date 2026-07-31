@@ -457,18 +457,19 @@ impl GunyahVm {
                 // >=2 independently-sourced folios in one call fails on this RM.
                 // Emit one SET_USER_MEM_REGION call per 2MB chunk instead.
                 //
-                // EXPERIMENT (DROIDVM_POOL_PREALLOC_MB): share only a PREFIX of a pool region at
-                // boot, leaving the remainder declared to the guest but unbacked. This is the
-                // shape a guest-managed growable pool needs, and it rests on two things nothing
-                // has ever tested on this device:
-                //   1. that the RM tolerates a pool region only partially SHARE'd at boot, and
-                //   2. that a later runtime SHARE + guest MEM_ACCEPT can land in the unbacked
-                //      remainder rather than returning RM_ERROR_MEM_INVALID (0xa).
-                // Static reading of the RM says both hold -- the untag is one range driven by
-                // mem_size_max, and region.size (the FULL window) is what feeds ram_top -> that
-                // size_max, so the whole window is untagged whether or not it is backed. But the
-                // shipping RM is a Qualcomm internal build whose platform_memparcel_* hooks are
-                // no-ops in the public tree, so it has to be measured.
+                // A growable pool is declared to the guest whole but SHARE'd only in part: the
+                // remainder is filled in at runtime as the guest asks for it. `boot_share_len`
+                // is that prefix, and it is the region's full size for everything that is not a
+                // growable pool -- including all three of the pre-existing pools, which set
+                // step_size == 0 and pre_alloc_size == size and therefore take exactly the code
+                // path they took before this existed.
+                //
+                // Measured on device (plans/DYNAMIC_POOL_PLAN.md): the RM accepts a partially
+                // shared pool region, the guest sees the whole window, and a later runtime SHARE
+                // plus MEM_ACCEPT lands in the unbacked remainder and is genuinely usable. It
+                // works because the region is still created at full size -- a sparse memfd, so
+                // host VA rather than host RAM -- so `region.size` still feeds ram_top and hence
+                // the RM's size-max, and the whole window gets untagged either way.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let is_pool = matches!(
                     region.options.purpose,
@@ -477,32 +478,22 @@ impl GunyahVm {
                         | MemoryRegionPurpose::Drm2KgslPool
                 );
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                let share_len: u64 = {
-                    let full: u64 = region.size.try_into().unwrap();
-                    if is_pool {
-                        std::env::var("DROIDVM_POOL_PREALLOC_MB")
-                            .ok()
-                            .and_then(|v| v.parse::<u64>().ok())
-                            // Never zero: a zero-length prefix would produce an empty chunk list,
-                            // which the branch below reads as "not a pool" and shares the whole
-                            // region -- the exact opposite of what was asked for.
-                            .map(|mb| (mb << 20).clamp(2 << 20, full))
-                            .unwrap_or(full)
-                    } else {
-                        full
-                    }
-                };
-                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let share_chunks = if is_pool {
-                    if share_len != region.size as u64 {
+                    let full: u64 = region.size.try_into().unwrap();
+                    // Clamped to at least one 2 MiB chunk: a zero-length prefix would produce an
+                    // empty chunk list, which the branch below reads as "not a pool" and shares
+                    // the whole region -- the exact opposite of what was asked for.
+                    let share_len = region.options.boot_share_len(full).max(2 << 20).min(full);
+                    if share_len != full {
                         base::warn!(
-                            "GH-POOL-EXP: {:?} gpa={:#x} window={:#x} -- sharing only {:#x} at \
-                             boot, leaving {:#x} declared but unbacked",
+                            "GH-POOL: {:?} gpa={:#x} window={:#x} -- sharing {:#x} at boot, \
+                             leaving {:#x} declared but unbacked (step={:#x})",
                             region.options.purpose,
                             region.guest_addr.offset(),
-                            region.size,
+                            full,
                             share_len,
-                            region.size as u64 - share_len,
+                            full - share_len,
+                            region.options.step_size,
                         );
                     }
                     mthp::compute_share_chunks(share_len)

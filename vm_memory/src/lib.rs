@@ -6,6 +6,7 @@
 
 mod guest_address;
 pub mod guest_memory;
+pub mod pool_grants;
 pub mod udmabuf;
 mod udmabuf_bindings;
 
