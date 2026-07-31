@@ -456,14 +456,56 @@ impl GunyahVm {
                 // region works only while it needs <=1 such chunk; feeding it
                 // >=2 independently-sourced folios in one call fails on this RM.
                 // Emit one SET_USER_MEM_REGION call per 2MB chunk instead.
+                //
+                // EXPERIMENT (DROIDVM_POOL_PREALLOC_MB): share only a PREFIX of a pool region at
+                // boot, leaving the remainder declared to the guest but unbacked. This is the
+                // shape a guest-managed growable pool needs, and it rests on two things nothing
+                // has ever tested on this device:
+                //   1. that the RM tolerates a pool region only partially SHARE'd at boot, and
+                //   2. that a later runtime SHARE + guest MEM_ACCEPT can land in the unbacked
+                //      remainder rather than returning RM_ERROR_MEM_INVALID (0xa).
+                // Static reading of the RM says both hold -- the untag is one range driven by
+                // mem_size_max, and region.size (the FULL window) is what feeds ram_top -> that
+                // size_max, so the whole window is untagged whether or not it is backed. But the
+                // shipping RM is a Qualcomm internal build whose platform_memparcel_* hooks are
+                // no-ops in the public tree, so it has to be measured.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                let share_chunks = if matches!(
+                let is_pool = matches!(
                     region.options.purpose,
                     MemoryRegionPurpose::GpuPool
                         | MemoryRegionPurpose::GpuPoolGuest
                         | MemoryRegionPurpose::Drm2KgslPool
-                ) {
-                    mthp::compute_share_chunks(region.size.try_into().unwrap())
+                );
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let share_len: u64 = {
+                    let full: u64 = region.size.try_into().unwrap();
+                    if is_pool {
+                        std::env::var("DROIDVM_POOL_PREALLOC_MB")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                            // Never zero: a zero-length prefix would produce an empty chunk list,
+                            // which the branch below reads as "not a pool" and shares the whole
+                            // region -- the exact opposite of what was asked for.
+                            .map(|mb| (mb << 20).clamp(2 << 20, full))
+                            .unwrap_or(full)
+                    } else {
+                        full
+                    }
+                };
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let share_chunks = if is_pool {
+                    if share_len != region.size as u64 {
+                        base::warn!(
+                            "GH-POOL-EXP: {:?} gpa={:#x} window={:#x} -- sharing only {:#x} at \
+                             boot, leaving {:#x} declared but unbacked",
+                            region.options.purpose,
+                            region.guest_addr.offset(),
+                            region.size,
+                            share_len,
+                            region.size as u64 - share_len,
+                        );
+                    }
+                    mthp::compute_share_chunks(share_len)
                 } else {
                     Vec::new()
                 };
