@@ -119,6 +119,8 @@ pub enum Error {
     SettingRefcountRefcount(io::Error),
     #[error("size too small for number of clusters")]
     SizeTooSmallForNumberOfClusters,
+    #[error("internal snapshots are not supported for writable images")]
+    SnapshotsUnsupported,
     #[error("l1 entry table too large: {0}")]
     TooManyL1Entries(u64),
     #[error("ref count table too large: {0}")]
@@ -511,6 +513,17 @@ impl QcowFile {
         }
         offset_is_cluster_boundary(header.l1_table_offset, header.cluster_bits)?;
         offset_is_cluster_boundary(header.snapshots_offset, header.cluster_bits)?;
+
+        // Internal snapshots are not implemented, and opening such an image for writing would
+        // damage them rather than merely ignore them: writes never copy a cluster that a
+        // snapshot still shares (`file_offset_write` reuses any already-mapped cluster without
+        // consulting its refcount), and a refcount rebuild only walks the active L1 table, so
+        // clusters reachable only from a snapshot are counted as free and handed out again.
+        // Reading is unaffected - the active L1 table is complete on its own - so read-only
+        // users, notably backing files, still work.
+        if !params.is_read_only && header.nb_snapshots != 0 {
+            return Err(Error::SnapshotsUnsupported);
+        }
         // refcount table must be a cluster boundary, and within the file's virtual or actual size.
         offset_is_cluster_boundary(header.refcount_table_offset, header.cluster_bits)?;
         let file_size = file.metadata().map_err(Error::GettingFileSize)?.len();
@@ -1820,6 +1833,30 @@ mod tests {
         header[99] = 2;
         with_basic_file(&header, |disk_file: File| {
             QcowFile::from(disk_file, test_params()).expect_err("Invalid refcount order worked.");
+        });
+    }
+
+    #[test]
+    fn snapshots_rejected_when_writable() {
+        let mut header = valid_header();
+        header[63] = 1; // nb_snapshots
+        with_basic_file(&header, |disk_file: File| {
+            QcowFile::from(disk_file, test_params())
+                .expect_err("Image with internal snapshots opened for writing.");
+        });
+    }
+
+    #[test]
+    fn snapshots_allowed_when_read_only() {
+        let mut header = valid_header();
+        header[63] = 1; // nb_snapshots
+        with_basic_file(&header, |disk_file: File| {
+            let params = DiskFileParams {
+                is_read_only: true,
+                ..test_params()
+            };
+            QcowFile::from(disk_file, params)
+                .expect("Read-only image with internal snapshots rejected.");
         });
     }
 
