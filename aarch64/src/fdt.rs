@@ -860,7 +860,7 @@ pub fn create_fdt(
         resv.set_prop("#address-cells", 0x2u32)?;
         resv.set_prop("#size-cells", 0x2u32)?;
         resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("gpu_blob_reserved@{:x}", gpa))?;
+        let node = resv.subnode_mut(&format!("gfx_host@{:x}", gpa))?;
         node.set_prop("reg", &[gpa, size])?;
         // The Gunyah RM blesses this range by matching THIS node's `reg` to the lend=false
         // memparcel (vm_creation.c find_memparcel_for_resmem_node_by_address); it does NOT look at
@@ -875,7 +875,7 @@ pub fn create_fdt(
     }
 
     // Guest-alloc pool: a second no-map reserved-memory node the guest virtio-gpu driver matches
-    // by the distinct name prefix `gpu_guest_reserved` (vs the host pool's `gpu_blob_reserved`).
+    // by the distinct name prefix `gpu_guest` (vs the host pool's `gfx_host`).
     // Same bless/no-map rationale as above; the guest driver owns a page allocator over this
     // range and sub-allocates BLOB_MEM_GUEST from it in guest-alloc mode.
     if let Some((gpa, size)) = gpu_guest_resv {
@@ -883,7 +883,7 @@ pub fn create_fdt(
         resv.set_prop("#address-cells", 0x2u32)?;
         resv.set_prop("#size-cells", 0x2u32)?;
         resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("gpu_guest_reserved@{:x}", gpa))?;
+        let node = resv.subnode_mut(&format!("gpu_guest@{:x}", gpa))?;
         node.set_prop("reg", &[gpa, size])?;
         node.set_prop("no-map", ())?;
     }
@@ -898,7 +898,7 @@ pub fn create_fdt(
         resv.set_prop("#address-cells", 0x2u32)?;
         resv.set_prop("#size-cells", 0x2u32)?;
         resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("droidvm_test_pool@{:x}", gpa))?;
+        let node = resv.subnode_mut(&format!("test_guest@{:x}", gpa))?;
         node.set_prop("compatible", "droidvm,dynamic-pool")?;
         node.set_prop("reg", &[gpa, size])?;
         node.set_prop("no-map", ())?;
@@ -918,7 +918,7 @@ pub fn create_fdt(
         resv.set_prop("#address-cells", 0x2u32)?;
         resv.set_prop("#size-cells", 0x2u32)?;
         resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("drm2kgsl_reserved@{:x}", gpa))?;
+        let node = resv.subnode_mut(&format!("drm2kgsl_host@{:x}", gpa))?;
         node.set_prop("reg", &[gpa, size])?;
         node.set_prop("no-map", ())?;
     }

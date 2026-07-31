@@ -1305,7 +1305,7 @@ impl arch::LinuxArch for AArch64 {
                     );
                     found = Some((gpa, region.size as u64));
                 }
-                // Guest-alloc pool: only collect its (gpa, size) for the `gpu_guest_reserved`
+                // Guest-alloc pool: only collect its (gpa, size) for the `gpu_guest`
                 // no-map node. The host gfxstream HostVisiblePool must NOT see it (no
                 // GFXSTREAM_POOL_* env); the guest driver finds it via that DT node and owns the
                 // allocator. The host resolves guest-blob mem-entries into it via get_slice_at_addr.

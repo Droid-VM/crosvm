@@ -143,7 +143,7 @@ pub enum MemoryRegionPurpose {
     /// GpuPool for access/bless/hugepage, that virglrenderer's drm2kgsl backend sub-allocates every
     /// GPU BO from. Distinct from GpuPool so a build carrying both renderers cannot hand the
     /// drm2kgsl arena to gfxstream's HostVisiblePool (which is handed any GpuPool region), so the
-    /// two can be sized independently, and so it gets its own `drm2kgsl_reserved` DT node.
+    /// two can be sized independently, and so it gets its own `drm2kgsl_host` DT node.
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     Drm2KgslPool,
 
@@ -162,7 +162,7 @@ pub enum MemoryRegionPurpose {
 
     /// DroidVM: gfxstream GUEST-alloc pool. A second SHARE-blessed region (treated exactly like
     /// GpuPool for access/bless/hugepage) that the guest virtio-gpu driver owns and sub-allocates
-    /// BLOB_MEM_GUEST from in guest-alloc mode. Distinct so it gets its own `gpu_guest_reserved`
+    /// BLOB_MEM_GUEST from in guest-alloc mode. Distinct so it gets its own `gpu_guest`
     /// DT node and is NOT handed to the host gfxstream HostVisiblePool (which sees only GpuPool).
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     GpuPoolGuest,
