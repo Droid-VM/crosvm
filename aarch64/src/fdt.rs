@@ -791,6 +791,7 @@ pub fn create_fdt(
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64)>,
+    test_pool_resv: Option<(u64, u64, u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
@@ -885,6 +886,28 @@ pub fn create_fdt(
         let node = resv.subnode_mut(&format!("gpu_guest_reserved@{:x}", gpa))?;
         node.set_prop("reg", &[gpa, size])?;
         node.set_prop("no-map", ())?;
+    }
+
+    // Growable test pool. Same no-map node as the pools above, plus the two numbers a guest
+    // driver cannot otherwise learn: where the pre-shared floor ends, and the granularity it must
+    // request in. Without them the driver would have to guess, and a misaligned request is
+    // refused by the host rather than rounded -- deliberately, since rounding would hand out
+    // memory nobody asked for.
+    if let Some((gpa, size, prealloc, step)) = test_pool_resv {
+        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+        resv.set_prop("#address-cells", 0x2u32)?;
+        resv.set_prop("#size-cells", 0x2u32)?;
+        resv.set_prop("ranges", ())?;
+        let node = resv.subnode_mut(&format!("droidvm_test_pool@{:x}", gpa))?;
+        node.set_prop("compatible", "droidvm,dynamic-pool")?;
+        node.set_prop("reg", &[gpa, size])?;
+        node.set_prop("no-map", ())?;
+        node.set_prop("droidvm,pre-alloc-size", prealloc)?;
+        node.set_prop("droidvm,step-size", step)?;
+        // Index into the host's growable-pool table, which is ordered by address. With one
+        // growable pool this is 0; it is emitted rather than assumed so a second one does not
+        // silently shift it.
+        node.set_prop("droidvm,pool-id", 0u32)?;
     }
 
     // DRM native context host-alloc pool: a no-map node on the same terms. The guest allocates

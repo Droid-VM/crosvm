@@ -147,6 +147,13 @@ pub enum MemoryRegionPurpose {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     Drm2KgslPool,
 
+    /// DroidVM: a GROWABLE test pool. Declared to the guest at its full size but SHARE'd only up
+    /// to `pre_alloc_size` at boot; the rest is granted at runtime over virtio-gunyah-accept's
+    /// pool queue. Exists so the growable path can be exercised end to end without disturbing the
+    /// three production pools, which are all fully pre-shared and must stay that way.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    DynamicTestPool,
+
     /// DroidVM: GPU pre-alloc pool (gfxstream HOST-visible pool). Appended after
     /// guest RAM, SHARE'd (not lent) at boot on protected Gunyah so the host renderer and the guest
     /// reach the same pages, hugepage-prepared, and announced as a no-map reserved-memory node.
@@ -798,6 +805,10 @@ impl GuestMemory {
             // process and sub-allocates BOs out of it, so the host needs access.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::Drm2KgslPool => self.check_pool_backed(region, guest_addr),
+            // The one region where this actually gates anything today: everything else has
+            // step_size == 0 and answers yes everywhere.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::DynamicTestPool => self.check_pool_backed(region, guest_addr),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::SharedFramebuffer => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

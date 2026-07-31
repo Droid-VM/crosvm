@@ -2231,6 +2231,15 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Some(mb) = pa.drm_host_mb {
             std::env::set_var("NCTX_DRM2KGSL_POOL_MB", mb.to_string());
         }
+        if let Some(mb) = pa.test_pool_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_prealloc_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_PREALLOC_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_step_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_STEP_MB", mb.to_string());
+        }
     }
 
     let components = setup_vm_components(&cfg)?;

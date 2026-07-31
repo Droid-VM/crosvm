@@ -291,6 +291,10 @@ impl GunyahVm {
                     // process and must keep reaching it.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::Drm2KgslPool => false,
+                    // Growable test pool: SHARE'd like the others. Only its pre_alloc prefix is
+                    // shared at boot; the remainder is granted at runtime.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::DynamicTestPool => false,
                     MemoryRegionPurpose::GuestMemoryRegion => true,
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::ProtectedFirmwareRegion => true,
@@ -476,6 +480,7 @@ impl GunyahVm {
                     MemoryRegionPurpose::GpuPool
                         | MemoryRegionPurpose::GpuPoolGuest
                         | MemoryRegionPurpose::Drm2KgslPool
+                        | MemoryRegionPurpose::DynamicTestPool
                 );
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let share_chunks = if is_pool {

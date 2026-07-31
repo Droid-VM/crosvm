@@ -649,6 +649,44 @@ impl arch::LinuxArch for AArch64 {
             ));
         }
 
+        // Growable TEST pool. Declared whole, SHARE'd only up to the prealloc prefix; the rest is
+        // granted at runtime. Unlike the three pools above this one really does have a non-zero
+        // step, so it is the only region for which the grant table and the host-access gate do
+        // anything.
+        let test_pool_mb: u64 = std::env::var("DROIDVM_TEST_POOL_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if test_pool_mb != 0 {
+            let step_mb: u64 = std::env::var("DROIDVM_TEST_POOL_STEP_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            // Default to fully pre-shared, i.e. an ordinary non-growable pool: asking for a test
+            // pool without saying how much of it to hold back should not change any behaviour.
+            let prealloc_mb: u64 = std::env::var("DROIDVM_TEST_POOL_PREALLOC_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(test_pool_mb);
+            let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
+            let size = test_pool_mb << 20;
+            let prealloc = (prealloc_mb << 20).min(size);
+            let step = step_mb << 20;
+            memory_regions.push((
+                GuestAddress(base),
+                size,
+                MemoryRegionOptions::new()
+                    .purpose(MemoryRegionPurpose::DynamicTestPool)
+                    .align(2 << 20)
+                    .growable_pool(prealloc, step)
+                    // One grant is one memparcel and the VM-wide limit is 1024, shared with
+                    // Android's own. 64 is deliberately far below it: this pool is for testing,
+                    // and exhausting the quota takes the phone down until it reboots.
+                    .max_grants(64),
+            ));
+            pool_top = base + size;
+        }
+
         // Add simplefb region as SharedFramebuffer.
         // For Gunyah (StaticSwiotlbAllocationRequired), the region is placed at
         // end of RAM (before swiotlb) and follows the swiotlb sharing path:
@@ -1220,6 +1258,24 @@ impl arch::LinuxArch for AArch64 {
         // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
         // pool region emitted).
         let mut gpu_guest_resv: Option<(u64, u64)> = None;
+        // (base, size, pre_alloc, step) for the growable test pool, read back off the region so
+        // the DT node and the region cannot disagree about what the guest was promised.
+        let test_pool_resv: Option<(u64, u64, u64, u64)> = {
+            let mut found = None;
+            for region in vm.get_memory().regions() {
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::DynamicTestPool {
+                    let size = region.size as u64;
+                    found = Some((
+                        region.guest_addr.offset(),
+                        size,
+                        region.options.boot_share_len(size),
+                        region.options.step_size,
+                    ));
+                }
+            }
+            found
+        };
         let mut drm2kgsl_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
             let mut found = None;
@@ -1327,6 +1383,7 @@ impl arch::LinuxArch for AArch64 {
             }),
             gpu_resv,
             gpu_guest_resv,
+            test_pool_resv,
             drm2kgsl_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,

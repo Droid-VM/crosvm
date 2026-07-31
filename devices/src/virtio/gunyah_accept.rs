@@ -425,6 +425,27 @@ impl PoolWorker {
         match r {
             Ok(()) => {
                 let _ = self.mem.pool_take_granted(pool_id, offset, len);
+                // Give the pages back for real.
+                //
+                // Unregistering only takes the range away from the GUEST; the pages are still in
+                // the memfd's page cache, so without this the host has released nothing and the
+                // reserve pool never sees them again -- a shrink that shrinks nothing. Punching
+                // the hole is what returns them to the allocator, where the reserve module's
+                // order-9 free hook picks them back up (its `served` falls and `avail` rises,
+                // which is how a test can tell this actually happened).
+                //
+                // Must be after the unregister: while the guest still has the range accepted the
+                // pages are pinned, and the punch would silently do nothing.
+                //
+                // Seals do not block it -- the guest memfd carries SHRINK|GROW|SEAL, and
+                // shmem_fallocate only refuses PUNCH_HOLE for F_SEAL_WRITE / F_SEAL_FUTURE_WRITE.
+                if let Err(e) = self.punch_range(gpa, len) {
+                    error!(
+                        "gunyah-pool: unshared {:#x}+{:#x} but could not punch it out ({:#}); \
+                         the guest lost the range and the host kept the memory",
+                        gpa, len, e
+                    );
+                }
                 0
             }
             Err(e) => {
@@ -432,6 +453,33 @@ impl PoolWorker {
                 -libc::EIO
             }
         }
+    }
+
+    /// Return a released range's pages to the allocator.
+    fn punch_range(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
+        let (shm, shm_offset) = self
+            .mem
+            .offset_from_base(GuestAddress(gpa))
+            .map_err(|e| anyhow!("pool address has no shm offset: {}", e))?;
+        // SAFETY: the descriptor belongs to a live GuestMemory region and the range was just
+        // validated as a grant of this pool, so it lies inside that region's slice of the file.
+        let rc = unsafe {
+            libc::fallocate(
+                shm.as_raw_descriptor(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                shm_offset as libc::off_t,
+                len as libc::off_t,
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow!(
+                "fallocate(PUNCH_HOLE) at {:#x}+{:#x}: {}",
+                shm_offset,
+                len,
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
     }
 
     fn process_requests(&mut self) {
