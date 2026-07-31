@@ -53,7 +53,15 @@ pub type MemSlot = u32;
 
 /// Per-operation policy for how a runtime-attached host region is accepted into a *protected*
 /// guest's stage-2 (Gunyah). Ignored (a plain no-op) by hypervisors whose runtime attach is a
-/// normal memslot (KVM / geniezone / Gunyah unprotected). CLI value `vm_accept=sync|false|async`.
+/// normal memslot (KVM / geniezone / Gunyah unprotected).
+///
+/// Chosen per call site, NOT from the command line. This used to document a
+/// `vm_accept=sync|false|async` CLI value; nothing parses one, and the launcher scripts that
+/// appear to pass it only mention it in comments. virtio-gpu hard-codes `Sync`
+/// (devices/src/virtio/gpu/virtio_gpu.rs), and the accept device itself is created for every
+/// protected VM (src/crosvm/sys/linux.rs), gated only by the debug escape
+/// `GUNYAH_ACCEPT_DEVICE_OFF=1`. Believing the old wording leads to thinking a change to the
+/// accept transport only affects an opt-in configuration, when it affects all of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum VmAccept {
     /// Transparent: notify the in-VM accept module over the transport and WAIT for it to
@@ -61,8 +69,8 @@ pub enum VmAccept {
     /// the RM handle is delivered to the generic guest-accept module (not the caller).
     #[default]
     Sync,
-    /// `vm_accept=false`: no transport. Return the RM handle to the caller (e.g. virtio-gpu) so it
-    /// drives the guest accept itself and owns the handle for the symmetric release. Low-latency.
+    /// No transport: return the RM handle to the caller (e.g. virtio-gpu) so it drives the guest
+    /// accept itself and owns the handle for the symmetric release. Low-latency.
     Off,
     /// Notify the transport but return without waiting for the accept to complete. (Future.)
     Async,

@@ -678,6 +678,12 @@ impl GuestMemory {
         grants.keys().nth(pool_id as usize).copied().map(GuestAddress)
     }
 
+    /// Grant granularity of a pool, or `None` if there is no such pool.
+    pub fn pool_step(&self, pool_id: u32) -> Option<u64> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants.values().nth(pool_id as usize).map(|p| p.step())
+    }
+
     /// Live grants in a pool, for the guest's reconciliation query.
     pub fn pool_live_grants(&self, pool_id: u32) -> Option<usize> {
         let grants = self.grants.lock().expect("pool grant table poisoned");

@@ -1250,6 +1250,15 @@ impl VmMemoryRequest {
 // The current implementation uses guest physical address as the unique identifier.
 pub struct VmMemoryRegionId(GuestAddress);
 
+impl VmMemoryRegionId {
+    /// The id of the region registered at `addr`. The identifier IS the guest physical address, so
+    /// a caller that knows where it registered something can name it again without having kept the
+    /// response -- which is what the growable-pool worker does when it releases a step.
+    pub fn from_guest_addr(addr: GuestAddress) -> Self {
+        VmMemoryRegionId(addr)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum VmMemoryResponse {
     /// The request to register memory into guest address space was successful.

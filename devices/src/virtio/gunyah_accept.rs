@@ -25,15 +25,23 @@ use base::warn;
 use base::AsRawDescriptor;
 use base::Event;
 use base::EventToken;
+use base::Protection;
 use base::RawDescriptor;
 use base::ReadNotifier;
 use base::Tube;
 use base::WaitContext;
 use base::WorkerThread;
 use snapshot::AnySnapshot;
+use hypervisor::MemCacheType;
+use vm_control::VmMemoryDestination;
+use vm_control::VmMemoryRegionId;
+use vm_control::VmMemoryRequest;
+use vm_control::VmMemoryResponse;
+use vm_control::VmMemorySource;
 use vm_control::GunyahAcceptOp;
 use vm_control::GunyahAcceptRequest;
 use vm_control::GunyahAcceptResponse;
+use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
 use super::DeviceType;
@@ -264,6 +272,53 @@ impl PoolWorker {
         resp
     }
 
+    /// One RegisterMemory round trip, one step of the pool.
+    ///
+    /// The backing is a slice of the pool's OWN memfd rather than freshly allocated memory, and
+    /// that is the crux of the whole design rather than an optimisation. The region was created at
+    /// the full window size -- sparse, so host VA rather than host RAM -- so a granted range is
+    /// already resolvable by `find_region`/`shm_region`, which is exactly what `create_udmabuf`
+    /// needs to turn guest-supplied addresses back into (memfd, offset) pairs. Share fresh memory
+    /// instead and every grant becomes a separate region that the udmabuf path would have to be
+    /// taught about.
+    fn grant_one(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
+        let addr = GuestAddress(gpa);
+        // One call, because the offset is only meaningful against the object it came from: a
+        // GuestMemory may have several backing objects.
+        let (shm, shm_offset) = self
+            .mem
+            .offset_from_base(addr)
+            .map_err(|e| anyhow!("pool address has no shm offset: {}", e))?;
+        let descriptor = shm.as_raw_descriptor();
+        // SAFETY: the descriptor belongs to a GuestMemory region that outlives this device, and
+        // clone_descriptor duplicates it rather than taking ownership.
+        let descriptor = base::clone_descriptor(&base::Descriptor(descriptor))
+            .context("failed to clone the pool memfd")?;
+
+        self.vm_memory
+            .send(&VmMemoryRequest::RegisterMemory {
+                source: VmMemorySource::Descriptor {
+                    descriptor,
+                    offset: shm_offset,
+                    size: len,
+                },
+                dest: VmMemoryDestination::GuestPhysicalAddress(gpa),
+                prot: Protection::read_write(),
+                cache: MemCacheType::CacheCoherent,
+                // The guest cannot touch the range until the RM has accepted it, so waiting for
+                // the accept is the point: returning early would hand back an address that reads
+                // as zeros rather than faulting.
+                vm_accept: hypervisor::VmAccept::Sync,
+            })
+            .context("failed to send RegisterMemory")?;
+
+        match self.vm_memory.recv::<VmMemoryResponse>() {
+            Ok(VmMemoryResponse::RegisterMemory { .. }) => Ok(()),
+            Ok(other) => Err(anyhow!("RegisterMemory refused: {:?}", other)),
+            Err(e) => Err(anyhow!("RegisterMemory response: {}", e)),
+        }
+    }
+
     fn share(&mut self, pool_id: u32, offset: u64, len: u64) -> i32 {
         // Check before doing anything: a refused request must leave no trace, so the guest can
         // pick a different range without having to reconcile with the host first.
@@ -274,10 +329,87 @@ impl PoolWorker {
             );
             return -e.as_errno();
         }
-        // TODO(stage 3b): allocate the backing, send RegisterMemory over self.vm_memory with
-        // dest=GuestPhysicalAddress(base+offset) and vm_accept=Sync, then mem.pool_mark_granted.
-        // The validation above and the transport below are what this commit establishes.
-        -libc::ENOSYS
+        let Some(base) = self.mem.pool_base(pool_id) else {
+            return -libc::ENODEV;
+        };
+        let step = match self.mem.pool_step(pool_id) {
+            Some(s) if s != 0 => s,
+            _ => return -libc::EOPNOTSUPP,
+        };
+
+        // One SHARE per step, because the reclaim label is derived per address (gpa >> 12) and a
+        // single wide parcel could not be released a step at a time afterwards.
+        let mut done: u64 = 0;
+        while done < len {
+            let gpa = base.offset() + offset + done;
+            if let Err(e) = self.grant_one(gpa, step) {
+                error!("gunyah-pool: grant at {:#x} failed: {:#}", gpa, e);
+                // Roll back what this request managed, so a partial failure leaves the pool in
+                // the state the guest already believes it is in. Anything that cannot be rolled
+                // back is recorded, not silently dropped: the guest reconciles with QUERY.
+                if done > 0 {
+                    if let Err(e2) = self.release_range(pool_id, base.offset() + offset, done) {
+                        error!(
+                            "gunyah-pool: rollback of {:#x}+{:#x} failed ({:#}); \
+                             those steps are stranded until the VM exits",
+                            base.offset() + offset,
+                            done,
+                            e2
+                        );
+                    }
+                }
+                return -libc::ENOMEM;
+            }
+            // Record each step as it lands, so a failure part way through has an accurate table
+            // to roll back from.
+            if let Err(e) = self.mem.pool_mark_granted(pool_id, offset + done, step, &[0]) {
+                error!("gunyah-pool: grant bookkeeping failed: {:?}", e);
+                return -libc::EIO;
+            }
+            done += step;
+        }
+        0
+    }
+
+    /// Unregister a range that is already recorded as granted, and forget it.
+    fn release_range(&mut self, pool_id: u32, gpa: u64, len: u64) -> anyhow::Result<()> {
+        let base = self
+            .mem
+            .pool_base(pool_id)
+            .context("no such pool")?
+            .offset();
+        let step = self.mem.pool_step(pool_id).unwrap_or(0);
+        if step == 0 {
+            return Err(anyhow!("pool {} does not grow", pool_id));
+        }
+        let mut off = 0u64;
+        let mut first_err = None;
+        while off < len {
+            let req = VmMemoryRequest::UnregisterMemory(VmMemoryRegionId::from_guest_addr(GuestAddress(gpa + off)));
+            let r = self
+                .vm_memory
+                .send(&req)
+                .map_err(|e| anyhow!("send: {}", e))
+                .and_then(|()| match self.vm_memory.recv::<VmMemoryResponse>() {
+                    Ok(VmMemoryResponse::Ok) => Ok(()),
+                    Ok(other) => Err(anyhow!("refused: {:?}", other)),
+                    Err(e) => Err(anyhow!("response: {}", e)),
+                });
+            // Keep going on error: leaving later steps registered because an earlier one failed
+            // would strand strictly more memory.
+            if let Err(e) = r {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            } else {
+                let _ = self.mem.pool_take_granted(pool_id, gpa + off - base, step);
+            }
+            off += step;
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn unshare(&mut self, pool_id: u32, offset: u64, len: u64) -> i32 {
@@ -288,11 +420,28 @@ impl PoolWorker {
             );
             return -e.as_errno();
         }
-        // TODO(stage 3b): the host must also confirm nothing of its own still references this
-        // range -- udmabuf, GPU mappings, scanout iovecs. The guest cannot answer that: its
-        // RESOURCE_UNREF is fire-and-forget, so it believes a buffer is released while the host
-        // still holds it.
-        -libc::ENOSYS
+        let Some(base) = self.mem.pool_base(pool_id) else {
+            return -libc::ENODEV;
+        };
+        //
+        // NOT YET CHECKED, and the guest must not be led to think otherwise: whether anything on
+        // the HOST still references these pages -- a udmabuf built over them, a GPU mapping, a
+        // scanout iovec. Only the host can answer that, because the guest's RESOURCE_UNREF is
+        // fire-and-forget: it believes a buffer is gone while the host still holds it. Answering
+        // needs the resource tables that live in the GPU device, which this worker cannot reach
+        // today.
+        //
+        // Until it can, shrink is safe only for a range nothing was ever built over, which is
+        // what the stage 4 test exercises. A consumer driver must not call it on memory it has
+        // handed to the host.
+        //
+        match self.release_range(pool_id, base.offset() + offset, len) {
+            Ok(()) => 0,
+            Err(e) => {
+                error!("gunyah-pool: unshare failed: {:#}", e);
+                -libc::EIO
+            }
+        }
     }
 
     fn process_requests(&mut self) {
