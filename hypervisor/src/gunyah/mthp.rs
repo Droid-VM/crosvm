@@ -471,6 +471,98 @@ pub unsafe fn folio_back_fd(fd: i32, rounded: u64) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Fold `[offset, offset+len)` of an already-sized fd into 2 MiB folios, leaving the rest of the
+/// file untouched.
+///
+/// [`folio_back_fd`] cannot be used for a growable pool: it ftruncates and collapses the WHOLE
+/// file, and a pool's file is the whole declared window. Doing that would populate the part the
+/// guest has not asked for, which is precisely the memory the design exists to not allocate.
+///
+/// The alignment dance is the same and for the same reason: MADV_COLLAPSE on a file mapping only
+/// forms a PMD when the virtual address and the file offset are congruent mod 2 MiB, so the fd is
+/// mapped at a 2 MiB-aligned VA with the window's own offset, rather than wherever mmap happens to
+/// land it. `offset` and `len` must both be 2 MiB multiples; anything else is rejected rather than
+/// silently degraded, because a degraded grant is a parcel with 512x the mem_entries and that
+/// failure shows up much later as an order-5 kcalloc failing under fragmentation.
+///
+/// Returns Ok even when individual collapses fail -- the caller gets 4 KiB backing, which works
+/// but is expensive, and `verify` below is how a caller finds out.
+///
+/// # Safety
+/// `fd` must be a live shmem descriptor at least `offset + len` bytes long.
+pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Result<()> {
+    let err = || std::io::Error::last_os_error();
+    if offset % THP_SIZE != 0 || len % THP_SIZE != 0 || len == 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // Punch the range in first: the file is sparse, and the pages have to exist before there is
+    // anything for a collapse to fold.
+    if libc::fallocate(
+        fd,
+        0,
+        offset as libc::off_t,
+        len as libc::off_t,
+    ) != 0
+    {
+        return Err(err());
+    }
+
+    let l = len as usize;
+    let thp = THP_SIZE as usize;
+    let base = libc::mmap(
+        std::ptr::null_mut(),
+        l + thp,
+        libc::PROT_NONE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        -1,
+        0,
+    );
+    if base == libc::MAP_FAILED {
+        return Err(err());
+    }
+    let base_u = base as usize;
+    let aligned = (base_u + thp - 1) & !(thp - 1);
+    // The file offset is a 2 MiB multiple and the VA is 2 MiB-aligned, so they are congruent.
+    let mapped = libc::mmap(
+        aligned as *mut libc::c_void,
+        l,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED | libc::MAP_FIXED,
+        fd,
+        offset as libc::off_t,
+    );
+    if mapped == libc::MAP_FAILED {
+        let e = err();
+        libc::munmap(base, l + thp);
+        return Err(e);
+    }
+    if aligned > base_u {
+        libc::munmap(base, aligned - base_u);
+    }
+    let tail_start = aligned + l;
+    let tail_end = base_u + l + thp;
+    if tail_end > tail_start {
+        libc::munmap(tail_start as *mut libc::c_void, tail_end - tail_start);
+    }
+
+    let _ = libc::madvise(mapped, l, libc::MADV_HUGEPAGE);
+    for w in 0..(len / THP_SIZE) {
+        let ptr = (mapped as *mut u8).add((w * THP_SIZE) as usize) as *mut libc::c_void;
+        if libc::madvise(ptr, THP_SIZE as usize, MADV_POPULATE_WRITE) != 0 {
+            // Older kernels lack MADV_POPULATE_WRITE; fault each page in by hand so the collapse
+            // has something to work with.
+            let npages = THP_SIZE / 4096;
+            for pg in 0..npages {
+                let p = (ptr as *mut u8).add((pg * 4096) as usize);
+                std::ptr::write_volatile(p, std::ptr::read_volatile(p));
+            }
+        }
+        let _ = libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE);
+    }
+    libc::munmap(mapped, l);
+    Ok(())
+}
+
 /// An individual chunk to LEND, produced by [`compute_lend_chunks`].
 pub struct LendChunk {
     /// Offset from the base of the region.

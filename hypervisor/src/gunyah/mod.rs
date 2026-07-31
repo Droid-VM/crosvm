@@ -1021,6 +1021,23 @@ impl Vm for GunyahVm {
         Ok(rounded)
     }
 
+    fn prepare_blob_range(
+        &mut self,
+        fd: &dyn base::AsRawDescriptor,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        // A grant that ends up 4 KiB-backed still works, but its parcel carries 512x the
+        // mem_entries and the host share module builds that array with a high-order kcalloc --
+        // which starts failing as uptime fragments memory. Report the failure rather than
+        // silently degrading, and let the caller decide.
+        //
+        // SAFETY: fd is the pool region's shmem descriptor, alive for the VM's lifetime, and
+        // folio_back_range only fallocates and collapses within [offset, offset+size).
+        unsafe { mthp::folio_back_range(fd.as_raw_descriptor(), offset, size) }
+            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))
+    }
+
     fn add_memory_region(
         &mut self,
         guest_addr: GuestAddress,

@@ -720,29 +720,30 @@ impl GuestMemory {
             .validate_unshare(offset, len)
     }
 
-    /// Record a completed grant.
+    /// Record a completed grant. One grant is one memparcel, whatever its length.
     pub fn pool_mark_granted(
         &self,
         pool_id: u32,
         offset: u64,
         len: u64,
-        handles: &[u32],
+        handle: u32,
     ) -> std::result::Result<(), GrantError> {
         let mut grants = self.grants.lock().expect("pool grant table poisoned");
         grants
             .values_mut()
             .nth(pool_id as usize)
             .ok_or(GrantError::NotGrowable)?
-            .mark_granted(offset, len, handles)
+            .mark_granted(offset, len, handle)
     }
 
-    /// Forget a released range, returning the RM handles recorded for it.
+    /// Forget a released grant, returning the RM handle recorded for it. The range must name a
+    /// grant exactly: the RM reclaims a parcel whole.
     pub fn pool_take_granted(
         &self,
         pool_id: u32,
         offset: u64,
         len: u64,
-    ) -> std::result::Result<Vec<u32>, GrantError> {
+    ) -> std::result::Result<u32, GrantError> {
         let mut grants = self.grants.lock().expect("pool grant table poisoned");
         grants
             .values_mut()

@@ -714,6 +714,15 @@ pub enum VmMemoryRequest {
         descriptor: SafeDescriptor,
         size: u64,
     },
+    /// Fold `[offset, offset+size)` of `descriptor` into 2 MiB folios, leaving the rest of the
+    /// file alone. Distinct from `PrepareBlobBacking`, which sizes and collapses the WHOLE file:
+    /// a growable pool's file is its whole declared window, so doing that would populate every
+    /// byte the guest has not asked for. Answered with `VmMemoryResponse::Ok`.
+    PrepareBlobRange {
+        descriptor: SafeDescriptor,
+        offset: u64,
+        size: u64,
+    },
 }
 
 /// Struct for managing `VmMemoryRequest`s IOMMU related state.
@@ -1241,6 +1250,14 @@ impl VmMemoryRequest {
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
+            PrepareBlobRange {
+                descriptor,
+                offset,
+                size,
+            } => match vm.prepare_blob_range(&descriptor, offset, size) {
+                Ok(()) => VmMemoryResponse::Ok,
+                Err(e) => VmMemoryResponse::Err(e),
+            },
         }
     }
 }

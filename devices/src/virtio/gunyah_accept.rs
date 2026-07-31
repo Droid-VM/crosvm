@@ -272,27 +272,60 @@ impl PoolWorker {
         resp
     }
 
-    /// One RegisterMemory round trip, one step of the pool.
+    /// Fold the range into 2 MiB folios before it is shared.
     ///
-    /// The backing is a slice of the pool's OWN memfd rather than freshly allocated memory, and
-    /// that is the crux of the whole design rather than an optimisation. The region was created at
-    /// the full window size -- sparse, so host VA rather than host RAM -- so a granted range is
-    /// already resolvable by `find_region`/`shm_region`, which is exactly what `create_udmabuf`
-    /// needs to turn guest-supplied addresses back into (memfd, offset) pairs. Share fresh memory
-    /// instead and every grant becomes a separate region that the udmabuf path would have to be
-    /// taught about.
-    fn grant_one(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
-        let addr = GuestAddress(gpa);
-        // One call, because the offset is only meaningful against the object it came from: a
-        // GuestMemory may have several backing objects.
+    /// Without this the pages are whatever the fault handler produces, which is 4 KiB, and a
+    /// 32 MiB grant becomes a parcel with 8192 mem_entries. That fails as an order-5 kcalloc in
+    /// the host share module once memory is fragmented -- a failure that looks like "grow stopped
+    /// working after a few hours of uptime" rather than like a missing preparation step.
+    ///
+    /// Deliberately NOT the existing PrepareBlobBacking: `folio_back_fd` ftruncates and collapses
+    /// the WHOLE file, and a pool's file is the whole declared window, so using it here would
+    /// populate everything the guest has not asked for -- exactly the memory this design exists
+    /// to leave unallocated.
+    fn prepare_folios(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
         let (shm, shm_offset) = self
             .mem
-            .offset_from_base(addr)
+            .offset_from_base(GuestAddress(gpa))
             .map_err(|e| anyhow!("pool address has no shm offset: {}", e))?;
-        let descriptor = shm.as_raw_descriptor();
-        // SAFETY: the descriptor belongs to a GuestMemory region that outlives this device, and
-        // clone_descriptor duplicates it rather than taking ownership.
-        let descriptor = base::clone_descriptor(&base::Descriptor(descriptor))
+        self.vm_memory
+            .send(&VmMemoryRequest::PrepareBlobRange {
+                descriptor: base::clone_descriptor(&base::Descriptor(shm.as_raw_descriptor()))
+                    .context("failed to clone the pool memfd")?,
+                offset: shm_offset,
+                size: len,
+            })
+            .context("failed to send PrepareBlobRange")?;
+        match self.vm_memory.recv::<VmMemoryResponse>() {
+            Ok(VmMemoryResponse::Ok) => Ok(()),
+            Ok(other) => Err(anyhow!("PrepareBlobRange refused: {:?}", other)),
+            Err(e) => Err(anyhow!("PrepareBlobRange response: {}", e)),
+        }
+    }
+
+    /// Share one grant: prepare the folios, hand the range to the hypervisor, wait for the guest
+    /// to accept it.
+    ///
+    /// ONE parcel for the whole request, however many steps it spans. A grant is one memparcel
+    /// regardless of length, and MAX_MEMPARCEL_PER_VM is 1024 for the entire VM -- shared with
+    /// Android's own, and not returned by anything short of a reboot for what a killed VMM leaves
+    /// behind. Splitting a 192 MiB request into six parcels would spend six times the quota for
+    /// nothing. The cost is that the RM gives a parcel back whole, so this grant is also the unit
+    /// of release; a caller that wants finer release asks for less at a time.
+    ///
+    /// The backing is a slice of the pool's OWN memfd rather than fresh memory, which is the crux
+    /// of the design rather than an optimisation: the region was created at the full window size
+    /// -- sparse, so host VA and not host RAM -- so a granted range is already resolvable by
+    /// find_region/shm_region, which is what create_udmabuf needs to turn guest-supplied addresses
+    /// back into (memfd, offset) pairs.
+    fn grant(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
+        self.prepare_folios(gpa, len)?;
+
+        let (shm, shm_offset) = self
+            .mem
+            .offset_from_base(GuestAddress(gpa))
+            .map_err(|e| anyhow!("pool address has no shm offset: {}", e))?;
+        let descriptor = base::clone_descriptor(&base::Descriptor(shm.as_raw_descriptor()))
             .context("failed to clone the pool memfd")?;
 
         self.vm_memory
@@ -305,9 +338,8 @@ impl PoolWorker {
                 dest: VmMemoryDestination::GuestPhysicalAddress(gpa),
                 prot: Protection::read_write(),
                 cache: MemCacheType::CacheCoherent,
-                // The guest cannot touch the range until the RM has accepted it, so waiting for
-                // the accept is the point: returning early would hand back an address that reads
-                // as zeros rather than faulting.
+                // Waiting for the accept IS the point: returning before the RM has accepted would
+                // hand the guest an address that reads as zeros instead of faulting.
                 vm_accept: hypervisor::VmAccept::Sync,
             })
             .context("failed to send RegisterMemory")?;
@@ -332,87 +364,29 @@ impl PoolWorker {
         let Some(base) = self.mem.pool_base(pool_id) else {
             return -libc::ENODEV;
         };
-        let step = match self.mem.pool_step(pool_id) {
-            Some(s) if s != 0 => s,
-            _ => return -libc::EOPNOTSUPP,
-        };
+        let gpa = base.offset() + offset;
 
-        // One SHARE per step, because the reclaim label is derived per address (gpa >> 12) and a
-        // single wide parcel could not be released a step at a time afterwards.
-        let mut done: u64 = 0;
-        while done < len {
-            let gpa = base.offset() + offset + done;
-            if let Err(e) = self.grant_one(gpa, step) {
-                error!("gunyah-pool: grant at {:#x} failed: {:#}", gpa, e);
-                // Roll back what this request managed, so a partial failure leaves the pool in
-                // the state the guest already believes it is in. Anything that cannot be rolled
-                // back is recorded, not silently dropped: the guest reconciles with QUERY.
-                if done > 0 {
-                    if let Err(e2) = self.release_range(pool_id, base.offset() + offset, done) {
-                        error!(
-                            "gunyah-pool: rollback of {:#x}+{:#x} failed ({:#}); \
-                             those steps are stranded until the VM exits",
-                            base.offset() + offset,
-                            done,
-                            e2
-                        );
-                    }
-                }
-                return -libc::ENOMEM;
-            }
-            // Record each step as it lands, so a failure part way through has an accurate table
-            // to roll back from.
-            if let Err(e) = self.mem.pool_mark_granted(pool_id, offset + done, step, &[0]) {
-                error!("gunyah-pool: grant bookkeeping failed: {:?}", e);
-                return -libc::EIO;
-            }
-            done += step;
+        if let Err(e) = self.grant(gpa, len) {
+            error!("gunyah-pool: grant at {:#x}+{:#x} failed: {:#}", gpa, len, e);
+            // Nothing to roll back: one request is one parcel, so a failure leaves the pool
+            // exactly as the guest already believes it to be.
+            return -libc::ENOMEM;
+        }
+        if let Err(e) = self.mem.pool_mark_granted(pool_id, offset, len, 0) {
+            // The share succeeded but the table does not know: the guest would be told no while
+            // holding memory it can use, and the range would never be released. Say so loudly.
+            error!(
+                "gunyah-pool: grant at {:#x} succeeded but bookkeeping failed ({:?}); \
+                 that range is stranded until the VM exits",
+                gpa, e
+            );
+            return -libc::EIO;
         }
         0
     }
 
-    /// Unregister a range that is already recorded as granted, and forget it.
-    fn release_range(&mut self, pool_id: u32, gpa: u64, len: u64) -> anyhow::Result<()> {
-        let base = self
-            .mem
-            .pool_base(pool_id)
-            .context("no such pool")?
-            .offset();
-        let step = self.mem.pool_step(pool_id).unwrap_or(0);
-        if step == 0 {
-            return Err(anyhow!("pool {} does not grow", pool_id));
-        }
-        let mut off = 0u64;
-        let mut first_err = None;
-        while off < len {
-            let req = VmMemoryRequest::UnregisterMemory(VmMemoryRegionId::from_guest_addr(GuestAddress(gpa + off)));
-            let r = self
-                .vm_memory
-                .send(&req)
-                .map_err(|e| anyhow!("send: {}", e))
-                .and_then(|()| match self.vm_memory.recv::<VmMemoryResponse>() {
-                    Ok(VmMemoryResponse::Ok) => Ok(()),
-                    Ok(other) => Err(anyhow!("refused: {:?}", other)),
-                    Err(e) => Err(anyhow!("response: {}", e)),
-                });
-            // Keep going on error: leaving later steps registered because an earlier one failed
-            // would strand strictly more memory.
-            if let Err(e) = r {
-                if first_err.is_none() {
-                    first_err = Some(e);
-                }
-            } else {
-                let _ = self.mem.pool_take_granted(pool_id, gpa + off - base, step);
-            }
-            off += step;
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
     fn unshare(&mut self, pool_id: u32, offset: u64, len: u64) -> i32 {
+        // Must name a grant exactly -- see PoolGrants: the RM reclaims a parcel whole.
         if let Err(e) = self.mem.pool_validate_unshare(pool_id, offset, len) {
             warn!(
                 "gunyah-pool: refusing UNSHARE pool={} offset={:#x} len={:#x}: {:?}",
@@ -423,22 +397,38 @@ impl PoolWorker {
         let Some(base) = self.mem.pool_base(pool_id) else {
             return -libc::ENODEV;
         };
+        let gpa = base.offset() + offset;
         //
-        // NOT YET CHECKED, and the guest must not be led to think otherwise: whether anything on
+        // NOT YET CHECKED, and a caller must not be led to believe otherwise: whether anything on
         // the HOST still references these pages -- a udmabuf built over them, a GPU mapping, a
-        // scanout iovec. Only the host can answer that, because the guest's RESOURCE_UNREF is
-        // fire-and-forget: it believes a buffer is gone while the host still holds it. Answering
-        // needs the resource tables that live in the GPU device, which this worker cannot reach
-        // today.
+        // scanout iovec. The host is the only side that CAN answer, because the guest's
+        // RESOURCE_UNREF is fire-and-forget and it drops a buffer from its allocator while the
+        // host still holds it. The information exists (VirtioGpuResource keeps backing_iovecs and
+        // pool_scanout_iovecs, and unref_resource is a definite moment); what is missing is a
+        // refcount on the grant table, incremented where create_udmabuf resolves an address and
+        // decremented where unref_resource drops one.
         //
-        // Until it can, shrink is safe only for a range nothing was ever built over, which is
-        // what the stage 4 test exercises. A consumer driver must not call it on memory it has
-        // handed to the host.
+        // Until that lands, shrink is safe only for a range nothing was ever built over.
         //
-        match self.release_range(pool_id, base.offset() + offset, len) {
-            Ok(()) => 0,
+        let req = VmMemoryRequest::UnregisterMemory(VmMemoryRegionId::from_guest_addr(
+            GuestAddress(gpa),
+        ));
+        let r = self
+            .vm_memory
+            .send(&req)
+            .map_err(|e| anyhow!("send: {}", e))
+            .and_then(|()| match self.vm_memory.recv::<VmMemoryResponse>() {
+                Ok(VmMemoryResponse::Ok) => Ok(()),
+                Ok(other) => Err(anyhow!("refused: {:?}", other)),
+                Err(e) => Err(anyhow!("response: {}", e)),
+            });
+        match r {
+            Ok(()) => {
+                let _ = self.mem.pool_take_granted(pool_id, offset, len);
+                0
+            }
             Err(e) => {
-                error!("gunyah-pool: unshare failed: {:#}", e);
+                error!("gunyah-pool: unshare at {:#x} failed: {:#}", gpa, e);
                 -libc::EIO
             }
         }

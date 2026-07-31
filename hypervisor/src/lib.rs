@@ -256,6 +256,22 @@ pub trait Vm: Send {
         Ok(0)
     }
 
+    /// Fold a sub-range of `fd` into 2 MiB folios. Default no-op; only Gunyah protected acts.
+    ///
+    /// Separate from [`Vm::prepare_runtime_blob_backing`] because that one owns the whole file --
+    /// it sizes it and collapses all of it -- which is right for a per-blob fd and wrong for a
+    /// growable pool, whose file is the entire declared window and must stay sparse where the
+    /// guest has not asked for memory.
+    fn prepare_blob_range(
+        &mut self,
+        fd: &dyn AsRawDescriptor,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        let _ = (fd, offset, size);
+        Ok(())
+    }
+
     /// Does a synchronous msync of the memory mapped at `slot`, syncing `size` bytes starting at
     /// `offset` from the start of the region.  `offset` must be page aligned.
     fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()>;
