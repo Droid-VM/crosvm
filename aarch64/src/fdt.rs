@@ -164,6 +164,104 @@ fn create_resv_memory_node(
     Ok(PHANDLE_RESTRICTED_DMA_POOL)
 }
 
+/// The parameters of a growable pool: the numbers a guest driver cannot work out from `reg`.
+struct GrowablePool {
+    /// Where the pre-shared floor ends. Below it the memory is backed at boot; above it a grant
+    /// must be asked for and must have returned before anything touches the address. There is no
+    /// recoverable fault to fall back on -- a read of an ungranted address returns zeros with no
+    /// error at all, and a write kills the VM.
+    pre_alloc_size: u64,
+    /// The granularity a grant must be requested in. A misaligned request is refused by the host
+    /// rather than rounded, deliberately: rounding would hand out memory nobody asked for.
+    step_size: u64,
+    /// Index into the host's growable-pool table, which is ordered by address. With one growable
+    /// pool this is 0; it is emitted rather than assumed so that adding a second one cannot
+    /// silently shift it.
+    pool_id: u32,
+}
+
+/// Announce one pool to the guest as a `/reserved-memory` node.
+///
+/// A pool is a slab of guest-physical address space the host can reach: SHARE'd rather than lent,
+/// so both sides see the same pages even in a protected VM. `name` says who the pool is for and
+/// which side allocates from it -- `gfx_host`, `gpu_guest`, `drm2kgsl_host` -- and it is a WIRE
+/// NAME: the guest driver finds its pool by matching this name prefix under `/reserved-memory`, so
+/// changing one is a cross-repo change.
+///
+/// # Adding a pool
+///
+/// 1. `vm_memory::MemoryRegionPurpose`: give it its own variant. Sharing an existing variant means
+///    sharing that pool's region, which is exactly what the separate variants exist to prevent.
+/// 2. `aarch64/src/lib.rs`: carve the region out after guest RAM and collect its `(gpa, size)`.
+/// 3. Here: one more `create_pool_node()` call, named `<consumer>_<side>`.
+/// 4. The consuming driver: find the node by that name prefix.
+///
+/// Nothing else needs touching, because both of the things that read this node are generic:
+///
+/// * The Gunyah RM blesses the range by matching this node's `reg` against the lend=false
+///   memparcel registered before VM start (`vm_creation.c
+///   find_memparcel_for_resmem_node_by_address`). It walks every `/reserved-memory` child and
+///   never looks at `compatible`.
+/// * edk2's `GunyahPoolAcpiDxe` walks every `droidvm,pool` node and emits one ACPI device per pool
+///   under `\_SB`, so a guest that cannot read a device tree -- Windows -- still finds its pool.
+///   `pool-name` becomes the ACPI `_UID`, so a pool shows up as e.g. `ACPI\DRVM0001\gpu_guest`.
+///
+/// # Why `no-map`, and why the `compatible` must stay unknown to Linux
+///
+/// The RM blesses by `reg`, so `compatible` is free for us to use -- but only for a string Linux
+/// has no `RESERVEDMEM_OF_DECLARE` handler for. Dynamic tracing of `gunyah_gup_demand_page`
+/// (2026-06-19) showed that with `restricted-dma-pool` the guest kernel EAGERLY initialises a DMA
+/// bounce pool here, zeroing the whole range during early boot, and then PSCI-resets before it
+/// ever probes virtio/PCI (zero MMIO exits observed). `no-map` plus a vendor `compatible` keeps
+/// the region out of the kernel's RAM/linear map -- no eager init, no crash -- while still letting
+/// a driver map it on demand.
+///
+/// # `acpi_hid`
+///
+/// `None` puts the pool on the shared `_HID` (`DRVM0001`), where one Windows provider driver binds
+/// every pool and hands them out by `_UID`. Override it only for a pool that needs its own Windows
+/// driver: Windows matches an INF on `ACPI\<_HID>` alone -- the instance id never takes part -- so
+/// a private driver needs a private `_HID`. edk2 then keeps `DRVM0001` as the `_CID`, so the
+/// shared provider still picks the pool up when that driver is not installed. Nothing needs this
+/// today; it is here so that adding a pool with its own driver stays a one-line change.
+fn create_pool_node(
+    fdt: &mut Fdt,
+    name: &str,
+    gpa: u64,
+    size: u64,
+    acpi_hid: Option<&str>,
+    growable: Option<GrowablePool>,
+) -> Result<()> {
+    let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+    // Set the parent's cells in case the swiotlb path did not create them (it normally does).
+    resv.set_prop("#address-cells", 0x2u32)?;
+    resv.set_prop("#size-cells", 0x2u32)?;
+    resv.set_prop("ranges", ())?;
+
+    let node = resv.subnode_mut(&format!("{}@{:x}", name, gpa))?;
+    // `droidvm,pool` is what edk2 scans for; the more specific string comes first, as usual for a
+    // compatible list. Both are vendor strings no Linux reserved-memory handler claims.
+    if growable.is_some() {
+        node.set_prop("compatible", &["droidvm,dynamic-pool", "droidvm,pool"][..])?;
+    } else {
+        node.set_prop("compatible", "droidvm,pool")?;
+    }
+    node.set_prop("reg", &[gpa, size])?;
+    node.set_prop("no-map", ())?;
+    // The name again, as a property: a consumer that reaches the node by phandle or by scanning
+    // for the compatible never sees the node name, and edk2 turns this into the ACPI `_UID`.
+    node.set_prop("droidvm,pool-name", name)?;
+    if let Some(hid) = acpi_hid {
+        node.set_prop("droidvm,acpi-hid", hid)?;
+    }
+    if let Some(g) = growable {
+        node.set_prop("droidvm,pre-alloc-size", g.pre_alloc_size)?;
+        node.set_prop("droidvm,step-size", g.step_size)?;
+        node.set_prop("droidvm,pool-id", g.pool_id)?;
+    }
+    Ok(())
+}
+
 fn create_cpu_nodes(
     fdt: &mut Fdt,
     num_cpus: u32,
@@ -851,76 +949,42 @@ pub fn create_fdt(
         }
     };
 
-    // GPU pool: emit an (unattached) reserved-memory node covering the blessed pool region. The
-    // Gunyah RM matches this node (by reg) to the lend=false memparcel registered before start
-    // and blesses the range, so the pool is reachable by the protected guest.
+    // The pools. See `create_pool_node` for what a pool node carries and how to add one.
+
+    // gfxstream's host-visible pool: the host renderer allocates every host-visible blob from it
+    // and the guest maps them by pool-relative offset.
     if let Some((gpa, size)) = gpu_resv {
-        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
-        // Set parent props in case the swiotlb path did not create them (it normally does).
-        resv.set_prop("#address-cells", 0x2u32)?;
-        resv.set_prop("#size-cells", 0x2u32)?;
-        resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("gfx_host@{:x}", gpa))?;
-        node.set_prop("reg", &[gpa, size])?;
-        // The Gunyah RM blesses this range by matching THIS node's `reg` to the lend=false
-        // memparcel (vm_creation.c find_memparcel_for_resmem_node_by_address); it does NOT look at
-        // `compatible`. So emit a plain `no-map` reservation, NOT `restricted-dma-pool`:
-        // dynamic tracing of gunyah_gup_demand_page (2026-06-19) showed that with
-        // `restricted-dma-pool` the guest kernel EAGERLY initializes a DMA bounce pool here —
-        // zeroing the whole BAR GPA range during early boot — and then PSCI-resets, before it ever
-        // probes virtio/PCI (zero MMIO exits observed). `no-map` keeps the region out of the
-        // kernel's RAM/linear map (no eager init, no crash) while still letting the virtio-gpu
-        // driver ioremap the BAR on demand. The RM bless is preserved via `reg`.
-        node.set_prop("no-map", ())?;
+        create_pool_node(&mut fdt, "gfx_host", gpa, size, None, None)?;
     }
 
-    // Guest-alloc pool: a second no-map reserved-memory node the guest virtio-gpu driver matches
-    // by the distinct name prefix `gpu_guest` (vs the host pool's `gfx_host`).
-    // Same bless/no-map rationale as above; the guest driver owns a page allocator over this
-    // range and sub-allocates BLOB_MEM_GUEST from it in guest-alloc mode.
+    // The guest-alloc pool: the guest virtio-gpu driver owns a page allocator over this range and
+    // sub-allocates BLOB_MEM_GUEST from it, handing the host ordinary mem-entries.
     if let Some((gpa, size)) = gpu_guest_resv {
-        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
-        resv.set_prop("#address-cells", 0x2u32)?;
-        resv.set_prop("#size-cells", 0x2u32)?;
-        resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("gpu_guest@{:x}", gpa))?;
-        node.set_prop("reg", &[gpa, size])?;
-        node.set_prop("no-map", ())?;
+        create_pool_node(&mut fdt, "gpu_guest", gpa, size, None, None)?;
     }
 
-    // Growable test pool. Same no-map node as the pools above, plus the two numbers a guest
-    // driver cannot otherwise learn: where the pre-shared floor ends, and the granularity it must
-    // request in. Without them the driver would have to guess, and a misaligned request is
-    // refused by the host rather than rounded -- deliberately, since rounding would hand out
-    // memory nobody asked for.
+    // The growable test pool: exists so the grow/shrink path can be exercised end to end without
+    // disturbing the production pools, which are all fully pre-shared and must stay that way.
     if let Some((gpa, size, prealloc, step)) = test_pool_resv {
-        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
-        resv.set_prop("#address-cells", 0x2u32)?;
-        resv.set_prop("#size-cells", 0x2u32)?;
-        resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("test_guest@{:x}", gpa))?;
-        node.set_prop("compatible", "droidvm,dynamic-pool")?;
-        node.set_prop("reg", &[gpa, size])?;
-        node.set_prop("no-map", ())?;
-        node.set_prop("droidvm,pre-alloc-size", prealloc)?;
-        node.set_prop("droidvm,step-size", step)?;
-        // Index into the host's growable-pool table, which is ordered by address. With one
-        // growable pool this is 0; it is emitted rather than assumed so a second one does not
-        // silently shift it.
-        node.set_prop("droidvm,pool-id", 0u32)?;
+        create_pool_node(
+            &mut fdt,
+            "test_guest",
+            gpa,
+            size,
+            None,
+            Some(GrowablePool {
+                pre_alloc_size: prealloc,
+                step_size: step,
+                pool_id: 0,
+            }),
+        )?;
     }
 
-    // DRM native context host-alloc pool: a no-map node on the same terms. The guest allocates
-    // nothing from it -- it holds the host's own msm shmem rings -- so nothing in the guest
-    // matches this name; it exists so the RM blesses the range by `reg`.
+    // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's
+    // own msm shmem rings -- so nothing in the guest matches this name. It is announced anyway so
+    // the RM blesses the range.
     if let Some((gpa, size)) = drm2kgsl_resv {
-        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
-        resv.set_prop("#address-cells", 0x2u32)?;
-        resv.set_prop("#size-cells", 0x2u32)?;
-        resv.set_prop("ranges", ())?;
-        let node = resv.subnode_mut(&format!("drm2kgsl_host@{:x}", gpa))?;
-        node.set_prop("reg", &[gpa, size])?;
-        node.set_prop("no-map", ())?;
+        create_pool_node(&mut fdt, "drm2kgsl_host", gpa, size, None, None)?;
     }
 
     create_cpu_nodes(
