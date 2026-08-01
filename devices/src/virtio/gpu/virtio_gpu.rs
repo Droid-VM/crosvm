@@ -670,16 +670,14 @@ impl VirtioGpuScanout {
                 strace!("flush.blob.export.begin res={}", resource.resource_id);
                 let exported = rutabaga.export_blob(resource.resource_id);
                 strace!("flush.blob.export.end ok={}", exported.is_ok());
-                note_flush_route(match &exported {
-                    Ok(_) => "blob: export ok",
-                    Err(e) => {
-                        if matches!(e, RutabagaError::InvalidRutabagaHandle) {
-                            "blob: export gave no fd"
-                        } else {
-                            "blob: export errored"
-                        }
-                    }
-                });
+                // The error text distinguishes the cases that matter here without pulling in
+                // RutabagaError, which is only imported on Windows: "invalid rutabaga handle" is
+                // gfxstream reporting success with fd -1, anything else is the export itself
+                // failing. One line per distinct message, so this cannot run away.
+                match &exported {
+                    Ok(_) => note_flush_route("blob: export ok"),
+                    Err(e) => note_flush_route(&format!("blob: export failed: {e}")),
+                }
                 if let Ok(handle) = exported {
                     let desc = to_safe_descriptor(handle.os_handle);
                     let data = resource.scanout_data.unwrap();
