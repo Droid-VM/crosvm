@@ -683,10 +683,29 @@ impl VirtioGpuScanout {
                     let data = resource.scanout_data.unwrap();
                     let map_size =
                         data.offsets[0] as usize + data.strides[0] as usize * data.height as usize;
-                    strace!("flush.blob.mmap.begin size={}", map_size);
-                    let mapped = MemoryMappingBuilder::new(map_size)
-                        .from_descriptor(&desc)
-                        .build();
+                    // A pool-resident blob exports the whole pool's memfd, not a descriptor for
+                    // the buffer: where the buffer actually lives is the pool offset. Mapping from
+                    // zero therefore reads whatever is at the start of the pool, which is right
+                    // exactly once -- for the first blob allocated, at offset zero -- and wrong
+                    // for every buffer after it. That is what a compositor cycling through
+                    // buffers looks like: the first composited frame appears and the display then
+                    // never changes again, with no error anywhere, because the copy keeps
+                    // succeeding against the buffer that is no longer being drawn into.
+                    let pool_offset = rutabaga.resource_pool_offset(resource.resource_id);
+                    strace!(
+                        "flush.blob.mmap.begin size={} pool_offset={:?}",
+                        map_size,
+                        pool_offset
+                    );
+                    note_flush_route(match pool_offset {
+                        Some(_) => "blob: mapping at a pool offset",
+                        None => "blob: mapping a whole descriptor",
+                    });
+                    let mut builder = MemoryMappingBuilder::new(map_size).from_descriptor(&desc);
+                    if let Some(off) = pool_offset {
+                        builder = builder.offset(off);
+                    }
+                    let mapped = builder.build();
                     strace!("flush.blob.mmap.end ok={}", mapped.is_ok());
                     if let Ok(m) = mapped {
                         resource.scanout_blob_map = Some(m);
