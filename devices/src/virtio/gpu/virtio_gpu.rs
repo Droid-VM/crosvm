@@ -119,6 +119,23 @@ fn note_no_import(reason: &str) {
     }
 }
 
+/// Report which way `flush` went for a scanout, once per distinct outcome.
+///
+/// GPU_SCANOUT_TRACE answers this too, but not usefully here: it writes with `write(2)` on every
+/// step of every present, and that is enough delay to change the result -- a KDE session that is
+/// black without it comes up correctly with it. Anything used to diagnose that has to be quiet
+/// enough not to move the thing it is measuring, so this logs each outcome the first time only,
+/// through the buffered logger.
+fn note_flush_route(outcome: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::BTreeSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap();
+    let set = seen.get_or_insert_with(Default::default);
+    if set.insert(outcome.to_string()) {
+        base::warn!("FLUSH-ROUTE: {outcome}");
+    }
+}
+
 /// Scanout tracing: `GPU_SCANOUT_TRACE=1` writes one marker per step of the scanout/flush path
 /// straight to fd 2 with `write(2)`. The buffered loggers are useless for this path -- a guest
 /// page flip can take the whole device down with it, and anything still sitting in a log buffer
@@ -481,6 +498,31 @@ impl VirtioGpuScanout {
         Ok(OkNoData)
     }
 
+    fn set_cursor_visible(
+        &mut self,
+        display: &Rc<RefCell<GpuDisplay>>,
+        visible: bool,
+    ) -> VirtioGpuResult {
+        if let Some(surface_id) = self.surface_id {
+            display.borrow_mut().set_cursor_visible(surface_id, visible)?;
+        }
+        Ok(OkNoData)
+    }
+
+    fn set_cursor_hotspot(
+        &mut self,
+        display: &Rc<RefCell<GpuDisplay>>,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> VirtioGpuResult {
+        if let Some(surface_id) = self.surface_id {
+            display
+                .borrow_mut()
+                .set_cursor_hotspot(surface_id, hot_x, hot_y)?;
+        }
+        Ok(OkNoData)
+    }
+
     fn commit(&self, display: &Rc<RefCell<GpuDisplay>>) -> VirtioGpuResult {
         if let Some(surface_id) = self.surface_id {
             display.borrow_mut().commit(surface_id)?;
@@ -554,6 +596,7 @@ impl VirtioGpuScanout {
         // memory into the display framebuffer. virgl can't transfer_read/export a guest-memory
         // blob for display (it returns EINVAL), so bypass rutabaga entirely for these resources.
         if resource.pool_scanout_iovecs.is_some() {
+            note_flush_route("pool: direct read from guest pool memory");
             let packed_stride = self.width as usize * 4;
             let (src_stride, src_offset) = match resource.scanout_data {
                 Some(d) => (d.strides[0] as usize, d.offsets[0] as usize),
@@ -622,10 +665,21 @@ impl VirtioGpuScanout {
         // the GPU composited into) and copy its LINEAR rows into the display framebuffer.
         if resource.scanout_data.is_some() {
             strace!("flush.blob.branch res={}", resource.resource_id);
-            if resource.scanout_blob_map.is_none() && rutabaga.query(resource.resource_id).is_err() {
+            let queryable = rutabaga.query(resource.resource_id).is_ok();
+            if resource.scanout_blob_map.is_none() && !queryable {
                 strace!("flush.blob.export.begin res={}", resource.resource_id);
                 let exported = rutabaga.export_blob(resource.resource_id);
                 strace!("flush.blob.export.end ok={}", exported.is_ok());
+                note_flush_route(match &exported {
+                    Ok(_) => "blob: export ok",
+                    Err(e) => {
+                        if matches!(e, RutabagaError::InvalidRutabagaHandle) {
+                            "blob: export gave no fd"
+                        } else {
+                            "blob: export errored"
+                        }
+                    }
+                });
                 if let Ok(handle) = exported {
                     let desc = to_safe_descriptor(handle.os_handle);
                     let data = resource.scanout_data.unwrap();
@@ -641,7 +695,13 @@ impl VirtioGpuScanout {
                     }
                 }
             }
+            if resource.scanout_blob_map.is_none() && queryable {
+                // rutabaga has Resource3DInfo for this one, so the blob mmap is skipped and the
+                // transfer_read path below is supposed to handle it.
+                note_flush_route("blob: skipped, resource is 3D-queryable");
+            }
             if let Some(ref m) = resource.scanout_blob_map {
+                note_flush_route("blob: copying from the mapped colorbuffer");
                 let data = resource.scanout_data.unwrap();
                 let src_stride = data.strides[0] as usize;
                 let src_offset = data.offsets[0] as usize;
@@ -686,6 +746,7 @@ impl VirtioGpuScanout {
 
         // Import failed, fall back to a copy.
         strace!("flush.transfer_read.branch res={}", resource.resource_id);
+        note_flush_route("transfer_read: rutabaga readback into the framebuffer");
         let mut display = display.borrow_mut();
 
         // Prevent overwriting a buffer that is currently being used by the compositor.
@@ -1286,9 +1347,25 @@ impl VirtioGpu {
         scanout_id: u32,
         x: u32,
         y: u32,
+        hot_x: u32,
+        hot_y: u32,
     ) -> VirtioGpuResult {
+        // resource_id 0 is the guest hiding its pointer (a switch to a text console does exactly
+        // this). Tell the backend BEFORE update_scanout_resource releases the surface, or the last
+        // cursor image simply stays on screen with nothing left to take it down.
+        if resource_id == 0 {
+            self.cursor_scanout.set_cursor_visible(&self.display, false)?;
+            return self.update_scanout_resource(
+                SurfaceType::Cursor, None, scanout_id, None, resource_id);
+        }
         self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
+        self.cursor_scanout.set_cursor_visible(&self.display, true)?;
 
+        // Before flush_resource, which is what hands the pixels to the backend: a backend that
+        // publishes image and hotspot together (VNC's rfbSetCursor does) would otherwise publish
+        // this frame's image with the previous frame's hotspot.
+        self.cursor_scanout
+            .set_cursor_hotspot(&self.display, hot_x, hot_y)?;
         self.cursor_scanout.set_position(&self.display, x, y)?;
 
         self.flush_resource(resource_id)
