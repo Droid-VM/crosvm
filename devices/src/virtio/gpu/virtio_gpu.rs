@@ -119,6 +119,16 @@ fn note_no_import(reason: &str) {
     }
 }
 
+/// Take the rutabaga transfer_read path for scanouts instead of mapping the exported blob.
+///
+/// A/B switch, not a tuning knob: the two differ in whether anything asks gfxstream to bring the
+/// rendered frame into the memory being read, and that is the open question for a compositor whose
+/// display freezes on its first frame. Read once; unset means the mapping path, as before.
+fn force_transfer_read() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GPU_SCANOUT_FORCE_TRANSFER").is_ok_and(|v| v != "0"))
+}
+
 /// Report which way `flush` went for a scanout, once per distinct outcome.
 ///
 /// GPU_SCANOUT_TRACE answers this too, but not usefully here: it writes with `write(2)` on every
@@ -663,7 +673,13 @@ impl VirtioGpuScanout {
         // the zero-copy display import (unsupported by VNC) and rutabaga.transfer_read() fail,
         // leaving the frame black. mmap the exported dmabuf once (it aliases the host colorbuffer
         // the GPU composited into) and copy its LINEAR rows into the display framebuffer.
-        if resource.scanout_data.is_some() {
+        // A mapped colorbuffer is only worth reading if something keeps it current. gfxstream
+        // renders into a tiled VkImage and the exported dmabuf is a separate linear copy, so if
+        // nothing asks for a readback the mapping stays at whatever it held when it was made --
+        // which looks exactly like a frozen display. GPU_SCANOUT_FORCE_TRANSFER=1 skips the
+        // mapping entirely and takes the transfer_read path, which does ask, so the two can be
+        // compared on one build instead of two.
+        if resource.scanout_data.is_some() && !force_transfer_read() {
             strace!("flush.blob.branch res={}", resource.resource_id);
             let queryable = rutabaga.query(resource.resource_id).is_ok();
             if resource.scanout_blob_map.is_none() && !queryable {
