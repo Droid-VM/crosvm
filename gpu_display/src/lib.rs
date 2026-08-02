@@ -269,6 +269,24 @@ trait GpuDisplaySurface {
         // no-op
     }
 
+    /// Sets the cursor hotspot: where inside the cursor image the pointer actually points.
+    ///
+    /// virtio-gpu carries this on every UPDATE_CURSOR and it is not optional dressing -- get it
+    /// wrong and an I-beam or a resize arrow clicks somewhere other than where it looks like it
+    /// points. Only backends that draw a real cursor need it, so the default ignores it.
+    fn set_cursor_hotspot(&mut self, _hot_x: u32, _hot_y: u32) {
+        // no-op
+    }
+
+    /// Show or hide the cursor this surface carries.
+    ///
+    /// The guest hides its pointer with UPDATE_CURSOR resource_id=0 -- switching to a text console
+    /// does exactly that. Without a signal the backend keeps presenting the last cursor image it
+    /// was given, so the pointer lingers on a console that should have none.
+    fn set_cursor_visible(&mut self, _visible: bool) {
+        // no-op
+    }
+
     /// Returns the type of the completed buffer.
     #[allow(dead_code)]
     fn buffer_completion_type(&self) -> u32 {
@@ -796,6 +814,34 @@ impl GpuDisplay {
             .ok_or(GpuDisplayError::InvalidSurfaceId)?;
 
         surface.set_position(x, y);
+        Ok(())
+    }
+
+    /// Sets the cursor hotspot on the identified surface. See
+    /// `GpuDisplaySurface::set_cursor_hotspot`.
+    pub fn set_cursor_hotspot(
+        &mut self,
+        surface_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> GpuDisplayResult<()> {
+        let surface = self
+            .surfaces
+            .get_mut(&surface_id)
+            .ok_or(GpuDisplayError::InvalidSurfaceId)?;
+
+        surface.set_cursor_hotspot(hot_x, hot_y);
+        Ok(())
+    }
+
+    /// See `GpuDisplaySurface::set_cursor_visible`.
+    pub fn set_cursor_visible(&mut self, surface_id: u32, visible: bool) -> GpuDisplayResult<()> {
+        let surface = self
+            .surfaces
+            .get_mut(&surface_id)
+            .ok_or(GpuDisplayError::InvalidSurfaceId)?;
+
+        surface.set_cursor_visible(visible);
         Ok(())
     }
 }

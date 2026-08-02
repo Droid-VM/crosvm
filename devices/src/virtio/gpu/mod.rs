@@ -535,6 +535,8 @@ impl Frontend {
                 info.pos.scanout_id.to_native(),
                 info.pos.x.into(),
                 info.pos.y.into(),
+                info.hot_x.into(),
+                info.hot_y.into(),
             ),
             GpuCommand::MoveCursor(info) => self.virtio_gpu.move_cursor(
                 info.pos.scanout_id.to_native(),

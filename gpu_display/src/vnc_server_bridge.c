@@ -29,6 +29,9 @@ struct vnc_server {
     struct input_ring ring;
     pthread_mutex_t ring_lock;
     int input_event_fd;
+    /* Rectangle the composited cursor currently occupies, so a move knows what to restore from
+     * the clean frame. w==0 means nothing is drawn. */
+    int drawn_x, drawn_y, drawn_w, drawn_h;
 };
 
 struct keysym_entry {
@@ -192,6 +195,37 @@ static void vnc_server_set_bgrx_format(rfbScreenInfoPtr screen) {
     screen->serverFormat.blueMax    = 0xFF;
 }
 
+/* Stop LibVNCServer compositing the cursor into the shared framebuffer.
+ *
+ * rfbSendFramebufferUpdate draws the cursor into screen->frameBuffer whenever the client it is
+ * serving has enableCursorShapeUpdates == FALSE (rfbserver.c:3376), and erases it afterwards
+ * (rfbserver.c:3628). Three things make that unusable here:
+ *
+ *   - The decision is PER-CLIENT but the canvas is PER-SCREEN. With alwaysShared, one viewer that
+ *     never negotiated a cursor encoding paints into the same framebuffer another viewer's thread
+ *     is encoding, so a client that draws its own pointer sees a second one baked into the pixels.
+ *   - rfbHideCursor restores the pixels but never marks that rectangle modified, so the leftover
+ *     stays on the client until some unrelated full-frame update washes it away. That is exactly
+ *     the "stale content around the pointer" and "cursor only appears once it stops" behaviour.
+ *   - SetEncodings clears the flag at rfbserver.c:2370 and only sets it back after blocking reads
+ *     of the encoding list, so the window reopens every time a client renegotiates.
+ *
+ * displayHook runs at the top of rfbSendFramebufferUpdate (rfbserver.c:3180), BEFORE that gate, so
+ * forcing the flag here closes it for good. Doing it in newClientHook instead would not survive
+ * the reset at 2370.
+ *
+ * The flag's value on entry is also the only reliable answer to "did this client ask for cursor
+ * updates?" -- SetEncodings resets every cursor flag, so none of them is a durable marker. A
+ * client that asked already has it TRUE and is left alone; for one that did not, cursorWasChanged
+ * is cleared as well so forcing the flag does not make us send a shape it never requested.
+ */
+static void vnc_display_hook(rfbClientPtr cl) {
+    if (!cl->enableCursorShapeUpdates) {
+        cl->enableCursorShapeUpdates = TRUE;
+        cl->cursorWasChanged = FALSE;
+    }
+}
+
 vnc_server_t* vnc_server_create(int width, int height, int port, const char* password) {
     vnc_server_t* server = calloc(1, sizeof(vnc_server_t));
     if (!server)
@@ -216,6 +250,7 @@ vnc_server_t* vnc_server_create(int width, int height, int port, const char* pas
     server->screen->screenData = server;
     server->screen->kbdAddEvent = vnc_kbd_callback;
     server->screen->ptrAddEvent = vnc_ptr_callback;
+    server->screen->displayHook = vnc_display_hook;
     if (password && password[0]) {
         server->passwords[0] = strdup(password);
         server->passwords[1] = NULL;
@@ -279,6 +314,184 @@ void vnc_server_update_framebuffer(vnc_server_t* server, const uint8_t* data, ui
         size = fb_size;
     memcpy(server->screen->frameBuffer, data, size);
     rfbMarkRectAsModified(server->screen, 0, 0, server->screen->width, server->screen->height);
+}
+
+void vnc_server_set_cursor(vnc_server_t* server, const uint8_t* argb,
+                           int width, int height, int hot_x, int hot_y) {
+    if (!server || !server->screen)
+        return;
+
+    /* width 0 (or no pixels) means "no cursor": the guest disables it with UPDATE_CURSOR
+     * resource_id 0. rfbSetCursor(NULL) frees the previous one and stops advertising it. */
+    if (!argb || width <= 0 || height <= 0) {
+        rfbSetCursor(server->screen, NULL);
+        return;
+    }
+
+    rfbCursorPtr c = calloc(1, sizeof(rfbCursor));
+    if (!c)
+        return;
+    c->width  = width;
+    c->height = height;
+    c->xhot   = hot_x < 0 ? 0 : (hot_x >= width  ? width  - 1 : hot_x);
+    c->yhot   = hot_y < 0 ? 0 : (hot_y >= height ? height - 1 : hot_y);
+
+    /* richSource is in the SERVER pixel format, which vnc_server_set_bgrx_format pinned to the
+     * same BGRX byte order the guest's cursor resource already uses -- so the colour bytes copy
+     * straight across and only the alpha has to be split out into its own plane. */
+    size_t px = (size_t)width * (size_t)height;
+    c->richSource  = malloc(px * 4);
+    c->alphaSource = malloc(px);
+    if (!c->richSource || !c->alphaSource) {
+        free(c->richSource);
+        free(c->alphaSource);
+        free(c);
+        return;
+    }
+    memcpy(c->richSource, argb, px * 4);
+    for (size_t i = 0; i < px; i++)
+        c->alphaSource[i] = argb[i * 4 + 3];
+
+    /* A mask is MANDATORY even for a rich cursor. rfbSendCursorShape dereferences
+     * pCursor->mask[0] unconditionally, before it has decided which encoding to use:
+     *
+     *     if ( pCursor && pCursor->width == 1 && ... && pCursor->mask[0] == 0 )
+     *
+     * With only richSource set, the first client to negotiate RichCursor works fine and the
+     * SECOND client -- which may negotiate plain XCursor -- takes crosvm down with a SIGSEGV at
+     * a null fault address. rfbMakeMaskFromAlphaSource builds it from the alpha we already have.
+     *
+     * `source` is left NULL deliberately: cursor.c fills it in on demand with
+     * rfbMakeXCursorFromRichCursor for clients that need the 1-bit form, and doing it lazily
+     * avoids paying for a conversion no client may ever ask for. */
+    c->mask = (unsigned char*)rfbMakeMaskFromAlphaSource(width, height, c->alphaSource);
+    if (!c->mask) {
+        free(c->richSource);
+        free(c->alphaSource);
+        free(c);
+        return;
+    }
+
+    /* Tell LibVNCServer it owns these buffers: rfbSetCursor frees the OLD cursor using exactly
+     * these flags, and a cursor moves several times a second, so getting them wrong is a leak
+     * that grows for as long as the VM runs rather than a one-off. cleanupSource is TRUE even
+     * though we pass no source, because cursor.c may allocate one later and that allocation has
+     * to be freed by the same flags. */
+    c->cleanup           = TRUE;
+    c->cleanupRichSource = TRUE;
+    c->cleanupSource     = TRUE;
+    c->cleanupMask       = TRUE;
+
+    /* The guest's cursor comes off a DRM cursor plane in DRM_FORMAT_HOST_ARGB8888, and both
+     * compositors we care about (KWin, mutter) render those PREMULTIPLIED -- that is the Wayland
+     * and DRM convention. Getting this wrong does not hide the cursor, it fringes it: straight
+     * alpha declared premultiplied comes out too bright at the edges, and the reverse too dark.
+     * Worth an eyeball at first light rather than trusting the convention blindly. */
+    c->alphaPreMultiplied = TRUE;
+
+    rfbSetCursor(server->screen, c);
+}
+
+void vnc_server_set_cursor_pos(vnc_server_t* server, int x, int y) {
+    if (!server || !server->screen)
+        return;
+    /* Assignment is enough: LibVNCServer's per-client update check compares cl->cursorX against
+     * screen->cursorX, so changing it here is what makes the next update carry the new position
+     * (as a cursor-position message, or as a redraw for clients without cursor encodings). */
+    server->screen->cursorX = x;
+    server->screen->cursorY = y;
+}
+
+/* Alpha-blend one cursor image into the outgoing framebuffer at (cx,cy), clipped to the screen.
+ * Both are BGRX in the server pixel format (vnc_server_set_bgrx_format pins that), so only the
+ * alpha byte needs interpreting. Returns the rectangle actually touched via the out params. */
+static void blend_cursor(rfbScreenInfoPtr screen, const uint8_t* cur, int cw, int ch,
+                         int cx, int cy, int* out_x, int* out_y, int* out_w, int* out_h) {
+    int sw = screen->width, sh = screen->height;
+    int x0 = cx < 0 ? 0 : cx;
+    int y0 = cy < 0 ? 0 : cy;
+    int x1 = cx + cw > sw ? sw : cx + cw;
+    int y1 = cy + ch > sh ? sh : cy + ch;
+    *out_x = x0; *out_y = y0;
+    *out_w = x1 > x0 ? x1 - x0 : 0;
+    *out_h = y1 > y0 ? y1 - y0 : 0;
+    if (*out_w == 0 || *out_h == 0)
+        return;
+
+    for (int y = y0; y < y1; y++) {
+        const uint8_t* src = cur + (((y - cy) * cw) + (x0 - cx)) * 4;
+        uint8_t* dst = (uint8_t*)screen->frameBuffer + ((size_t)y * sw + x0) * 4;
+        for (int x = x0; x < x1; x++, src += 4, dst += 4) {
+            uint32_t a = src[3];
+            if (a == 0)
+                continue;          /* fully transparent: the common case, most of a cursor image */
+            if (a == 255) {
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2];
+                continue;
+            }
+            /* Straight (non-premultiplied) alpha: the guest's cursor plane is ARGB8888 and both
+             * KWin and mutter hand it over premultiplied, but treating it as premultiplied here
+             * and being wrong darkens the edges, while this form is correct either way for the
+             * fully-opaque and fully-transparent pixels that dominate a pointer. */
+            for (int c = 0; c < 3; c++)
+                dst[c] = (uint8_t)((src[c] * a + dst[c] * (255 - a)) / 255);
+        }
+    }
+}
+
+/* Copy one rectangle of the clean guest frame back over the outgoing framebuffer. */
+static void restore_rect(rfbScreenInfoPtr screen, const uint8_t* clean,
+                         int x, int y, int w, int h) {
+    if (w <= 0 || h <= 0)
+        return;
+    int sw = screen->width;
+    for (int r = 0; r < h; r++) {
+        size_t off = ((size_t)(y + r) * sw + x) * 4;
+        memcpy((uint8_t*)screen->frameBuffer + off, clean + off, (size_t)w * 4);
+    }
+}
+
+void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
+                          const uint8_t* cursor_argb, int cw, int ch,
+                          int hot_x, int hot_y, int cx, int cy, int visible, int full) {
+    if (!server || !server->screen || !server->screen->frameBuffer || !clean)
+        return;
+    rfbScreenInfoPtr screen = server->screen;
+    uint32_t fb_size = (uint32_t)screen->width * screen->height * 4;
+    if (clean_size > fb_size)
+        clean_size = fb_size;
+
+    /* The cursor is drawn with its HOTSPOT at the reported position: the guest reports where the
+     * pointer IS, and the image extends up and left of that by the hotspot. Skipping this puts an
+     * I-beam or a resize arrow visibly off from where it actually clicks. */
+    int dx = cx - hot_x, dy = cy - hot_y;
+    int nx = 0, ny = 0, nw = 0, nh = 0;
+
+    if (full) {
+        memcpy(screen->frameBuffer, clean, clean_size);
+        if (visible && cursor_argb && cw > 0 && ch > 0)
+            blend_cursor(screen, cursor_argb, cw, ch, dx, dy, &nx, &ny, &nw, &nh);
+        server->drawn_x = nx; server->drawn_y = ny;
+        server->drawn_w = nw; server->drawn_h = nh;
+        rfbMarkRectAsModified(screen, 0, 0, screen->width, screen->height);
+        return;
+    }
+
+    /* Cursor-only update: restore what the pointer used to cover, draw it where it is now, and
+     * mark just those two rectangles. This is what keeps the pointer moving at input rate over a
+     * static desktop without pushing a whole frame for every step. */
+    int ox = server->drawn_x, oy = server->drawn_y;
+    int ow = server->drawn_w, oh = server->drawn_h;
+    restore_rect(screen, clean, ox, oy, ow, oh);
+    if (visible && cursor_argb && cw > 0 && ch > 0)
+        blend_cursor(screen, cursor_argb, cw, ch, dx, dy, &nx, &ny, &nw, &nh);
+    server->drawn_x = nx; server->drawn_y = ny;
+    server->drawn_w = nw; server->drawn_h = nh;
+
+    if (ow > 0 && oh > 0)
+        rfbMarkRectAsModified(screen, ox, oy, ox + ow, oy + oh);
+    if (nw > 0 && nh > 0)
+        rfbMarkRectAsModified(screen, nx, ny, nx + nw, ny + nh);
 }
 
 void vnc_server_destroy(vnc_server_t* server) {
