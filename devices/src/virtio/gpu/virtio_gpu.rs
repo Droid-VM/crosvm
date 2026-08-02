@@ -309,6 +309,7 @@ struct VirtioGpuScanout {
     position: Option<(u32, u32)>,
     // Reused packed staging buffer for flushes into padded-stride window buffers.
     flush_staging: Vec<u8>,
+    flush_probe_counter: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -344,6 +345,7 @@ impl VirtioGpuScanout {
             resource_id: None,
             position: None,
             flush_staging: Vec::new(),
+            flush_probe_counter: 0,
         }
     }
 
@@ -361,6 +363,7 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_probe_counter: 0,
             flush_staging: Vec::new(),
         }
     }
@@ -802,6 +805,37 @@ impl VirtioGpuScanout {
                 unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
             );
             rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
+            // Whether the readback produced anything, every 64th frame: a black display can mean
+            // the copy went to the wrong place or that these bytes were zero to begin with, and
+            // nothing else distinguishes the two.
+            self.flush_probe_counter = self.flush_probe_counter.wrapping_add(1);
+            if self.flush_probe_counter % 64 == 1 {
+                let probe = unsafe {
+                    std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, 4096.min(fb_slice.size()))
+                };
+                // Count only the color channels: XRGB frames carry 0xff in every fourth byte,
+                // which made an all-black frame read as "25% nonzero" and pass for content.
+                let rgb_nz = probe
+                    .chunks_exact(4)
+                    .flat_map(|px| &px[..3])
+                    .filter(|b| **b != 0)
+                    .count();
+                let head: Vec<String> = probe[..16.min(probe.len())]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                strace!(
+                    "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
+                    resource.resource_id,
+                    rgb_nz,
+                    head.join(" ")
+                );
+                if rgb_nz == 0 {
+                    note_flush_route("transfer_read: readback is black");
+                } else {
+                    note_flush_route("transfer_read: readback has color");
+                }
+            }
         } else {
             // The window buffer rows are padded (gralloc stride alignment), and the readback
             // backend writes tightly-packed rows no matter what Transfer3D::stride says (observed
