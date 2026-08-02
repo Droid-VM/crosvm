@@ -533,6 +533,16 @@ impl VirtioGpuScanout {
             }
         }
 
+        // Tell the backend which byte order the guest actually wrote, so backends whose window
+        // format is fixed can decide whether a channel swap is needed. Resources without scanout
+        // blob data are legacy SET_SCANOUT paths, which the virtio-gpu guest driver only ever
+        // drives with host-endian XRGB8888.
+        let fourcc = resource
+            .scanout_data
+            .map(|data| u32::from(data.drm_format))
+            .unwrap_or(DRM_FORMAT_XRGB8888);
+        display.set_framebuffer_format(surface_id, fourcc);
+
         display.flip(surface_id);
         Ok(None)
     }

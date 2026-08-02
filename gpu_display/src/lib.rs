@@ -237,6 +237,14 @@ trait GpuDisplaySurface {
         false
     }
 
+    /// Declares the DRM fourcc of the pixels the guest writes into the CPU framebuffer returned by
+    /// `framebuffer()`. Backends whose window format is fixed use this to decide whether the bytes
+    /// need reordering before being posted. Only meaningful for the CPU copy path; the zero-copy
+    /// `flip_to()` path carries its format in the import instead.
+    fn set_framebuffer_format(&mut self, _fourcc: u32) {
+        // no-op
+    }
+
     /// Puts the next buffer on the screen, making it the current buffer.
     fn flip(&mut self) {
         // no-op
@@ -696,6 +704,14 @@ impl GpuDisplay {
             .get(&surface_id)
             .map(|s| s.next_buffer_in_use())
             .unwrap_or(false)
+    }
+
+    /// Tells the identified surface the DRM fourcc of the pixels the guest writes into its CPU
+    /// framebuffer, so backends with a fixed window format can reorder bytes correctly.
+    pub fn set_framebuffer_format(&mut self, surface_id: u32, fourcc: u32) {
+        if let Some(surface) = self.surfaces.get_mut(&surface_id) {
+            surface.set_framebuffer_format(fourcc)
+        }
     }
 
     /// Changes the visible contents of the identified surface to the contents of the framebuffer

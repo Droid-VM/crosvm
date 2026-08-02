@@ -806,11 +806,16 @@ impl Frontend {
                 let mut strides: [u32; 4] = [0; 4];
                 let mut offsets: [u32; 4] = [0; 4];
 
-                // As of v4.19, virtio-gpu kms only really uses these formats.  If that changes,
-                // the following may have to change too.
+                // virtio-gpu kms historically only used the B8G8R8X8/B8G8R8A8 pair. The
+                // R8G8B8X8/R8G8B8A8 pair is what a little-endian guest sends for
+                // DRM_FORMAT_XBGR8888/ABGR8888, whose byte order (R,G,B,X) already matches the
+                // RGBA_8888 buffers the Android display backend posts, so accepting them lets the
+                // scanout skip a channel swap on the host side.
                 let drm_format = match virtio_gpu_format {
                     VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM => DrmFormat::new(b'X', b'R', b'2', b'4'),
                     VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM => DrmFormat::new(b'A', b'R', b'2', b'4'),
+                    VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM => DrmFormat::new(b'X', b'B', b'2', b'4'),
+                    VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM => DrmFormat::new(b'A', b'B', b'2', b'4'),
                     _ => {
                         error!("unrecognized virtio-gpu format {}", virtio_gpu_format);
                         return Err(GpuResponse::ErrUnspec);

@@ -123,6 +123,15 @@ extern "C" {
         surface: *mut AndroidDisplaySurface,
     );
 
+    /// Declares the DRM fourcc of the pixels the client writes into the buffer obtained from
+    /// `get_android_surface_buffer`. The native window format is fixed (RGBA_8888), so the backend
+    /// uses this to decide whether the bytes need a channel swap before being posted.
+    fn set_android_surface_buffer_format(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        fourcc: u32,
+    );
+
     fn android_display_import_dmabuf(
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
@@ -298,6 +307,17 @@ impl GpuDisplaySurface for AndroidSurface {
             Some(anb.into())
         } else {
             None
+        }
+    }
+
+    fn set_framebuffer_format(&mut self, fourcc: u32) {
+        // SAFETY: context and surface are opaque handles.
+        unsafe {
+            set_android_surface_buffer_format(
+                self.context.0.as_ptr(),
+                self.surface.as_ptr(),
+                fourcc,
+            )
         }
     }
 
