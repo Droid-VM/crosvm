@@ -310,6 +310,9 @@ struct VirtioGpuScanout {
     // Reused packed staging buffer for flushes into padded-stride window buffers.
     flush_staging: Vec<u8>,
     flush_probe_counter: u64,
+    // The pool branch needs its own counter: sharing one with the transfer_read probe means a
+    // low-frequency path can sit on the wrong side of the modulus forever and never report.
+    pool_probe_counter: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -346,6 +349,7 @@ impl VirtioGpuScanout {
             position: None,
             flush_staging: Vec::new(),
             flush_probe_counter: 0,
+            pool_probe_counter: 0,
         }
     }
 
@@ -364,6 +368,7 @@ impl VirtioGpuScanout {
             resource_id: None,
             position: None,
             flush_probe_counter: 0,
+            pool_probe_counter: 0,
             flush_staging: Vec::new(),
         }
     }
@@ -617,11 +622,16 @@ impl VirtioGpuScanout {
             };
             let mut display = display.borrow_mut();
             if display.next_buffer_in_use(surface_id) {
+                note_flush_route("pool: display buffer busy, frame dropped");
                 return Ok(OkNoData);
             }
-            let fb = display
-                .framebuffer_region(surface_id, 0, 0, self.width, self.height)
-                .ok_or(ErrUnspec)?;
+            let fb = match display.framebuffer_region(surface_id, 0, 0, self.width, self.height) {
+                Some(fb) => fb,
+                None => {
+                    note_flush_route("pool: no framebuffer region for the surface");
+                    return Err(ErrUnspec);
+                }
+            };
             // Gather the (possibly fragmented) pool run segments into a contiguous staging buffer.
             let segs = resource.pool_scanout_iovecs.as_ref().unwrap();
             let total: usize = segs.iter().map(|&(_, l)| l).sum();
@@ -657,6 +667,39 @@ impl VirtioGpuScanout {
             let staging = &self.flush_staging[..total];
             let fb_stride = fb.stride() as usize;
             let fb_slice = fb.as_volatile_slice();
+            // Whether the pool actually holds a frame. `transfer_read` has had this probe for a
+            // while and reports colour, but that is a different branch on a different resource --
+            // nothing has ever looked at the bytes this branch copies, so "the host can read the
+            // guest pool" and "the guest pool contains the composited frame" were never
+            // distinguished. Count colour channels only: XRGB carries 0xff in every fourth byte.
+            self.pool_probe_counter = self.pool_probe_counter.wrapping_add(1);
+            if self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0 {
+                let probe = &staging[src_offset.min(staging.len())..];
+                let probe = &probe[..4096.min(probe.len())];
+                let rgb_nz = probe
+                    .chunks_exact(4)
+                    .flat_map(|px| &px[..3])
+                    .filter(|b| **b != 0)
+                    .count();
+                let head: Vec<String> = probe[..16.min(probe.len())]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                base::warn!(
+                    "POOL-SCANOUT#{} res={} {}x{} src_stride={} src_off={} fb_stride={} total={} segs={} rgb_nonzero={} head=[{}]",
+                    self.pool_probe_counter,
+                    resource.resource_id,
+                    self.width,
+                    self.height,
+                    src_stride,
+                    src_offset,
+                    fb_stride,
+                    total,
+                    segs.len(),
+                    rgb_nz,
+                    head.join(" "),
+                );
+            }
             for row in 0..self.height as usize {
                 let s = src_offset + row * src_stride;
                 if s + packed_stride > staging.len() {
