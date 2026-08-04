@@ -785,10 +785,30 @@ impl Frontend {
             Ok(gpu_response) => gpu_response,
             Err(gpu_response) => {
                 if let Some(gpu_cmd) = gpu_cmd {
-                    error!(
-                        "error processing gpu command {:?}: {:?}",
-                        gpu_cmd, gpu_response
+                    // Detaching a resource from a context that is already gone is what teardown
+                    // looks like, not a fault: the guest driver destroys the context and frees
+                    // its id in postclose, and resources of that context are detached as their
+                    // GEM handles go away, which can land either side of it. The resource is
+                    // being torn down regardless, so nothing is lost -- but at error level it
+                    // fills the log with 732 lines per session that read like a real failure.
+                    let expected_during_teardown = matches!(
+                        (&gpu_cmd, &gpu_response),
+                        (
+                            GpuCommand::CtxDetachResource(_),
+                            GpuResponse::ErrRutabaga(RutabagaError::InvalidContextId)
+                        )
                     );
+                    if expected_during_teardown {
+                        debug!(
+                            "gpu command {:?} arrived after its context went away: {:?}",
+                            gpu_cmd, gpu_response
+                        );
+                    } else {
+                        error!(
+                            "error processing gpu command {:?}: {:?}",
+                            gpu_cmd, gpu_response
+                        );
+                    }
                 }
                 gpu_response
             }

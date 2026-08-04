@@ -673,7 +673,12 @@ impl VirtioGpuScanout {
             // guest pool" and "the guest pool contains the composited frame" were never
             // distinguished. Count colour channels only: XRGB carries 0xff in every fourth byte.
             self.pool_probe_counter = self.pool_probe_counter.wrapping_add(1);
-            if self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0 {
+            // Behind the switch, and the scan with it: this ran on the display path and put a
+            // line in the log several times a second on an idle desktop, which is where anyone
+            // looking for a real message has to find it. GFXSTREAM_DIAG=1 brings it back.
+            if gpu_diag_enabled()
+                && (self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0)
+            {
                 let probe = &staging[src_offset.min(staging.len())..];
                 let probe = &probe[..4096.min(probe.len())];
                 let rgb_nz = probe
@@ -1149,6 +1154,15 @@ pub enum ProcessDisplayResult {
     Success,
     CloseRequested,
     Error(GpuDisplayError),
+}
+
+/// One switch for the per-operation gpu traces on this route, shared with gfxstream's host side so
+/// that a single variable turns both halves on. Read once; a site that is off costs a load.
+fn gpu_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GFXSTREAM_DIAG").map_or(false, |v| !v.is_empty() && v != "0")
+    })
 }
 
 impl VirtioGpu {
@@ -1735,7 +1749,9 @@ impl VirtioGpu {
         let mut pool_refs: Option<Vec<(GuestAddress, usize)>> = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
-            base::warn!(
+            // debug!, like the GPU-MAPBLOB traces below: this fires once per blob creation,
+            // which is hundreds per desktop session and thousands under a benchmark.
+            base::debug!(
                 "GUEST-ALLOC: create_blob CREATE_GUEST_HANDLE res={} mem={} nvecs={} first={:#x} len={} udmabuf={}",
                 resource_id,
                 resource_create_blob.blob_mem,
@@ -1845,7 +1861,7 @@ impl VirtioGpu {
                 .ok_or(ErrInvalidResourceId)?;
             resource.pool_offset = Some(pool_offset);
             let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
-            base::warn!(
+            base::debug!(
                 "GPU-MAPBLOB: res={} POOL-resident offset={:#x} (no SHARE)",
                 resource_id,
                 pool_offset,
