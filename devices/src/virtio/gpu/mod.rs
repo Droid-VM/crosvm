@@ -530,18 +530,21 @@ impl Frontend {
             GpuCommand::ResourceDetachBacking(info) => {
                 self.virtio_gpu.detach_backing(info.resource_id.to_native())
             }
+            // pos is the guest's crtc_x/crtc_y for the cursor plane -- the image's top-left corner,
+            // already hotspot-compensated, and SIGNED. Reading it unsigned turns a pointer against
+            // the left edge into a position near 4.29e9.
             GpuCommand::UpdateCursor(info) => self.virtio_gpu.update_cursor(
                 info.resource_id.to_native(),
                 info.pos.scanout_id.to_native(),
-                info.pos.x.into(),
-                info.pos.y.into(),
+                info.pos.x.to_native() as i32,
+                info.pos.y.to_native() as i32,
                 info.hot_x.into(),
                 info.hot_y.into(),
             ),
             GpuCommand::MoveCursor(info) => self.virtio_gpu.move_cursor(
                 info.pos.scanout_id.to_native(),
-                info.pos.x.into(),
-                info.pos.y.into(),
+                info.pos.x.to_native() as i32,
+                info.pos.y.to_native() as i32,
             ),
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id.to_native();

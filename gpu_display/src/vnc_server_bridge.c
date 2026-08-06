@@ -453,7 +453,7 @@ static void restore_rect(rfbScreenInfoPtr screen, const uint8_t* clean,
 
 void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
                           const uint8_t* cursor_argb, int cw, int ch,
-                          int hot_x, int hot_y, int cx, int cy, int visible, int full) {
+                          int cx, int cy, int visible, int full) {
     if (!server || !server->screen || !server->screen->frameBuffer || !clean)
         return;
     rfbScreenInfoPtr screen = server->screen;
@@ -461,10 +461,12 @@ void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t c
     if (clean_size > fb_size)
         clean_size = fb_size;
 
-    /* The cursor is drawn with its HOTSPOT at the reported position: the guest reports where the
-     * pointer IS, and the image extends up and left of that by the hotspot. Skipping this puts an
-     * I-beam or a resize arrow visibly off from where it actually clicks. */
-    int dx = cx - hot_x, dy = cy - hot_y;
+    /* (cx,cy) is the cursor image's top-left corner, already hotspot-compensated by the guest --
+     * measured, not assumed: a pointer driven to (700,400) with hot=(22,21) arrives here as
+     * (678,379). Subtracting the hotspot a second time was drawing the pointer up and left of
+     * the truth by exactly the hotspot, invisible on an arrow and 22px on a resize arrow.
+     * blend_cursor clips negative origins, so a pointer against the left edge is simply cut off. */
+    int dx = cx, dy = cy;
     int nx = 0, ny = 0, nw = 0, nh = 0;
 
     if (full) {

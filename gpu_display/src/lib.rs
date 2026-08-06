@@ -265,7 +265,16 @@ trait GpuDisplaySurface {
     }
 
     /// Sets the position of the identified subsurface relative to its parent.
-    fn set_position(&mut self, _x: u32, _y: u32) {
+    ///
+    /// For a cursor surface this is the TOP-LEFT CORNER of the cursor image, not where the pointer
+    /// points: virtio-gpu carries the guest's `crtc_x/crtc_y`, and the guest has already subtracted
+    /// the hotspot. A backend that treats it as the pointer position and subtracts the hotspot
+    /// again draws the cursor up and left of the truth by exactly the hotspot -- barely visible on
+    /// an arrow (5,5), a very visible 22px on a resize arrow.
+    ///
+    /// Signed because `crtc_x` is: a pointer within `hot_x` of the left edge puts the image origin
+    /// off-screen, and the wire carries that as a negative number in a `__le32` field.
+    fn set_position(&mut self, _x: i32, _y: i32) {
         // no-op
     }
 
@@ -807,7 +816,7 @@ impl GpuDisplay {
     /// Sets the position of the identified subsurface relative to its parent.
     ///
     /// The change in position will not be visible until `commit` is called for the parent surface.
-    pub fn set_position(&mut self, surface_id: u32, x: u32, y: u32) -> GpuDisplayResult<()> {
+    pub fn set_position(&mut self, surface_id: u32, x: i32, y: i32) -> GpuDisplayResult<()> {
         let surface = self
             .surfaces
             .get_mut(&surface_id)

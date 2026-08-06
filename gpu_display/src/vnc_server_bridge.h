@@ -67,7 +67,7 @@ void vnc_server_set_cursor_pos(vnc_server_t* server, int x, int y);
  * pointer keep moving over a completely static desktop without pushing a whole frame. */
 void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
                           const uint8_t* cursor_argb, int cw, int ch,
-                          int hot_x, int hot_y, int cx, int cy, int visible, int full);
+                          int cx, int cy, int visible, int full);
 void vnc_server_set_input_event_fd(vnc_server_t* server, int fd);
 int vnc_server_poll_input_event(vnc_server_t* server, struct vnc_input_event* out);
 

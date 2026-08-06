@@ -82,8 +82,6 @@ extern "C" {
         cursor_argb: *const u8,
         cw: c_int,
         ch: c_int,
-        hot_x: c_int,
-        hot_y: c_int,
         cx: c_int,
         cy: c_int,
         visible: c_int,
@@ -125,8 +123,10 @@ struct CursorState {
     height: u32,
     hot_x: u32,
     hot_y: u32,
-    x: u32,
-    y: u32,
+    /// Top-left corner of the cursor image, as the guest reported it. Signed: it goes negative
+    /// when the pointer is within the hotspot of the left or top edge.
+    x: i32,
+    y: i32,
     visible: bool,
 }
 
@@ -146,8 +146,6 @@ impl SharedFramebuffer {
                 if has_img { c.pixels.as_ptr() } else { std::ptr::null() },
                 c.width as c_int,
                 c.height as c_int,
-                c.hot_x as c_int,
-                c.hot_y as c_int,
                 c.x as c_int,
                 c.y as c_int,
                 (c.visible && has_img) as c_int,
@@ -279,7 +277,7 @@ impl GpuDisplaySurface for VncCursorSurface {
     /// its own channel, so a VNC client can be a passive VIEWER that never sends a PointerEvent.
     /// Its cursorX/cursorY would then stay at the origin and the composited pointer would sit in
     /// the top-left corner no matter where the guest actually put it.
-    fn set_position(&mut self, x: u32, y: u32) {
+    fn set_position(&mut self, x: i32, y: i32) {
         if let Ok(mut fb) = self.shared_fb.lock() {
             fb.cursor.x = x;
             fb.cursor.y = y;
@@ -287,8 +285,16 @@ impl GpuDisplaySurface for VncCursorSurface {
             // would only move when the guest happened to send a frame.
             fb.composite(false);
         }
+        // LibVNCServer wants the POINTER, not the image: it draws the cursor at
+        // cursorX - hot_x. (x,y) is the image origin, so the hotspot goes back on here.
         // SAFETY: server handle is valid for this surface's lifetime.
-        unsafe { vnc_server_set_cursor_pos(self.server.ptr, x as c_int, y as c_int) }
+        unsafe {
+            vnc_server_set_cursor_pos(
+                self.server.ptr,
+                x + self.hot_x as c_int,
+                y + self.hot_y as c_int,
+            )
+        }
     }
 
     fn set_cursor_visible(&mut self, visible: bool) {

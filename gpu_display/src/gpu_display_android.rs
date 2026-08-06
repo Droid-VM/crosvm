@@ -224,9 +224,16 @@ impl GpuDisplaySurface for AndroidSurface {
         unsafe { post_android_surface_buffer(self.context.0.as_ptr(), self.surface.as_ptr()) }
     }
 
-    fn set_position(&mut self, x: u32, y: u32) {
+    fn set_position(&mut self, x: i32, y: i32) {
+        // The image origin goes negative when the pointer is within the hotspot of the left or top
+        // edge, but the app owns this FFI and it takes u32 -- and u32::MAX is the hide sentinel,
+        // which -1 would land on exactly, making the pointer vanish near the edge. Clamp instead:
+        // the cursor stops up to a hotspot short of the corner rather than disappearing into it.
+        // Drawing it properly clipped would mean re-rendering the plane, which is the app's side.
         // SAFETY: context is an opaque handle.
-        unsafe { set_android_surface_position(self.context.0.as_ptr(), x, y) };
+        unsafe {
+            set_android_surface_position(self.context.0.as_ptr(), x.max(0) as u32, y.max(0) as u32)
+        };
     }
 
     /// Hiding rides the existing position pipe rather than a new FFI entry point: the native side

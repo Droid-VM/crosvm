@@ -306,7 +306,7 @@ struct VirtioGpuScanout {
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
     // Reused packed staging buffer for flushes into padded-stride window buffers.
     flush_staging: Vec<u8>,
     flush_probe_counter: u64,
@@ -330,7 +330,7 @@ struct VirtioGpuScanoutSnapshot {
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
 }
 
 impl VirtioGpuScanout {
@@ -506,8 +506,8 @@ impl VirtioGpuScanout {
     fn set_position(
         &mut self,
         display: &Rc<RefCell<GpuDisplay>>,
-        x: u32,
-        y: u32,
+        x: i32,
+        y: i32,
     ) -> VirtioGpuResult {
         if let Some(surface_id) = self.surface_id {
             display.borrow_mut().set_position(surface_id, x, y)?;
@@ -1469,8 +1469,8 @@ impl VirtioGpu {
         &mut self,
         resource_id: u32,
         scanout_id: u32,
-        x: u32,
-        y: u32,
+        x: i32,
+        y: i32,
         hot_x: u32,
         hot_y: u32,
     ) -> VirtioGpuResult {
@@ -1485,6 +1485,18 @@ impl VirtioGpu {
         self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
         self.cursor_scanout.set_cursor_visible(&self.display, true)?;
 
+        // What the guest actually asked for. Two cursor complaints need this and neither can be
+        // settled by reading the code: a VNC client's own pointer drifting up-left from the one
+        // crosvm composites, worst on the double-headed resize cursor, and the native path
+        // freezing the position once the pointer nears the left edge. Both would follow from a
+        // hotspot applied on one path and not the other, or a position clamped after subtracting
+        // it -- so print the four numbers and compare them with what lands on screen.
+        if gpu_diag_enabled() {
+            base::warn!(
+                "CURSOR: res={} pos=({},{}) hot=({},{})",
+                resource_id, x, y, hot_x, hot_y
+            );
+        }
         // Before flush_resource, which is what hands the pixels to the backend: a backend that
         // publishes image and hotspot together (VNC's rfbSetCursor does) would otherwise publish
         // this frame's image with the previous frame's hotspot.
@@ -1496,7 +1508,10 @@ impl VirtioGpu {
     }
 
     /// Moves the cursor's position to the given coordinates.
-    pub fn move_cursor(&mut self, _scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
+    pub fn move_cursor(&mut self, _scanout_id: u32, x: i32, y: i32) -> VirtioGpuResult {
+        if gpu_diag_enabled() {
+            base::warn!("CURSOR-MOVE: pos=({},{})", x, y);
+        }
         self.cursor_scanout.set_position(&self.display, x, y)?;
         self.cursor_scanout.commit(&self.display)?;
         Ok(OkNoData)

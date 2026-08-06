@@ -1281,7 +1281,10 @@ bool dwl_surface_close_requested(const struct dwl_surface *self)
 	return self->close_requested;
 }
 
-void dwl_surface_set_position(struct dwl_surface *self, uint32_t x, uint32_t y)
+/* Signed: a cursor image origin is negative when the pointer is within its hotspot of the left or
+ * top edge, and wl_subsurface_set_position takes int32_t. Taking it unsigned turned -1 into a
+ * division of 4294967295 by the scale. */
+void dwl_surface_set_position(struct dwl_surface *self, int32_t x, int32_t y)
 {
 	if (self->subsurface) {
 		wl_subsurface_set_position(self->subsurface, x / self->scale,
