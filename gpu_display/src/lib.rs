@@ -269,6 +269,11 @@ trait GpuDisplaySurface {
         // no-op
     }
 
+    /// Sets the DRM FourCC describing bytes written through `framebuffer`.
+    fn set_buffer_fourcc(&mut self, _fourcc: u32) {
+        // no-op
+    }
+
     /// Sets the cursor hotspot: where inside the cursor image the pointer actually points.
     ///
     /// virtio-gpu carries this on every UPDATE_CURSOR and it is not optional dressing -- get it
@@ -814,6 +819,17 @@ impl GpuDisplay {
             .ok_or(GpuDisplayError::InvalidSurfaceId)?;
 
         surface.set_position(x, y);
+        Ok(())
+    }
+
+    /// Sets the DRM FourCC describing CPU fallback framebuffer contents.
+    pub fn set_buffer_fourcc(&mut self, surface_id: u32, fourcc: u32) -> GpuDisplayResult<()> {
+        let surface = self
+            .surfaces
+            .get_mut(&surface_id)
+            .ok_or(GpuDisplayError::InvalidSurfaceId)?;
+
+        surface.set_buffer_fourcc(fourcc);
         Ok(())
     }
 

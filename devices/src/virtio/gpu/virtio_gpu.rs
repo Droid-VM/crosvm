@@ -2145,6 +2145,20 @@ impl VirtioGpu {
         }
         resource.scanout_data = scanout_data;
 
+        let buffer_fourcc = scanout_data
+            .map(|data| data.drm_format.into())
+            .or_else(|| {
+                self.rutabaga
+                    .query(resource_id)
+                    .ok()
+                    .map(|query| query.drm_fourcc)
+            });
+        if let (Some(surface_id), Some(fourcc)) = (scanout.surface_id, buffer_fourcc) {
+            self.display
+                .borrow_mut()
+                .set_buffer_fourcc(surface_id, fourcc)?;
+        }
+
         // `resource_id` has already been verified to be non-zero
         let resource_id = match NonZeroU32::new(resource_id) {
             Some(id) => id,

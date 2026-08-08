@@ -69,6 +69,15 @@ extern "C" fn post_android_surface_buffer(
 }
 
 #[no_mangle]
+extern "C" fn set_android_surface_buffer_format(
+    _ctx: *mut AndroidDisplayContext,
+    _surface: *mut AndroidDisplaySurface,
+    _fourcc: u32,
+) {
+    unimplemented!();
+}
+
+#[no_mangle]
 extern "C" fn android_display_import_dmabuf(
     _ctx: *mut AndroidDisplayContext,
     _surface: *mut AndroidDisplaySurface,

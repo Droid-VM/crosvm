@@ -122,6 +122,12 @@ extern "C" {
         surface: *mut AndroidDisplaySurface,
     );
 
+    fn set_android_surface_buffer_format(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        fourcc: u32,
+    );
+
     fn android_display_import_dmabuf(
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
@@ -227,6 +233,17 @@ impl GpuDisplaySurface for AndroidSurface {
     fn set_position(&mut self, x: u32, y: u32) {
         // SAFETY: context is an opaque handle.
         unsafe { set_android_surface_position(self.context.0.as_ptr(), x, y) };
+    }
+
+    fn set_buffer_fourcc(&mut self, fourcc: u32) {
+        // SAFETY: context and surface are live opaque handles owned by this surface.
+        unsafe {
+            set_android_surface_buffer_format(
+                self.context.0.as_ptr(),
+                self.surface.as_ptr(),
+                fourcc,
+            )
+        };
     }
 
     /// Hiding rides the existing position pipe rather than a new FFI entry point: the native side
