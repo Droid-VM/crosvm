@@ -575,6 +575,15 @@ pub struct PreAllocConfig {
     /// two names for one thing, and setting both would silently pin a whole second pool the guest
     /// never touches.
     pub gpu_guest_mb: Option<u64>,
+    /// Bytes of the guest-alloc pool SHARE'd before boot. Defaults to `gpu-guest-mb`, preserving
+    /// the current fully pre-shared pool. A smaller value enables runtime growth in `step` chunks.
+    pub gpu_guest_prealloc_mb: Option<u64>,
+    /// Runtime growth/reclaim granularity for the guest-alloc pool. Zero or absent keeps the pool
+    /// fully pre-shared; non-zero values must satisfy the growable-pool alignment rules.
+    pub gpu_guest_step_mb: Option<u64>,
+    /// Maximum number of simultaneously live runtime memparcels for the guest-alloc pool. Zero
+    /// leaves the host-side cap unset; the actual RM quota is shared by the whole VM.
+    pub gpu_guest_max_grants: Option<u32>,
 
     /// DRM native context HOST-allocated pool size (MB): the region virglrenderer's DRM backend
     /// sub-allocates from. Since BO backing moved to the guest this holds only the per-context msm

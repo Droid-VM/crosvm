@@ -260,9 +260,18 @@ impl PoolWorker {
         let (ret, extra) = match op {
             VGP_OP_SHARE => (self.share(pool_id, offset, len), 0u64),
             VGP_OP_UNSHARE => (self.unshare(pool_id, offset, len), 0u64),
-            VGP_OP_QUERY => match self.mem.pool_live_grants(pool_id) {
-                Some(n) => (0, n as u64),
-                None => (-libc::ENODEV, 0),
+            VGP_OP_QUERY => {
+                if offset == 0 && len == 0 {
+                    match self.mem.pool_live_grants(pool_id) {
+                        Some(n) => (0, n as u64),
+                        None => (-libc::ENODEV, 0),
+                    }
+                } else {
+                    match self.mem.pool_range_backed(pool_id, offset, len) {
+                        Some(backed) => (0, backed as u64),
+                        None => (-libc::ENODEV, 0),
+                    }
+                }
             },
             VGP_OP_TEST_REF | VGP_OP_TEST_UNREF => (self.test_ref(op, pool_id, offset, len), 0),
             _ => {
@@ -325,7 +334,18 @@ impl PoolWorker {
     /// find_region/shm_region, which is what create_udmabuf needs to turn guest-supplied addresses
     /// back into (memfd, offset) pairs.
     fn grant(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
-        self.prepare_folios(gpa, len)?;
+        if let Err(e) = self.prepare_folios(gpa, len) {
+            // PrepareBlobRange cannot create a guest mapping. If it failed after partially
+            // populating the sparse memfd, this is the one failure path whose state is known, so
+            // it is safe to return those pages immediately.
+            if let Err(punch_err) = self.punch_range(gpa, len) {
+                warn!(
+                    "gunyah-pool: failed to roll back prepared range {:#x}+{:#x}: {:#}",
+                    gpa, len, punch_err
+                );
+            }
+            return Err(e);
+        }
 
         let (shm, shm_offset) = self
             .mem
@@ -352,6 +372,7 @@ impl PoolWorker {
 
         match self.vm_memory.recv::<VmMemoryResponse>() {
             Ok(VmMemoryResponse::RegisterMemory { .. }) => Ok(()),
+            Ok(VmMemoryResponse::Err(e)) => Err(anyhow::Error::new(e)),
             Ok(other) => Err(anyhow!("RegisterMemory refused: {:?}", other)),
             Err(e) => Err(anyhow!("RegisterMemory response: {}", e)),
         }
@@ -396,9 +417,13 @@ impl PoolWorker {
 
         if let Err(e) = self.grant(gpa, len) {
             error!("gunyah-pool: grant at {:#x}+{:#x} failed: {:#}", gpa, len, e);
-            // Nothing to roll back: one request is one parcel, so a failure leaves the pool
-            // exactly as the guest already believes it to be.
-            return -libc::ENOMEM;
+            // RegisterMemory may have reached the VM handler before its response was lost. Do
+            // not punch this range here: without an explicit "mapping was never established"
+            // result, reclaiming it could race a live guest/host mapping. The prepared pages are
+            // deliberately retained as the conservative recovery state.
+            return -e
+                .downcast_ref::<base::Error>()
+                .map_or(libc::ENOMEM, |errno| errno.errno());
         }
         if let Err(e) = self.mem.pool_mark_granted(pool_id, offset, len, 0) {
             // The share succeeded but the table does not know: the guest would be told no while
@@ -415,7 +440,10 @@ impl PoolWorker {
 
     fn unshare(&mut self, pool_id: u32, offset: u64, len: u64) -> i32 {
         // Must name a grant exactly -- see PoolGrants: the RM reclaims a parcel whole.
-        if let Err(e) = self.mem.pool_validate_unshare(pool_id, offset, len) {
+        // Reserve before unregistering. The reservation makes the reference check and the
+        // unregister effectively one operation from the resource-create path's perspective:
+        // another thread cannot add a dma-buf reference while this request is in flight.
+        if let Err(e) = self.mem.pool_begin_unshare(pool_id, offset, len) {
             warn!(
                 "gunyah-pool: refusing UNSHARE pool={} offset={:#x} len={:#x}: {:?}",
                 pool_id, offset, len, e
@@ -423,21 +451,10 @@ impl PoolWorker {
             return -e.as_errno();
         }
         let Some(base) = self.mem.pool_base(pool_id) else {
+            self.mem.pool_cancel_unshare(pool_id, offset, len);
             return -libc::ENODEV;
         };
         let gpa = base.offset() + offset;
-        //
-        // NOT YET CHECKED, and a caller must not be led to believe otherwise: whether anything on
-        // the HOST still references these pages -- a udmabuf built over them, a GPU mapping, a
-        // scanout iovec. The host is the only side that CAN answer, because the guest's
-        // RESOURCE_UNREF is fire-and-forget and it drops a buffer from its allocator while the
-        // host still holds it. The information exists (VirtioGpuResource keeps backing_iovecs and
-        // pool_scanout_iovecs, and unref_resource is a definite moment); what is missing is a
-        // refcount on the grant table, incremented where create_udmabuf resolves an address and
-        // decremented where unref_resource drops one.
-        //
-        // Until that lands, shrink is safe only for a range nothing was ever built over.
-        //
         let req = VmMemoryRequest::UnregisterMemory(VmMemoryRegionId::from_guest_addr(
             GuestAddress(gpa),
         ));
@@ -447,12 +464,12 @@ impl PoolWorker {
             .map_err(|e| anyhow!("send: {}", e))
             .and_then(|()| match self.vm_memory.recv::<VmMemoryResponse>() {
                 Ok(VmMemoryResponse::Ok) => Ok(()),
+                Ok(VmMemoryResponse::Err(e)) => Err(anyhow::Error::new(e)),
                 Ok(other) => Err(anyhow!("refused: {:?}", other)),
                 Err(e) => Err(anyhow!("response: {}", e)),
             });
         match r {
             Ok(()) => {
-                let _ = self.mem.pool_take_granted(pool_id, offset, len);
                 // Give the pages back for real.
                 //
                 // Unregistering only takes the range away from the GUEST; the pages are still in
@@ -470,15 +487,65 @@ impl PoolWorker {
                 if let Err(e) = self.punch_range(gpa, len) {
                     error!(
                         "gunyah-pool: unshared {:#x}+{:#x} but could not punch it out ({:#}); \
-                         the guest lost the range and the host kept the memory",
+                         trying to restore the mapping",
                         gpa, len, e
                     );
+
+                    // UnregisterMemory has already released the guest acceptance and the host
+                    // runtime mapping. Keep the grant reserved while trying to put that mapping
+                    // back; otherwise the guest would retain the old backed prefix and could
+                    // allocate an address whose stage-2 mapping no longer exists.
+                    match self.grant(gpa, len) {
+                        Ok(()) => {
+                            self.mem.pool_cancel_unshare(pool_id, offset, len);
+                            return -libc::EIO;
+                        }
+                        Err(regrant_err) => {
+                            error!(
+                                "gunyah-pool: could not restore {:#x}+{:#x} after punch failure: \
+                                 {:#}; dropping the grant so the guest can reconcile the range",
+                                gpa, len, regrant_err
+                            );
+                            // The pages were not reclaimed, but the guest must stop using the
+                            // range. Finishing the bookkeeping makes QUERY report it unbacked;
+                            // the guest shrink path will lower its backed boundary and a later
+                            // grow can retry the SHARE. This is safer than leaving a stale grant
+                            // that makes the guest reuse an unmapped range.
+                            if let Err(finish_err) =
+                                self.mem.pool_finish_unshare(pool_id, offset, len)
+                            {
+                                error!(
+                                    "gunyah-pool: failed to drop unreclaimable grant {:#x}+{:#}: {:?}",
+                                    gpa, len, finish_err
+                                );
+                            }
+                            return -libc::EIO;
+                        }
+                    }
+                }
+
+                if let Err(e) = self.mem.pool_finish_unshare(pool_id, offset, len) {
+                    // The hole was punched and the guest mapping is gone. Do not clear the
+                    // reservation on bookkeeping failure: making the range reusable could let a
+                    // new resource alias a range whose accounting no longer matches the RM. The
+                    // guest must also discard this suffix, because the backing is already gone;
+                    // EUCLEAN is the private signal for that unrecoverable state.
+                    error!(
+                        "gunyah-pool: reclaimed {:#x}+{:#x} but could not finish bookkeeping: {:?}",
+                        gpa, len, e
+                    );
+                    return -libc::EUCLEAN;
                 }
                 0
             }
             Err(e) => {
+                // The guest mapping is still registered, so the reservation is safe to
+                // release. Otherwise a transient tube/unregister failure permanently strands
+                // this grant in the `releasing` state.
+                self.mem.pool_cancel_unshare(pool_id, offset, len);
                 error!("gunyah-pool: unshare at {:#x} failed: {:#}", gpa, e);
-                -libc::EIO
+                -e.downcast_ref::<base::Error>()
+                    .map_or(libc::EIO, |errno| errno.errno())
             }
         }
     }
@@ -673,15 +740,29 @@ impl VirtioDevice for GunyahAccept {
     }
 
     fn virtio_sleep(&mut self) -> anyhow::Result<Option<BTreeMap<usize, Queue>>> {
+        let mut queues = BTreeMap::new();
+
+        // Queue 2 belongs to a separate worker. It must be stopped and returned along with the
+        // accept queues; otherwise wake would either leave the old pool worker owning the queue or
+        // reactivate with only two queues even though activate requires all three.
+        if let Some(pool_worker_thread) = self.pool_worker_thread.take() {
+            let pool_worker = pool_worker_thread.stop();
+            self.pool_tube = Some(pool_worker.vm_memory);
+            queues.insert(2, pool_worker.pool_queue);
+        }
+
         if let Some(worker_thread) = self.worker_thread.take() {
             let worker = worker_thread.stop();
             self.tube = Some(worker.tube);
-            return Ok(Some(BTreeMap::from([
-                (0, worker.req_queue),
-                (1, worker.comp_queue),
-            ])));
+            queues.insert(0, worker.req_queue);
+            queues.insert(1, worker.comp_queue);
         }
-        Ok(None)
+
+        if queues.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(queues))
+        }
     }
 
     fn virtio_wake(

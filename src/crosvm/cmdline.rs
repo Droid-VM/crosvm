@@ -2019,7 +2019,7 @@ pub struct RunCommand {
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
-    #[argh(option, arg_name = "gfx-host-mb=MB,gfx-guest-mb=MB")]
+    #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB")]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
     /// host-owned pre-allocated GPU pool sizes (MB). Boot-blessed regions the in-process renderer
@@ -2027,6 +2027,9 @@ pub struct RunCommand {
     /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
     ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
     ///     gpu-guest-mb=<MB> - guest-alloc pool size, shared by both renderers (0 = off)
+    ///     gpu-guest-prealloc-mb=<MB> - boot-SHARE'd floor; defaults to gpu-guest-mb
+    ///     gpu-guest-step-mb=<MB> - runtime grow/reclaim granularity (0 = fully pre-shared)
+    ///     gpu-guest-max-grants=<N> - per-pool live runtime grant cap (0 = no local cap)
     ///     drm-host-mb=<MB>  - drm2kgsl host arena size (0 = drm2kgsl runtime-share)
     pub pre_alloc: Option<PreAllocConfig>,
 

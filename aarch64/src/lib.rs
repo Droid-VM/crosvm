@@ -592,6 +592,18 @@ impl arch::LinuxArch for AArch64 {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
+        let gpu_guest_prealloc_mb: u64 = std::env::var("NCTX_GFX_GUEST_POOL_PREALLOC_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(gpu_guest_pool_mb);
+        let gpu_guest_step_mb: u64 = std::env::var("NCTX_GFX_GUEST_POOL_STEP_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let gpu_guest_max_grants: u32 = std::env::var("NCTX_GFX_GUEST_POOL_MAX_GRANTS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let mut pool_top = AARCH64_PHYS_MEM_START + components.memory_size;
         if gpu_pool_mb != 0 {
             memory_regions.push((
@@ -611,19 +623,22 @@ impl arch::LinuxArch for AArch64 {
         if gpu_guest_pool_mb != 0 {
             // 2 MiB-align the base (matches the pool align) so it never overlaps the host pool.
             let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
+            let size = gpu_guest_pool_mb << 20;
+            let prealloc = gpu_guest_prealloc_mb << 20;
+            let step = gpu_guest_step_mb << 20;
             memory_regions.push((
                 GuestAddress(base),
-                gpu_guest_pool_mb << 20,
+                size,
                 MemoryRegionOptions::new()
                     .purpose(MemoryRegionPurpose::GpuPoolGuest)
                     .align(2 << 20)
-                    // Fully pre-shared: this pool does not grow. `growable_pool(size, 0)` is
-                    // the same thing the defaults already produce -- it is written out so the
-                    // intent is in the code rather than in an absent field, and so that turning
-                    // one of these into a growable pool is a visible edit here.
-                    .growable_pool(gpu_guest_pool_mb << 20, 0),
+                    // The default remains fully pre-shared. With a non-zero step, the whole
+                    // window is declared in the guest but only the prealloc prefix is SHARE'd at
+                    // boot; the guest pool allocator grows and shrinks the suffix at runtime.
+                    .growable_pool(prealloc, step)
+                    .max_grants(gpu_guest_max_grants),
             ));
-            pool_top = base + (gpu_guest_pool_mb << 20);
+            pool_top = base + size;
         }
         // DRM native context HOST-alloc pool (--pre-alloc drm-host-mb): what virglrenderer's DRM
         // backend sub-allocates from. Since BO backing moved to the guest pool above, this holds
@@ -1257,7 +1272,7 @@ impl arch::LinuxArch for AArch64 {
         // mode the host-visible blobs sub-allocate from this pool (no runtime SHARE); without
         // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
         // pool region emitted).
-        let mut gpu_guest_resv: Option<(u64, u64)> = None;
+        let mut gpu_guest_resv: Option<(u64, u64, u64, u64)> = None;
         // (base, size, pre_alloc, step) for the growable test pool, read back off the region so
         // the DT node and the region cannot disagree about what the guest was promised.
         let test_pool_resv: Option<(u64, u64, u64, u64)> = {
@@ -1312,12 +1327,20 @@ impl arch::LinuxArch for AArch64 {
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 if region.options.purpose == vm_memory::MemoryRegionPurpose::GpuPoolGuest {
                     let gpa = region.guest_addr.offset();
+                    let size = region.size as u64;
                     base::warn!(
-                        "GPU-POOL: GpuPoolGuest region gpa={:#x} size={:#x} (blessed, guest-owned)",
+                        "GPU-POOL: GpuPoolGuest region gpa={:#x} size={:#x} prealloc={:#x} step={:#x} (blessed, guest-owned)",
                         gpa,
-                        region.size,
+                        size,
+                        region.options.boot_share_len(size),
+                        region.options.step_size,
                     );
-                    gpu_guest_resv = Some((gpa, region.size as u64));
+                    gpu_guest_resv = Some((
+                        gpa,
+                        size,
+                        region.options.boot_share_len(size),
+                        region.options.step_size,
+                    ));
                 }
                 // drm2kgsl arena: hand virglrenderer's drm2kgsl backend the memfd view. It lives in this
                 // process, so the host VA crosvm already mapped is directly usable and saves the
