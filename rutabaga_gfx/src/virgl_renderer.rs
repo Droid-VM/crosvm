@@ -343,14 +343,15 @@ fn virgl_pool_windows() -> &'static [(u64, u64)] {
     })
 }
 
-/// Byte offset of a resource inside the drm2kgsl pool, or None if it does not live there.
+/// Byte offset of a resource inside a host-owned renderer pool (drm2kgsl arena or venus_host),
+/// or None if it does not live in one.
 ///
 /// Asked at creation, when the drm2kgsl backend has just recorded the arena pointer on the
 /// resource, and asked through an accessor that only READS it. The obvious alternative --
 /// map() then unmap() -- is not a query: virglrenderer's map records res->mapped and its
 /// unmap munmaps a dmabuf, so probing with the pair tears down mappings the renderer is
 /// still using.
-fn drm2kgsl_pool_offset(resource_id: u32) -> Option<u64> {
+fn virgl_pool_offset(resource_id: u32) -> Option<u64> {
     let windows = virgl_pool_windows();
     if windows.is_empty() {
         return None;
@@ -881,7 +882,7 @@ impl RutabagaComponent for VirglRenderer {
             component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
             size: resource_create_blob.size,
             mapping: None,
-            pool_offset: drm2kgsl_pool_offset(resource_id),
+            pool_offset: virgl_pool_offset(resource_id),
         })
     }
 
