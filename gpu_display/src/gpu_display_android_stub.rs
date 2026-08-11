@@ -9,6 +9,7 @@
 //! not functional at runtime.
 
 use std::ffi::c_char;
+use std::ffi::c_int;
 
 use crate::gpu_display_android::ANativeWindow_Buffer;
 use crate::gpu_display_android::AndroidDisplayContext;
@@ -106,6 +107,11 @@ extern "C" fn android_display_flip_to(
     _ctx: *mut AndroidDisplayContext,
     _surface: *mut AndroidDisplaySurface,
     _raw_handle: i64,
+    out_completion_fence_fd: *mut c_int,
 ) -> bool {
+    if !out_completion_fence_fd.is_null() {
+        // SAFETY: checked non-null, and the caller passes a pointer to its own c_int.
+        unsafe { *out_completion_fence_fd = -1 };
+    }
     false
 }
