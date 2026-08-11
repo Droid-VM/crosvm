@@ -147,6 +147,7 @@ pub enum MemoryRegionPurpose {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     Drm2KgslPool,
 
+
     /// DroidVM: a GROWABLE test pool. Declared to the guest at its full size but SHARE'd only up
     /// to `pre_alloc_size` at boot; the rest is granted at runtime over virtio-gunyah-accept's
     /// pool queue. Exists so the growable path can be exercised end to end without disturbing the
@@ -184,6 +185,12 @@ pub enum MemoryRegionPurpose {
 
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     StaticSwiotlbRegion,
+
+    /// DroidVM: venus (vkr) host-alloc transport pool. The region vkr's blob_id==0 shmems
+    /// (per-instance ring, CS/reply chunks) are served from once the vkr pool merge lands;
+    /// blessed and access-checked exactly like GpuPool. Its own `venus_host` DT node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    VenusPool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues, PartialEq, Eq, PartialOrd, Ord)]
@@ -866,6 +873,10 @@ impl GuestMemory {
             // process and sub-allocates BOs out of it, so the host needs access.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::Drm2KgslPool => self.check_pool_backed(region, guest_addr),
+            // venus transport pool: SHARE'd like the gfx pools; vkr lives in this process and
+            // sub-allocates ring shmems out of it, so the host needs access.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::VenusPool => self.check_pool_backed(region, guest_addr),
             // The one region where this actually gates anything today: everything else has
             // step_size == 0 and answers yes everywhere.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

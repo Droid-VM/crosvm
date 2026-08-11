@@ -649,6 +649,31 @@ impl arch::LinuxArch for AArch64 {
             ));
         }
 
+        // venus (vkr) HOST-alloc transport pool (--pre-alloc venus-host-mb): where vkr's
+        // blob_id==0 shmems are served from (pool merge). Blessed like the others. The drm
+        // block above does not advance pool_top, so chain from the highest pushed region.
+        let venus_pool_mb: u64 = std::env::var("NCTX_VENUS_POOL_MB")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if venus_pool_mb != 0 {
+            let top = memory_regions
+                .last()
+                .map(|(a, s, _)| a.offset() + *s)
+                .unwrap_or(pool_top)
+                .max(pool_top);
+            let base = (top + (2 << 20) - 1) & !((2 << 20) - 1);
+            memory_regions.push((
+                GuestAddress(base),
+                venus_pool_mb << 20,
+                MemoryRegionOptions::new()
+                    .purpose(MemoryRegionPurpose::VenusPool)
+                    .align(2 << 20)
+                    .growable_pool(venus_pool_mb << 20, 0),
+            ));
+            pool_top = base + (venus_pool_mb << 20);
+        }
+
         // Growable TEST pool. Declared whole, SHARE'd only up to the prealloc prefix; the rest is
         // granted at runtime. Unlike the three pools above this one really does have a non-zero
         // step, so it is the only region for which the grant table and the host-access gate do
@@ -1277,6 +1302,7 @@ impl arch::LinuxArch for AArch64 {
             found
         };
         let mut drm2kgsl_resv: Option<(u64, u64)> = None;
+        let mut venus_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
             let mut found = None;
             for region in vm.get_memory().regions() {
@@ -1349,6 +1375,29 @@ impl arch::LinuxArch for AArch64 {
                     );
                     drm2kgsl_resv = Some((gpa, region.size as u64));
                 }
+                // venus transport pool: hand vkr the memfd view for the pool merge, and
+                // announce `venus_host` so the guest maps ring blobs by pool-relative offset.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::VenusPool {
+                    let fd = region.shm.as_raw_descriptor();
+                    let gpa = region.guest_addr.offset();
+                    std::env::set_var("VENUS_POOL_FD", fd.to_string());
+                    std::env::set_var("VENUS_POOL_FD_OFFSET", region.shm_offset.to_string());
+                    std::env::set_var(
+                        "VENUS_POOL_HOST_VA",
+                        (region.host_addr as u64).to_string(),
+                    );
+                    std::env::set_var("VENUS_POOL_GPA", format!("{:#x}", gpa));
+                    std::env::set_var("VENUS_POOL_SIZE", (region.size as u64).to_string());
+                    base::warn!(
+                        "GPU-POOL: VenusPool region gpa={:#x} size={:#x} fd={} off={:#x}                          (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        fd,
+                        region.shm_offset,
+                    );
+                    venus_resv = Some((gpa, region.size as u64));
+                }
             }
             found
         };
@@ -1383,6 +1432,7 @@ impl arch::LinuxArch for AArch64 {
             }),
             gpu_resv,
             gpu_guest_resv,
+            venus_resv,
             test_pool_resv,
             drm2kgsl_resv,
             bat_mmio_base_and_irq,

@@ -584,6 +584,12 @@ pub struct PreAllocConfig {
     /// node. Only meaningful with `--gpu backend=virglrenderer`.
     pub drm_host_mb: Option<u64>,
 
+    /// venus (vkr) HOST-allocated pool size (MB): where the venus transport shmems (per-instance
+    /// ring + CS/reply chunks) are served from once the vkr pool merge lands; until then it is
+    /// blessed but inert. Its own VenusPool region + `venus_host` DT node. Only meaningful with
+    /// `--gpu backend=virglrenderer,context-types=venus`.
+    pub venus_host_mb: Option<u64>,
+
     /// Growable TEST pool: total window size (MB). Declared to the guest whole but backed only up
     /// to `test-pool-prealloc-mb`; the rest is granted at runtime as the guest asks, a
     /// `test-pool-step-mb` multiple at a time.

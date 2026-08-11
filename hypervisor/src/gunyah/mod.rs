@@ -291,6 +291,10 @@ impl GunyahVm {
                     // process and must keep reaching it.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::Drm2KgslPool => false,
+                    // venus transport pool: SHARE'd like the gfx pools; vkr runs in this
+                    // process and must keep reaching it.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::VenusPool => false,
                     // Growable test pool: SHARE'd like the others. Only its pre_alloc prefix is
                     // shared at boot; the remainder is granted at runtime.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -415,6 +419,7 @@ impl GunyahVm {
                         MemoryRegionPurpose::GpuPool
                             | MemoryRegionPurpose::GpuPoolGuest
                             | MemoryRegionPurpose::Drm2KgslPool
+                            | MemoryRegionPurpose::VenusPool
                     )
                 {
                     // SAFETY: host_addr is a valid mapping of region.size bytes.
@@ -480,6 +485,7 @@ impl GunyahVm {
                     MemoryRegionPurpose::GpuPool
                         | MemoryRegionPurpose::GpuPoolGuest
                         | MemoryRegionPurpose::Drm2KgslPool
+                        | MemoryRegionPurpose::VenusPool
                         | MemoryRegionPurpose::DynamicTestPool
                 );
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

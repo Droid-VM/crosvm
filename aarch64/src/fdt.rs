@@ -889,6 +889,7 @@ pub fn create_fdt(
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64)>,
+    venus_resv: Option<(u64, u64)>,
     test_pool_resv: Option<(u64, u64, u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
@@ -985,6 +986,12 @@ pub fn create_fdt(
     // the RM blesses the range.
     if let Some((gpa, size)) = drm2kgsl_resv {
         create_pool_node(&mut fdt, "drm2kgsl_host", gpa, size, None, None)?;
+    }
+
+    // venus's host-alloc transport pool: the guest maps ring blobs by pool-relative offset
+    // (MAP_INFO_POOL), same contract as gfx_host.
+    if let Some((gpa, size)) = venus_resv {
+        create_pool_node(&mut fdt, "venus_host", gpa, size, None, None)?;
     }
 
     create_cpu_nodes(

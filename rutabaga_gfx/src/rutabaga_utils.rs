@@ -421,6 +421,10 @@ const VIRGLRENDERER_VENUS: u32 = 1 << 6;
 const VIRGLRENDERER_NO_VIRGL: u32 = 1 << 7;
 const VIRGLRENDERER_USE_ASYNC_FENCE_CB: u32 = 1 << 8;
 const VIRGLRENDERER_RENDER_SERVER: u32 = 1 << 9;
+/// Upstream 1.3 flag: the venus capset advertises use_guest_vram, telling the guest that host
+/// memory cannot be injected and every host-visible/exportable VkDeviceMemory must be
+/// guest-allocated and imported (the only workable arrangement in a Gunyah protected VM).
+const VIRGLRENDERER_USE_GUEST_VRAM: u32 = 1 << 14;
 const VIRGLRENDERER_DRM: u32 = 1 << 10;
 
 /// virglrenderer flag struct.
@@ -517,6 +521,11 @@ impl VirglRendererFlags {
 
     pub fn use_render_server(self, v: bool) -> VirglRendererFlags {
         self.set_flag(VIRGLRENDERER_RENDER_SERVER, v)
+    }
+
+    /// Advertise use_guest_vram in the venus capset (guest-allocated VkDeviceMemory).
+    pub fn use_guest_vram(self, v: bool) -> VirglRendererFlags {
+        self.set_flag(VIRGLRENDERER_USE_GUEST_VRAM, v)
     }
 }
 
