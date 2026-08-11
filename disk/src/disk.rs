@@ -68,6 +68,8 @@ use sys::read_from_disk;
 #[cfg(feature = "zstd")]
 mod zstd;
 #[cfg(feature = "zstd")]
+mod zstd_ffi;
+#[cfg(feature = "zstd")]
 use zstd::ZstdDisk;
 #[cfg(feature = "zstd")]
 use zstd::ZSTD_FRAME_MAGIC;

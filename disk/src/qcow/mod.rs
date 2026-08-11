@@ -48,6 +48,7 @@ use crate::qcow::vec_cache::VecCache;
 use crate::AsyncDisk;
 use crate::AsyncDiskFileWrapper;
 use crate::DiskFile;
+use crate::zstd_ffi as zstd;
 use crate::DiskFileParams;
 use crate::DiskGetLen;
 use crate::ToAsyncDisk;
@@ -2289,6 +2290,7 @@ fn offset_is_cluster_boundary(offset: u64, cluster_bits: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use crate::zstd_ffi as zstd;
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::io::Seek;
