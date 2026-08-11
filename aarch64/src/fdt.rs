@@ -888,7 +888,7 @@ pub fn create_fdt(
     psci_version: PsciVersion,
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
-    gpu_guest_resv: Option<(u64, u64)>,
+    gpu_guest_resv: Option<(u64, u64, u64, u64)>,
     venus_resv: Option<(u64, u64)>,
     test_pool_resv: Option<(u64, u64, u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
@@ -960,24 +960,43 @@ pub fn create_fdt(
 
     // The guest-alloc pool: the guest virtio-gpu driver owns a page allocator over this range and
     // sub-allocates BLOB_MEM_GUEST from it, handing the host ordinary mem-entries.
-    if let Some((gpa, size)) = gpu_guest_resv {
-        create_pool_node(&mut fdt, "gpu_guest", gpa, size, None, None)?;
+    let mut next_growable_pool_id = 0;
+    if let Some((gpa, size, prealloc, step)) = gpu_guest_resv {
+        let growable = if step != 0 {
+            let pool_id = next_growable_pool_id;
+            next_growable_pool_id += 1;
+            Some(GrowablePool {
+                pre_alloc_size: prealloc,
+                step_size: step,
+                pool_id,
+            })
+        } else {
+            None
+        };
+        create_pool_node(&mut fdt, "gpu_guest", gpa, size, None, growable)?;
     }
 
     // The growable test pool: exists so the grow/shrink path can be exercised end to end without
     // disturbing the production pools, which are all fully pre-shared and must stay that way.
     if let Some((gpa, size, prealloc, step)) = test_pool_resv {
+        let growable = if step != 0 {
+            let pool_id = next_growable_pool_id;
+            next_growable_pool_id += 1;
+            Some(GrowablePool {
+                pre_alloc_size: prealloc,
+                step_size: step,
+                pool_id,
+            })
+        } else {
+            None
+        };
         create_pool_node(
             &mut fdt,
             "test_guest",
             gpa,
             size,
             None,
-            Some(GrowablePool {
-                pre_alloc_size: prealloc,
-                step_size: step,
-                pool_id: 0,
-            }),
+            growable,
         )?;
     }
 

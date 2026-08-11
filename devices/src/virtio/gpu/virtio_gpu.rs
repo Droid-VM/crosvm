@@ -1695,23 +1695,37 @@ impl VirtioGpu {
             .remove(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        // Release the growable-pool grants this resource was holding, so a shrink of that range
-        // can go ahead. Paired with the ref taken in resource_create_blob; nothing enforces the
-        // pairing but the two sites, which is why the ranges are stored on the resource rather
-        // than recomputed here.
+        // Keep the pool reference until the renderer has actually dropped the resource. If an
+        // unmap/unref fails, put the resource back so a later cleanup can retry; releasing the
+        // grant before that point would let the guest reuse pages still held by the renderer.
+        let result = (|| -> VirtioGpuResult {
+            resource.transition_display_import(
+                &mut self.display.borrow_mut(),
+                DisplayImportState::Unknown,
+            );
+
+            if resource.rutabaga_external_mapping {
+                self.rutabaga.unmap(resource_id)?;
+                resource.rutabaga_external_mapping = false;
+            }
+
+            self.rutabaga.unref_resource(resource_id)?;
+            Ok(OkNoData)
+        })();
+
+        if result.is_err() {
+            self.resources.insert(resource_id, resource);
+            return result;
+        }
+
+        // Release the growable-pool grants only after the renderer no longer owns the resource.
+        // Paired with the ref taken in resource_create_blob; the ranges are stored on the resource
+        // rather than recomputed here because backing_iovecs can be detached independently.
         if let Some(refs) = resource.pool_refs.take() {
             mem.pool_unref_iovecs(&refs[..]);
         }
 
-        resource
-            .transition_display_import(&mut self.display.borrow_mut(), DisplayImportState::Unknown);
-
-        if resource.rutabaga_external_mapping {
-            self.rutabaga.unmap(resource_id)?;
-        }
-
-        self.rutabaga.unref_resource(resource_id)?;
-        Ok(OkNoData)
+        result
     }
 
     /// Copies data to host resource from the attached iovecs. Can also be used to flush caches.
@@ -1795,6 +1809,7 @@ impl VirtioGpu {
                     ErrUnspec
                 })?),
                 None => {
+                    mem.pool_unref_iovecs(&vecs[..]);
                     base::error!("GUEST-ALLOC: udmabuf_driver is None (need /dev/udmabuf)");
                     return Err(ErrUnspec);
                 }
@@ -1828,7 +1843,13 @@ impl VirtioGpu {
             // udmabuf above is what the GPU ends up bound to; these are what makes the resource
             // legal to create in the first place.
             if resource_create_blob.blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST {
-                let iovs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
+                let iovs = match sglist_to_rutabaga_iovecs(&vecs[..], mem) {
+                    Ok(iovs) => iovs,
+                    Err(_) => {
+                        mem.pool_unref_iovecs(&vecs[..]);
+                        return Err(ErrUnspec);
+                    }
+                };
                 rutabaga_iovecs = Some(iovs);
             }
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
@@ -1836,7 +1857,7 @@ impl VirtioGpu {
             rutabaga_iovecs = Some(iovs);
         }
 
-        self.rutabaga.resource_create_blob(
+        let create_result = self.rutabaga.resource_create_blob(
             ctx_id,
             resource_id,
             resource_create_blob,
@@ -1845,10 +1866,17 @@ impl VirtioGpu {
                 os_handle: to_rutabaga_descriptor(descriptor),
                 handle_type: RUTABAGA_HANDLE_TYPE_MEM_DMABUF,
             }),
-        )?;
+        );
+        if create_result.is_err() {
+            if let Some(refs) = pool_refs.as_ref() {
+                mem.pool_unref_iovecs(refs);
+            }
+        }
+        create_result?;
 
         let mut resource = VirtioGpuResource::new(resource_id, 0, 0, resource_create_blob.size);
         resource.pool_scanout_iovecs = pool_iovecs;
+        resource.pool_refs = pool_refs;
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
@@ -2224,6 +2252,20 @@ impl VirtioGpu {
             );
         }
         resource.scanout_data = scanout_data;
+
+        let buffer_fourcc = scanout_data
+            .map(|data| data.drm_format.into())
+            .or_else(|| {
+                self.rutabaga
+                    .query(resource_id)
+                    .ok()
+                    .map(|query| query.drm_fourcc)
+            });
+        if let (Some(surface_id), Some(fourcc)) = (scanout.surface_id, buffer_fourcc) {
+            self.display
+                .borrow_mut()
+                .set_buffer_fourcc(surface_id, fourcc)?;
+        }
 
         // `resource_id` has already been verified to be non-zero
         let resource_id = match NonZeroU32::new(resource_id) {

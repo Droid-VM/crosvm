@@ -5,6 +5,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::c_char;
+use std::ffi::c_int;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::panic::catch_unwind;
@@ -16,7 +17,9 @@ use std::slice;
 use base::error;
 use base::AsRawDescriptor;
 use base::Event;
+use base::FromRawDescriptor;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use base::VolatileSlice;
 use vm_control::gpu::DisplayParameters;
 
@@ -122,6 +125,12 @@ extern "C" {
         surface: *mut AndroidDisplaySurface,
     );
 
+    fn set_android_surface_buffer_format(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        fourcc: u32,
+    );
+
     fn android_display_import_dmabuf(
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
@@ -139,10 +148,17 @@ extern "C" {
 
     fn android_display_is_vulkan_blit_available(ctx: *mut AndroidDisplayContext) -> bool;
 
+    /// `out_completion_fence_fd` is written by the callee and is mandatory: the C side rejects a
+    /// null pointer outright, and on the async-blit path it hands back an owned sync_file fd that
+    /// this side must close. Keep the arity in step with the definition in
+    /// `crosvm_android_display_client.cpp` -- these symbols are not declared in any shared header,
+    /// so this extern block is the only "declaration" the compiler ever sees and a mismatch links
+    /// silently.
     fn android_display_flip_to(
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
         raw_handle: i64,
+        out_completion_fence_fd: *mut c_int,
     ) -> bool;
 }
 
@@ -236,6 +252,17 @@ impl GpuDisplaySurface for AndroidSurface {
         };
     }
 
+    fn set_buffer_fourcc(&mut self, fourcc: u32) {
+        // SAFETY: context and surface are live opaque handles owned by this surface.
+        unsafe {
+            set_android_surface_buffer_format(
+                self.context.0.as_ptr(),
+                self.surface.as_ptr(),
+                fourcc,
+            )
+        };
+    }
+
     /// Hiding rides the existing position pipe rather than a new FFI entry point: the native side
     /// forwards whatever it is given straight to the app, so a coordinate the guest can never
     /// produce carries the message with no change to the C bridge or the AIDL.
@@ -262,16 +289,42 @@ impl GpuDisplaySurface for AndroidSurface {
             .get(&import_id)
             .copied()
             .ok_or_else(|| anyhow::anyhow!("invalid Android display import id {}", import_id))?;
-        // The native bridge waits for the Turnip queue before handing the AHB to
-        // SurfaceControl, so no separate Vulkan semaphore is needed here.
+        // On the synchronous blit path the bridge waits for the Turnip queue before handing the AHB
+        // to SurfaceControl and reports -1 here. The async path instead exports a sync_file for the
+        // blit's completion and transfers it to us, so this fd must be owned on every success path
+        // or the process leaks one per presented frame.
+        let mut completion_fence_fd: c_int = -1;
         let success = unsafe {
-            android_display_flip_to(self.context.0.as_ptr(), self.surface.as_ptr(), raw_handle)
+            android_display_flip_to(
+                self.context.0.as_ptr(),
+                self.surface.as_ptr(),
+                raw_handle,
+                &mut completion_fence_fd,
+            )
+        };
+        // Adopt the fd before the error check: `success` says whether the flip happened, not
+        // whether an fd came back, and leaking it on the failure path would be the same bug.
+        let completion_fence = if completion_fence_fd >= 0 {
+            // SAFETY: the bridge transfers ownership of this fd to us, and it is only written when
+            // the export succeeded.
+            Some(unsafe { SafeDescriptor::from_raw_descriptor(completion_fence_fd) })
+        } else {
+            None
         };
         if !success {
             return Err(anyhow::anyhow!(
                 "Android display Vulkan blit failed; switching to CPU fallback"
             ));
         }
+        // Dropping the fence closes it without waiting, which is what every caller of flip_to
+        // already gets: `sync::Waitable` is a condvar pair with no fd backing, and the only caller
+        // (virtio_gpu.rs resource_flush) discards the Waitable and completes RESOURCE_FLUSH
+        // immediately. Backpressure comes from the bridge instead -- blit() calls reclaimSlot() on
+        // the slot it is about to reuse, which CPU-waits that slot's previous fence, so with
+        // kAsyncInFlightSlotCount=3 a blit is at most 2 frames behind. That bounds it but does not
+        // order the guest's reuse of the *source* dmabuf against the blit reading it; closing the
+        // real barrier needs an fd-backed Waitable plus a caller that waits on it.
+        drop(completion_fence);
         Ok(sync::Waitable::signaled())
     }
 }
