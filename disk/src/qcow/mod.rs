@@ -8,6 +8,7 @@ mod vec_cache;
 
 use std::cmp::max;
 use std::cmp::min;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::io::Read;
@@ -33,7 +34,6 @@ use base::WriteZeroesAt;
 use cros_async::Executor;
 use libc::EINVAL;
 use libc::ENOSPC;
-use libc::ENOTSUP;
 use remain::sorted;
 use sync::Mutex;
 use thiserror::Error;
@@ -125,6 +125,18 @@ pub enum Error {
     TooManyL1Entries(u64),
     #[error("ref count table too large: {0}")]
     TooManyRefcounts(u64),
+    #[error(
+        "compression type {compression_type} is inconsistent with the compression incompatible \
+         feature bit (incompatible_features={incompatible_features:#x})"
+    )]
+    UnsupportedCompressionFeatureMismatch {
+        compression_type: u8,
+        incompatible_features: u64,
+    },
+    #[error("unsupported compression type: {0}")]
+    UnsupportedCompressionType(u8),
+    #[error("unsupported incompatible features: {0:#x}")]
+    UnsupportedIncompatibleFeatures(u64),
     #[error("unsupported refcount order")]
     UnsupportedRefcountOrder,
     #[error("unsupported version: {0}")]
@@ -163,6 +175,41 @@ const COMPRESSED_FLAG: u64 = 1 << 62;
 const CLUSTER_USED_FLAG: u64 = 1 << 63;
 const COMPATIBLE_FEATURES_LAZY_REFCOUNTS: u64 = 1 << 0;
 
+// qcow2 "incompatible feature" bits (header offset 72). A bit set here that the implementation
+// does not understand means the image cannot be parsed correctly, so opening must fail. The bits
+// are, low to high: bit 0 dirty (refcounts may be stale; crosvm always rebuilds them, tolerated);
+// bit 1 corrupt (rejected); bit 2 external data file (data lives in a separate file crosvm does
+// not open, rejected); bit 3 compression type (a non-default/non-zlib compression type is in use;
+// tolerated, but must be set iff the compression type header field is non-zero); bit 4 extended L2
+// (128-bit L2 entries with a subcluster bitmap that crosvm's 64-bit L2 parsing cannot read,
+// rejected).
+const INCOMPATIBLE_FEATURES_DIRTY: u64 = 1 << 0;
+const INCOMPATIBLE_FEATURES_COMPRESSION: u64 = 1 << 3;
+// The set of incompatible feature bits crosvm can open. The dirty bit is tolerated because the
+// refcounts are always rebuilt; the compression bit is tolerated because compressed clusters are
+// decompressed on read. Any bit outside this mask (corrupt, external data file, extended L2, or a
+// bit from a future format revision) makes the image unparseable and is rejected.
+const SUPPORTED_INCOMPATIBLE_FEATURES: u64 =
+    INCOMPATIBLE_FEATURES_DIRTY | INCOMPATIBLE_FEATURES_COMPRESSION;
+
+// Compressed clusters are stored in 512 byte sectors.
+const QCOW_COMPRESSED_SECTOR_SIZE: u64 = 512;
+// Compression algorithm used by compressed clusters (value of the compression type
+// header extension). 0 = zlib (raw DEFLATE), 1 = zstd.
+const QCOW_COMPRESSION_TYPE_ZLIB: u8 = 0;
+const QCOW_COMPRESSION_TYPE_ZSTD: u8 = 1;
+
+// Upper bound on the memory used by the decompressed-cluster LRU cache. At least one cluster is
+// always cached; with the qcow2 default 64 KiB cluster size this holds 32 clusters.
+const DECOMPRESSED_CLUSTER_CACHE_BYTES: u64 = 2 << 20;
+
+// Upper bound on the number of worker threads used to decompress the clusters of a single read
+// request in parallel. Decompression is pure CPU work, so parallelizing it across cores turns the
+// per-cluster decode of a large (multi-cluster) compressed read from serial into concurrent. The
+// cap keeps a burst of large reads from oversubscribing the host; single-cluster reads never spawn
+// a thread (they decode inline).
+const MAX_DECODE_THREADS: usize = 8;
+
 // The format supports a "header extension area", that crosvm does not use.
 const QCOW_EMPTY_HEADER_EXTENSION_SIZE: u32 = 8;
 
@@ -198,8 +245,21 @@ pub struct QcowHeader {
     pub refcount_order: u32,
     pub header_size: u32,
 
+    // Compression algorithm for compressed clusters, from the compression type header
+    // extension. Defaults to zlib (0) when the extension is absent.
+    pub compression_type: u8,
+
     // Post-header entries
     pub backing_file_path: Option<String>,
+}
+
+// Reads the next u8 from the file.
+fn read_u8_from_file(mut f: &File) -> Result<u8> {
+    let mut value = [0u8; 1];
+    (&mut f)
+        .read_exact(&mut value)
+        .map_err(Error::ReadingHeader)?;
+    Ok(value[0])
 }
 
 // Reads the next u16 from the file.
@@ -227,6 +287,99 @@ fn read_u64_from_file(mut f: &File) -> Result<u64> {
         .read_exact(&mut value)
         .map_err(Error::ReadingHeader)?;
     Ok(u64::from_be_bytes(value))
+}
+
+// Reads from `r` until `buf` is completely filled or the reader reaches its end. Any bytes left
+// unfilled at end-of-stream keep their original value (the caller pre-zeroes the buffer). qcow2
+// compressed clusters always decompress to a full cluster, but tolerating a short read keeps this
+// robust against images whose final cluster is not padded.
+fn read_fill(r: &mut impl Read, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+// Decompresses one zstd-compressed qcow2 cluster (via C libzstd) into `out`, leaving any
+// remainder untouched (callers pass a zeroed buffer to get qemu's zero-fill semantics).
+// single_frame() stops at the frame boundary, so the sector-granular padding stored after the
+// compressed frame is never parsed and a short frame simply hits EOF, matching qemu.
+fn decompress_zstd_cluster(compressed: &[u8], out: &mut [u8]) -> std::io::Result<()> {
+    let decoder = zstd::stream::read::Decoder::with_buffer(compressed)?;
+    read_fill(&mut decoder.single_frame(), out)
+}
+
+// Decompresses one compressed qcow2 cluster of the given `compression_type` into `out` (which the
+// caller pre-zeroes to get qemu's zero-fill semantics for short frames). This is the pure-CPU core
+// of decode with no `&self` dependency, so it can run on a worker thread.
+fn decompress_cluster_into(
+    compression_type: u8,
+    compressed: &[u8],
+    out: &mut [u8],
+) -> std::io::Result<()> {
+    match compression_type {
+        QCOW_COMPRESSION_TYPE_ZSTD => decompress_zstd_cluster(compressed, out),
+        _ => {
+            // zlib compression in qcow2 is a raw DEFLATE stream with no zlib header.
+            let mut decoder = flate2::read::DeflateDecoder::new(compressed);
+            read_fill(&mut decoder, out)
+        }
+    }
+}
+
+// Decompresses a batch of compressed clusters, one `(l2_entry, compressed_bytes)` job each, into
+// full `cluster_size` buffers. Decode is pure CPU work, so for two or more jobs the batch is split
+// across up to `MAX_DECODE_THREADS` scoped worker threads and decoded concurrently; a single job
+// (or zero) decodes inline to avoid thread-spawn overhead. The returned order is unspecified.
+fn decompress_clusters_parallel(
+    compression_type: u8,
+    cluster_size: usize,
+    jobs: Vec<(u64, Vec<u8>)>,
+) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+    // Decodes one chunk of jobs sequentially.
+    let decode_chunk = |chunk: &[(u64, Vec<u8>)]| -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+        chunk
+            .iter()
+            .map(|(l2_entry, compressed)| {
+                let mut out = vec![0u8; cluster_size];
+                decompress_cluster_into(compression_type, compressed, &mut out)?;
+                Ok((*l2_entry, out))
+            })
+            .collect()
+    };
+
+    if jobs.len() < 2 {
+        return decode_chunk(&jobs);
+    }
+
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, MAX_DECODE_THREADS)
+        .min(jobs.len());
+    let chunk_size = jobs.len().div_ceil(threads);
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = jobs
+            .chunks(chunk_size)
+            .map(|chunk| scope.spawn(|| decode_chunk(chunk)))
+            .collect();
+
+        let mut decoded = Vec::with_capacity(jobs.len());
+        for handle in handles {
+            let chunk = handle
+                .join()
+                .map_err(|_| io::Error::other("qcow: decompression worker panicked"))??;
+            decoded.extend(chunk);
+        }
+        Ok(decoded)
+    })
 }
 
 impl QcowHeader {
@@ -258,10 +411,19 @@ impl QcowHeader {
             autoclear_features: read_u64_from_file(f)?,
             refcount_order: read_u32_from_file(f)?,
             header_size: read_u32_from_file(f)?,
+            compression_type: QCOW_COMPRESSION_TYPE_ZLIB,
             backing_file_path: None,
         };
         if header.backing_file_size > MAX_BACKING_FILE_SIZE {
             return Err(Error::BackingFileTooLong(header.backing_file_size as usize));
+        }
+        // The compression type is an additional header field at offset 104 (one byte, followed by
+        // seven bytes of padding), present when the header is extended past the bare v3 layout.
+        // qemu writes it and sets incompatible feature bit 3 whenever the type is not zlib.
+        if header.version >= 3 && header.header_size > V3_BARE_HEADER_SIZE {
+            f.seek(SeekFrom::Start(u64::from(V3_BARE_HEADER_SIZE)))
+                .map_err(Error::ReadingHeader)?;
+            header.compression_type = read_u8_from_file(f)?;
         }
         if header.backing_file_offset != 0 {
             f.seek(SeekFrom::Start(header.backing_file_offset))
@@ -328,6 +490,7 @@ impl QcowHeader {
             autoclear_features: 0,
             refcount_order: DEFAULT_REFCOUNT_ORDER,
             header_size: V3_BARE_HEADER_SIZE,
+            compression_type: QCOW_COMPRESSION_TYPE_ZLIB,
             backing_file_path: backing_file.map(String::from),
         })
     }
@@ -393,6 +556,41 @@ fn max_refcount_clusters(refcount_order: u32, cluster_size: u32, num_clusters: u
     for_data + for_refcounts
 }
 
+// Decodes a compressed cluster L2 entry (bit 62 set) into the host byte offset and byte length
+// of its compressed payload, per the qcow2 specification. The low `csize_shift` bits hold the
+// host byte offset; the next `cluster_bits - 8` bits hold the number of 512 byte sectors minus one.
+fn decode_compressed_descriptor(l2_entry: u64, cluster_bits: u64) -> (u64, u64) {
+    let csize_shift = 62 - (cluster_bits - 8);
+    let offset_mask = (1u64 << csize_shift) - 1;
+    let sectors_mask = (1u64 << (cluster_bits - 8)) - 1;
+    let coffset = l2_entry & offset_mask;
+    let nb_csectors = ((l2_entry >> csize_shift) & sectors_mask) + 1;
+    let csize =
+        nb_csectors * QCOW_COMPRESSED_SECTOR_SIZE - (coffset & (QCOW_COMPRESSED_SECTOR_SIZE - 1));
+    (coffset, csize)
+}
+
+// Returns the cluster-aligned host cluster addresses spanned by the compressed payload referenced
+// by `l2_entry`. A single compressed cluster's byte-packed payload may straddle two host clusters,
+// and several compressed clusters may share one host cluster, so refcounts are kept per host
+// cluster (this is what makes shared compressed storage safe to reference-count and reclaim).
+fn compressed_host_clusters(l2_entry: u64, cluster_bits: u64) -> Vec<u64> {
+    let cluster_size = 1u64 << cluster_bits;
+    let (coffset, csize) = decode_compressed_descriptor(l2_entry, cluster_bits);
+    if csize == 0 {
+        return Vec::new();
+    }
+    let first = (coffset / cluster_size) * cluster_size;
+    let last = ((coffset + csize - 1) / cluster_size) * cluster_size;
+    let mut clusters = Vec::new();
+    let mut addr = first;
+    while addr <= last {
+        clusters.push(addr);
+        addr += cluster_size;
+    }
+    clusters
+}
+
 /// Represents a qcow2 file. This is a sparse file format maintained by the qemu project.
 /// Full documentation of the format can be found in the qemu repository.
 ///
@@ -428,6 +626,31 @@ pub struct QcowFile {
 }
 
 #[derive(Debug)]
+// How the data for a guest cluster is stored in the qcow file.
+enum ClusterData {
+    // The cluster is not allocated; reads return zeroes (or the backing file's contents).
+    Unallocated,
+    // The cluster is stored uncompressed at this absolute offset in the raw file.
+    Plain(u64),
+    // The cluster is stored compressed. The value is the raw (unmasked) L2 entry, which encodes
+    // the host offset and size of the compressed data.
+    Compressed(u64),
+}
+
+// The source of data for a single cluster-bounded read.
+enum ReadSource<'a> {
+    // Read the bytes from this disk file at the given offset.
+    Disk {
+        file: &'a mut dyn DiskFile,
+        offset: u64,
+    },
+    // Copy the bytes directly from this in-memory buffer (a decompressed cluster).
+    Memory(&'a [u8]),
+    // The range reads back as zeroes.
+    Zero,
+}
+
+#[derive(Debug)]
 struct QcowFileInner {
     raw_file: QcowRawFile,
     header: QcowHeader,
@@ -440,7 +663,16 @@ struct QcowFileInner {
     // List of unreferenced clusters available to be used. unref clusters become available once the
     // removal of references to them have been synced to disk.
     avail_clusters: Vec<u64>,
+    // Host clusters backing freed compressed data, hole-punched only after the metadata that
+    // stopped referencing them is durable (end of sync_caches). Punching immediately would zero
+    // data the on-disk tables still point at, corrupting the image if crosvm crashed before the
+    // next flush.
+    punch_clusters: Vec<u64>,
     backing_file: Option<Box<dyn DiskFile>>,
+    // LRU cache of recently decompressed clusters, keyed by raw L2 entry, most recently used at
+    // the front. Avoids re-decompressing when a guest issues several sub-cluster reads to the
+    // same cluster or revisits a hot cluster. Bounded by DECOMPRESSED_CLUSTER_CACHE_BYTES.
+    decompressed_clusters: VecDeque<(u64, Vec<u8>)>,
 }
 
 impl DiskFile for QcowFile {}
@@ -461,6 +693,36 @@ impl QcowFile {
         // Only v3 files are supported.
         if header.version != 3 {
             return Err(Error::UnsupportedVersion(header.version));
+        }
+
+        // Reject images that set an incompatible feature crosvm cannot honor (external data file,
+        // extended L2 entries, the corrupt bit, or any unknown future bit). Parsing such an image
+        // as if the feature were absent would silently return wrong data, so refuse to open it.
+        let unsupported = header.incompatible_features & !SUPPORTED_INCOMPATIBLE_FEATURES;
+        if unsupported != 0 {
+            return Err(Error::UnsupportedIncompatibleFeatures(unsupported));
+        }
+
+        // Compressed clusters are decompressed on read; only zlib and zstd are understood.
+        if header.compression_type != QCOW_COMPRESSION_TYPE_ZLIB
+            && header.compression_type != QCOW_COMPRESSION_TYPE_ZSTD
+        {
+            return Err(Error::UnsupportedCompressionType(header.compression_type));
+        }
+
+        // The compression incompatible feature bit must be set exactly when a non-default
+        // (non-zlib) compression type is used. A mismatch means the header is malformed:
+        // e.g. a zstd image without the bit would be mis-detected as zlib by other tools,
+        // and the bit without a matching type is meaningless. Refuse either way instead of
+        // guessing.
+        let compression_bit_set =
+            header.incompatible_features & INCOMPATIBLE_FEATURES_COMPRESSION != 0;
+        let non_default_compression = header.compression_type != QCOW_COMPRESSION_TYPE_ZLIB;
+        if compression_bit_set != non_default_compression {
+            return Err(Error::UnsupportedCompressionFeatureMismatch {
+                compression_type: header.compression_type,
+                incompatible_features: header.incompatible_features,
+            });
         }
 
         // Make sure that the L1 table fits in RAM.
@@ -550,6 +812,14 @@ impl QcowFile {
             refcount_rebuild_required = true;
         }
 
+        // The dirty bit means the refcounts were left in an unknown state by an interrupted write.
+        // We tolerate opening such an image (unlike the other incompatible bits), but only after
+        // rebuilding the refcounts from the L1/L2 tables; trusting stale refcounts could hand out a
+        // cluster that is still in use and corrupt the image.
+        if (header.incompatible_features & INCOMPATIBLE_FEATURES_DIRTY) != 0 {
+            refcount_rebuild_required = true;
+        }
+
         let mut raw_file =
             QcowRawFile::from(file, cluster_size).ok_or(Error::InvalidClusterSize)?;
         if refcount_rebuild_required {
@@ -609,7 +879,9 @@ impl QcowFile {
             current_offset: 0,
             unref_clusters: Vec::new(),
             avail_clusters: Vec::new(),
+            punch_clusters: Vec::new(),
             backing_file,
+            decompressed_clusters: VecDeque::new(),
         };
 
         // Check that the L1 and refcount tables fit in a 64bit address space.
@@ -702,9 +974,9 @@ impl QcowFile {
 }
 
 impl QcowFileInner {
-    /// Returns the first cluster in the file with a 0 refcount. Used for testing.
+    /// Returns every cluster in the file with a 0 refcount. Used for testing.
     #[cfg(test)]
-    fn first_zero_refcount(&mut self) -> Result<Option<u64>> {
+    fn zero_refcount_clusters(&mut self) -> Result<Vec<u64>> {
         let file_size = self
             .raw_file
             .file_mut()
@@ -713,6 +985,7 @@ impl QcowFileInner {
             .len();
         let cluster_size = 0x01u64 << self.header.cluster_bits;
 
+        let mut zeros = Vec::new();
         let mut cluster_addr = 0;
         while cluster_addr < file_size {
             let cluster_refcount = self
@@ -720,11 +993,11 @@ impl QcowFileInner {
                 .get_cluster_refcount(&mut self.raw_file, cluster_addr)
                 .map_err(Error::GettingRefcount)?;
             if cluster_refcount == 0 {
-                return Ok(Some(cluster_addr));
+                zeros.push(cluster_addr);
             }
             cluster_addr += cluster_size;
         }
-        Ok(None)
+        Ok(zeros)
     }
 
     fn find_avail_clusters(&mut self) -> Result<()> {
@@ -800,17 +1073,30 @@ impl QcowFileInner {
                     // Add a reference to the L2 table cluster itself.
                     add_ref(refcounts, cluster_size, l2_addr_disk)?;
 
-                    // Read the L2 table and find all referenced data clusters.
+                    // Read the raw L2 table (no mask) so compressed entries can be decoded
+                    // properly; a compressed entry encodes a byte offset + sector count, not a
+                    // cluster address, so masking it as a plain pointer would refcount a garbage
+                    // cluster and corrupt the refcount table.
+                    let cluster_bits = u64::from(header.cluster_bits);
                     let l2_table = raw_file
                         .read_pointer_table(
                             l2_addr_disk,
                             cluster_size / size_of::<u64>() as u64,
-                            Some(L2_TABLE_OFFSET_MASK),
+                            None,
                         )
                         .map_err(Error::ReadingPointers)?;
-                    for data_cluster_addr in l2_table {
-                        if data_cluster_addr != 0 {
-                            add_ref(refcounts, cluster_size, data_cluster_addr)?;
+                    for l2_entry in l2_table {
+                        if l2_entry == 0 {
+                            continue;
+                        }
+                        if l2_entry & COMPRESSED_FLAG != 0 {
+                            // A compressed cluster's payload may span two host clusters, each of
+                            // which is reference-counted independently.
+                            for host in compressed_host_clusters(l2_entry, cluster_bits) {
+                                add_ref(refcounts, cluster_size, host)?;
+                            }
+                        } else {
+                            add_ref(refcounts, cluster_size, l2_entry & L2_TABLE_OFFSET_MASK)?;
                         }
                     }
                 }
@@ -1023,9 +1309,9 @@ impl QcowFileInner {
         (address / self.raw_file.cluster_size()) % self.l2_entries
     }
 
-    // Gets the offset of the given guest address in the host file. If L1, L2, or data clusters have
-    // yet to be allocated, return None.
-    fn file_offset_read(&mut self, address: u64) -> std::io::Result<Option<u64>> {
+    // Resolves how the cluster containing the given guest address is stored in the host file. If
+    // the L1, L2, or data cluster has yet to be allocated, returns `ClusterData::Unallocated`.
+    fn file_offset_read(&mut self, address: u64) -> std::io::Result<ClusterData> {
         if address >= self.virtual_size() {
             return Err(std::io::Error::from_raw_os_error(EINVAL));
         }
@@ -1038,7 +1324,7 @@ impl QcowFileInner {
 
         if l2_addr_disk == 0 {
             // Reading from an unallocated cluster will return zeros.
-            return Ok(None);
+            return Ok(ClusterData::Unallocated);
         }
 
         let l2_index = self.l2_table_index(address) as usize;
@@ -1061,14 +1347,24 @@ impl QcowFileInner {
 
         let cluster_addr = self.l2_cache.get(&l1_index).unwrap()[l2_index];
         if cluster_addr == 0 {
-            return Ok(None);
+            return Ok(ClusterData::Unallocated);
         }
-        Ok(Some(cluster_addr + self.raw_file.cluster_offset(address)))
+        if cluster_addr & COMPRESSED_FLAG != 0 {
+            return Ok(ClusterData::Compressed(cluster_addr));
+        }
+        Ok(ClusterData::Plain(
+            cluster_addr + self.raw_file.cluster_offset(address),
+        ))
     }
 
-    // Gets the offset of the given guest address in the host file. If L1, L2, or data clusters need
-    // to be allocated, they will be.
-    fn file_offset_write(&mut self, address: u64) -> std::io::Result<u64> {
+    // Gets the offset of the given guest address in the host file. If L1, L2, or data clusters
+    // need to be allocated, they will be. `overwrite_len` is the number of bytes starting at
+    // `address` that the caller promises to write at the returned offset before the cluster can
+    // be read again; if that covers the whole cluster, a newly allocated cluster is not filled
+    // with the old contents (backing file data or decompressed data), since every byte of it
+    // would be overwritten anyway. Callers that don't write through the returned offset must
+    // pass 0.
+    fn file_offset_write(&mut self, address: u64, overwrite_len: usize) -> std::io::Result<u64> {
         if address >= self.virtual_size() {
             return Err(std::io::Error::from_raw_os_error(EINVAL));
         }
@@ -1106,9 +1402,19 @@ impl QcowFileInner {
             })?;
         }
 
+        // True when the caller will overwrite every byte of this cluster through the returned
+        // offset, so a newly allocated cluster need not be filled with the old contents — they
+        // could never be read.
+        let overwrites_cluster = self.raw_file.cluster_offset(address) == 0
+            && overwrite_len as u64 >= self.raw_file.cluster_size();
+
         let cluster_addr = match self.l2_cache.get(&l1_index).unwrap()[l2_index] {
             0 => {
-                let initial_data = if let Some(backing) = self.backing_file.as_mut() {
+                let initial_data = if overwrites_cluster {
+                    // Newly allocated clusters read back as zeroes, so there is no need to fill
+                    // in contents that are about to be overwritten.
+                    None
+                } else if let Some(backing) = self.backing_file.as_mut() {
                     let cluster_size = self.raw_file.cluster_size();
                     let cluster_begin = address - (address % cluster_size);
                     let mut cluster_data = vec![0u8; cluster_size as usize];
@@ -1121,6 +1427,25 @@ impl QcowFileInner {
                 // Need to allocate a data cluster
                 let cluster_addr = self.append_data_cluster(initial_data)?;
                 self.update_cluster_addr(l1_index, l2_index, cluster_addr, &mut set_refcounts)?;
+                cluster_addr
+            }
+            entry if entry & COMPRESSED_FLAG != 0 => {
+                // Copy-on-write from a compressed cluster: decompress it into a freshly allocated
+                // uncompressed cluster and repoint the L2 entry there (clearing the compressed
+                // descriptor), unless the caller overwrites the whole cluster — then hand out a
+                // zeroed cluster and skip the decompression. Fill the new cluster before
+                // releasing the old compressed host storage so it doesn't leak. Refcounts are per
+                // host cluster, so storage shared with a neighbouring compressed cluster is only
+                // reclaimed once its last referrer releases it.
+                let initial_data = if overwrites_cluster {
+                    None
+                } else {
+                    Some(self.read_and_decompress_cluster(entry)?)
+                };
+                let cluster_addr = self.append_data_cluster(initial_data)?;
+                self.update_cluster_addr(l1_index, l2_index, cluster_addr, &mut set_refcounts)?;
+                self.decompressed_clusters.retain(|(key, _)| *key != entry);
+                self.unref_compressed_cluster(entry)?;
                 cluster_addr
             }
             a => a,
@@ -1242,6 +1567,17 @@ impl QcowFileInner {
             return Ok(());
         }
 
+        if cluster_addr & COMPRESSED_FLAG != 0 {
+            // Drop the mapping so the range reads back as zeroes, then release the compressed host
+            // storage so it doesn't leak. Refcounts are per host cluster, so storage shared with a
+            // neighbouring compressed cluster is only reclaimed once its last referrer releases it.
+            self.l2_cache.get_mut(&l1_index).unwrap()[l2_index] = 0;
+            self.decompressed_clusters
+                .retain(|(key, _)| *key != cluster_addr);
+            self.unref_compressed_cluster(cluster_addr)?;
+            return Ok(());
+        }
+
         // Decrement the refcount.
         let refcount = self
             .refcounts
@@ -1290,11 +1626,19 @@ impl QcowFileInner {
                     // There is a backing file, so we need to allocate a cluster in order to
                     // zero out the hole-punched bytes such that the backing file contents do not
                     // show through.
-                    Some(self.file_offset_write(curr_addr)?)
+                    Some(self.file_offset_write(curr_addr, count)?)
                 } else {
-                    // Any space in unallocated clusters can be left alone, since
-                    // unallocated clusters already read back as zeroes.
-                    self.file_offset_read(curr_addr)?
+                    match self.file_offset_read(curr_addr)? {
+                        ClusterData::Plain(offset) => Some(offset),
+                        // Any space in unallocated clusters can be left alone, since
+                        // unallocated clusters already read back as zeroes.
+                        ClusterData::Unallocated => None,
+                        // Materialize the compressed cluster to an uncompressed one so the
+                        // requested bytes can be zeroed in place.
+                        ClusterData::Compressed(_) => {
+                            Some(self.file_offset_write(curr_addr, count)?)
+                        }
+                    }
                 };
                 if let Some(offset) = offset {
                     // Partial cluster - zero it out.
@@ -1307,74 +1651,274 @@ impl QcowFileInner {
         Ok(())
     }
 
-    // Reads an L2 cluster from the disk, returning an error if the file can't be read or if any
-    // cluster is compressed.
+    // Reads an L2 cluster from the disk, returning an error if the file can't be read.
+    //
+    // Uncompressed entries are masked down to their host cluster offset. Compressed entries are
+    // kept as their raw value (including the compressed flag and the encoded offset/size), so the
+    // read and write paths can recognize and decode them. `write_pointer_table` leaves compressed
+    // entries untouched (it neither sets nor strips their flags), so the descriptor is preserved
+    // across cache flushes. Any stray `CLUSTER_USED_FLAG` (bit 63) introduced by an older buggy
+    // write is stripped on write-back, since the qcow2 spec forbids `OFLAG_COPIED` on compressed
+    // clusters.
     fn read_l2_cluster(raw_file: &mut QcowRawFile, cluster_addr: u64) -> std::io::Result<Vec<u64>> {
         let file_values = raw_file.read_pointer_cluster(cluster_addr, None)?;
-        if file_values.iter().any(|entry| entry & COMPRESSED_FLAG != 0) {
-            return Err(std::io::Error::from_raw_os_error(ENOTSUP));
-        }
         Ok(file_values
             .iter()
-            .map(|entry| *entry & L2_TABLE_OFFSET_MASK)
+            .map(|entry| {
+                if entry & COMPRESSED_FLAG != 0 {
+                    *entry
+                } else {
+                    *entry & L2_TABLE_OFFSET_MASK
+                }
+            })
             .collect())
+    }
+
+    // Releases the host storage backing the compressed cluster described by `l2_entry` by
+    // decrementing the refcount of every host cluster its payload spans. qemu-assigned refcounts
+    // already account for compressed clusters that share a host cluster, so a shared cluster is
+    // only freed once its last referrer releases it. Any host cluster whose refcount reaches zero
+    // is scheduled for hole-punching and reuse after the next metadata sync — punching earlier
+    // could zero data the on-disk tables still reference. This is what prevents compressed
+    // clusters from leaking when they are copied-on-write or unmapped.
+    fn unref_compressed_cluster(&mut self, l2_entry: u64) -> std::io::Result<()> {
+        let cluster_bits = u64::from(self.header.cluster_bits);
+        for host in compressed_host_clusters(l2_entry, cluster_bits) {
+            let refcount = self
+                .refcounts
+                .get_cluster_refcount(&mut self.raw_file, host)
+                .map_err(|_| std::io::Error::from_raw_os_error(EINVAL))?;
+            if refcount == 0 {
+                // Nothing references this host cluster (already released, or shared accounting
+                // drove it to zero on a neighbour). Leave it alone.
+                continue;
+            }
+            let new_refcount = refcount - 1;
+            let mut newly_unref = self.set_cluster_refcount(host, new_refcount)?;
+            self.unref_clusters.append(&mut newly_unref);
+            if new_refcount == 0 {
+                // No compressed cluster references this host cluster anymore. Defer both the
+                // hole-punch and the reuse to the next metadata sync: until then the on-disk L2
+                // tables may still point at this data, and punching it now would corrupt the
+                // image if crosvm crashed before the sync.
+                self.punch_clusters.push(host);
+                self.unref_clusters.push(host);
+            }
+        }
+        Ok(())
+    }
+
+    // Reads the raw compressed payload of the cluster identified by `l2_entry` from the file. The
+    // returned buffer is the exact byte length encoded in the descriptor and still compressed;
+    // decoding it is pure CPU work handled by `decompress_cluster_into` (so it can be offloaded).
+    fn read_compressed_bytes(&mut self, l2_entry: u64) -> std::io::Result<Vec<u8>> {
+        let cluster_bits = u64::from(self.header.cluster_bits);
+
+        // Decode the compressed cluster descriptor (see the qcow2 specification).
+        let (coffset, csize) = decode_compressed_descriptor(l2_entry, cluster_bits);
+
+        let mut compressed = vec![0u8; csize as usize];
+        if let Err(e) = self
+            .raw_file
+            .file()
+            .read_exact_at_volatile(VolatileSlice::new(&mut compressed), coffset)
+        {
+            error!(
+                "qcow: reading {} compressed bytes at {:#x} failed (l2_entry={:#x}, \
+                 cluster_bits={}): {}",
+                csize, coffset, l2_entry, cluster_bits, e
+            );
+            return Err(e);
+        }
+        Ok(compressed)
+    }
+
+    // Reads and decompresses a single compressed cluster given its raw L2 entry. Returns a buffer
+    // exactly one cluster in size; if the decompressed stream is shorter the remainder is zeroed.
+    fn read_and_decompress_cluster(&mut self, l2_entry: u64) -> std::io::Result<Vec<u8>> {
+        let cluster_size = self.raw_file.cluster_size() as usize;
+        let compression_type = self.header.compression_type;
+        let compressed = self.read_compressed_bytes(l2_entry)?;
+
+        let mut out = vec![0u8; cluster_size];
+        if let Err(e) = decompress_cluster_into(compression_type, &compressed, &mut out) {
+            error!(
+                "qcow: decompressing cluster failed (compression_type={}, l2_entry={:#x}, \
+                 csize={}): {}",
+                compression_type,
+                l2_entry,
+                compressed.len(),
+                e
+            );
+            return Err(e);
+        }
+        Ok(out)
+    }
+
+    // Number of clusters the decompressed-cluster LRU cache can hold (at least one).
+    fn decompressed_cache_capacity(&self) -> usize {
+        max(
+            1,
+            (DECOMPRESSED_CLUSTER_CACHE_BYTES / self.raw_file.cluster_size()) as usize,
+        )
+    }
+
+    // Inserts an already-decompressed cluster at the front of the LRU, evicting least-recently-used
+    // entries to stay within the cache bound. A no-op refresh if the key is already cached (the
+    // freshly decoded copy is discarded); callers that pre-decode filter cached keys out first.
+    fn insert_decompressed_cluster(&mut self, l2_entry: u64, data: Vec<u8>) {
+        if let Some(pos) = self
+            .decompressed_clusters
+            .iter()
+            .position(|(key, _)| *key == l2_entry)
+        {
+            if pos != 0 {
+                let hit = self.decompressed_clusters.remove(pos).unwrap();
+                self.decompressed_clusters.push_front(hit);
+            }
+            return;
+        }
+        let max_entries = self.decompressed_cache_capacity();
+        while self.decompressed_clusters.len() >= max_entries {
+            self.decompressed_clusters.pop_back();
+        }
+        self.decompressed_clusters.push_front((l2_entry, data));
+    }
+
+    // Ensures the decompressed contents of the compressed cluster identified by `l2_entry` are
+    // cached, moved to the front of the LRU so `decompressed_clusters.front()` returns them.
+    fn ensure_decompressed_cluster(&mut self, l2_entry: u64) -> std::io::Result<()> {
+        if self
+            .decompressed_clusters
+            .iter()
+            .any(|(key, _)| *key == l2_entry)
+        {
+            self.insert_decompressed_cluster(l2_entry, Vec::new());
+            return Ok(());
+        }
+        let data = self.read_and_decompress_cluster(l2_entry)?;
+        self.insert_decompressed_cluster(l2_entry, data);
+        Ok(())
+    }
+
+    // Pre-decodes, in parallel, the compressed clusters that a read of `count` bytes at `address`
+    // will touch but that are not already in the LRU cache. Reads their compressed payloads (a
+    // serial `&mut self` step) then decompresses them concurrently across worker threads and
+    // populates the cache, so the subsequent copy loop hits the cache instead of decoding serially.
+    // Bounded to the cache capacity: any excess compressed clusters fall through to inline decode.
+    fn prefetch_compressed_clusters(&mut self, address: u64, count: usize) -> std::io::Result<()> {
+        let read_count = self.limit_range_file(address, count);
+        let capacity = self.decompressed_cache_capacity();
+
+        // Collect the distinct, not-yet-cached compressed L2 entries this request will touch.
+        let mut pending: Vec<u64> = Vec::new();
+        let mut scanned = 0usize;
+        while scanned < read_count && pending.len() < capacity {
+            let curr_addr = address + scanned as u64;
+            let seg = self.limit_range_cluster(curr_addr, read_count - scanned);
+            if let ClusterData::Compressed(l2_entry) = self.file_offset_read(curr_addr)? {
+                let cached = self
+                    .decompressed_clusters
+                    .iter()
+                    .any(|(key, _)| *key == l2_entry);
+                if !cached && !pending.contains(&l2_entry) {
+                    pending.push(l2_entry);
+                }
+            }
+            scanned += seg;
+        }
+
+        // Fewer than two clusters to decode: the copy loop's inline path is already optimal.
+        if pending.len() < 2 {
+            return Ok(());
+        }
+
+        // Read the compressed payloads (serial file I/O), then decode them in parallel.
+        let mut jobs = Vec::with_capacity(pending.len());
+        for l2_entry in pending {
+            let compressed = self.read_compressed_bytes(l2_entry)?;
+            jobs.push((l2_entry, compressed));
+        }
+        let compression_type = self.header.compression_type;
+        let cluster_size = self.raw_file.cluster_size() as usize;
+        let decoded = decompress_clusters_parallel(compression_type, cluster_size, jobs)?;
+        for (l2_entry, data) in decoded {
+            self.insert_decompressed_cluster(l2_entry, data);
+        }
+        Ok(())
     }
 
     // Set the refcount for a cluster with the given address.
     // Returns a list of any refblocks that can be reused, this happens when a refblock is moved,
     // the old location can be reused.
+    //
+    // Assigning one refcount can copy-on-write the refblock that holds it: the old refblock cluster
+    // is dropped (and must be marked free, refcount 0, or `qemu-img check` reports it as a leaked
+    // cluster) and a new refblock cluster may be allocated (and must be reserved, refcount 1). Both
+    // of those refcount updates can in turn COW further refblocks, so the assignments are driven
+    // from a worklist until it drains. Each refblock is dirtied on first touch and won't COW again
+    // this cycle, and a cluster is only ever scheduled to be freed once, so this converges.
     fn set_cluster_refcount(&mut self, address: u64, refcount: u16) -> std::io::Result<Vec<u64>> {
-        let mut added_clusters = Vec::new();
-        let mut unref_clusters = Vec::new();
-        let mut refcount_set = false;
-        let mut new_cluster = None;
+        // Clusters dropped by refblock COW, handed back to the caller for reuse via the avail pool.
+        let mut dropped = Vec::new();
+        // Pending (cluster address, target refcount) assignments still to apply.
+        let mut pending = vec![(address, refcount)];
 
-        while !refcount_set {
-            match self.refcounts.set_cluster_refcount(
-                &mut self.raw_file,
-                address,
-                refcount,
-                new_cluster.take(),
-            ) {
-                Ok(None) => {
-                    refcount_set = true;
-                }
-                Ok(Some(freed_cluster)) => {
-                    unref_clusters.push(freed_cluster);
-                    refcount_set = true;
-                }
-                Err(refcount::Error::EvictingRefCounts(e)) => {
-                    return Err(e);
-                }
-                Err(refcount::Error::InvalidIndex) => {
-                    return Err(std::io::Error::from_raw_os_error(EINVAL));
-                }
-                Err(refcount::Error::NeedCluster(addr)) => {
-                    // Read the address and call set_cluster_refcount again.
-                    new_cluster = Some((
-                        addr,
-                        VecCache::from_vec(self.raw_file.read_refcount_block(addr)?),
-                    ));
-                }
-                Err(refcount::Error::NeedNewCluster) => {
-                    // Allocate the cluster and call set_cluster_refcount again.
-                    let addr = self.get_new_cluster(None)?;
-                    added_clusters.push(addr);
-                    new_cluster = Some((
-                        addr,
-                        VecCache::new(self.refcounts.refcounts_per_block() as usize),
-                    ));
-                }
-                Err(refcount::Error::ReadingRefCounts(e)) => {
-                    return Err(e);
+        while let Some((addr, count)) = pending.pop() {
+            let mut refcount_set = false;
+            let mut new_cluster = None;
+
+            while !refcount_set {
+                match self.refcounts.set_cluster_refcount(
+                    &mut self.raw_file,
+                    addr,
+                    count,
+                    new_cluster.take(),
+                ) {
+                    Ok(None) => {
+                        refcount_set = true;
+                    }
+                    Ok(Some(freed_cluster)) => {
+                        // The old refblock cluster is no longer referenced by the refcount table.
+                        // Mark it free (refcount 0) so it doesn't leak, and return it for reuse.
+                        // Guard against scheduling the same cluster twice to guarantee termination.
+                        if !dropped.contains(&freed_cluster) {
+                            dropped.push(freed_cluster);
+                            pending.push((freed_cluster, 0));
+                        }
+                        refcount_set = true;
+                    }
+                    Err(refcount::Error::EvictingRefCounts(e)) => {
+                        return Err(e);
+                    }
+                    Err(refcount::Error::InvalidIndex) => {
+                        return Err(std::io::Error::from_raw_os_error(EINVAL));
+                    }
+                    Err(refcount::Error::NeedCluster(need_addr)) => {
+                        // Read the address and call set_cluster_refcount again.
+                        new_cluster = Some((
+                            need_addr,
+                            VecCache::from_vec(self.raw_file.read_refcount_block(need_addr)?),
+                        ));
+                    }
+                    Err(refcount::Error::NeedNewCluster) => {
+                        // Allocate the cluster and call set_cluster_refcount again. The new
+                        // refblock cluster must itself be reserved with a refcount of one.
+                        let new_addr = self.get_new_cluster(None)?;
+                        pending.push((new_addr, 1));
+                        new_cluster = Some((
+                            new_addr,
+                            VecCache::new(self.refcounts.refcounts_per_block() as usize),
+                        ));
+                    }
+                    Err(refcount::Error::ReadingRefCounts(e)) => {
+                        return Err(e);
+                    }
                 }
             }
         }
 
-        for addr in added_clusters {
-            self.set_cluster_refcount(addr, 1)?;
-        }
-        Ok(unref_clusters)
+        Ok(dropped)
     }
 
     fn sync_caches(&mut self) -> std::io::Result<()> {
@@ -1402,10 +1946,16 @@ impl QcowFileInner {
         // guaranteed to be valid.
         let mut sync_required = false;
         if self.l1_table.dirty() {
+            // L1 entries are held in memory masked to the L2 table offset (the `OFLAG_COPIED`
+            // bit is stripped on read). Every L2 table crosvm allocates has a refcount of exactly
+            // one and is never shared, so the qcow2 spec requires `OFLAG_COPIED` (bit 63) to be set
+            // on each non-zero L1 entry. Re-OR `CLUSTER_USED_FLAG` here so we don't strip the flag
+            // qemu set; otherwise `qemu-img check` reports "OFLAG_COPIED L2 cluster" for every
+            // entry.
             self.raw_file.write_pointer_table(
                 self.header.l1_table_offset,
                 self.l1_table.get_values(),
-                0,
+                CLUSTER_USED_FLAG,
             )?;
             self.l1_table.mark_clean();
             sync_required = true;
@@ -1414,31 +1964,73 @@ impl QcowFileInner {
         if sync_required {
             self.raw_file.file_mut().sync_data()?;
         }
+
+        // The synced metadata no longer references the storage of freed compressed clusters, so
+        // it is safe to reclaim now. punch_hole may be unsupported by the underlying FS; a
+        // failure is non-fatal (the space is simply not reclaimed).
+        let cluster_size = self.raw_file.cluster_size();
+        for host in std::mem::take(&mut self.punch_clusters) {
+            let _ = self.raw_file.file().punch_hole(host, cluster_size);
+        }
         Ok(())
     }
 
-    // Reads `count` bytes starting at `address`, calling `cb` repeatedly with the data source,
-    // number of bytes read so far, offset to read from, and number of bytes to read from the file
-    // in that invocation. If None is given to `cb` in place of the backing file, the `cb` should
-    // infer zeros would have been read.
+    // Reads `count` bytes starting at `address`, calling `cb` repeatedly with the number of bytes
+    // read so far, the number of bytes to read in that invocation, and the source of those bytes
+    // (an uncompressed region of the raw file, the backing file, an in-memory decompressed cluster,
+    // or a hole that reads back as zeroes).
     fn read_cb<F>(&mut self, address: u64, count: usize, mut cb: F) -> std::io::Result<usize>
     where
-        F: FnMut(Option<&mut dyn DiskFile>, usize, u64, usize) -> std::io::Result<()>,
+        F: FnMut(usize, usize, ReadSource) -> std::io::Result<()>,
     {
         let read_count: usize = self.limit_range_file(address, count);
+
+        // Decode all of this request's compressed clusters up front and in parallel, so the copy
+        // loop below serves them from the cache instead of decoding them one at a time.
+        self.prefetch_compressed_clusters(address, count)?;
 
         let mut nread: usize = 0;
         while nread < read_count {
             let curr_addr = address + nread as u64;
-            let file_offset = self.file_offset_read(curr_addr)?;
             let count = self.limit_range_cluster(curr_addr, read_count - nread);
 
-            if let Some(offset) = file_offset {
-                cb(Some(self.raw_file.file_mut()), nread, offset, count)?;
-            } else if let Some(backing) = self.backing_file.as_mut() {
-                cb(Some(backing.as_mut()), nread, curr_addr, count)?;
-            } else {
-                cb(None, nread, 0, count)?;
+            match self.file_offset_read(curr_addr)? {
+                ClusterData::Plain(offset) => {
+                    cb(
+                        nread,
+                        count,
+                        ReadSource::Disk {
+                            file: self.raw_file.file_mut(),
+                            offset,
+                        },
+                    )?;
+                }
+                ClusterData::Compressed(l2_entry) => {
+                    let cluster_offset = self.raw_file.cluster_offset(curr_addr) as usize;
+                    self.ensure_decompressed_cluster(l2_entry)?;
+                    // Safe to unwrap: ensure_decompressed_cluster just moved this entry to the
+                    // front of the cache.
+                    let (_, data) = self.decompressed_clusters.front().unwrap();
+                    cb(
+                        nread,
+                        count,
+                        ReadSource::Memory(&data[cluster_offset..cluster_offset + count]),
+                    )?;
+                }
+                ClusterData::Unallocated => {
+                    if let Some(backing) = self.backing_file.as_mut() {
+                        cb(
+                            nread,
+                            count,
+                            ReadSource::Disk {
+                                file: backing.as_mut(),
+                                offset: curr_addr,
+                            },
+                        )?;
+                    } else {
+                        cb(nread, count, ReadSource::Zero)?;
+                    }
+                }
             }
 
             nread += count;
@@ -1448,8 +2040,17 @@ impl QcowFileInner {
 
     // Writes `count` bytes starting at `address`, calling `cb` repeatedly with the backing file,
     // number of bytes written so far, raw file offset, and number of bytes to write to the file in
-    // that invocation.
-    fn write_cb<F>(&mut self, address: u64, count: usize, mut cb: F) -> std::io::Result<usize>
+    // that invocation. `cb_writes_data` promises that `cb` writes every byte it is asked to;
+    // full-cluster writes can then skip copying the old cluster contents (backing file data or
+    // decompressed data) into the newly allocated cluster. Callers whose `cb` writes nothing
+    // (e.g. bare allocation) must pass false.
+    fn write_cb<F>(
+        &mut self,
+        address: u64,
+        count: usize,
+        cb_writes_data: bool,
+        mut cb: F,
+    ) -> std::io::Result<usize>
     where
         F: FnMut(&mut File, usize, u64, usize) -> std::io::Result<()>,
     {
@@ -1458,8 +2059,9 @@ impl QcowFileInner {
         let mut nwritten: usize = 0;
         while nwritten < write_count {
             let curr_addr = address + nwritten as u64;
-            let offset = self.file_offset_write(curr_addr)?;
             let count = self.limit_range_cluster(curr_addr, write_count - nwritten);
+            let overwrite_len = if cb_writes_data { count } else { 0 };
+            let offset = self.file_offset_write(curr_addr, overwrite_len)?;
 
             cb(self.raw_file.file_mut(), nwritten, offset, count)?;
 
@@ -1493,20 +2095,23 @@ impl Read for QcowFile {
         let inner = self.inner.get_mut();
         let len = buf.len();
         let slice = VolatileSlice::new(buf);
-        let read_count = inner.read_cb(
-            inner.current_offset,
-            len,
-            |file, already_read, offset, count| {
+        let read_count =
+            inner.read_cb(inner.current_offset, len, |already_read, count, source| {
                 let sub_slice = slice.get_slice(already_read, count).unwrap();
-                match file {
-                    Some(f) => f.read_exact_at_volatile(sub_slice, offset),
-                    None => {
+                match source {
+                    ReadSource::Disk { file, offset } => {
+                        file.read_exact_at_volatile(sub_slice, offset)
+                    }
+                    ReadSource::Memory(bytes) => {
+                        sub_slice.copy_from(bytes);
+                        Ok(())
+                    }
+                    ReadSource::Zero => {
                         sub_slice.write_bytes(0);
                         Ok(())
                     }
                 }
-            },
-        )?;
+            })?;
         inner.current_offset += read_count as u64;
         Ok(read_count)
     }
@@ -1551,6 +2156,7 @@ impl Write for QcowFile {
         let write_count = inner.write_cb(
             inner.current_offset,
             buf.len(),
+            true,
             |file, offset, raw_offset, count| {
                 file.seek(SeekFrom::Start(raw_offset))?;
                 file.write_all(&buf[offset..(offset + count)])
@@ -1568,11 +2174,15 @@ impl Write for QcowFile {
 impl FileReadWriteAtVolatile for QcowFile {
     fn read_at_volatile(&self, slice: VolatileSlice, offset: u64) -> io::Result<usize> {
         let mut inner = self.inner.lock();
-        inner.read_cb(offset, slice.size(), |file, read, offset, count| {
+        inner.read_cb(offset, slice.size(), |read, count, source| {
             let sub_slice = slice.get_slice(read, count).unwrap();
-            match file {
-                Some(f) => f.read_exact_at_volatile(sub_slice, offset),
-                None => {
+            match source {
+                ReadSource::Disk { file, offset } => file.read_exact_at_volatile(sub_slice, offset),
+                ReadSource::Memory(bytes) => {
+                    sub_slice.copy_from(bytes);
+                    Ok(())
+                }
+                ReadSource::Zero => {
                     sub_slice.write_bytes(0);
                     Ok(())
                 }
@@ -1582,10 +2192,15 @@ impl FileReadWriteAtVolatile for QcowFile {
 
     fn write_at_volatile(&self, slice: VolatileSlice, offset: u64) -> io::Result<usize> {
         let mut inner = self.inner.lock();
-        inner.write_cb(offset, slice.size(), |file, offset, raw_offset, count| {
-            let sub_slice = slice.get_slice(offset, count).unwrap();
-            file.write_all_at_volatile(sub_slice, raw_offset)
-        })
+        inner.write_cb(
+            offset,
+            slice.size(),
+            true,
+            |file, offset, raw_offset, count| {
+                let sub_slice = slice.get_slice(offset, count).unwrap();
+                file.write_all_at_volatile(sub_slice, raw_offset)
+            },
+        )
     }
 }
 
@@ -1623,10 +2238,13 @@ impl FileAllocate for QcowFile {
     fn allocate(&self, offset: u64, len: u64) -> io::Result<()> {
         let mut inner = self.inner.lock();
         // Call write_cb with a do-nothing callback, which will have the effect
-        // of allocating all clusters in the specified range.
+        // of allocating all clusters in the specified range. The callback writes no data, so it
+        // must not promise `cb_writes_data`: existing contents (backing file or compressed data)
+        // still have to be copied into any newly allocated cluster.
         inner.write_cb(
             offset,
             len as usize,
+            false,
             |_file, _offset, _raw_offset, _count| Ok(()),
         )?;
         Ok(())
@@ -1681,6 +2299,80 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+
+    #[test]
+    fn decompress_zstd_cluster_full_frame_with_sector_padding() {
+        let cluster: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let mut compressed = zstd::stream::encode_all(cluster.as_slice(), 3).unwrap();
+        // qcow2 stores compressed clusters at 512-byte sector granularity; the tail past the
+        // frame is arbitrary junk that the decoder must never parse.
+        compressed.resize(compressed.len().next_multiple_of(512), 0xa5);
+        let mut out = vec![0u8; 4096];
+        decompress_zstd_cluster(&compressed, &mut out).unwrap();
+        assert_eq!(out, cluster);
+    }
+
+    #[test]
+    fn decompress_zstd_cluster_short_frame_stops_at_frame_end() {
+        // A frame shorter than the cluster must fill only its own bytes and must not try to
+        // parse the junk padding after the frame as a second zstd frame.
+        let data = vec![0x5au8; 1000];
+        let mut compressed = zstd::stream::encode_all(data.as_slice(), 3).unwrap();
+        compressed.resize(compressed.len().next_multiple_of(512), 0xa5);
+        let mut out = vec![0xffu8; 4096];
+        decompress_zstd_cluster(&compressed, &mut out).unwrap();
+        assert_eq!(&out[..1000], data.as_slice());
+        // The remainder is left untouched; read_and_decompress_cluster passes a zeroed buffer.
+        assert!(out[1000..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn decompress_clusters_parallel_matches_serial() {
+        // Many distinct clusters so the batch is split across several worker threads; each L2 key
+        // is arbitrary here (the decoder only uses it as the returned tag).
+        let cluster_size = 4096usize;
+        let clusters: Vec<(u64, Vec<u8>)> = (0..37u64)
+            .map(|i| {
+                let content: Vec<u8> = (0..cluster_size)
+                    .map(|b| ((b as u64).wrapping_mul(i + 1) % 253) as u8)
+                    .collect();
+                (i * 0x1000, content)
+            })
+            .collect();
+
+        let jobs: Vec<(u64, Vec<u8>)> = clusters
+            .iter()
+            .map(|(l2, content)| (*l2, zstd::stream::encode_all(content.as_slice(), 3).unwrap()))
+            .collect();
+
+        let mut decoded =
+            decompress_clusters_parallel(QCOW_COMPRESSION_TYPE_ZSTD, cluster_size, jobs).unwrap();
+        // The returned order is unspecified, so sort by key before comparing.
+        decoded.sort_by_key(|(l2, _)| *l2);
+
+        assert_eq!(decoded.len(), clusters.len());
+        for ((got_l2, got), (want_l2, want)) in decoded.iter().zip(clusters.iter()) {
+            assert_eq!(got_l2, want_l2);
+            assert_eq!(got, want);
+        }
+    }
+
+    #[test]
+    fn decompress_clusters_parallel_single_and_empty() {
+        let cluster_size = 4096usize;
+        // Zero jobs -> empty result (no thread spawned).
+        assert!(decompress_clusters_parallel(QCOW_COMPRESSION_TYPE_ZSTD, cluster_size, vec![])
+            .unwrap()
+            .is_empty());
+
+        // One job -> inline decode, correct content.
+        let content: Vec<u8> = (0..cluster_size).map(|b| (b % 250) as u8).collect();
+        let compressed = zstd::stream::encode_all(content.as_slice(), 3).unwrap();
+        let decoded =
+            decompress_clusters_parallel(QCOW_COMPRESSION_TYPE_ZSTD, cluster_size, vec![(9, compressed)])
+                .unwrap();
+        assert_eq!(decoded, vec![(9, content)]);
+    }
 
     fn valid_header() -> Vec<u8> {
         vec![
@@ -1793,6 +2485,49 @@ mod tests {
         disk_file.seek(SeekFrom::Start(0)).unwrap();
         QcowFile::from(disk_file, test_params())
             .expect("Failed to create Qcow from default Header");
+    }
+
+    // Writes a valid default image whose header has `incompatible_features` forced to `features`,
+    // then tries to open it, returning the result.
+    fn open_with_incompatible_features(features: u64) -> Result<QcowFile> {
+        let mut header = QcowHeader::create_for_size_and_path(0x10_0000, None)
+            .expect("Failed to create header.");
+        header.incompatible_features = features;
+        let mut disk_file = tempfile().expect("failed to create temp file");
+        header
+            .write_to(&mut disk_file)
+            .expect("Failed to write header.");
+        disk_file.seek(SeekFrom::Start(0)).unwrap();
+        QcowFile::from(disk_file, test_params())
+    }
+
+    #[test]
+    fn rejects_unsupported_incompatible_feature() {
+        // Bit 4 (extended L2 entries) is a layout crosvm cannot parse; opening must fail rather
+        // than silently misread the 128-bit L2 entries as 64-bit pointers.
+        let extended_l2 = 1 << 4;
+        match open_with_incompatible_features(extended_l2) {
+            Err(Error::UnsupportedIncompatibleFeatures(bits)) => assert_eq!(bits, extended_l2),
+            other => panic!("expected UnsupportedIncompatibleFeatures, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_compression_feature_mismatch() {
+        // The compression incompatible bit (3) is set but the compression type is the default
+        // (zlib); qemu only sets the bit for a non-default type, so this header is malformed.
+        match open_with_incompatible_features(INCOMPATIBLE_FEATURES_COMPRESSION) {
+            Err(Error::UnsupportedCompressionFeatureMismatch { .. }) => {}
+            other => panic!("expected UnsupportedCompressionFeatureMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tolerates_dirty_incompatible_feature() {
+        // The dirty bit is tolerated: crosvm rebuilds the refcounts on open, so the image is safe
+        // to use even though an interrupted write may have left the refcounts stale.
+        open_with_incompatible_features(INCOMPATIBLE_FEATURES_DIRTY)
+            .expect("dirty image should open after a refcount rebuild");
     }
 
     #[test]
@@ -2494,10 +3229,17 @@ mod tests {
                 }
             }
 
-            assert_eq!(
-                qcow_file.inner.get_mut().first_zero_refcount().unwrap(),
-                None
-            );
+            // Clusters freed by refblock copy-on-write are marked refcount 0 and queued for
+            // reuse. Every refcount-0 cluster must be accounted for in the reuse pools: a
+            // refcount-0 cluster that is not tracked would be a leak, and one still referenced
+            // by metadata would be corruption.
+            let inner = qcow_file.inner.get_mut();
+            for addr in inner.zero_refcount_clusters().unwrap() {
+                assert!(
+                    inner.avail_clusters.contains(&addr) || inner.unref_clusters.contains(&addr),
+                    "refcount-0 cluster {addr:#x} is not tracked for reuse",
+                );
+            }
         });
     }
 
