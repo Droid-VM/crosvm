@@ -45,6 +45,7 @@ use devices::PciAddress;
 use devices::PciConfigMmio;
 use devices::PciDevice;
 use devices::PciRootCommand;
+use devices::Pflash;
 use devices::Serial;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::VirtCpufreq;
@@ -110,6 +111,7 @@ const AARCH64_GIC_CPUI_SIZE: u64 = 0x20000;
 // This indicates the start of DRAM inside the physical address space.
 pub const AARCH64_PHYS_MEM_START: u64 = 0x80000000;
 const AARCH64_PLATFORM_MMIO_SIZE: u64 = 0x800000;
+const AARCH64_PFLASH_MAX_SIZE: u64 = AARCH64_PLATFORM_MMIO_SIZE;
 
 const AARCH64_PROTECTED_VM_FW_MAX_SIZE: u64 = 0x400000;
 const AARCH64_PROTECTED_VM_FW_START: u64 =
@@ -178,6 +180,8 @@ const AARCH64_PCI_CAM_SIZE_DEFAULT: u64 = 0x100000;
 const AARCH64_PCI_MEM_BASE_DEFAULT: u64 = 0x2000000;
 // Default PCI mem size.
 const AARCH64_PCI_MEM_SIZE_DEFAULT: u64 = 0x2000000;
+// Keep pflash below the legacy Gunyah VMMIO limit and outside the default PCI aperture.
+const AARCH64_PFLASH_BASE: u64 = AARCH64_PCI_MEM_BASE_DEFAULT + AARCH64_PCI_MEM_SIZE_DEFAULT;
 // Virtio devices start at SPI interrupt number 4
 const AARCH64_IRQ_BASE: u32 = 4;
 
@@ -386,6 +390,14 @@ pub enum Error {
     LoadElfKernel(kernel_loader::Error),
     #[error("failed to map arm pvtime memory: {0}")]
     MapPvtimeError(base::Error),
+    #[error("pflash image is empty")]
+    PflashEmpty,
+    #[error("failed to query pflash image: {0}")]
+    PflashIo(io::Error),
+    #[error("failed to instantiate pflash device: {0}")]
+    PflashSetup(anyhow::Error),
+    #[error("pflash image size {0} exceeds maximum {1}")]
+    PflashTooLarge(u64, u64),
     #[error("failed to prepare gpu blob arena: {0}")]
     PrepareBlobArena(base::Error),
     #[error("pVM firmware could not be loaded: {0}")]
@@ -402,6 +414,8 @@ pub enum Error {
     RegisterIrqfd(base::Error),
     #[error("error registering PCI bus: {0}")]
     RegisterPci(BusError),
+    #[error("error registering pflash device: {0}")]
+    RegisterPflash(BusError),
     #[error("error registering virtual cpufreq device: {0}")]
     RegisterVirtCpufreq(BusError),
     #[error("error registering virtual socket device: {0}")]
@@ -523,6 +537,15 @@ impl arch::LinuxArch for AArch64 {
             )));
         }
 
+        let pflash_window =
+            AddressRange::from_start_and_size(AARCH64_PFLASH_BASE, AARCH64_PFLASH_MAX_SIZE)
+                .unwrap();
+        if pci_cam.overlaps(pflash_window) {
+            return Err(Error::ConfigurePciCam(format!(
+                "PCI CAM ({pci_cam:?}) overlaps reserved pflash window ({pflash_window:?})"
+            )));
+        }
+
         let pci_mem = match components.pci_config.mem {
             Some(MemoryRegionConfig { start, size }) => AddressRange::from_start_and_size(
                 start,
@@ -535,6 +558,11 @@ impl arch::LinuxArch for AArch64 {
             )
             .unwrap(),
         };
+        if pci_mem.overlaps(pflash_window) {
+            return Err(Error::ConfigurePciMem(format!(
+                "PCI MMIO ({pci_mem:?}) overlaps reserved pflash window ({pflash_window:?})"
+            )));
+        }
 
         Ok(ArchMemoryLayout { pci_cam, pci_mem })
     }
@@ -1081,6 +1109,16 @@ impl arch::LinuxArch for AArch64 {
             vmwdt_control_tube,
         )?;
 
+        let pflash_cfg = if let Some(pflash_image) = components.pflash_image.take() {
+            Some(Self::setup_pflash(
+                pflash_image,
+                components.pflash_block_size,
+                &mmio_bus,
+            )?)
+        } else {
+            None
+        };
+
         let com_evt_1_3 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         let com_evt_2_4 = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
         let serial_devices = arch::add_serial_devices(
@@ -1493,6 +1531,7 @@ impl arch::LinuxArch for AArch64 {
             components.virt_cpufreq_v2,
             matches!(vm.hypervisor_kind(), HypervisorKind::Kvm),
             &components.smbios,
+            pflash_cfg,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -1820,6 +1859,34 @@ impl AArch64 {
         let mut cmdline = kernel_cmdline::Cmdline::new();
         cmdline.insert_str("panic=-1").unwrap();
         cmdline
+    }
+
+    fn setup_pflash(
+        pflash_image: File,
+        block_size: u32,
+        mmio_bus: &Bus,
+    ) -> Result<fdt::PflashDtConfig> {
+        let size = pflash_image.metadata().map_err(Error::PflashIo)?.len();
+        if size == 0 {
+            return Err(Error::PflashEmpty);
+        }
+        if size > AARCH64_PFLASH_MAX_SIZE {
+            return Err(Error::PflashTooLarge(size, AARCH64_PFLASH_MAX_SIZE));
+        }
+
+        let pflash = Pflash::new(Box::new(pflash_image), block_size)
+            .map_err(Error::PflashSetup)?;
+        let base = AARCH64_PFLASH_BASE;
+
+        mmio_bus
+            .insert(Arc::new(Mutex::new(pflash)), base, size)
+            .map_err(Error::RegisterPflash)?;
+
+        Ok(fdt::PflashDtConfig {
+            base,
+            size,
+            block_size,
+        })
     }
 
     /// This adds any early platform devices for this architecture.

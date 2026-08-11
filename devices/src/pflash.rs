@@ -10,9 +10,9 @@
 //! taking even more shortcuts, chief among them being the complete lack of CFI
 //! tables, which systems would normally use to learn how to use the device.
 //!
-//! In addition to full-width reads, we only support single byte writes,
-//! block erases, and status requests, which OVMF uses to probe the device to
-//! determine if it is pflash.
+//! In addition to full-width reads, we support single byte and word writes,
+//! block erases, and status requests, which OVMF uses to probe and program the
+//! device.
 //!
 //! Note that without SMM support in crosvm (which it doesn't yet have) this
 //! device is directly accessible to potentially malicious kernels. With SMM
@@ -41,6 +41,8 @@ const COMMAND_WRITE_BYTE: u8 = 0x10;
 const COMMAND_BLOCK_ERASE: u8 = 0x20;
 const COMMAND_CLEAR_STATUS: u8 = 0x50;
 const COMMAND_READ_STATUS: u8 = 0x70;
+const COMMAND_READ_DEVICE_ID: u8 = 0x90;
+const COMMAND_BUFFERED_PROGRAM: u8 = 0xe8;
 const COMMAND_BLOCK_ERASE_CONFIRM: u8 = 0xd0;
 const COMMAND_READ_ARRAY: u8 = 0xff;
 
@@ -62,8 +64,15 @@ pub struct PflashParameters {
 enum State {
     ReadArray,
     ReadStatus,
+    ReadDeviceId,
     BlockErase(u64),
     Write(u64),
+    BufferedProgramCount(u64),
+    BufferedProgramData {
+        next_offset: u64,
+        remaining: u64,
+    },
+    BufferedProgramConfirm,
 }
 
 pub struct Pflash {
@@ -97,6 +106,12 @@ impl Pflash {
             status: STATUS_READY,
         })
     }
+
+    fn read_status(&self, data: &mut [u8]) {
+        for (index, value) in data.iter_mut().enumerate() {
+            *value = if index % 2 == 0 { self.status } else { 0 };
+        }
+    }
 }
 
 impl BusDevice for Pflash {
@@ -125,9 +140,14 @@ impl BusDevice for Pflash {
             }
             State::ReadStatus => {
                 self.state = State::ReadArray;
-                for d in data {
-                    *d = self.status;
-                }
+                self.read_status(data);
+            }
+            State::ReadDeviceId => {
+                self.state = State::ReadArray;
+                data.fill(0);
+            }
+            State::BufferedProgramCount(_) => {
+                self.read_status(data);
             }
             _ => {
                 error!(
@@ -140,14 +160,81 @@ impl BusDevice for Pflash {
     }
 
     fn write(&mut self, info: BusAccessInfo, data: &[u8]) {
-        if data.len() > 1 {
-            error!("pflash write request for >1 byte, ignoring");
+        if data.is_empty() {
             return;
         }
-        let data = data[0];
+        let command = data[0];
         let offset = info.offset;
 
         match self.state {
+            State::BufferedProgramCount(start_offset) => {
+                if command == COMMAND_BUFFERED_PROGRAM {
+                    self.state = State::BufferedProgramCount(offset);
+                    return;
+                }
+                if command > 31 {
+                    error!("invalid pflash buffered program word count {}", command);
+                    self.state = State::ReadArray;
+                    return;
+                }
+                let byte_count = (u64::from(command) + 1) * 4;
+                if start_offset + byte_count > self.image_size {
+                    error!(
+                        "pflash buffered write at offset {} with size {} exceeds image size {}",
+                        start_offset, byte_count, self.image_size
+                    );
+                    self.state = State::ReadArray;
+                    return;
+                }
+                self.state = State::BufferedProgramData {
+                    next_offset: start_offset,
+                    remaining: byte_count,
+                };
+            }
+            State::BufferedProgramData {
+                next_offset,
+                remaining,
+            } => {
+                if offset != next_offset || data.len() as u64 > remaining {
+                    error!(
+                        "invalid pflash buffered write at offset {} with size {}; expected offset {} with at most {} bytes remaining",
+                        offset,
+                        data.len(),
+                        next_offset,
+                        remaining
+                    );
+                    self.state = State::ReadArray;
+                    return;
+                }
+                if let Err(e) = self.image.write_all_at_volatile(
+                    VolatileSlice::new(&mut data.to_vec()),
+                    offset,
+                ) {
+                    error!("failed to write buffered data to pflash: {}", e);
+                    self.state = State::ReadArray;
+                    return;
+                }
+
+                let remaining = remaining - data.len() as u64;
+                self.state = if remaining == 0 {
+                    State::BufferedProgramConfirm
+                } else {
+                    State::BufferedProgramData {
+                        next_offset: next_offset + data.len() as u64,
+                        remaining,
+                    }
+                };
+            }
+            State::BufferedProgramConfirm => {
+                self.state = State::ReadArray;
+                self.status = STATUS_READY;
+                if command != COMMAND_BLOCK_ERASE_CONFIRM {
+                    error!(
+                        "pflash buffered write confirm data {}, wanted {}",
+                        command, COMMAND_BLOCK_ERASE_CONFIRM
+                    );
+                }
+            }
             State::Write(expected_offset) => {
                 self.state = State::ReadArray;
                 self.status = STATUS_READY;
@@ -164,10 +251,20 @@ impl BusDevice for Pflash {
                     return;
                 }
 
-                if let Err(e) = self
-                    .image
-                    .write_all_at_volatile(VolatileSlice::new(&mut [data]), offset)
-                {
+                if offset + data.len() as u64 > self.image_size {
+                    error!(
+                        "pflash write at offset {} with size {} exceeds image size {}",
+                        offset,
+                        data.len(),
+                        self.image_size
+                    );
+                    return;
+                }
+
+                if let Err(e) = self.image.write_all_at_volatile(
+                    VolatileSlice::new(&mut data.to_vec()),
+                    offset,
+                ) {
                     error!("failed to write to pflash: {}", e);
                 }
             }
@@ -175,8 +272,8 @@ impl BusDevice for Pflash {
                 self.state = State::ReadArray;
                 self.status = STATUS_READY;
 
-                if data != COMMAND_BLOCK_ERASE_CONFIRM {
-                    error!("pflash write data {} after BLOCK_ERASE command, wanted COMMAND_BLOCK_ERASE_CONFIRM", data);
+                if command != COMMAND_BLOCK_ERASE_CONFIRM {
+                    error!("pflash write data {} after BLOCK_ERASE command, wanted COMMAND_BLOCK_ERASE_CONFIRM", command);
                     return;
                 }
                 if offset != expected_offset {
@@ -208,20 +305,22 @@ impl BusDevice for Pflash {
             _ => {
                 // If we're not expecting anything else then assume this is a
                 // command to transition states.
-                let command = data;
-
                 match command {
                     COMMAND_READ_ARRAY => {
                         self.state = State::ReadArray;
                         self.status = STATUS_READY;
                     }
                     COMMAND_READ_STATUS => self.state = State::ReadStatus,
+                    COMMAND_READ_DEVICE_ID => self.state = State::ReadDeviceId,
                     COMMAND_CLEAR_STATUS => {
                         self.state = State::ReadArray;
-                        self.status = 0;
+                        self.status = STATUS_READY;
                     }
                     COMMAND_WRITE_BYTE => self.state = State::Write(offset),
                     COMMAND_BLOCK_ERASE => self.state = State::BlockErase(offset),
+                    COMMAND_BUFFERED_PROGRAM => {
+                        self.state = State::BufferedProgramCount(offset)
+                    }
                     _ => {
                         error!("received unexpected/unsupported pflash command {}, ignoring and returning to read mode", command);
                         self.state = State::ReadArray
@@ -329,8 +428,94 @@ mod tests {
         let mut got = [0u8; 4];
         pflash.write(off(offset), &[COMMAND_READ_STATUS]);
         pflash.read(off(offset), &mut got);
-        let want = [STATUS_READY; 4];
+        let want = [STATUS_READY, 0, STATUS_READY, 0];
         assert_eq!(want, got);
+    }
+
+    #[test]
+    fn write_word_with_dual_lane_command() {
+        let f = empty_image();
+        let want = [0xde, 0xad, 0xbe, 0xef];
+        let offset = 0x1000;
+
+        let mut pflash = new(f);
+        pflash.write(
+            off(offset),
+            &[COMMAND_WRITE_BYTE, 0, COMMAND_WRITE_BYTE, 0],
+        );
+        pflash.write(off(offset), &want);
+
+        pflash.write(off(0), &[COMMAND_READ_ARRAY, 0, COMMAND_READ_ARRAY, 0]);
+        let mut got = [0u8; 4];
+        pflash.read(off(offset), &mut got);
+        assert_eq!(want, got);
+    }
+
+    #[test]
+    fn buffered_program() {
+        let f = empty_image();
+        let first = [0xde, 0xad, 0xbe, 0xef];
+        let second = [0x12, 0x34, 0x56, 0x78];
+        let offset = 0x1000;
+
+        let mut pflash = new(f);
+        pflash.write(
+            off(offset),
+            &[COMMAND_BUFFERED_PROGRAM, 0, COMMAND_BUFFERED_PROGRAM, 0],
+        );
+        let mut status = [0u8; 4];
+        pflash.read(off(offset), &mut status);
+        assert_eq!(status, [STATUS_READY, 0, STATUS_READY, 0]);
+
+        pflash.write(
+            off(offset),
+            &[COMMAND_BUFFERED_PROGRAM, 0, COMMAND_BUFFERED_PROGRAM, 0],
+        );
+        pflash.read(off(offset), &mut status);
+        assert_eq!(status, [STATUS_READY, 0, STATUS_READY, 0]);
+
+        pflash.write(off(offset), &[1, 0, 1, 0]);
+        pflash.write(off(offset), &first);
+        pflash.write(off(offset + 4), &second);
+        pflash.write(
+            off(0),
+            &[
+                COMMAND_BLOCK_ERASE_CONFIRM,
+                0,
+                COMMAND_BLOCK_ERASE_CONFIRM,
+                0,
+            ],
+        );
+
+        pflash.write(off(0), &[COMMAND_READ_ARRAY, 0, COMMAND_READ_ARRAY, 0]);
+        let mut got = [0u8; 8];
+        pflash.read(off(offset), &mut got);
+        assert_eq!(got, [first, second].concat().as_slice());
+    }
+
+    #[test]
+    fn read_device_lock_status() {
+        let mut pflash = new(empty_image());
+        pflash.write(
+            off(8),
+            &[COMMAND_READ_DEVICE_ID, 0, COMMAND_READ_DEVICE_ID, 0],
+        );
+
+        let mut status = [0xff; 4];
+        pflash.read(off(8), &mut status);
+        assert_eq!(status, [0; 4]);
+    }
+
+    #[test]
+    fn clear_status_preserves_ready_bit() {
+        let mut pflash = new(empty_image());
+        pflash.status = 0xff;
+        pflash.write(off(0), &[COMMAND_CLEAR_STATUS]);
+        pflash.write(off(0), &[COMMAND_READ_STATUS]);
+
+        let mut status = [0; 4];
+        pflash.read(off(0), &mut status);
+        assert_eq!(status, [STATUS_READY, 0, STATUS_READY, 0]);
     }
 
     #[test]
