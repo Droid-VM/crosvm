@@ -560,9 +560,26 @@ impl RutabagaComponent for VirglRenderer {
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        // A fence carrying a ring index belongs to a per-context timeline (venus
+        // queue rings, drm native-context submit queues); handing it to the global
+        // virgl_renderer_create_fence retires it on vrend's GL timeline instead and
+        // the guest's per-ring fence never signals. Venus's WSI present blocked on
+        // exactly that (sync_wait(-1) on the EXECBUF out-fence), wedging the whole
+        // desktop behind the first swapchain buffer.
         // TODO(b/315870313): Add safety comment
         #[allow(clippy::undocumented_unsafe_blocks)]
-        let ret = unsafe { virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) };
+        let ret = if fence.flags & RUTABAGA_FLAG_INFO_RING_IDX != 0 {
+            unsafe {
+                virgl_renderer_context_create_fence(
+                    fence.ctx_id,
+                    VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+                    fence.ring_idx.into(),
+                    fence.fence_id,
+                )
+            }
+        } else {
+            unsafe { virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) }
+        };
         ret_to_res(ret)
     }
 
