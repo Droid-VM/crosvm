@@ -650,35 +650,3 @@ pub fn compute_lend_chunks(total_size: u64, prep: Option<&LendPrepResult>) -> Ve
 
     chunks
 }
-
-/// Split a SHARE'd region (the GpuPool, or any other region prepared via
-/// `prepare_lend_region` but registered with a single always-physically-contiguous-VA
-/// `set_user_memory_region` call) into per-2MB chunks, WITHOUT coalescing adjacent
-/// THP-backed chunks the way [`compute_lend_chunks`] does.
-///
-/// Why not reuse `compute_lend_chunks`: that function assumes two adjacent 2MB units
-/// that both ended up THP-backed are also *physically* adjacent -- true for LEND'd guest
-/// RAM, where MADV_COLLAPSE replaces a virtually-contiguous range with genuinely
-/// contiguous physical memory. It's false for the GpuPool: each 2MB unit's backing page
-/// comes from the reserve module's `page_pool[]`, filled by a loop of *independent*
-/// `alloc_pages(order=9)` calls at module load -- consecutive pool entries are whatever
-/// the buddy allocator happened to have free at that moment, with no adjacency guarantee
-/// between them. `set_user_memory_region` (unlike the custom SHARE_BLOB module, which
-/// explicitly coalesces contiguous runs into multi-entry mem_entries) issues a single
-/// hypercall assuming one contiguous physical run; feeding it >=2 independently-sourced
-/// 2MB folios in one call empirically fails on this RM (confirmed: a pool needing only
-/// one 2MB reserve folio works, one needing two or more does not -- pool size 3 MB vs
-/// 4 MB, the exact one-vs-two-2MB-chunk boundary, is the reproducible cutoff).
-///
-/// Every chunk here is emitted separately, one hypercall each, regardless of THP-backing
-/// status -- safe by construction, since it makes no physical-adjacency assumption at all.
-pub fn compute_share_chunks(total_size: u64) -> Vec<LendChunk> {
-    let mut chunks = Vec::new();
-    let mut offset: u64 = 0;
-    while offset < total_size {
-        let chunk_sz = std::cmp::min(total_size - offset, THP_SIZE);
-        chunks.push(LendChunk { offset, size: chunk_sz });
-        offset += chunk_sz;
-    }
-    chunks
-}

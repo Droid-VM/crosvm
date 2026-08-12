@@ -489,14 +489,6 @@ impl GunyahVm {
                         return Err(Error::new(libc::ENOMEM));
                     }
                 }
-                // The GpuPool's 2MB chunks each come from an independent
-                // alloc_pages(order=9) call in the reserve module (see
-                // compute_share_chunks's doc comment) -- never assume two are
-                // physically adjacent. A single SHARE hypercall for the whole
-                // region works only while it needs <=1 such chunk; feeding it
-                // >=2 independently-sourced folios in one call fails on this RM.
-                // Emit one SET_USER_MEM_REGION call per 2MB chunk instead.
-                //
                 // A growable pool is declared to the guest whole but SHARE'd only in part: the
                 // remainder is filled in at runtime as the guest asks for it. `boot_share_len`
                 // is that prefix, and it is the region's full size for everything that is not a
@@ -526,71 +518,46 @@ impl GunyahVm {
                     continue;
                 }
 
-                // Whole-region single SHARE vs per-2MB chunked SHARE.
+                // Every SHARE'd region -- swiotlb, the framebuffer, and every GPU / test pool --
+                // is shared with ONE whole-region SET_USER_MEM_REGION, exactly the way swiotlb
+                // always was. The RM builds a single multi-entry mem parcel from the region's
+                // (possibly non-contiguous, order-9-sourced) folios in that one call. A pool
+                // shares only its boot_share_len prefix (the growable remainder is granted at
+                // runtime over the accept transport); a non-pool shares its whole size, and its
+                // boot_share_len already equals the full size, so the same expression covers both.
                 //
-                // The sm8650-era RM (pre-6.6 hosts) accepts exactly ONE parcel per region:
-                // swiotlb (whole-region single SET_USER_MEM_REGION) and single-mode LEND work,
-                // while the per-2MB chunked SHARE is rejected at the first chunk (RM message
-                // 51000013 error 3). It is the ONLY shape that works there, so pre-6.6 hosts
-                // always take the single-parcel path. (The earlier belief that single-parcel
-                // "hard-resets sm8650" was a misdiagnosis: the reset was a kernel-CFI fault in
-                // the udmabuf module's memfd_fcntl call, since fixed; with that fix the
-                // whole-region pool SHARE is stable and the drm2kgsl desktop renders.)
-                //
-                // Newer RMs (6.6+) were assumed to require chunking (they reject a single SHARE
-                // spanning >1 independently-sourced 2MB folio). GUNYAH_POOL_SINGLE_PARCEL=1
-                // forces the whole-region path on any host so that assumption can be tested on
-                // 6.6/6.12 -- if it holds there too, the 2MB chunking can be dropped entirely.
+                // The old per-2MB chunked SHARE emitted one parcel per 2 MiB. The sm8650-era RM
+                // rejects that outright (it accepts exactly one parcel per region -- RM message
+                // 51000013 error 3 at the first chunk); newer RMs accepted either shape. Validated
+                // on 6.1 / 6.6 / 6.12, the single whole-region parcel works everywhere -- including
+                // a 256 MiB / 128-folio pool prefix on 6.6 -- so the chunking, and the kernel-version
+                // gate that selected it, are gone. (The belief that a whole-region pool SHARE
+                // "hard-resets sm8650" was a separate misdiagnosis: that reset was a kernel-CFI
+                // fault in the udmabuf module's memfd_fcntl call, since fixed.)
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                let force_single_parcel =
-                    host_kernel_pre_6_6() || std::env::var_os("GUNYAH_POOL_SINGLE_PARCEL").is_some();
-                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                let share_chunks = if is_pool {
-                    let share_len = boot_share_len;
-                    if force_single_parcel {
-                        base::info!(
-                            "GH-POOL: sharing {:?} as a single parcel (whole region {:#x}, pre_6_6={})",
-                            region.options.purpose,
-                            share_len,
-                            host_kernel_pre_6_6(),
-                        );
-                        if share_len != 0 {
-                            unsafe {
-                                set_user_memory_region(
-                                    &vm_descriptor,
-                                    region.index as MemSlot,
-                                    false,
-                                    !cfg.protection_type.isolates_memory(),
-                                    region.guest_addr.offset(),
-                                    share_len,
-                                    region.host_addr as *mut u8,
-                                )?;
-                            }
-                        }
-                        continue;
-                    }
-                    if share_len != full_size {
-                        base::warn!(
-                            "GH-POOL: {:?} gpa={:#x} window={:#x} -- sharing {:#x} at boot, \
-                             leaving {:#x} declared but unbacked (step={:#x})",
-                            region.options.purpose,
-                            region.guest_addr.offset(),
-                            full_size,
-                            share_len,
-                            full_size - share_len,
-                            region.options.step_size,
-                        );
-                    }
-                    mthp::compute_share_chunks(share_len)
-                } else {
-                    Vec::new()
-                };
+                let share_len = boot_share_len;
                 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
-                let share_chunks: Vec<mthp::LendChunk> = Vec::new();
-
-                if share_chunks.is_empty() {
-                    // SAFETY:
-                    // Safe because the guest regions are guarnteed not to overlap.
+                let share_len: u64 = region.size.try_into().unwrap();
+                // Announce a SPARSE pool -- one declared larger than the prefix we SHARE at boot,
+                // with a runtime-grown hole. This is exactly the layout an older RM (sm8650 / 6.1)
+                // rejects at GH_VM_START ("failed to build the vm", ENODEV): it validates the whole
+                // declared window and refuses one that is not fully backed. So when that error
+                // follows, this line pins which region caused it and by how much it was sparse.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if is_pool && share_len != full_size {
+                    base::info!(
+                        "GH-POOL: SPARSE {:?} gpa={:#x} window={:#x} -- SHARE {:#x} at boot, \
+                         {:#x} demand-grown (step={:#x}); older RMs reject this at VM_START",
+                        region.options.purpose,
+                        region.guest_addr.offset(),
+                        full_size,
+                        share_len,
+                        full_size - share_len,
+                        region.options.step_size,
+                    );
+                }
+                if share_len != 0 {
+                    // SAFETY: guest regions are guaranteed not to overlap.
                     unsafe {
                         set_user_memory_region(
                             &vm_descriptor,
@@ -601,33 +568,9 @@ impl GunyahVm {
                             // data-only regions.
                             !cfg.protection_type.isolates_memory(),
                             region.guest_addr.offset(),
-                            region.size.try_into().unwrap(),
+                            share_len,
                             region.host_addr as *mut u8,
                         )?;
-                    }
-                } else {
-                    for (i, chunk) in share_chunks.iter().enumerate() {
-                        let slot = if i == 0 {
-                            region.index as MemSlot
-                        } else {
-                            next_lend_slot as MemSlot
-                        };
-                        if i != 0 {
-                            next_lend_slot += 1;
-                        }
-                        // SAFETY: chunks are non-overlapping sub-ranges of a region the
-                        // caller already guaranteed doesn't overlap any other region.
-                        unsafe {
-                            set_user_memory_region(
-                                &vm_descriptor,
-                                slot,
-                                false,
-                                !cfg.protection_type.isolates_memory(),
-                                region.guest_addr.offset() + chunk.offset,
-                                chunk.size,
-                                (region.host_addr as *mut u8).add(chunk.offset as usize),
-                            )?;
-                        }
                     }
                 }
             }
