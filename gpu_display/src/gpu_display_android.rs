@@ -214,6 +214,10 @@ struct AndroidSurface {
     context: Rc<AndroidDisplayContextWrapper>,
     surface: NonNull<AndroidDisplaySurface>,
     imports: Rc<RefCell<BTreeMap<u32, i64>>>,
+    /// Completion fence of the most recent async flip, parked here until the caller collects it
+    /// with `take_flip_completion_fence()`. A fence that is never collected is closed (without
+    /// waiting) when the next flip replaces it, which degrades to the old drop-it behaviour.
+    pending_flip_fence: Option<SafeDescriptor>,
 }
 
 impl GpuDisplaySurface for AndroidSurface {
@@ -316,16 +320,18 @@ impl GpuDisplaySurface for AndroidSurface {
                 "Android display Vulkan blit failed; switching to CPU fallback"
             ));
         }
-        // Dropping the fence closes it without waiting, which is what every caller of flip_to
-        // already gets: `sync::Waitable` is a condvar pair with no fd backing, and the only caller
-        // (virtio_gpu.rs resource_flush) discards the Waitable and completes RESOURCE_FLUSH
-        // immediately. Backpressure comes from the bridge instead -- blit() calls reclaimSlot() on
-        // the slot it is about to reuse, which CPU-waits that slot's previous fence, so with
-        // kAsyncInFlightSlotCount=3 a blit is at most 2 frames behind. That bounds it but does not
-        // order the guest's reuse of the *source* dmabuf against the blit reading it; closing the
-        // real barrier needs an fd-backed Waitable plus a caller that waits on it.
-        drop(completion_fence);
+        // Park the fence for take_flip_completion_fence(). The caller (virtio_gpu.rs
+        // flush_resource) collects it and defers the RESOURCE_FLUSH virtio fence until it
+        // signals, which is what finally orders the guest's reuse of the source dmabuf against
+        // the async blit reading it (the bridge's own reclaimSlot() only bounds the AHB slots,
+        // not the source). An uncollected fence is closed on the next flip -- the old
+        // drop-immediately behaviour.
+        self.pending_flip_fence = completion_fence;
         Ok(sync::Waitable::signaled())
+    }
+
+    fn take_flip_completion_fence(&mut self) -> Option<SafeDescriptor> {
+        self.pending_flip_fence.take()
     }
 }
 
@@ -407,6 +413,7 @@ impl DisplayT for DisplayAndroid {
             context: self.context.clone(),
             surface,
             imports: self.imports.clone(),
+            pending_flip_fence: None,
         }))
     }
 

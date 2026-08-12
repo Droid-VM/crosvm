@@ -15,6 +15,7 @@ use base::AsRawDescriptor;
 use base::Error as BaseError;
 use base::EventToken;
 use base::EventType;
+use base::SafeDescriptor;
 use base::VolatileSlice;
 use base::WaitContext;
 use remain::sorted;
@@ -252,6 +253,17 @@ trait GpuDisplaySurface {
     ) -> anyhow::Result<Waitable> {
         // no-op
         Ok(Waitable::signaled())
+    }
+
+    /// Takes the completion fence of the most recent `flip_to`, when the backend has one.
+    ///
+    /// A `Some` fd is a sync_file that signals when the display is done *reading* the flipped
+    /// buffer, i.e. when the guest may safely render into it again. Backends whose flip consumes
+    /// the buffer synchronously (VNC and the CPU-copy paths never even reach `flip_to`; wayland
+    /// commits are decoupled by wl_buffer semantics) return `None`, and the caller must then
+    /// complete the flush synchronously exactly as before.
+    fn take_flip_completion_fence(&mut self) -> Option<SafeDescriptor> {
+        None
     }
 
     /// Commits the surface to the compositor.
@@ -801,6 +813,14 @@ impl GpuDisplay {
         surface
             .flip_to(import_id, acquire_timepoint, release_timepoint, extra_info)
             .context("failed in flip on GpuDisplaySurface")
+    }
+
+    /// Takes the completion fence of the identified surface's most recent flip, if the backend
+    /// produced one (see `GpuDisplaySurface::take_flip_completion_fence`).
+    pub fn take_flip_completion_fence(&mut self, surface_id: u32) -> Option<SafeDescriptor> {
+        self.surfaces
+            .get_mut(&surface_id)
+            .and_then(|surface| surface.take_flip_completion_fence())
     }
 
     /// Sets the mouse mode used on this surface.

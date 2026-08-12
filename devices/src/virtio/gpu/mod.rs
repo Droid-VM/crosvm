@@ -18,6 +18,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use ::snapshot::AnySnapshot;
 use anyhow::anyhow;
@@ -409,9 +410,32 @@ pub struct ReturnDescriptor {
     pub len: u32,
 }
 
+/// A RESOURCE_FLUSH whose virtio fence completion is parked on a display fence: the zero-copy
+/// flip handed back a sync_file that signals when the display has finished reading the flipped
+/// buffer, and the guest (which dma_fence-waits this virtio fence in its plane update) must not
+/// reuse the dmabuf before then.  The descriptor itself already sits in `fence_state.descs`;
+/// this records what to complete and when to give up.
+struct PendingFlipFence {
+    ring: VirtioGpuRing,
+    fence_id: u64,
+    fence: SafeDescriptor,
+    /// Safety valve: a display that never signals (surface torn down mid-flip, HWC stall) must
+    /// not freeze the guest compositor.  Past this instant the fence is completed regardless.
+    deadline: std::time::Instant,
+    /// Whether the fd has been added to the worker's WaitContext yet.
+    registered: bool,
+}
+
+/// How long a flip completion fence may stay unsignaled before it is force-completed.  Three
+/// 120Hz vsyncs -- generous for a healthy display, small enough that a torn-down surface only
+/// hiccups the guest instead of stalling it (the guest side waits with its own multi-second
+/// timeout, which would otherwise be the visible failure).
+const FLIP_FENCE_TIMEOUT: Duration = Duration::from_millis(25);
+
 pub struct Frontend {
     fence_state: Arc<Mutex<FenceState>>,
     virtio_gpu: VirtioGpu,
+    pending_flip_fences: Vec<PendingFlipFence>,
 }
 
 impl Frontend {
@@ -419,7 +443,89 @@ impl Frontend {
         Frontend {
             fence_state,
             virtio_gpu,
+            pending_flip_fences: Vec::new(),
         }
+    }
+
+    /// Registers any not-yet-registered flip fences with the worker's WaitContext so their
+    /// signal wakes the worker exactly when the display is done, rather than on the timeout.
+    fn register_flip_fences(&mut self, wait_ctx: &WaitContext<WorkerToken>) {
+        for pending in self.pending_flip_fences.iter_mut() {
+            if !pending.registered {
+                // Registration failure is not fatal: the deadline path still completes it.
+                if let Err(e) = wait_ctx.add(&pending.fence, WorkerToken::FlipFence) {
+                    base::warn!("failed to poll flip fence, falling back to timeout: {}", e);
+                }
+                pending.registered = true;
+            }
+        }
+    }
+
+    /// The nearest deadline among pending flip fences, if any -- the worker bounds its wait by
+    /// this so an unsignaled fence cannot stall the guest past `FLIP_FENCE_TIMEOUT`.
+    fn next_flip_fence_deadline(&self) -> Option<std::time::Instant> {
+        self.pending_flip_fences.iter().map(|f| f.deadline).min()
+    }
+
+    /// Completes every pending flip fence that has signaled or passed its deadline.  Returns
+    /// whether any completion was delivered (the caller then signals the ctrl queue).
+    fn complete_flip_fences(
+        &mut self,
+        ctrl_queue: &dyn QueueReader,
+        wait_ctx: &WaitContext<WorkerToken>,
+    ) -> bool {
+        let now = std::time::Instant::now();
+        let mut any = false;
+        let mut i = 0;
+        while i < self.pending_flip_fences.len() {
+            let pending = &self.pending_flip_fences[i];
+            // A sync_file reads as POLLIN once its fence signals.
+            let mut pfd = libc::pollfd {
+                fd: pending.fence.as_raw_descriptor(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: pfd points at a valid pollfd for the duration of the call.
+            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } > 0;
+            if !signaled && now < pending.deadline {
+                i += 1;
+                continue;
+            }
+            if !signaled {
+                base::warn!(
+                    "flip fence {} timed out after {:?}; completing anyway",
+                    pending.fence_id,
+                    FLIP_FENCE_TIMEOUT
+                );
+            }
+            let pending = self.pending_flip_fences.remove(i);
+            if pending.registered {
+                let _ = wait_ctx.delete(&pending.fence);
+            }
+            // Mirror create_fence_handler: deliver every descriptor at or below this fence on
+            // the same ring, then advance the ring's completed counter.
+            let mut fence_state = self.fence_state.lock();
+            let mut j = 0;
+            while j < fence_state.descs.len() {
+                if fence_state.descs[j].ring == pending.ring
+                    && fence_state.descs[j].fence_id <= pending.fence_id
+                {
+                    let completed = fence_state.descs.remove(j);
+                    ctrl_queue.add_used(completed.desc_chain, completed.len);
+                    any = true;
+                } else {
+                    j += 1;
+                }
+            }
+            let completed = fence_state
+                .completed_fences
+                .entry(pending.ring.clone())
+                .or_insert(0);
+            if pending.fence_id > *completed {
+                *completed = pending.fence_id;
+            }
+        }
+        any
     }
 
     /// Returns the internal connection to the compositor and its associated state.
@@ -822,6 +928,12 @@ impl Frontend {
             }
         };
 
+        // A flush that performed a zero-copy flip parks its display completion fence in
+        // virtio_gpu; collect it here regardless of FLAG_FENCE so a stale fence can never leak
+        // onto a later, unrelated command.  Without FLAG_FENCE it is dropped -- closed without
+        // waiting, which is the pre-fence behaviour the legacy guest path expects.
+        let flip_fence = self.virtio_gpu.take_pending_flip_fence();
+
         if writer.available_bytes() != 0 {
             let mut fence_id = 0;
             let mut ctx_id = 0;
@@ -835,6 +947,10 @@ impl Frontend {
             // that strands the descriptor forever and hard-hangs the whole VM
             // (all vCPUs idle waiting on a GPU fence). Respond with the error instead.
             let mut fence_created = false;
+            // A fenced flush with a display fence skips rutabaga entirely: its virtio fence
+            // completes when the display fence fires (see complete_flip_fences), not when the
+            // renderer is done.  This is what backpressures the guest compositor to the display.
+            let mut deferred_flip: Option<SafeDescriptor> = None;
             if let Some(cmd) = gpu_cmd {
                 let ctrl_hdr = cmd.ctrl_hdr();
                 if ctrl_hdr.flags.to_native() & VIRTIO_GPU_FLAG_FENCE != 0 {
@@ -843,22 +959,26 @@ impl Frontend {
                     ctx_id = ctrl_hdr.ctx_id.to_native();
                     ring_idx = ctrl_hdr.ring_idx;
 
-                    let fence = RutabagaFence {
-                        flags,
-                        fence_id,
-                        ctx_id,
-                        ring_idx,
-                    };
-                    gpu_response = match self.virtio_gpu.create_fence(fence) {
-                        Ok(_) => {
-                            fence_created = true;
-                            gpu_response
-                        }
-                        Err(fence_resp) => {
-                            warn!("create_fence {} -> {:?}", fence_id, fence_resp);
-                            fence_resp
-                        }
-                    };
+                    if let Some(fence) = flip_fence {
+                        deferred_flip = Some(fence);
+                    } else {
+                        let fence = RutabagaFence {
+                            flags,
+                            fence_id,
+                            ctx_id,
+                            ring_idx,
+                        };
+                        gpu_response = match self.virtio_gpu.create_fence(fence) {
+                            Ok(_) => {
+                                fence_created = true;
+                                gpu_response
+                            }
+                            Err(fence_resp) => {
+                                warn!("create_fence {} -> {:?}", fence_id, fence_resp);
+                                fence_resp
+                            }
+                        };
+                    }
                 }
             }
 
@@ -867,6 +987,27 @@ impl Frontend {
             match gpu_response.encode(flags, fence_id, ctx_id, ring_idx, writer) {
                 Ok(l) => len = l,
                 Err(e) => debug!("ctrl queue response encode error: {}", e),
+            }
+
+            if let Some(fence) = deferred_flip {
+                let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                    0 => VirtioGpuRing::Global,
+                    _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
+                };
+                self.fence_state.lock().descs.push(FenceDescriptor {
+                    ring: ring.clone(),
+                    fence_id,
+                    desc_chain,
+                    len,
+                });
+                self.pending_flip_fences.push(PendingFlipFence {
+                    ring,
+                    fence_id,
+                    fence,
+                    deadline: std::time::Instant::now() + FLIP_FENCE_TIMEOUT,
+                    registered: false,
+                });
+                return None;
             }
 
             if fence_created {
@@ -912,6 +1053,9 @@ enum WorkerToken {
         index: usize,
     },
     VirtioGpuPoll,
+    /// A zero-copy flip's completion fence signaled; one token covers every pending fence and
+    /// the handler polls each to find the signaled ones (they are few and short-lived).
+    FlipFence,
     #[cfg(windows)]
     DisplayDescriptorRequest,
 }
@@ -1292,10 +1436,24 @@ impl Worker {
         // isn't used so this isn't a huge issue.
 
         loop {
-            let events = event_manager
-                .wait_ctx
-                .wait()
-                .context("failed polling for gpu worker events")?;
+            // A pending flip fence bounds the wait: its fd wakes us the moment the display is
+            // done, and the deadline turns a fence that never fires into a bounded hiccup
+            // instead of a frozen guest compositor.
+            let events = match self.state.next_flip_fence_deadline() {
+                Some(deadline) => {
+                    let timeout = deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .max(Duration::from_millis(1));
+                    event_manager
+                        .wait_ctx
+                        .wait_timeout(timeout)
+                        .context("failed polling for gpu worker events")?
+                }
+                None => event_manager
+                    .wait_ctx
+                    .wait()
+                    .context("failed polling for gpu worker events")?,
+            };
 
             let mut signal_used_cursor = false;
             let mut signal_used_ctrl = false;
@@ -1304,8 +1462,12 @@ impl Worker {
             let mut needs_config_interrupt = false;
 
             // Remove event triggers that have been hung-up to prevent unnecessary worker wake-ups
-            // (see b/244486346#comment62 for context).
-            for event in events.iter().filter(|e| e.is_hungup) {
+            // (see b/244486346#comment62 for context).  FlipFence fds are exempt: their
+            // completion sweep below owns their registration lifecycle.
+            for event in events
+                .iter()
+                .filter(|e| e.is_hungup && !matches!(e.token, WorkerToken::FlipFence))
+            {
                 error!(
                     "unhandled virtio-gpu worker event hang-up detected: {:?}",
                     event.token
@@ -1379,6 +1541,10 @@ impl Worker {
                     WorkerToken::VirtioGpuPoll => {
                         self.state.event_poll();
                     }
+                    WorkerToken::FlipFence => {
+                        // Handled by the completion sweep after queue processing; the wake-up
+                        // itself is all this event needed to accomplish.
+                    }
                     WorkerToken::Sleep => {
                         return Ok(WorkerStopReason::Sleep);
                     }
@@ -1417,6 +1583,17 @@ impl Worker {
             // processed above and before the corresponding bridge is processed below.
             self.resource_bridges
                 .process_resource_bridges(&mut self.state, &mut event_manager.wait_ctx);
+
+            // Flip fences: register the ones queue processing just parked, then complete every
+            // one that signaled (or expired).  Runs every iteration -- the wait above was woken
+            // either by the fence fd itself or bounded by its deadline.
+            self.state.register_flip_fences(&event_manager.wait_ctx);
+            if self
+                .state
+                .complete_flip_fences(&activation_resources.ctrl_queue, &event_manager.wait_ctx)
+            {
+                signal_used_ctrl = true;
+            }
 
             if signal_used_ctrl {
                 activation_resources.ctrl_queue.signal_used();

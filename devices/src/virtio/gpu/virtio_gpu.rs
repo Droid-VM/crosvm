@@ -1113,6 +1113,10 @@ pub struct VirtioGpu {
     udmabuf_driver: Option<UdmabufDriver>,
     snapshot_scratch_directory: Option<PathBuf>,
     deferred_snapshot_load: Option<VirtioGpuSnapshot>,
+    /// Completion fence of the most recent zero-copy flip (see `take_pending_flip_fence`).
+    /// Deliberately NOT snapshot'd: a fence outstanding across a snapshot degrades to the
+    /// synchronous completion the pre-fence code always had.
+    pending_flip_fence: Option<base::SafeDescriptor>,
 }
 
 // Only the 2D mode is supported. Notes on `VirtioGpu` fields:
@@ -1238,6 +1242,7 @@ impl VirtioGpu {
             fixed_blob_mapping,
             udmabuf_driver,
             deferred_snapshot_load: None,
+            pending_flip_fence: None,
             snapshot_scratch_directory,
         })
     }
@@ -1479,6 +1484,17 @@ impl VirtioGpu {
         for scanout in self.scanouts.values_mut() {
             if scanout.resource_id == resource_id {
                 scanout.flush(&self.display, resource, &mut self.rutabaga)?;
+                // A zero-copy flip may leave a completion fence on the surface: a sync_file that
+                // signals when the display's async blit has finished READING the flipped buffer.
+                // Park it for the frontend, which defers this RESOURCE_FLUSH's virtio fence until
+                // it fires -- that is what orders the guest's next render into this dmabuf against
+                // the blit. The CPU-copy paths (VNC, CpuFallback) never reach flip_to and leave
+                // this None, keeping their synchronous completion.
+                if let Some(id) = scanout.surface_id {
+                    if let Some(fence) = self.display.borrow_mut().take_flip_completion_fence(id) {
+                        self.pending_flip_fence = Some(fence);
+                    }
+                }
             }
         }
         if self.cursor_scanout.resource_id == resource_id {
@@ -1488,6 +1504,12 @@ impl VirtioGpu {
 
         strace!("flush_resource.exit res={:?}", resource_id);
         Ok(OkNoData)
+    }
+
+    /// Takes the display completion fence of the most recent `flush_resource`, if that flush
+    /// performed a zero-copy flip whose backend handed one back.
+    pub fn take_pending_flip_fence(&mut self) -> Option<base::SafeDescriptor> {
+        self.pending_flip_fence.take()
     }
 
     /// Updates the cursor's memory to the given resource_id, and sets its position to the given
