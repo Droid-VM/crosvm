@@ -664,7 +664,6 @@ impl VirtioGpuScanout {
                 self.flush_staging[off..off + len].copy_from_slice(src);
                 off += len;
             }
-            let staging = &self.flush_staging[..total];
             let fb_stride = fb.stride() as usize;
             let fb_slice = fb.as_volatile_slice();
             // Whether the pool actually holds a frame. `transfer_read` has had this probe for a
@@ -679,6 +678,8 @@ impl VirtioGpuScanout {
             if gpu_diag_enabled()
                 && (self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0)
             {
+                // Read the RAW guest bytes (RGBX) before the R<->B swizzle below.
+                let staging = &self.flush_staging[..total];
                 let probe = &staging[src_offset.min(staging.len())..];
                 let probe = &probe[..4096.min(probe.len())];
                 let rgb_nz = probe
@@ -705,6 +706,15 @@ impl VirtioGpuScanout {
                     head.join(" "),
                 );
             }
+            // drm2kgsl pool bytes are RGBX; every display consumer downstream (VNC surface XR24,
+            // Android backend swapRedBlueInPlace) wants BGRX. Swap R<->B in place before the
+            // framebuffer copy (see pool_scanout_swizzle). gfxstream never reaches this branch.
+            if pool_scanout_swizzle() {
+                for px in self.flush_staging[..total].chunks_exact_mut(4) {
+                    px.swap(0, 2);
+                }
+            }
+            let staging = &self.flush_staging[..total];
             for row in 0..self.height as usize {
                 let s = src_offset + row * src_stride;
                 if s + packed_stride > staging.len() {
@@ -1162,6 +1172,20 @@ fn gpu_diag_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("GFXSTREAM_DIAG").map_or(false, |v| !v.is_empty() && v != "0")
+    })
+}
+
+/// drm2kgsl guest-pool scanout arrives as RGBX (byte0=R): guest turnip composites the frame in
+/// R8G8B8X8 order even though the KMS plane declares XRGB8888, so the pool bytes are red-first.
+/// Every display consumer downstream assumes BGRX -- the VNC surface is XR24 and the Android
+/// backend applies a fixed swapRedBlueInPlace -- so the pool-direct-read swaps R<->B to land BGRX
+/// in the framebuffer. Confirmed empirically: a solid-red desktop reads back head=[fe 00 00 ff].
+/// Only the guest-alloc pool-scanout path reaches this (gfxstream's host-colorbuffer import returns
+/// earlier), so the swap is drm2kgsl-scoped. Kill-switch for regressions: GPU_POOL_SCANOUT_NO_SWIZZLE=1.
+fn pool_scanout_swizzle() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GPU_POOL_SCANOUT_NO_SWIZZLE").map_or(true, |v| v.is_empty() || v == "0")
     })
 }
 
