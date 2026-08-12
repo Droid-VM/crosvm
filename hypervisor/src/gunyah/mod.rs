@@ -140,7 +140,7 @@ unsafe fn android_lend_user_memory_region(
     if ret == 0 {
         Ok(())
     } else {
-        errno_result()
+        { base::error!("GH-DIAG: GH_VM_ANDROID_LEND_USER_MEM failed"); errno_result() }
     }
 }
 
@@ -184,7 +184,7 @@ unsafe fn set_user_memory_region(
     if ret == 0 {
         Ok(())
     } else {
-        errno_result()
+        { base::error!("GH-DIAG: GH_VM_SET_USER_MEM_REGION failed"); errno_result() }
     }
 }
 
@@ -222,7 +222,7 @@ fn map_cma_region(
     if ret == 0 {
         Ok(())
     } else {
-        errno_result()
+        { base::error!("GH-DIAG: GH_VM_ANDROID_MAP_CMA_MEM failed"); errno_result() }
     }
 }
 
@@ -606,7 +606,7 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_ANDROID_SET_AUTH_TYPE failed"); errno_result() }
         }
     }
 
@@ -637,6 +637,7 @@ impl GunyahVm {
         // SAFETY:
         // Safe because we know this is a Gunyah VCPU
         let res = unsafe { ioctl(&vcpu, GH_VCPU_MMAP_SIZE) };
+        if res < 0 { base::error!("GH-DIAG: GH_VCPU_MMAP_SIZE failed"); }
         if res < 0 {
             return errno_result();
         }
@@ -679,7 +680,7 @@ impl GunyahVm {
                 .insert(GunyahIrqRoute { irq: label, level });
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed"); errno_result() }
         }
     }
 
@@ -701,7 +702,7 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed"); errno_result() }
         }
     }
 
@@ -736,7 +737,7 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_SET_DTB_CONFIG failed"); errno_result() }
         }
     }
 
@@ -752,7 +753,7 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_ANDROID_SET_FW_CONFIG failed"); errno_result() }
         }
     }
 
@@ -780,7 +781,7 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_SET_BOOT_CONTEXT failed"); errno_result() }
         }
     }
 
@@ -790,6 +791,7 @@ impl GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
+            base::error!("GH-DIAG: GH_VM_START failed");
             errno_result()
         }
     }
@@ -1289,7 +1291,7 @@ impl Vm for GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_ADD_FUNCTION failed"); errno_result() }
         }
     }
 
@@ -1321,7 +1323,7 @@ impl Vm for GunyahVm {
         if ret == 0 {
             Ok(())
         } else {
-            errno_result()
+            { base::error!("GH-DIAG: GH_VM_REMOVE_FUNCTION failed"); errno_result() }
         }
     }
 

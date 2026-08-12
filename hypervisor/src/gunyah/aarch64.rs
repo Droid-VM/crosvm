@@ -321,7 +321,9 @@ impl VmAArch64 for GunyahVm {
         }
 
         if let Err(e) = self.set_boot_pc(payload_entry_address.offset()) {
-            if e.errno() == ENOTTY {
+            // Kernels without GH_VM_SET_BOOT_CONTEXT answer ENOTTY (mainline ioctl
+            // dispatch) or ENODEV (OPPO sm8650 6.1 downstream dispatch).
+            if e.errno() == ENOTTY || e.errno() == libc::ENODEV {
                 // GH_VM_SET_BOOT_CONTEXT ioctl is not supported, but returning success
                 // for backward compatibility when the offset is zero.
                 if payload_offset != 0 {
