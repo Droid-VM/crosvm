@@ -586,10 +586,13 @@ impl VirtioGpuScanout {
             strace!("flush.import.end imported={:?}", imported);
             if let Some(import_id) = imported {
                 strace!("flush.flip_to.begin import={}", import_id);
-                match display
+                // Bind the flip result to a `let` so the `RefMut` is dropped at the end of this
+                // statement. Holding it as a `match` scrutinee keeps the borrow alive across the
+                // arms, and the error arm below borrows `display` again to release the import.
+                let flip_result = display
                     .borrow_mut()
-                    .flip_to(surface_id, import_id, None, None, None)
-                {
+                    .flip_to(surface_id, import_id, None, None, None);
+                match flip_result {
                     Ok(_) => {
                         strace!("flush.flip_to.end");
                         return Ok(OkNoData);
