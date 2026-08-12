@@ -146,6 +146,7 @@ impl VmAArch64 for GunyahVm {
         let window_top = window_base.next_multiple_of(BAR_TARGET) + BAR_TARGET + (1u64 << 29);
         let size_max =
             core::cmp::max((window_top - base_address).next_multiple_of(GIB), 4 * GIB);
+        base::info!("GH: layout base={:#x} ram_top={:#x} size-max={:#x}", base_address, ram_top, size_max);
         memory_node.set_prop("base-address", base_address)?;
         memory_node.set_prop("size-max", size_max)?;
 
@@ -256,7 +257,36 @@ impl VmAArch64 for GunyahVm {
         // guest RAM can legitimately exist below it; it is the natural bottom of the fence.
         const GUNYAH_RM_LOWMEM_FLOOR: u64 = 0x4000_0000;
         let resv_top = firmware_base.unwrap_or(base_address);
-        if resv_top > GUNYAH_RM_LOWMEM_FLOOR {
+        // The sm8650-era RM (observed on 6.1 host kernels, OPPO 6.1.118) REJECTS a
+        // guest DTB that carries this reserved-memory node: VM init fails with
+        // ENODEV at GH_VM_START. Newer RMs (6.6/6.12 hosts) accept it, and there
+        // the fence is required (the RM's low-IPA donation is silently
+        // non-executable; without the fence the guest faults on code placed
+        // there -- see the commit that introduced it). No RM version is exposed
+        // to the host, so the host kernel release is the best available proxy
+        // for the RM generation. GUNYAH_LOWMEM_FENCE=0/1 forces either way.
+        let fence_enabled = match std::env::var("GUNYAH_LOWMEM_FENCE").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => {
+                let pre_6_6 = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .ok()
+                    .and_then(|r| {
+                        let mut it = r.trim().split('.');
+                        let major: u32 = it.next()?.parse().ok()?;
+                        let minor: u32 = it.next()?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()?;
+                        Some((major, minor) < (6, 6))
+                    })
+                    .unwrap_or(false);
+                if pre_6_6 {
+                    base::info!(
+                        "GH: pre-6.6 host kernel: omitting the RM-lowmem fence node                          (this RM generation rejects DTBs that carry it)"
+                    );
+                }
+                !pre_6_6
+            }
+        };
+        if fence_enabled && resv_top > GUNYAH_RM_LOWMEM_FLOOR {
             let resv_size = resv_top - GUNYAH_RM_LOWMEM_FLOOR;
             let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
             resv.set_prop("#address-cells", 2u32)?;
