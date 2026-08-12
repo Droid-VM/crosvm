@@ -29,6 +29,10 @@ use base::error;
 use base::info;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use base::linux::move_task_to_cgroup;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use base::set_rt_fifo;
+#[cfg(any(target_os = "android", target_os = "linux"))]
+use base::set_rt_prio_limit;
 use base::warn;
 use base::AsRawDescriptor;
 use base::Event;
@@ -1512,6 +1516,69 @@ pub struct Gpu {
     snapshot_scratch_directory: Option<PathBuf>,
 }
 
+/// Default real time priority for the virtio-gpu worker thread.
+///
+/// The worker sits between a guest that is blocked on a fence and a GPU that has already finished:
+/// every millisecond it spends waiting for a timeslice is a millisecond added to frame latency. It
+/// is also, unlike a vcpu, guaranteed to block rather than spin -- its whole loop is
+/// `WaitContext::wait()` plus blocking KGSL ioctls -- so a high priority costs nothing when there is
+/// no work and cannot monopolize a CPU when there is.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+const DEFAULT_GPU_RT_LEVEL: u16 = 97;
+
+/// Promotes the calling thread to `SCHED_FIFO` for the virtio-gpu worker.
+///
+/// `CROSVM_GPU_RT_PRIO` overrides the level; `0`/`off` opts out entirely. Failure is not fatal --
+/// without `CAP_SYS_NICE` or a high enough `RLIMIT_RTPRIO` the worker simply stays on CFS, which is
+/// the pre-existing behaviour.
+///
+/// Call this *after* renderer and display init. The FIFO policy is inherited by threads created
+/// afterwards, and init is what spawns the LibVNCServer event loop -- a CPU-hungry encode thread
+/// that must not land on RT.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn set_gpu_worker_rt_prio() {
+    let prio = match std::env::var("CROSVM_GPU_RT_PRIO") {
+        Ok(v) => {
+            let v = v.trim().to_lowercase();
+            if v == "off" || v == "false" {
+                0
+            } else {
+                match v.parse::<u16>() {
+                    Ok(p) if p <= 99 => p,
+                    _ => {
+                        warn!(
+                            "invalid CROSVM_GPU_RT_PRIO={:?}, using default {}",
+                            v, DEFAULT_GPU_RT_LEVEL
+                        );
+                        DEFAULT_GPU_RT_LEVEL
+                    }
+                }
+            }
+        }
+        Err(_) => DEFAULT_GPU_RT_LEVEL,
+    };
+
+    if prio == 0 {
+        info!("v_gpu: real time scheduling disabled by CROSVM_GPU_RT_PRIO");
+        return;
+    }
+
+    // RLIMIT_RTPRIO is per-process and only consulted for callers without CAP_SYS_NICE; raising it
+    // is what lets an unprivileged crosvm reach `prio` at all. A failure here is not itself fatal,
+    // so keep going and let sched_setscheduler render the verdict.
+    if let Err(e) = set_rt_prio_limit(u64::from(prio)) {
+        warn!("v_gpu: failed to raise RLIMIT_RTPRIO to {}: {}", prio, e);
+    }
+
+    match set_rt_fifo(i32::from(prio)) {
+        Ok(()) => info!("v_gpu: running at SCHED_FIFO {}", prio),
+        Err(e) => warn!(
+            "v_gpu: failed to set SCHED_FIFO {} (staying on CFS): {}",
+            prio, e
+        ),
+    }
+}
+
 impl Gpu {
     pub fn new(
         exit_evt_wrtube: SendTube,
@@ -1864,6 +1931,14 @@ impl Gpu {
 
             // Tell the parent thread that the init phase is complete.
             let _ = init_finished_tx.send(());
+
+            // Promote to SCHED_FIFO only now that init is done. Renderer and display setup spawn
+            // helper threads (notably the LibVNCServer event loop, which does full-framebuffer
+            // encode) and those inherit the caller's policy -- they must not become RT. Threads
+            // created later by the worker itself, i.e. the per-context KGSL fence sync threads, do
+            // inherit it, which is what we want: they are the ones the guest is blocked on.
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            set_gpu_worker_rt_prio();
 
             worker.run()
         });
