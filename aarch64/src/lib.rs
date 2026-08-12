@@ -693,21 +693,27 @@ impl arch::LinuxArch for AArch64 {
         // granted at runtime. Unlike the three pools above this one really does have a non-zero
         // step, so it is the only region for which the grant table and the host-access gate do
         // anything.
-        let test_pool_mb: u64 = std::env::var("DROIDVM_TEST_POOL_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if test_pool_mb != 0 {
-            let step_mb: u64 = std::env::var("DROIDVM_TEST_POOL_STEP_MB")
+        // Up to two growable TEST pools. The suffixed env vars (…_2) declare a second pool so
+        // the two-pool / hole-in-the-middle grow+unshare path can be exercised. Each pool is
+        // declared whole, SHARE'd only up to its prealloc prefix, and grows in `step` chunks.
+        for suffix in ["", "_2"] {
+            let ev = |name: &str| -> Option<u64> {
+                std::env::var(format!("DROIDVM_TEST_POOL{}_{}", suffix, name))
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+            };
+            // Base key is DROIDVM_TEST_POOL_MB (suffix "") / DROIDVM_TEST_POOL_2_MB (suffix "_2").
+            let test_pool_mb: u64 = std::env::var(format!("DROIDVM_TEST_POOL{}_MB", suffix))
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(0);
+            if test_pool_mb == 0 {
+                continue;
+            }
+            let step_mb = ev("STEP_MB").unwrap_or(0);
             // Default to fully pre-shared, i.e. an ordinary non-growable pool: asking for a test
             // pool without saying how much of it to hold back should not change any behaviour.
-            let prealloc_mb: u64 = std::env::var("DROIDVM_TEST_POOL_PREALLOC_MB")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(test_pool_mb);
+            let prealloc_mb = ev("PREALLOC_MB").unwrap_or(test_pool_mb);
             let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
             let size = test_pool_mb << 20;
             let prealloc = (prealloc_mb << 20).min(size);
@@ -1300,13 +1306,13 @@ impl arch::LinuxArch for AArch64 {
         let mut gpu_guest_resv: Option<(u64, u64, u64, u64)> = None;
         // (base, size, pre_alloc, step) for the growable test pool, read back off the region so
         // the DT node and the region cannot disagree about what the guest was promised.
-        let test_pool_resv: Option<(u64, u64, u64, u64)> = {
-            let mut found = None;
+        let test_pool_resv: Vec<(u64, u64, u64, u64)> = {
+            let mut found = Vec::new();
             for region in vm.get_memory().regions() {
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 if region.options.purpose == vm_memory::MemoryRegionPurpose::DynamicTestPool {
                     let size = region.size as u64;
-                    found = Some((
+                    found.push((
                         region.guest_addr.offset(),
                         size,
                         region.options.boot_share_len(size),

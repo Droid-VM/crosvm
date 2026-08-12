@@ -890,7 +890,7 @@ pub fn create_fdt(
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
     venus_resv: Option<(u64, u64)>,
-    test_pool_resv: Option<(u64, u64, u64, u64)>,
+    test_pool_resv: Vec<(u64, u64, u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
@@ -978,7 +978,7 @@ pub fn create_fdt(
 
     // The growable test pool: exists so the grow/shrink path can be exercised end to end without
     // disturbing the production pools, which are all fully pre-shared and must stay that way.
-    if let Some((gpa, size, prealloc, step)) = test_pool_resv {
+    for (idx, (gpa, size, prealloc, step)) in test_pool_resv.into_iter().enumerate() {
         let growable = if step != 0 {
             let pool_id = next_growable_pool_id;
             next_growable_pool_id += 1;
@@ -990,14 +990,10 @@ pub fn create_fdt(
         } else {
             None
         };
-        create_pool_node(
-            &mut fdt,
-            "test_guest",
-            gpa,
-            size,
-            None,
-            growable,
-        )?;
+        // First pool keeps the historical node name; a second gets a distinct one so both
+        // droidvm,dynamic-pool nodes are present and the guest can drive each by pool-id.
+        let name = if idx == 0 { "test_guest".to_string() } else { format!("test_guest{}", idx + 1) };
+        create_pool_node(&mut fdt, &name, gpa, size, None, growable)?;
     }
 
     // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's

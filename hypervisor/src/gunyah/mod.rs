@@ -226,6 +226,26 @@ fn map_cma_region(
     }
 }
 
+/// Best-available proxy for the Gunyah RM generation: no RM version reaches the
+/// host (the DT compatible is identical across generations), but the host kernel
+/// tracks the SoC line. Pre-6.6 hosts (sm8650 era) carry the older RM.
+pub(crate) fn host_kernel_pre_6_6() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .and_then(|r| {
+            let mut it = r.trim().split('.');
+            let major: u32 = it.next()?.parse().ok()?;
+            let minor: u32 = it
+                .next()?
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()?;
+            Some((major, minor) < (6, 6))
+        })
+        .unwrap_or(false)
+}
+
 #[derive(PartialEq, Eq, Hash)]
 pub struct GunyahIrqRoute {
     irq: u32,
@@ -506,9 +526,49 @@ impl GunyahVm {
                     continue;
                 }
 
+                // Whole-region single SHARE vs per-2MB chunked SHARE.
+                //
+                // The sm8650-era RM (pre-6.6 hosts) accepts exactly ONE parcel per region:
+                // swiotlb (whole-region single SET_USER_MEM_REGION) and single-mode LEND work,
+                // while the per-2MB chunked SHARE is rejected at the first chunk (RM message
+                // 51000013 error 3). It is the ONLY shape that works there, so pre-6.6 hosts
+                // always take the single-parcel path. (The earlier belief that single-parcel
+                // "hard-resets sm8650" was a misdiagnosis: the reset was a kernel-CFI fault in
+                // the udmabuf module's memfd_fcntl call, since fixed; with that fix the
+                // whole-region pool SHARE is stable and the drm2kgsl desktop renders.)
+                //
+                // Newer RMs (6.6+) were assumed to require chunking (they reject a single SHARE
+                // spanning >1 independently-sourced 2MB folio). GUNYAH_POOL_SINGLE_PARCEL=1
+                // forces the whole-region path on any host so that assumption can be tested on
+                // 6.6/6.12 -- if it holds there too, the 2MB chunking can be dropped entirely.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let force_single_parcel =
+                    host_kernel_pre_6_6() || std::env::var_os("GUNYAH_POOL_SINGLE_PARCEL").is_some();
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let share_chunks = if is_pool {
                     let share_len = boot_share_len;
+                    if force_single_parcel {
+                        base::info!(
+                            "GH-POOL: sharing {:?} as a single parcel (whole region {:#x}, pre_6_6={})",
+                            region.options.purpose,
+                            share_len,
+                            host_kernel_pre_6_6(),
+                        );
+                        if share_len != 0 {
+                            unsafe {
+                                set_user_memory_region(
+                                    &vm_descriptor,
+                                    region.index as MemSlot,
+                                    false,
+                                    !cfg.protection_type.isolates_memory(),
+                                    region.guest_addr.offset(),
+                                    share_len,
+                                    region.host_addr as *mut u8,
+                                )?;
+                            }
+                        }
+                        continue;
+                    }
                     if share_len != full_size {
                         base::warn!(
                             "GH-POOL: {:?} gpa={:#x} window={:#x} -- sharing {:#x} at boot, \
