@@ -269,15 +269,7 @@ impl VmAArch64 for GunyahVm {
             Some("0") => false,
             Some(_) => true,
             None => {
-                let pre_6_6 = std::fs::read_to_string("/proc/sys/kernel/osrelease")
-                    .ok()
-                    .and_then(|r| {
-                        let mut it = r.trim().split('.');
-                        let major: u32 = it.next()?.parse().ok()?;
-                        let minor: u32 = it.next()?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()?;
-                        Some((major, minor) < (6, 6))
-                    })
-                    .unwrap_or(false);
+                let pre_6_6 = super::host_kernel_pre_6_6();
                 if pre_6_6 {
                     base::info!(
                         "GH: pre-6.6 host kernel: omitting the RM-lowmem fence node                          (this RM generation rejects DTBs that carry it)"
