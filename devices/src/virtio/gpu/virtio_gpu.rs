@@ -99,6 +99,13 @@ const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
 const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
 const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
 
+// A guest-pool blob must be at least this large to be retained as a possible scanout source (its
+// udmabuf duped for direct display import in `try_import_resource_to_display`). Real scanouts are
+// multi-MiB; gating on size keeps us from holding an extra fd for every small guest BO (which can
+// be thousands under load). A blob below this can still reach the screen via the pool_scanout_iovecs
+// CPU copy, so the gate only ever costs the accelerated path on a buffer too small to be a scanout.
+const POOL_SCANOUT_DMABUF_MIN_SIZE: u64 = 512 * 1024;
+
 /// A single-plane 8888 RGB layout is the one case where a LINEAR modifier can be trusted
 /// without a 3D query: stride and offset fully describe it, so the display backend can blit
 /// it directly instead of falling back to a CPU copy.
@@ -222,6 +229,13 @@ struct VirtioGpuResource {
     // (VNC can't) nor transfer_read works -- `flush` mmaps the exported dmabuf once and copies its
     // LINEAR rows into the display framebuffer. Keyed to this resource's lifetime.
     scanout_blob_map: Option<MemoryMapping>,
+
+    // For a guest-pool scanout blob: a dup of the linear udmabuf that resource_create_blob built
+    // over this blob's pool bytes. `flush` imports it straight to the display -- rutabaga's export
+    // can't hand a guest-alloc blob's dmabuf back on the drm2kgsl/virgl route ("invalid rutabaga
+    // handle"), so without this the frame falls to a per-frame CPU copy via pool_scanout_iovecs.
+    // Only retained for blobs large enough to be a scanout (POOL_SCANOUT_DMABUF_MIN_SIZE).
+    pool_scanout_dmabuf: Option<SafeDescriptor>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -253,6 +267,7 @@ impl VirtioGpuResource {
             pool_refs: None,
             pool_scanout_iovecs: None,
             scanout_blob_map: None,
+            pool_scanout_dmabuf: None,
         }
     }
 
@@ -995,6 +1010,78 @@ impl VirtioGpuScanout {
         resource: &mut VirtioGpuResource,
         rutabaga: &mut Rutabaga,
     ) -> Option<u32> {
+        // Guest-pool scanout fast path: we already hold a linear udmabuf over exactly this blob's
+        // pool bytes (duped in resource_create_blob). Import it directly. The rutabaga export below
+        // cannot hand a guest-alloc blob's dmabuf back on the drm2kgsl/virgl route ("invalid
+        // rutabaga handle"), so without this the frame falls to a per-frame CPU copy via
+        // pool_scanout_iovecs. Requires SET_SCANOUT_BLOB geometry (scanout_data) to describe it.
+        if resource.pool_scanout_dmabuf.is_some() {
+            if let Some(data) = resource.scanout_data {
+                let width = data.width;
+                let height = data.height;
+                let format: u32 = data.drm_format.into();
+                let stride = data.strides[0];
+                let source_offset = data.offsets[0];
+                let min_stride = width.checked_mul(4);
+                let image_size = u64::from(stride).checked_mul(u64::from(height));
+                let image_end = image_size.and_then(|s| u64::from(source_offset).checked_add(s));
+                // The udmabuf is a window over exactly this blob, so byte zero is the image start.
+                let linear_layout_verified = source_offset == 0
+                    && min_stride.is_some_and(|m| stride >= m)
+                    && image_end.is_some_and(|end| end <= resource.size)
+                    && is_single_plane_8888_rgb(format);
+                // Scope the &-borrow of pool_scanout_dmabuf so the resource is free to mutate after.
+                let import_result = {
+                    let dmabuf = resource.pool_scanout_dmabuf.as_ref().unwrap();
+                    display.borrow_mut().import_resource(
+                        surface_id,
+                        DisplayExternalResourceImport::Dmabuf {
+                            descriptor: dmabuf,
+                            offset: 0,
+                            stride,
+                            modifiers: DRM_FORMAT_MOD_LINEAR,
+                            linear_layout_verified,
+                            width,
+                            height,
+                            fourcc: format,
+                        },
+                    )
+                };
+                match import_result {
+                    Ok(import_id) => {
+                        // One line per process confirms the accelerated path engaged; the
+                        // per-resource detail stays at debug so the log is not spammed as the
+                        // compositor cycles scanout buffers.
+                        static ENGAGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !ENGAGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            base::warn!(
+                                "pool-scanout udmabuf import engaged (drm2kgsl 1-gpu-copy): \
+                                 res={} {}x{} fourcc={:#x} stride={}",
+                                resource.resource_id, width, height, format, stride,
+                            );
+                        } else {
+                            base::debug!(
+                                "pool-scanout udmabuf import res={} {}x{} fourcc={:#x} stride={} linear_verified={}",
+                                resource.resource_id, width, height, format, stride, linear_layout_verified,
+                            );
+                        }
+                        resource.display_import_state = DisplayImportState::Imported {
+                            import_id,
+                            surface_id,
+                        };
+                        return Some(import_id);
+                    }
+                    Err(e) => {
+                        note_no_import(&format!(
+                            "pool udmabuf import refused {width}x{height} fourcc={format:#x} stride={stride}: {e:#}"
+                        ));
+                        // fall through to the rutabaga export path below
+                    }
+                }
+            }
+        }
+
         // Virgl's normal export for a pool/arena-backed resource is a shared-memory fd covering
         // the WHOLE pool, which must not be handed to the display. The display-only export
         // builds a UDMABUF window over just this resource's range and leaves the guest export
@@ -1951,6 +2038,14 @@ impl VirtioGpu {
             rutabaga_iovecs = Some(iovs);
         }
 
+        // Retain a dup of the pool udmabuf so `flush` can import it straight to the display; see
+        // the pool_scanout_dmabuf field. Must happen before `descriptor` is moved into rutabaga.
+        let pool_scanout_dmabuf = if resource_create_blob.size >= POOL_SCANOUT_DMABUF_MIN_SIZE {
+            descriptor.as_ref().and_then(|d| d.try_clone().ok())
+        } else {
+            None
+        };
+
         let create_result = self.rutabaga.resource_create_blob(
             ctx_id,
             resource_id,
@@ -1971,6 +2066,7 @@ impl VirtioGpu {
         let mut resource = VirtioGpuResource::new(resource_id, 0, 0, resource_create_blob.size);
         resource.pool_scanout_iovecs = pool_iovecs;
         resource.pool_refs = pool_refs;
+        resource.pool_scanout_dmabuf = pool_scanout_dmabuf;
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
