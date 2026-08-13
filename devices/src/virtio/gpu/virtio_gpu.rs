@@ -578,7 +578,16 @@ impl VirtioGpuScanout {
         // Cursors are excluded: a virtio cursor is an ordinary small guest-backed resource with
         // no dmabuf provenance to import, so attempting it once per cursor move only produces a
         // rejection to log before doing the 64x64 copy we were always going to do.
-        if matches!(self.scanout_type, SurfaceType::Scanout) {
+        // Zero-copy display import is skipped entirely in force-CPU mode. On devices whose
+        // SurfaceFlinger RenderEngine (Skia-GL) cannot import our guest-blob dmabuf, the import
+        // "succeeds" at the crosvm boundary but the frame never composites -- and crosvm, which
+        // no longer owns the bytes, cannot correct it. The CPU-copy path below produces a plain
+        // RGBA_8888 window buffer that every RenderEngine accepts and whose bytes crosvm fully
+        // controls (swizzle, format). The app selects this per device via GPU_DISPLAY_COPY_MODE;
+        // `zero`/`auto` keep the fast path. See display_copy_mode().
+        if matches!(self.scanout_type, SurfaceType::Scanout)
+            && display_copy_mode() != DisplayCopyMode::ForceCpu
+        {
             strace!("flush.import.begin res={}", resource.resource_id);
             let imported = VirtioGpuScanout::import_resource_to_display(
                 display, surface_id, resource, rutabaga,
@@ -709,10 +718,21 @@ impl VirtioGpuScanout {
                     head.join(" "),
                 );
             }
-            // drm2kgsl pool bytes are RGBX; every display consumer downstream (VNC surface XR24,
-            // Android backend swapRedBlueInPlace) wants BGRX. Swap R<->B in place before the
-            // framebuffer copy (see pool_scanout_swizzle). gfxstream never reaches this branch.
-            if pool_scanout_swizzle() {
+            // Match the byte order to what every one-copy consumer downstream assumes: BGRX (the
+            // VNC surface reads XR24, and the Android backend's swapRedBlueInPlace converts BGRX ->
+            // RGBA_8888). Whether a swap is needed depends on the guest's declared scanout fourcc,
+            // NOT a fixed assumption -- the desktop plane declares ABGR8888 (R-first, RGBX byte
+            // order) so it needs the swap, while fbcon declares XRGB8888 (B-first, already BGRX) so
+            // it must NOT be swapped or its colours invert. This mirrors the zero-copy path, which
+            // is fourcc-correct by construction (the fd's fourcc picks the VkFormat). No
+            // scanout_data means the legacy SET_SCANOUT desktop path: default to swapping, the
+            // pre-fourcc behaviour. gfxstream never reaches this branch. Kill-switch:
+            // GPU_POOL_SCANOUT_NO_SWIZZLE=1.
+            let needs_swizzle = match resource.scanout_data.map(|d| d.drm_format.0) {
+                Some(fourcc) => fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_XBGR8888,
+                None => true,
+            };
+            if pool_scanout_swizzle() && needs_swizzle {
                 for px in self.flush_staging[..total].chunks_exact_mut(4) {
                     px.swap(0, 2);
                 }
@@ -1182,17 +1202,42 @@ fn gpu_diag_enabled() -> bool {
     })
 }
 
-/// drm2kgsl guest-pool scanout arrives as RGBX (byte0=R): guest turnip composites the frame in
-/// R8G8B8X8 order even though the KMS plane declares XRGB8888, so the pool bytes are red-first.
-/// Every display consumer downstream assumes BGRX -- the VNC surface is XR24 and the Android
-/// backend applies a fixed swapRedBlueInPlace -- so the pool-direct-read swaps R<->B to land BGRX
-/// in the framebuffer. Confirmed empirically: a solid-red desktop reads back head=[fe 00 00 ff].
-/// Only the guest-alloc pool-scanout path reaches this (gfxstream's host-colorbuffer import returns
-/// earlier), so the swap is drm2kgsl-scoped. Kill-switch for regressions: GPU_POOL_SCANOUT_NO_SWIZZLE=1.
+/// Master kill-switch for the pool-direct-read R<->B swap. The swap itself is applied per-frame
+/// only when the scanout's declared fourcc is R-first (see the call site) -- a drm2kgsl desktop
+/// scanout arrives RGBX (ABGR8888) and must land BGRX for the one-copy consumers, while fbcon's
+/// XRGB8888 is already BGRX and is left alone. This returns whether the swap is permitted at all;
+/// GPU_POOL_SCANOUT_NO_SWIZZLE=1 disables it globally for regression bisects.
 fn pool_scanout_swizzle() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("GPU_POOL_SCANOUT_NO_SWIZZLE").map_or(true, |v| v.is_empty() || v == "0")
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayCopyMode {
+    /// Try zero-copy dmabuf import + flip first; fall back to CPU copy only on failure (default).
+    Auto,
+    /// Never import: always CPU-copy the scanout into a plain RGBA_8888 window buffer. For devices
+    /// whose SurfaceFlinger cannot composite our guest-blob dmabuf (Skia-GL RenderEngine), where a
+    /// zero-copy flip is accepted at the boundary but never reaches the screen.
+    ForceCpu,
+}
+
+/// Host-side display path selector, set by the app from the device's compositing capability.
+/// `GPU_DISPLAY_COPY_MODE=cpu` forces the CPU-copy path; `zero`/`auto`/unset keep the zero-copy
+/// fast path (which the flip fence orders). Read once.
+fn display_copy_mode() -> DisplayCopyMode {
+    static MODE: std::sync::OnceLock<DisplayCopyMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("GPU_DISPLAY_COPY_MODE") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "one-copy" | "onecopy" | "force-cpu" => {
+                base::info!("GPU: display copy mode = force-cpu (zero-copy import disabled)");
+                DisplayCopyMode::ForceCpu
+            }
+            _ => DisplayCopyMode::Auto,
+        },
+        Err(_) => DisplayCopyMode::Auto,
     })
 }
 
