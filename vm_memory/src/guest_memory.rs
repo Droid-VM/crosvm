@@ -187,8 +187,9 @@ pub enum MemoryRegionPurpose {
     StaticSwiotlbRegion,
 
     /// DroidVM: venus (vkr) host-alloc transport pool. The region vkr's blob_id==0 shmems
-    /// (per-instance ring, CS/reply chunks) are served from once the vkr pool merge lands;
-    /// blessed and access-checked exactly like GpuPool. Its own `venus_host` DT node.
+    /// (per-instance ring, CS/reply chunks) are sub-allocated from (pool merge landed), so the
+    /// guest maps them pool-relative with no runtime SHARE; blessed and access-checked exactly
+    /// like GpuPool. Its own `venus_host` DT node.
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     VenusPool,
 }

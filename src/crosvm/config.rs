@@ -594,8 +594,13 @@ pub struct PreAllocConfig {
     pub drm_host_mb: Option<u64>,
 
     /// venus (vkr) HOST-allocated pool size (MB): where the venus transport shmems (per-instance
-    /// ring + CS/reply chunks) are served from once the vkr pool merge lands; until then it is
-    /// blessed but inert. Its own VenusPool region + `venus_host` DT node. Only meaningful with
+    /// ring + CS/reply chunks) are served from. The vkr pool merge is landed (virglrenderer vkr
+    /// sub-allocates every blob_id==0 shmem from this region and publishes map_ptr, so the guest
+    /// maps pool_base+offset with no runtime SHARE); venus's real VkDeviceMemory is separately
+    /// guest-alloc in the shared gpu-guest pool. Absent/0 => vkr falls back to a per-blob memfd +
+    /// runtime SHARE apiece (the round trip this pool exists to avoid; fatal to the fragile sm8650
+    /// RM). Size for the peak transport working set (cs pool alone is >=8M per instance). Its own
+    /// VenusPool region + `venus_host` DT node. Only meaningful with
     /// `--gpu backend=virglrenderer,context-types=venus`.
     pub venus_host_mb: Option<u64>,
 

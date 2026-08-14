@@ -1442,8 +1442,9 @@ impl arch::LinuxArch for AArch64 {
                     );
                     drm2kgsl_resv = Some((gpa, region.size as u64));
                 }
-                // venus transport pool: hand vkr the memfd view for the pool merge, and
-                // announce `venus_host` so the guest maps ring blobs by pool-relative offset.
+                // venus transport pool (pool merge, landed): hand vkr the memfd view it
+                // sub-allocates blob_id==0 shmems from, and announce `venus_host` so the guest
+                // maps those ring/CS/reply blobs by pool-relative offset (no runtime SHARE).
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 if region.options.purpose == vm_memory::MemoryRegionPurpose::VenusPool {
                     let fd = region.shm.as_raw_descriptor();
