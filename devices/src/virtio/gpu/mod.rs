@@ -459,7 +459,17 @@ impl Frontend {
         cmd: GpuCommand,
         reader: &mut Reader,
     ) -> VirtioGpuResult {
-        self.virtio_gpu.force_ctx_0();
+        let is_drm_submit = matches!(
+            &cmd,
+            GpuCommand::CmdSubmit3d(info)
+                if self.virtio_gpu.context_uses_capset(
+                    info.hdr.ctx_id.to_native(),
+                    RUTABAGA_CAPSET_DRM,
+                )
+        );
+        if !is_drm_submit {
+            self.virtio_gpu.force_ctx_0();
+        }
 
         match cmd {
             GpuCommand::GetDisplayInfo(_) => Ok(GpuResponse::OkDisplayInfo(

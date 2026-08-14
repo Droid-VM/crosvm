@@ -378,6 +378,11 @@ pub trait RutabagaContext {
     /// Implementations must return the component type associated with the context.
     fn component_type(&self) -> RutabagaComponentType;
 
+    /// Returns the capset used to create this context, when the implementation tracks it.
+    fn capset_id(&self) -> Option<u32> {
+        None
+    }
+
     /// Implementations must serialize the context.
     fn snapshot(&self) -> RutabagaResult<Vec<u8>> {
         Err(RutabagaError::Unsupported)
@@ -695,6 +700,11 @@ impl Rutabaga {
         if let Some(component) = self.components.get(&self.default_component) {
             component.force_ctx_0();
         }
+    }
+
+    /// Returns whether `ctx_id` was created for `capset_id`.
+    pub fn context_uses_capset(&self, ctx_id: u32, capset_id: u32) -> bool {
+        self.contexts.get(&ctx_id).and_then(|ctx| ctx.capset_id()) == Some(capset_id)
     }
 
     /// Creates a fence with the given `fence`.

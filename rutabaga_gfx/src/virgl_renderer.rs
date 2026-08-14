@@ -60,6 +60,7 @@ pub struct VirglRenderer {}
 
 struct VirglRendererContext {
     ctx_id: u32,
+    capset_id: u32,
 }
 
 fn import_resource(resource: &mut RutabagaResource) -> RutabagaResult<()> {
@@ -168,6 +169,10 @@ impl RutabagaContext for VirglRendererContext {
 
     fn component_type(&self) -> RutabagaComponentType {
         RutabagaComponentType::VirglRenderer
+    }
+
+    fn capset_id(&self) -> Option<u32> {
+        Some(self.capset_id)
     }
 
     fn context_create_fence(
@@ -928,6 +933,9 @@ impl RutabagaComponent for VirglRenderer {
             }
         };
         ret_to_res(ret)?;
-        Ok(Box::new(VirglRendererContext { ctx_id }))
+        Ok(Box::new(VirglRendererContext {
+            ctx_id,
+            capset_id: context_init & RUTABAGA_CONTEXT_INIT_CAPSET_ID_MASK,
+        }))
     }
 }

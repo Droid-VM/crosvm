@@ -1511,6 +1511,11 @@ impl VirtioGpu {
         self.rutabaga.force_ctx_0()
     }
 
+    /// Returns whether `ctx_id` was created for `capset_id`.
+    pub fn context_uses_capset(&self, ctx_id: u32, capset_id: u32) -> bool {
+        self.rutabaga.context_uses_capset(ctx_id, capset_id)
+    }
+
     /// Creates a fence with the RutabagaFence that can be used to determine when the previous
     /// command completed.
     pub fn create_fence(&mut self, rutabaga_fence: RutabagaFence) -> VirtioGpuResult {
