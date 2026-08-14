@@ -195,8 +195,11 @@ fn write_all_stderr(bytes: &[u8]) {
 /// forks a `crash_dump` helper via `clone()`, which fails with EAGAIN ("second clone failed") when
 /// the process is under teardown resource pressure -- leaving no backtrace at all. This handler runs
 /// *in-process* on an alternate stack, so it needs no fork/clone and prints a symbolized backtrace
-/// straight to stderr (captured by the app's console log) before letting the default disposition
-/// (re-)raise for the tombstone. `SA_RESETHAND` guarantees the second fault terminates the process.
+/// straight to stderr (captured by the app's console log), then `_exit`s -- it does NOT re-raise
+/// into debuggerd. Re-raising a fatal signal while this process still holds a running protected VM
+/// makes crash_dump64 attach and the phone reboot ~100ms later (same hazard main.rs documents for
+/// SIGABRT); `_exit` skips that, exactly like SIGKILL, which was measured to be survivable.
+/// `SA_RESETHAND` is kept only as a backstop should the handler itself fault before the `_exit`.
 /// Parse one /proc/self/maps line into (start, end, perms, path).
 fn parse_maps_line(line: &str) -> Option<(usize, usize, &str, &str)> {
     let mut it = line.split_whitespace();
@@ -314,6 +317,17 @@ extern "C" fn crash_signal_handler(
     out.push_str("(symbolize: llvm-symbolizer -e <module> <vaddr>)\n");
     out.push_str("==== end crash handler ====\n");
     write_all_stderr(out.as_bytes());
+
+    // Do NOT return: SA_RESETHAND reset the disposition to SIG_DFL, so returning would re-run the
+    // faulting instruction and re-raise into bionic debuggerd. On this platform debuggerd/
+    // crash_dump64 attaching to a process that still holds a running protected VM + lent guest
+    // memory + in-flight GPU work is exactly what makes the phone reboot (~100ms later, boot reason
+    // "reboot", no pstore) -- the same measured hazard that `exit_without_crash_dump` converts
+    // SIGABRT away from in main.rs. Take the survivable path: skip debuggerd and _exit like SIGKILL,
+    // which was measured to leave the host alive. We already printed the backtrace above, so nothing
+    // of diagnostic value is lost (the tombstone was unreliable under teardown pressure anyway).
+    // Async-signal-safe: _exit only.
+    unsafe { libc::_exit(128 + signum) };
 }
 
 /// Read a u64 at byte `off` from the ucontext pointer (unaligned-safe).
