@@ -165,7 +165,15 @@ pub fn create_gpu_device(
     //   - is_sandboxed implies that blob mapping will be done out-of-process by the crosvm
     //     hypervisor process.
     //   - fixed_blob_mapping is not yet compatible with VmMemorySource::ExternalMapping
-    gpu_params.external_blob = is_sandboxed || gpu_params.fixed_blob_mapping;
+    //   - udmabuf (guest-alloc): the guest owns the pool and hands the host an external descriptor
+    //     per blob. gfxstream's guest-handle blob path (VirtioGpuResource::create, the
+    //     STREAM_BLOB_MEM_GUEST|CREATE_GUEST_HANDLE branch) is gated on ExternalBlob; with it off,
+    //     ResourceCreateBlob falls through to no-premapped-external-blob-mapping and returns
+    //     ComponentError(-22), so guest Vulkan can't allocate device memory. Under --disable-sandbox
+    //     with the gfxstream feature (fixed_blob_mapping=false) that gate was always off, which is
+    //     what broke app-driven gfxstream guest-alloc. drm2kgsl is unaffected: its guest pool goes
+    //     through virglrenderer's own path, not the gfxstream ExternalBlob one.
+    gpu_params.external_blob = is_sandboxed || gpu_params.fixed_blob_mapping || gpu_params.udmabuf;
 
     // Implicit launch is not allowed when sandboxed. A socket fd from a separate sandboxed
     // render_server process must be provided instead.
