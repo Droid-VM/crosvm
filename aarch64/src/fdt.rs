@@ -693,6 +693,24 @@ fn create_simplefb_node(fdt: &mut Fdt, cfg: &SimplefbDtConfig, has_resv: bool) -
     Ok(())
 }
 
+pub struct PflashDtConfig {
+    pub base: u64,
+    pub size: u64,
+    pub block_size: u32,
+}
+
+fn create_pflash_node(fdt: &mut Fdt, cfg: &PflashDtConfig) -> Result<()> {
+    let node = fdt
+        .root_mut()
+        .subnode_mut(&format!("pflash@{:x}", cfg.base))?;
+    node.set_prop("compatible", "cfi-flash")?;
+    node.set_prop("reg", &[cfg.base, cfg.size])?;
+    node.set_prop("erase-size", cfg.block_size)?;
+    node.set_prop("no-unaligned-direct-access", ())?;
+    node.set_prop("status", "okay")?;
+    Ok(())
+}
+
 fn create_vmwdt_node(fdt: &mut Fdt, vmwdt_cfg: VmWdtConfig, num_cpus: u32) -> Result<()> {
     let vmwdt_name = format!("vmwdt@{:x}", vmwdt_cfg.base);
     let reg = [vmwdt_cfg.base, vmwdt_cfg.size];
@@ -784,6 +802,7 @@ pub fn create_fdt(
     serial_devices: &[SerialDeviceInfo],
     virt_cpufreq_v2: bool,
     is_kvm: bool,
+    pflash_cfg: Option<PflashDtConfig>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -856,6 +875,9 @@ pub fn create_fdt(
         let has_resv = swiotlb.is_some() || sfb_cfg.addr >= crate::AARCH64_PHYS_MEM_START;
         create_simplefb_node(&mut fdt, sfb_cfg, has_resv)?;
     }
+    if let Some(ref pflash_cfg) = pflash_cfg {
+        create_pflash_node(&mut fdt, pflash_cfg)?;
+    }
     create_vmwdt_node(&mut fdt, vmwdt_cfg, num_cpus)?;
     if is_kvm {
         create_kvm_cpufreq_node(&mut fdt)?;
@@ -924,6 +946,25 @@ pub fn create_fdt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pflash_node() {
+        let mut fdt = Fdt::new(&[]);
+        let config = PflashDtConfig {
+            base: 0x9000_0000,
+            size: 0xc_0000,
+            block_size: 0x1000,
+        };
+
+        create_pflash_node(&mut fdt, &config).unwrap();
+
+        let node = fdt.get_node("/pflash@90000000").unwrap();
+        assert_eq!(node.get_prop::<String>("compatible").unwrap(), "cfi-flash");
+        assert_eq!(node.get_prop::<Vec<u64>>("reg").unwrap(), [config.base, config.size]);
+        assert_eq!(node.get_prop::<u32>("erase-size").unwrap(), config.block_size);
+        assert!(node.get_prop::<()>("no-unaligned-direct-access").is_some());
+        assert_eq!(node.get_prop::<String>("status").unwrap(), "okay");
+    }
 
     #[test]
     fn psci_compatible_v0_1() {
