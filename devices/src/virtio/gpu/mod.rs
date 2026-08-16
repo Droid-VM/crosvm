@@ -1755,7 +1755,10 @@ fn set_gpu_worker_rt_prio() {
                 }
             }
         }
-        Err(_) => DEFAULT_GPU_RT_LEVEL,
+        // Absent -> do not set real-time scheduling at all. RT is opt-in: the daemon only exports
+        // CROSVM_GPU_RT_PRIO when the graphics tab's switch is on. (An explicit "off"/"0" also
+        // disables it; an explicit level sets SCHED_FIFO at that level.)
+        Err(_) => 0,
     };
 
     if prio == 0 {
