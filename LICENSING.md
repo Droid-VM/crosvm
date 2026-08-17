@@ -12,9 +12,11 @@ relicense them either — a patched upstream file is still an upstream file.
 
 ## Material written for DroidVM
 
-Files carrying `SPDX-License-Identifier: GPL-3.0-or-later` are DroidVM work
-and are licensed under the GNU GPL, version 3 or later, **with the
-additional permissions in `ADDITIONAL-PERMISSIONS`**.
+Files carrying `SPDX-License-Identifier: GPL-2.0-or-later` are DroidVM work
+and are licensed under the GNU GPL, version 2 or later, **with the
+additional permissions in `ADDITIONAL-PERMISSIONS`** — with the exception of the
+two ported files named under *Third-party material* below, which carry the same
+tag because that is the license they came with.
 
 Those permissions exist so this work can go upstream. They let anyone
 relicense it under the terms an upstream project requires, for the purpose of
@@ -28,10 +30,11 @@ Two added files are Rust ports of QEMU code and are **not** DroidVM-original:
 - `hypervisor/src/gunyah/mthp.rs` — ported from QEMU's `gunyah_add_mem()`
 - `devices/src/pl061.rs` — a translation of QEMU's `hw/gpio/pl061.c`
 
-QEMU is GPL-licensed. These are marked `GPL-2.0-or-later` rather than
-`GPL-3.0-or-later` so they stay compatible with the project they came from, and
-the additional permissions do not extend to QEMU's copyright in them. Sending
-either of them anywhere needs QEMU's license honoured, not this project's.
+QEMU is GPL-licensed. They carry `GPL-2.0-or-later` like the rest of DroidVM's
+work here, but they carry it as QEMU's own license rather than as this project's
+choice, and the additional permissions do not extend to QEMU's copyright in
+them. Sending either of them anywhere needs QEMU's license honoured, not this
+project's.
 
 `gpu_display/src/vnc_server_bridge.{c,h}` are DroidVM-written but link
 LibVNCServer (GPL-2.0-or-later); no LibVNCServer code is copied in.

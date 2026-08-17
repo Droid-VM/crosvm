@@ -1,11 +1,12 @@
-Additional permissions under GNU GPL version 3, section 7
-=========================================================
+Additional permissions, granted alongside the GNU GPL version 2 or later
+========================================================================
 
-These additional permissions apply to the parts of this work copyrighted by
-the Droid-VM organization and by contributors to this project. They do not
-apply to material copyrighted by others -- in particular, material inherited
-from the upstream project this repository is derived from, which remains under
-its own terms and is not affected by anything below.
+This work is licensed under the GNU General Public License version 2 or later.
+The following additional permissions apply to the parts of this work
+copyrighted by the Droid-VM organization and by contributors to this project.
+They do not apply to material copyrighted by others -- in particular, material
+inherited from the upstream project this repository is derived from, which
+remains under its own terms and is not affected by anything below.
 
 
 1. Upstream contribution
@@ -48,10 +49,10 @@ a mirror, a vendored copy, and a redistribution are not official repositories.
 3. Notes
 --------
 
-Under GPL version 3 section 7, a recipient may remove these additional
-permissions from a copy they convey. Doing so does not affect the terms on
-which the permissions are offered here, and does not withdraw them from anyone
-who received them.
+GPL version 2 has no mechanism for additional permissions of its own. This
+grant therefore stands on its own, as a separate permission from the copyright
+holder, in the way linking exceptions to GPL version 2 have always been written.
+It may be ignored: a recipient who wants only the plain GPL has it.
 
 Adding permissions on top of the GNU GPL does not restrict any freedom the GPL
 grants. Every recipient keeps the full GPL grant regardless of whether they use
