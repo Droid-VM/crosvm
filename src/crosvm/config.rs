@@ -806,6 +806,10 @@ pub struct Config {
     pub display_window_mouse: bool,
     pub dump_device_tree_blob: Option<PathBuf>,
     pub dynamic_power_coefficient: BTreeMap<usize, u32>,
+    /// Dedicated EDK2 preload pool size in MiB (`--edk2-preload-mb`). It has no boot-time shared
+    /// prefix. Firmware requests one runtime RWX SHARE for the complete range, accepts it, and
+    /// promotes only this pool to System RAM before Linux boots. Zero or absent disables the pool.
+    pub edk2_preload_mb: Option<u64>,
     pub enable_fw_cfg: bool,
     pub enable_hwp: bool,
     pub executable_path: Option<Executable>,
@@ -882,10 +886,6 @@ pub struct Config {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub pmem_ext2: Vec<crate::crosvm::sys::config::PmemExt2Option>,
     pub pmems: Vec<PmemOption>,
-    /// Dedicated EDK2 preload pool size in MiB (`--edk2-preload-mb`). It has no boot-time shared
-    /// prefix. Firmware requests one runtime RWX SHARE for the complete range, accepts it, and
-    /// promotes only this pool to System RAM before Linux boots. Zero or absent disables the pool.
-    pub edk2_preload_mb: Option<u64>,
     /// Host-owned pre-allocated GPU pool sizes (`--pre-alloc`; gfx host / guest). Exported to the
     /// renderer as NCTX_GFX_POOL_MB env at startup.
     pub pre_alloc: Option<PreAllocConfig>,
@@ -1052,6 +1052,7 @@ impl Default for Config {
             display_window_mouse: false,
             dump_device_tree_blob: None,
             dynamic_power_coefficient: BTreeMap::new(),
+            edk2_preload_mb: None,
             enable_fw_cfg: false,
             enable_hwp: false,
             executable_path: None,
@@ -1139,7 +1140,6 @@ impl Default for Config {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             pmem_ext2: Vec::new(),
             pmems: Vec::new(),
-            edk2_preload_mb: None,
             pre_alloc: None,
             #[cfg(feature = "process-invariants")]
             process_invariants_data_handle: None,
@@ -1237,9 +1237,9 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
     }
 
     if let Some(mb) = cfg.edk2_preload_mb {
-        if mb != 0 && (mb < 2 || !mb.is_power_of_two()) {
+        if mb != 0 && (mb < 2 || mb % 2 != 0) {
             return Err(
-                "`edk2-preload-mb` must be 0 or a power of two of at least 2 MiB".to_string(),
+                "`edk2-preload-mb` must be 0 or a multiple of 2 MiB".to_string(),
             );
         }
     }
@@ -1502,6 +1502,35 @@ mod tests {
             .unwrap()
             .try_into()
             .unwrap()
+    }
+
+    #[test]
+    fn validate_edk2_preload_size() {
+        for mb in ["0", "2", "6", "100"] {
+            let command = crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &["--edk2-preload-mb", mb, "/dev/null"],
+            )
+            .unwrap();
+            let result: Result<Config, String> = command.try_into();
+            assert!(result.is_ok(), "{mb} MiB should be accepted");
+        }
+
+        for mb in ["1", "3", "99"] {
+            let command = crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &["--edk2-preload-mb", mb, "/dev/null"],
+            )
+            .unwrap();
+            let result: Result<Config, String> = command.try_into();
+            assert!(
+                matches!(
+                    result,
+                    Err(ref error) if error.contains("must be 0 or a multiple of 2 MiB")
+                ),
+                "{mb} MiB should be rejected"
+            );
+        }
     }
 
     #[test]

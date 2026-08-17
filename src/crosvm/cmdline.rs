@@ -1347,6 +1347,13 @@ pub struct RunCommand {
     /// voltage and frequency for calculating power; in units of uW/MHz/^2
     pub dynamic_power_coefficient: Option<BTreeMap<usize, u32>>,
 
+    #[argh(option, arg_name = "MB")]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// size of the dedicated EDK2 preload pool in MiB; must be a multiple of 2
+    /// (default: 0 = disabled)
+    pub edk2_preload_mb: Option<u64>,
+
     #[argh(switch)]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
@@ -2018,12 +2025,6 @@ pub struct RunCommand {
     ///     gidmap=GIDMAP - a gid map in the same format as uidmap
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
-
-    #[argh(option, arg_name = "MB")]
-    #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// size of the dedicated EDK2 preload pool in MiB (default: 0 = disabled)
-    pub edk2_preload_mb: Option<u64>,
 
     #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB")]
     #[serde(skip)]

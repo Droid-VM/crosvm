@@ -239,8 +239,9 @@ pub struct MemoryRegionOptions {
     /// Granularity of a runtime grant into the unbacked remainder, in bytes.
     ///
     /// `0` means this pool does not grow at all: everything is shared before boot, which is what
-    /// the three existing pools do and must keep doing. Non-zero must be at least 2 MiB (the folio
-    /// size the share path is built around) and a power of two (drm_buddy rejects anything else).
+    /// the three existing pools do and must keep doing. Non-zero must be a multiple of 2 MiB (the
+    /// folio size the share path is built around). GPU pools additionally require a power of two
+    /// because drm_buddy rejects anything else; the one-shot EDK2 preload grant does not.
     ///
     /// Each grant costs one RM memparcel, and MAX_MEMPARCEL_PER_VM is 1024 across the whole VM --
     /// shared with Android's own parcels, and never released until the phone reboots for anything
@@ -303,9 +304,7 @@ impl MemoryRegionOptions {
     }
 
     /// Validate the pool parameters against a region size. Returns the reason it is not usable, so
-    /// the caller can refuse at configuration time rather than at first grant -- an invalid step
-    /// otherwise surfaces as drm_buddy returning -EINVAL inside the guest, which reads as a guest
-    /// driver bug rather than a command line mistake.
+    /// the caller can refuse at configuration time rather than at first grant.
     pub fn pool_param_error(&self, size: u64) -> Option<String> {
         const MIN_STEP: u64 = 2 << 20;
         let pre_alloc = self.pre_alloc_size.unwrap_or(size);
@@ -332,7 +331,17 @@ impl MemoryRegionOptions {
                 self.step_size, MIN_STEP
             ));
         }
-        if !self.step_size.is_power_of_two() {
+        if self.step_size % MIN_STEP != 0 {
+            return Some(format!(
+                "step_size {:#x} is not a multiple of {:#x} (a grant is shared as 2 MiB folios)",
+                self.step_size, MIN_STEP
+            ));
+        }
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        let requires_power_of_two = self.purpose != MemoryRegionPurpose::Edk2PreloadPool;
+        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+        let requires_power_of_two = true;
+        if requires_power_of_two && !self.step_size.is_power_of_two() {
             return Some(format!(
                 "step_size {:#x} is not a power of two (drm_buddy in the guest rejects it)",
                 self.step_size
@@ -481,11 +490,10 @@ impl GuestMemory {
     pub fn new_with_options(
         ranges: &[(GuestAddress, u64, MemoryRegionOptions)],
     ) -> Result<GuestMemory> {
-        // Refuse bad pool parameters here, before a single page is mapped. Left to run, a step
-        // that is not a power of two surfaces as drm_buddy returning -EINVAL inside the guest and
-        // a pre_alloc short of the size on a non-growable pool surfaces as reads of the shortfall
-        // silently returning zeros -- both of which read as guest driver bugs rather than as the
-        // command line mistake they are.
+        // Refuse bad pool parameters here, before a single page is mapped. Left to run, an invalid
+        // GPU step surfaces as drm_buddy returning -EINVAL inside the guest and a pre_alloc short
+        // of the size on a non-growable pool surfaces as reads of the shortfall silently returning
+        // zeros -- both of which read as guest driver bugs rather than command line mistakes.
         for (addr, size, options) in ranges {
             if let Some(why) = options.pool_param_error(*size) {
                 return Err(Error::PoolParams(*addr, why));
@@ -1660,6 +1668,30 @@ unsafe impl BackingMemory for GuestMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    #[test]
+    fn edk2_preload_step_allows_non_power_of_two_2m_multiple() {
+        const MIB: u64 = 1 << 20;
+        let edk2 = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::Edk2PreloadPool)
+            .growable_pool(0, 6 * MIB);
+        assert_eq!(edk2.pool_param_error(6 * MIB), None);
+
+        let gpu = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::GpuPoolGuest)
+            .growable_pool(0, 6 * MIB);
+        assert!(gpu
+            .pool_param_error(6 * MIB)
+            .is_some_and(|error| error.contains("not a power of two")));
+
+        let unaligned_edk2 = MemoryRegionOptions::new()
+            .purpose(MemoryRegionPurpose::Edk2PreloadPool)
+            .growable_pool(0, 3 * MIB);
+        assert!(unaligned_edk2
+            .pool_param_error(3 * MIB)
+            .is_some_and(|error| error.contains("not a multiple")));
+    }
 
     #[test]
     fn test_alignment() {
