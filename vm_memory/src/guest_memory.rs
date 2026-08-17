@@ -147,12 +147,11 @@ pub enum MemoryRegionPurpose {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     Drm2KgslPool,
 
-    /// DroidVM: a GROWABLE test pool. Declared to the guest at its full size but SHARE'd only up
-    /// to `pre_alloc_size` at boot; the rest is granted at runtime over virtio-gunyah-accept's
-    /// pool queue. Exists so the growable path can be exercised end to end without disturbing the
-    /// three production pools, which are all fully pre-shared and must stay that way.
+    /// DroidVM: memory accepted by EDK2 before Linux boots. The range starts with no boot-time
+    /// backing and is granted as one runtime SHARE over virtio-gunyah-accept. Firmware removes
+    /// only this pool's reserved-memory node after MEM_ACCEPT succeeds.
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-    DynamicTestPool,
+    Edk2PreloadPool,
 
     /// DroidVM: GPU pre-alloc pool (gfxstream HOST-visible pool). Appended after
     /// guest RAM, SHARE'd (not lent) at boot on protected Gunyah so the host renderer and the guest
@@ -943,10 +942,9 @@ impl GuestMemory {
             MemoryRegionPurpose::Drm2KgslPool => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
-            // The one region where this actually gates anything today: everything else has
-            // step_size == 0 and answers yes everywhere.
+            // EDK2 may access this range only after its complete runtime grant is live.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-            MemoryRegionPurpose::DynamicTestPool => {
+            MemoryRegionPurpose::Edk2PreloadPool => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

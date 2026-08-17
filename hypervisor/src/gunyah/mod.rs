@@ -160,7 +160,7 @@ unsafe fn set_user_memory_region(
 ) -> Result<()> {
     let mut flags = 0;
 
-    // In protected VMs, SHARE'd memory (GH_VM_SET_USER_MEM_REGION) cannot be made executable —
+    // In protected VMs, SHARE'd memory (GH_VM_SET_USER_MEM_REGION) cannot be made executable -
     // requesting GH_MEM_ALLOW_EXEC prevents Gunyah from creating valid stage-2 mappings, so the
     // guest faults (SIGBUS) on access. Only LEND'd memory gets exec at stage-2. Host-visible
     // virtio-gpu blobs (gfxstream ASG rings) are data-only and must be SHARE'd without exec.
@@ -291,10 +291,9 @@ impl GunyahVm {
                     // process and must keep reaching it.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::Drm2KgslPool => false,
-                    // Growable test pool: SHARE'd like the others. Only its pre_alloc prefix is
-                    // shared at boot; the remainder is granted at runtime.
+                    // EDK2 preload pool: no boot-time prefix; firmware accepts one runtime SHARE.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                    MemoryRegionPurpose::DynamicTestPool => false,
+                    MemoryRegionPurpose::Edk2PreloadPool => false,
                     MemoryRegionPurpose::GuestMemoryRegion => true,
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::ProtectedFirmwareRegion => true,
@@ -407,7 +406,7 @@ impl GunyahVm {
                     MemoryRegionPurpose::GpuPool
                         | MemoryRegionPurpose::GpuPoolGuest
                         | MemoryRegionPurpose::Drm2KgslPool
-                        | MemoryRegionPurpose::DynamicTestPool
+                        | MemoryRegionPurpose::Edk2PreloadPool
                 );
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let full_size: u64 = region.size.try_into().unwrap();
@@ -531,9 +530,6 @@ impl GunyahVm {
                             &vm_descriptor,
                             region.index as MemSlot,
                             false,
-                            // SHARE'd memory is executable only in non-protected VMs (where
-                            // guest RAM itself is SHARE'd). In protected VMs these are
-                            // data-only regions.
                             !cfg.protection_type.isolates_memory(),
                             region.guest_addr.offset(),
                             region.size.try_into().unwrap(),
@@ -843,8 +839,8 @@ impl GunyahVm {
             (guest_addr.offset() >> 12) as u32
         };
 
-        // Host-visible blobs are data-only: READ|WRITE, never EXEC.
-        let mut flags = GH_MEM_ALLOW_READ;
+        // Allow the guest to create executable Stage-1 mappings of runtime-shared blobs.
+        let mut flags = GH_MEM_ALLOW_READ | GH_MEM_ALLOW_EXEC;
         if !read_only {
             flags |= GH_MEM_ALLOW_WRITE;
         }
@@ -878,10 +874,11 @@ impl GunyahVm {
         let old = self.blob_regions.lock().insert(label, mem_region);
         drop(old);
         debug!(
-            "GUNYAH-SHARE-BLOB: gpa=0x{:x} size=0x{:x} label={} handle=0x{:x}",
+            "GUNYAH-SHARE-BLOB: gpa=0x{:x} size=0x{:x} label={} flags=0x{:x} handle=0x{:x}",
             guest_addr.offset(),
             size,
             label,
+            flags,
             blob.mem_handle,
         );
         Ok(blob.mem_handle)

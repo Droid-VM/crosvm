@@ -889,7 +889,7 @@ pub fn create_fdt(
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
-    test_pool_resv: Option<(u64, u64, u64, u64)>,
+    edk2_preload_resv: Option<(u64, u64, u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
@@ -975,9 +975,9 @@ pub fn create_fdt(
         create_pool_node(&mut fdt, "gpu_guest", gpa, size, None, growable)?;
     }
 
-    // The growable test pool: exists so the grow/shrink path can be exercised end to end without
-    // disturbing the production pools, which are all fully pre-shared and must stay that way.
-    if let Some((gpa, size, prealloc, step)) = test_pool_resv {
+    // Dedicated firmware preload pool. EDK2 accepts its complete runtime SHARE and removes this
+    // reserved-memory node before handing the otherwise already-declared RAM range to Linux.
+    if let Some((gpa, size, prealloc, step)) = edk2_preload_resv {
         let growable = if step != 0 {
             let pool_id = next_growable_pool_id;
             next_growable_pool_id += 1;
@@ -991,7 +991,7 @@ pub fn create_fdt(
         };
         create_pool_node(
             &mut fdt,
-            "test_guest",
+            "edk2_preload",
             gpa,
             size,
             None,

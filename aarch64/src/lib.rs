@@ -650,9 +650,10 @@ impl arch::LinuxArch for AArch64 {
             .unwrap_or(0);
         if drm2kgsl_pool_mb != 0 {
             let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
+            let size = drm2kgsl_pool_mb << 20;
             memory_regions.push((
                 GuestAddress(base),
-                drm2kgsl_pool_mb << 20,
+                size,
                 MemoryRegionOptions::new()
                     .purpose(MemoryRegionPurpose::Drm2KgslPool)
                     .align(2 << 20)
@@ -660,44 +661,29 @@ impl arch::LinuxArch for AArch64 {
                     // the same thing the defaults already produce -- it is written out so the
                     // intent is in the code rather than in an absent field, and so that turning
                     // one of these into a growable pool is a visible edit here.
-                    .growable_pool(drm2kgsl_pool_mb << 20, 0),
+                    .growable_pool(size, 0),
             ));
+            pool_top = base + size;
         }
 
-        // Growable TEST pool. Declared whole, SHARE'd only up to the prealloc prefix; the rest is
-        // granted at runtime. Unlike the three pools above this one really does have a non-zero
-        // step, so it is the only region for which the grant table and the host-access gate do
-        // anything.
-        let test_pool_mb: u64 = std::env::var("DROIDVM_TEST_POOL_MB")
+        // Dedicated EDK2 preload pool. It is absent from Stage-2 at boot and granted as one
+        // runtime memparcel, so firmware can promote it without changing a GPU-owned pool.
+        // Disabled unless the UEFI launcher explicitly requests the independent crosvm option.
+        let edk2_preload_mb: u64 = std::env::var("DROIDVM_EDK2_PRELOAD_MB")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        if test_pool_mb != 0 {
-            let step_mb: u64 = std::env::var("DROIDVM_TEST_POOL_STEP_MB")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            // Default to fully pre-shared, i.e. an ordinary non-growable pool: asking for a test
-            // pool without saying how much of it to hold back should not change any behaviour.
-            let prealloc_mb: u64 = std::env::var("DROIDVM_TEST_POOL_PREALLOC_MB")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(test_pool_mb);
+        if edk2_preload_mb != 0 {
             let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
-            let size = test_pool_mb << 20;
-            let prealloc = (prealloc_mb << 20).min(size);
-            let step = step_mb << 20;
+            let size = edk2_preload_mb << 20;
             memory_regions.push((
                 GuestAddress(base),
                 size,
                 MemoryRegionOptions::new()
-                    .purpose(MemoryRegionPurpose::DynamicTestPool)
+                    .purpose(MemoryRegionPurpose::Edk2PreloadPool)
                     .align(2 << 20)
-                    .growable_pool(prealloc, step)
-                    // One grant is one memparcel and the VM-wide limit is 1024, shared with
-                    // Android's own. 64 is deliberately far below it: this pool is for testing,
-                    // and exhausting the quota takes the phone down until it reboots.
-                    .max_grants(64),
+                    .growable_pool(0, size)
+                    .max_grants(1),
             ));
             pool_top = base + size;
         }
@@ -1273,13 +1259,13 @@ impl arch::LinuxArch for AArch64 {
         // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
         // pool region emitted).
         let mut gpu_guest_resv: Option<(u64, u64, u64, u64)> = None;
-        // (base, size, pre_alloc, step) for the growable test pool, read back off the region so
-        // the DT node and the region cannot disagree about what the guest was promised.
-        let test_pool_resv: Option<(u64, u64, u64, u64)> = {
+        // Read the dedicated preload pool back from the final memory layout so its DT metadata
+        // cannot disagree with the host-side grant table.
+        let edk2_preload_resv: Option<(u64, u64, u64, u64)> = {
             let mut found = None;
             for region in vm.get_memory().regions() {
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-                if region.options.purpose == vm_memory::MemoryRegionPurpose::DynamicTestPool {
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::Edk2PreloadPool {
                     let size = region.size as u64;
                     found = Some((
                         region.guest_addr.offset(),
@@ -1406,7 +1392,7 @@ impl arch::LinuxArch for AArch64 {
             }),
             gpu_resv,
             gpu_guest_resv,
-            test_pool_resv,
+            edk2_preload_resv,
             drm2kgsl_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,

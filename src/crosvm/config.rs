@@ -592,24 +592,6 @@ pub struct PreAllocConfig {
     /// the round trip this route exists to avoid. Its own Drm2KgslPool region + `drm2kgsl_host` DT
     /// node. Only meaningful with `--gpu backend=virglrenderer`.
     pub drm_host_mb: Option<u64>,
-
-    /// Growable TEST pool: total window size (MB). Declared to the guest whole but backed only up
-    /// to `test-pool-prealloc-mb`; the rest is granted at runtime as the guest asks, a
-    /// `test-pool-step-mb` multiple at a time.
-    ///
-    /// Exists to exercise the growable-pool path end to end -- the three pools above are all
-    /// fully pre-shared (step 0) and cannot. Nothing in the guest uses it except the test driver.
-    pub test_pool_mb: Option<u64>,
-    /// Bytes of the test pool SHARE'd before boot. Defaults to the whole window, i.e. an ordinary
-    /// non-growable pool, so setting only `test-pool-mb` changes nothing about how it behaves.
-    pub test_pool_prealloc_mb: Option<u64>,
-    /// Grant granularity for the test pool (MB). Must be >= 2 and a power of two. 0, or absent,
-    /// means the pool does not grow.
-    ///
-    /// One grant is one RM memparcel however many steps it spans, and MAX_MEMPARCEL_PER_VM is
-    /// 1024 for the whole VM -- so this is not "how much to allocate at once", it is the smallest
-    /// piece the guest can ever release. Small steps buy fine-grained release and spend quota.
-    pub test_pool_step_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
@@ -900,6 +882,10 @@ pub struct Config {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub pmem_ext2: Vec<crate::crosvm::sys::config::PmemExt2Option>,
     pub pmems: Vec<PmemOption>,
+    /// Dedicated EDK2 preload pool size in MiB (`--edk2-preload-mb`). It has no boot-time shared
+    /// prefix. Firmware requests one runtime RWX SHARE for the complete range, accepts it, and
+    /// promotes only this pool to System RAM before Linux boots. Zero or absent disables the pool.
+    pub edk2_preload_mb: Option<u64>,
     /// Host-owned pre-allocated GPU pool sizes (`--pre-alloc`; gfx host / guest). Exported to the
     /// renderer as NCTX_GFX_POOL_MB env at startup.
     pub pre_alloc: Option<PreAllocConfig>,
@@ -1153,6 +1139,7 @@ impl Default for Config {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             pmem_ext2: Vec::new(),
             pmems: Vec::new(),
+            edk2_preload_mb: None,
             pre_alloc: None,
             #[cfg(feature = "process-invariants")]
             process_invariants_data_handle: None,
@@ -1247,6 +1234,14 @@ impl Default for Config {
 pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
     if cfg.executable_path.is_none() {
         return Err("Executable is not specified".to_string());
+    }
+
+    if let Some(mb) = cfg.edk2_preload_mb {
+        if mb != 0 && (mb < 2 || !mb.is_power_of_two()) {
+            return Err(
+                "`edk2-preload-mb` must be 0 or a power of two of at least 2 MiB".to_string(),
+            );
+        }
     }
 
     if cfg.plugin_root.is_some() && !executable_is_plugin(&cfg.executable_path) {
