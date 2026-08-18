@@ -218,7 +218,7 @@ impl DeviceType {
             DeviceType::Tpm => 1,           // request queue
             DeviceType::Pvclock => 1,       // request queue
             DeviceType::Media => 2,         // commandq, eventq
-            DeviceType::GunyahAccept => 2,  // requestq, completionq
+            DeviceType::GunyahAccept => 3,  // requestq, completionq, poolq
         }
     }
 }
