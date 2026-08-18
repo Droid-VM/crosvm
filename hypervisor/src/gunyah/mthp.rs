@@ -495,18 +495,16 @@ pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Resul
     if offset % THP_SIZE != 0 || len % THP_SIZE != 0 || len == 0 {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    // Punch the range in first: the file is sparse, and the pages have to exist before there is
-    // anything for a collapse to fold.
-    if libc::fallocate(
-        fd,
-        0,
-        offset as libc::off_t,
-        len as libc::off_t,
-    ) != 0
-    {
-        return Err(err());
-    }
-
+    // NO fallocate here, deliberately. Punching the range in first allocates it as ordinary 4 KiB
+    // shmem, and on these phones the free memory a 4 KiB allocation can reach is whatever the
+    // gh_hugepage reserve pool did not park (measured on 8gen3: MemAvailable ~1 GiB against a
+    // 5.5 GiB reservoir). So a 1 GiB grant failed with ENOMEM inside fallocate while 5.5 GiB of
+    // 2 MiB folios sat unused, and the collapse below would then have had to allocate the folio
+    // *and* migrate into it -- twice the peak for a worse result.
+    //
+    // MADV_POPULATE_WRITE through the mapping, with MADV_HUGEPAGE already set, faults the file
+    // pages in as order-9 folios straight from the reserve pool's supply hook: the same path the
+    // multi-GiB LEND of guest RAM has always taken (prepare_lend_region).
     let l = len as usize;
     let thp = THP_SIZE as usize;
     let base = libc::mmap(
@@ -549,12 +547,24 @@ pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Resul
     for w in 0..(len / THP_SIZE) {
         let ptr = (mapped as *mut u8).add((w * THP_SIZE) as usize) as *mut libc::c_void;
         if libc::madvise(ptr, THP_SIZE as usize, MADV_POPULATE_WRITE) != 0 {
-            // Older kernels lack MADV_POPULATE_WRITE; fault each page in by hand so the collapse
-            // has something to work with.
-            let npages = THP_SIZE / 4096;
-            for pg in 0..npages {
-                let p = (ptr as *mut u8).add((pg * 4096) as usize);
-                std::ptr::write_volatile(p, std::ptr::read_volatile(p));
+            let e = err();
+            match e.raw_os_error() {
+                // Older kernels lack MADV_POPULATE_WRITE; fault each page in by hand so the
+                // collapse has something to work with.
+                Some(libc::EINVAL) | Some(libc::ENOSYS) => {
+                    let npages = THP_SIZE / 4096;
+                    for pg in 0..npages {
+                        let p = (ptr as *mut u8).add((pg * 4096) as usize);
+                        std::ptr::write_volatile(p, std::ptr::read_volatile(p));
+                    }
+                }
+                // Out of memory is the caller's business, and it must not be answered by the
+                // hand-fault loop: a write fault that cannot allocate raises SIGBUS, which kills
+                // the VMM instead of failing one grant.
+                _ => {
+                    libc::munmap(mapped, l);
+                    return Err(e);
+                }
             }
         }
         let _ = libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE);

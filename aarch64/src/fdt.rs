@@ -95,10 +95,26 @@ const IRQ_TYPE_LEVEL_LOW: u32 = 0x00000008;
 fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     let mut mem_reg_prop = Vec::new();
     let mut previous_memory_region_end = None;
+    // A growable pool is declared to the guest whole but backed only up to its floor, so it must
+    // not appear here: a guest that took the window for ordinary RAM would allocate in the part
+    // nothing has granted yet, where a read silently returns zeros and a write kills the VM. The
+    // floor is described by the pool's own reserved-memory node instead, and everything above it
+    // is address space the guest only reaches through a grant.
+    //
+    // Non-growable pools stay in `/memory` exactly as before, marked no-map by their node -- the
+    // arrangement every existing pool boots with.
+    let growable: HashSet<u64> = guest_mem
+        .regions()
+        .filter(|r| r.options.step_size != 0)
+        .map(|r| r.guest_addr.offset())
+        .collect();
     let mut regions = guest_mem.guest_memory_regions();
     regions.sort();
     for region in regions {
         if region.0.offset() == AARCH64_PROTECTED_VM_FW_START {
+            continue;
+        }
+        if growable.contains(&region.0.offset()) {
             continue;
         }
         // Merge with the previous region if possible.
@@ -202,6 +218,21 @@ struct GrowablePool {
 ///   memparcel registered before VM start (`vm_creation.c
 ///   find_memparcel_for_resmem_node_by_address`). It walks every `/reserved-memory` child and
 ///   never looks at `compatible`.
+///
+/// # `reg` is the FLOOR, not the window
+///
+/// For a growable pool the two are different, and which one goes in `reg` decides whether the VM
+/// starts at all. The RM's match is exact -- same base, same size, one mapping -- so a `reg` that
+/// covers the whole declared window while only its floor is really shared matches nothing, and
+/// android14-6.1's RM refuses the VM outright (`GH_VM_START` -> ENODEV). Measured on sm8650: the
+/// same pool boots with the node removed and is refused with it present.
+///
+/// So `reg` describes exactly what was SHARE'd before boot, and the window's real size travels in
+/// `droidvm,pool-size`. The rest of the window is address space the guest is never told about
+/// through `reg` at all; a grant lands there as a runtime memparcel the guest accepts itself,
+/// which is a shape the RM does not police (measured on the same device). A pool that is fully
+/// pre-shared emits exactly the node it always did -- no `pool-size`, `reg` covering everything --
+/// because for it the floor IS the window.
 /// * edk2's `GunyahPoolAcpiDxe` walks every `droidvm,pool` node and emits one ACPI device per pool
 ///   under `\_SB`, so a guest that cannot read a device tree -- Windows -- still finds its pool.
 ///   `pool-name` becomes the ACPI `_UID`, so a pool shows up as e.g. `ACPI\DRVM0001\gpu_guest`.
@@ -246,7 +277,13 @@ fn create_pool_node(
     } else {
         node.set_prop("compatible", "droidvm,pool")?;
     }
-    node.set_prop("reg", &[gpa, size])?;
+    // See "`reg` is the FLOOR" above: the node describes the pre-shared floor, and the window's
+    // size rides along beside it when the two differ.
+    let floor = growable.as_ref().map_or(size, |g| g.pre_alloc_size.min(size));
+    node.set_prop("reg", &[gpa, floor])?;
+    if floor != size {
+        node.set_prop("droidvm,pool-size", size)?;
+    }
     node.set_prop("no-map", ())?;
     // The name again, as a property: a consumer that reaches the node by phandle or by scanning
     // for the compatible never sees the node name, and edk2 turns this into the ACPI `_UID`.

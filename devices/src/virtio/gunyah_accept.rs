@@ -334,6 +334,10 @@ impl PoolWorker {
     /// find_region/shm_region, which is what create_udmabuf needs to turn guest-supplied addresses
     /// back into (memfd, offset) pairs.
     fn grant(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
+        // Split the cost of a grant into its two halves -- folio preparation on the host, then
+        // SHARE plus the guest's own MEM_ACCEPT -- because they scale differently with the size
+        // of the range and the pseudo-unprotected window is sized on that difference.
+        let folios_started = std::time::Instant::now();
         if let Err(e) = self.prepare_folios(gpa, len) {
             // PrepareBlobRange cannot create a guest mapping. If it failed after partially
             // populating the sparse memfd, this is the one failure path whose state is known, so
@@ -347,6 +351,8 @@ impl PoolWorker {
             return Err(e);
         }
 
+        let folios_elapsed = folios_started.elapsed();
+
         let (shm, shm_offset) = self
             .mem
             .offset_from_base(GuestAddress(gpa))
@@ -354,6 +360,7 @@ impl PoolWorker {
         let descriptor = base::clone_descriptor(&base::Descriptor(shm.as_raw_descriptor()))
             .context("failed to clone the pool memfd")?;
 
+        let share_started = std::time::Instant::now();
         self.vm_memory
             .send(&VmMemoryRequest::RegisterMemory {
                 source: VmMemorySource::Descriptor {
@@ -370,12 +377,21 @@ impl PoolWorker {
             })
             .context("failed to send RegisterMemory")?;
 
-        match self.vm_memory.recv::<VmMemoryResponse>() {
+        let res = match self.vm_memory.recv::<VmMemoryResponse>() {
             Ok(VmMemoryResponse::RegisterMemory { .. }) => Ok(()),
             Ok(VmMemoryResponse::Err(e)) => Err(anyhow::Error::new(e)),
             Ok(other) => Err(anyhow!("RegisterMemory refused: {:?}", other)),
             Err(e) => Err(anyhow!("RegisterMemory response: {}", e)),
-        }
+        };
+        base::info!(
+            "gunyah-pool: grant gpa={:#x} len={:#x} folios {:?} + share/accept {:?} -> {}",
+            gpa,
+            len,
+            folios_elapsed,
+            share_started.elapsed(),
+            if res.is_ok() { "ok" } else { "FAILED" },
+        );
+        res
     }
 
     /// Debug: take or drop a reference on a range, as a dma-buf import would.

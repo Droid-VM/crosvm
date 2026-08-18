@@ -248,8 +248,8 @@ pub struct MemoryRegionOptions {
     /// Granularity of a runtime grant into the unbacked remainder, in bytes.
     ///
     /// `0` means this pool does not grow at all: everything is shared before boot, which is what
-    /// the three existing pools do and must keep doing. Non-zero must be at least 2 MiB (the folio
-    /// size the share path is built around) and a power of two (drm_buddy rejects anything else).
+    /// the three existing pools do and must keep doing. Non-zero must be a multiple of 2 MiB --
+    /// the folio the share path is built around, and the granularity the reserve pool serves.
     ///
     /// Each grant costs one RM memparcel, and MAX_MEMPARCEL_PER_VM is 1024 across the whole VM --
     /// shared with Android's own parcels, and never released until the phone reboots for anything
@@ -341,16 +341,41 @@ impl MemoryRegionOptions {
                 self.step_size, MIN_STEP
             ));
         }
-        if !self.step_size.is_power_of_two() {
+        // A multiple of a folio, not a power of two. The power-of-two rule was written down as
+        // "drm_buddy rejects anything else", and that turned out to be about a different number:
+        // the guest's allocator is initialised with PAGE_SIZE as its chunk (virtgpu_vram.c
+        // `drm_buddy_init(..., PAGE_SIZE)`), and never sees the step at all. What the step really
+        // has to satisfy is the share path -- grants are made of 2 MiB folios -- and the
+        // bookkeeping below, which wants the window and the floor to be whole numbers of steps.
+        if self.step_size % MIN_STEP != 0 {
             return Some(format!(
-                "step_size {:#x} is not a power of two (drm_buddy in the guest rejects it)",
-                self.step_size
+                "step_size {:#x} is not a multiple of {:#x} (a grant is shared as 2 MiB folios)",
+                self.step_size, MIN_STEP
             ));
         }
         if size % self.step_size != 0 || pre_alloc % self.step_size != 0 {
             return Some(format!(
                 "size {:#x} and pre_alloc_size {:#x} must both be multiples of step_size {:#x}",
                 size, pre_alloc, self.step_size
+            ));
+        }
+        // A growable pool must have SOMETHING shared before boot, and at least a folio of it.
+        //
+        // The pool's `/reserved-memory` node declares the pre-shared floor, and the Gunyah
+        // resource manager on android14-6.1 requires every such node's `reg` to match an accepted
+        // memparcel exactly -- base, size, and a single mapping. A zero floor leaves nothing for
+        // it to match and the VM does not start at all: GH_VM_START answers ENODEV, which reads
+        // as a broken VMM rather than as the one line of configuration it is. (Measured on
+        // sm8650: with the node the VM is refused, without it the same VM boots -- see
+        // plans/PSEUDO_UNPROTECTED_SHIM_PLAN.md.)
+        //
+        // The floor is also where the pool's identity lives: it is the range a driver may touch
+        // without asking, and the node that carries the pool's name, id, step and total size.
+        const MIN_FLOOR: u64 = 2 << 20;
+        if pre_alloc < MIN_FLOOR {
+            return Some(format!(
+                "pre_alloc_size {:#x} is below the {:#x} minimum for a growable pool; the                  reserved-memory node has to describe a memparcel that really exists",
+                pre_alloc, MIN_FLOOR
             ));
         }
         None
@@ -491,7 +516,7 @@ impl GuestMemory {
         ranges: &[(GuestAddress, u64, MemoryRegionOptions)],
     ) -> Result<GuestMemory> {
         // Refuse bad pool parameters here, before a single page is mapped. Left to run, a step
-        // that is not a power of two surfaces as drm_buddy returning -EINVAL inside the guest and
+        // the share path cannot honour surfaces as an error deep inside the guest driver, and
         // a pre_alloc short of the size on a non-growable pool surfaces as reads of the shortfall
         // silently returning zeros -- both of which read as guest driver bugs rather than as the
         // command line mistake they are.
