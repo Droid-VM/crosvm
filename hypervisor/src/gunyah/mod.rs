@@ -858,6 +858,16 @@ impl GunyahVm {
         if !read_only {
             flags |= GH_MEM_ALLOW_WRITE;
         }
+        // GH_SHARE_EXEC (diagnostic, pseudo-unprotected bring-up): also ask for X in the guest's
+        // ACL entry. The boot-time SHARE path cannot do this (the RM/driver map SHARE'd regions
+        // non-executable, see set_user_memory_region), but a runtime memparcel carries whatever
+        // rights the ACL asks for -- and the QCOM SCM assign keeps HLOS's own RWX either way, so
+        // the host does not lose access. This flag exists to measure whether that is true on
+        // every RM generation we ship on, 6.1 (sm8650) included. It applies to every runtime
+        // share, blobs included, so it is a measurement flag, not a shipping one.
+        if std::env::var_os("GH_SHARE_EXEC").is_some_and(|v| v != "0") {
+            flags |= GH_MEM_ALLOW_EXEC;
+        }
 
         // The runtime-SHARE ioctl is served by the out-of-tree `gunyah_share_mod` module via its
         // own `/dev/gunyah_share` char device (the in-tree gh_vm_ioctl has no such case), so the

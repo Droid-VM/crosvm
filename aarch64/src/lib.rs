@@ -742,6 +742,22 @@ impl arch::LinuxArch for AArch64 {
             // Default to fully pre-shared, i.e. an ordinary non-growable pool: asking for a test
             // pool without saying how much of it to hold back should not change any behaviour.
             let prealloc_mb = ev("PREALLOC_MB").unwrap_or(test_pool_mb);
+            // DROIDVM_TEST_POOL_GAP_MB (diagnostic): leave a hole of guest-physical address space
+            // in FRONT of this pool -- no region, no DT node, no shm vdevice, nothing SHARE'd.
+            // It is the pseudo-unprotected window in miniature: the layout covers it (ram_top and
+            // therefore size-max are computed from the pool above it), the guest is never told it
+            // exists, and the only way anything appears there is a runtime SHARE plus the guest's
+            // own MEM_ACCEPT. Measuring that on the sm8650-era RM is what the flag is for.
+            let gap = ev("GAP_MB").unwrap_or(0) << 20;
+            if gap != 0 {
+                base::info!(
+                    "GH-POOL: leaving a {:#x} byte hole at {:#x} before the {} test pool",
+                    gap,
+                    (pool_top + (2 << 20) - 1) & !((2 << 20) - 1),
+                    if suffix.is_empty() { "first" } else { "second" },
+                );
+                pool_top = ((pool_top + (2 << 20) - 1) & !((2 << 20) - 1)) + gap;
+            }
             let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
             let size = test_pool_mb << 20;
             let prealloc = (prealloc_mb << 20).min(size);

@@ -1049,6 +1049,19 @@ pub fn create_fdt(
         // First pool keeps the historical node name; a second gets a distinct one so both
         // droidvm,dynamic-pool nodes are present and the guest can drive each by pool-id.
         let name = if idx == 0 { "test_guest".to_string() } else { format!("test_guest{}", idx + 1) };
+        // DROIDVM_POOL_HIDE=dt|shm|both (diagnostic): omit the reserved-memory node for the test
+        // pools. The sm8650-era RM refuses a `/reserved-memory` child whose `reg` does not match
+        // an accepted memparcel exactly, which is one of three tangled explanations for why a
+        // partially-shared pool fails to start there -- the others being the shm vdevice node and
+        // the region itself. Each has to be removable on its own or the cause stays unknown.
+        let hide = std::env::var("DROIDVM_POOL_HIDE").unwrap_or_default();
+        if hide == "dt" || hide == "both" {
+            base::warn!(
+                "GH-POOL: DROIDVM_POOL_HIDE={} -- omitting the {} reserved-memory node ({:#x}+{:#x})",
+                hide, name, gpa, size,
+            );
+            continue;
+        }
         create_pool_node(&mut fdt, &name, gpa, size, None, growable)?;
     }
 
