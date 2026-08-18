@@ -1,0 +1,6 @@
+# crosvm pins 1.77.2 for its own build; this crate is not part of that build and needs a target
+# (aarch64-unknown-none) that pin does not carry. Naming a toolchain here stops the parent
+# directory's pin from applying to a bare-metal binary it was never meant to describe.
+[toolchain]
+channel = "stable"
+targets = ["aarch64-unknown-none"]

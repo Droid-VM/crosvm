@@ -1,0 +1,45 @@
+/dts-v1/;
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	memory {
+		device_type = "memory";
+		/* two ranges, the way the resource manager hands them back once it has
+		 * prepended its own low-memory donation to the boot region */
+		reg = <0x0 0x40000000 0x0 0x04000000>,
+		      <0x0 0x80000000 0x0 0x00400000>;
+	};
+
+	/* Every vdevice under /hypervisor has a reg of its own, and the resource manager's node
+	 * is one child among them -- the case a walker with global state gets wrong. */
+	hypervisor {
+		compatible = "gunyah-hypervisor";
+		reg = <0x0 0xdeadbeef 0x0 0x1>;
+
+		bell-3 {
+			compatible = "gunyah-doorbell";
+			reg = <0x0 0x1111 0x0 0x2222>;
+		};
+
+		qcom,resource-mgr {
+			compatible = "gunyah-resource-manager";
+			reg = <0x0 0x2a 0x0 0x2b>;
+		};
+
+		bell-9 {
+			compatible = "gunyah-doorbell";
+			reg = <0x0 0x3333 0x0 0x4444>;
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		test_guest@100000000 {
+			compatible = "droidvm,dynamic-pool", "droidvm,pool";
+			reg = <0x1 0x0 0x0 0x1000000>;
+			no-map;
+		};
+	};
+};

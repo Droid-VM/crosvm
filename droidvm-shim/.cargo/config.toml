@@ -1,0 +1,13 @@
+# Bare metal: no std, no dynamic loader, one flat binary linked by our own script. `-C
+# relocation-model=static` because nothing processes relocations at load time -- crosvm copies the
+# bytes to a fixed address and the hypervisor branches to them.
+[build]
+target = "aarch64-unknown-none"
+
+[target.aarch64-unknown-none]
+rustflags = [
+    "-C", "link-arg=-Tshim.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "relocation-model=static",
+    "-C", "force-frame-pointers=yes",
+]
