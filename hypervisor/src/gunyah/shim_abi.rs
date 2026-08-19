@@ -32,7 +32,7 @@ pub const SHIM_ABI_VERSION: u32 = 1;
 /// The most parcels one window may be shared as. A window is one parcel unless something forces
 /// it to be split, so this is headroom rather than a target: every parcel costs one of the 1024
 /// the resource manager allows per VM, shared with Android's own and not returned until reboot.
-pub const SHIM_MAX_PARCELS: usize = 8;
+pub const SHIM_MAX_PARCELS: usize = 32;
 
 /// Offset of the header within the shim image. Offset 0 is the entry branch.
 pub const SHIM_HEADER_OFFSET: usize = 8;

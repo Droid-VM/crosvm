@@ -604,6 +604,14 @@ pub struct PreAllocConfig {
     /// `--gpu backend=virglrenderer,context-types=venus`.
     pub venus_host_mb: Option<u64>,
 
+    /// Take every pool below out of the VM's system RAM instead of adding it on top of `--mem`.
+    ///
+    /// Off by default, which is the arithmetic these pools have always had: `--mem 4096` with a
+    /// 1 GiB pool asks the host for 5 GiB. On, the same VM asks for 4 GiB and gives the guest 3 --
+    /// so what a VM costs is what was typed, which is the number worth being able to predict when
+    /// the memory comes out of a fixed reserve pool.
+    pub alloc_from_vm_sys_ram: Option<bool>,
+
     /// Growable TEST pool: total window size (MB). Declared to the guest whole but backed only up
     /// to `test-pool-prealloc-mb`; the rest is granted at runtime as the guest asks, a
     /// `test-pool-step-mb` multiple at a time.

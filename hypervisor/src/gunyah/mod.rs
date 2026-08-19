@@ -921,55 +921,97 @@ impl GunyahVm {
             };
 
             let size: u64 = window.size.try_into().unwrap();
-            // A second mapping of the region's own memfd, because share_blob wants something it
-            // can hold for as long as the parcel lives. The payload the host wrote into it before
-            // the VM started is already there and stays there: sharing does not sanitise, which
-            // is what lets the window arrive with a kernel in it.
-            let dup = base::clone_descriptor(&base::Descriptor(window.shm.as_raw_descriptor()))
-                .map_err(|_| Error::new(EINVAL))?;
-            // SAFETY: the descriptor was just duplicated from the region's own memfd and is owned
-            // by this File from here on.
-            let file = unsafe { std::fs::File::from_raw_descriptor(dup.into_raw_descriptor()) };
-            let mapping = MemoryMappingBuilder::new(window.size)
-                .from_file(&file)
-                .offset(window.shm_offset)
-                .build()
-                .map_err(|e| {
-                    base::error!("GH-SHIM: cannot map the window to share it: {:?}", e);
-                    Error::new(EINVAL)
-                })?;
+            let ho = handoff.guest_addr;
+
+            // DROIDVM_SHIM_PARCEL_MB: hand the window over in parcels of at most this many MiB.
+            //
+            // Zero, the default, means one parcel however big the window is. It is worth a knob
+            // because the cost of building a parcel is not the same everywhere: on android14-6.1
+            // the resource manager assembles it from every folio there and then (~3.4 s for
+            // 4 GiB), while the 6.12 driver demand-pages it (~60 ms). Splitting spends memparcels
+            // -- MAX_MEMPARCEL_PER_VM is 1024 for the whole VM, shared with Android's own -- and
+            // buys nothing unless something is measured to be faster for it, so nobody gets it
+            // without asking.
+            let chunk = std::env::var("DROIDVM_SHIM_PARCEL_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb << 20)
+                .filter(|c| *c != 0)
+                // A parcel is built out of folios; a chunk that is not a whole number of them
+                // would hand the guest a boundary in the middle of one.
+                .map(|c| c.next_multiple_of(2 << 20).min(size))
+                .unwrap_or(size);
+            let nparcels = size.div_ceil(chunk);
+            if nparcels > abi::SHIM_MAX_PARCELS as u64 {
+                base::error!(
+                    "GH-SHIM: {:#x} of window in {:#x} chunks needs {} parcels; the handoff page                      holds {}",
+                    size,
+                    chunk,
+                    nparcels,
+                    abi::SHIM_MAX_PARCELS,
+                );
+                return Err(Error::new(EINVAL));
+            }
+
             let started = std::time::Instant::now();
-            // exec: the payload runs from here.
-            let handle = self.share_blob(window.guest_addr, Box::new(mapping), false, true)?;
+            for i in 0..nparcels {
+                let off = i * chunk;
+                let len = chunk.min(size - off);
+                let at = window
+                    .guest_addr
+                    .checked_add(off)
+                    .ok_or_else(|| Error::new(EINVAL))?;
+                // A second mapping of the region's own memfd, because share_blob wants something
+                // it can hold for as long as the parcel lives. The payload the host wrote into it
+                // before the VM started is already there and stays there: sharing does not
+                // sanitise, which is what lets the window arrive with a kernel in it.
+                let dup = base::clone_descriptor(&base::Descriptor(window.shm.as_raw_descriptor()))
+                    .map_err(|_| Error::new(EINVAL))?;
+                // SAFETY: the descriptor was just duplicated from the region's own memfd and is
+                // owned by this File from here on.
+                let file = unsafe { std::fs::File::from_raw_descriptor(dup.into_raw_descriptor()) };
+                let mapping = MemoryMappingBuilder::new(len.try_into().unwrap())
+                    .from_file(&file)
+                    .offset(window.shm_offset + off)
+                    .build()
+                    .map_err(|e| {
+                        base::error!("GH-SHIM: cannot map the window to share it: {:?}", e);
+                        Error::new(EINVAL)
+                    })?;
+                // exec: the payload runs from here.
+                let handle = self.share_blob(at, Box::new(mapping), false, true)?;
+                let parcel = abi::ShimParcel {
+                    handle,
+                    reserved: 0,
+                    base: at.offset(),
+                    size: len,
+                };
+                let dst = ho
+                    .checked_add(core::mem::offset_of!(abi::ShimHandoff, parcel) as u64)
+                    .and_then(|a| {
+                        a.checked_add(i * core::mem::size_of::<abi::ShimParcel>() as u64)
+                    })
+                    .ok_or_else(|| Error::new(EINVAL))?;
+                // SAFETY: ShimParcel is repr(C) and made of integers; every byte pattern is valid.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &parcel as *const abi::ShimParcel as *const u8,
+                        core::mem::size_of::<abi::ShimParcel>(),
+                    )
+                };
+                mem.write_all_at_addr(bytes, dst)
+                    .map_err(|_| Error::new(EINVAL))?;
+            }
             base::info!(
-                "GH-SHIM: window {:#x}+{:#x} shared as handle {:#x} in {:?}",
+                "GH-SHIM: window {:#x}+{:#x} shared as {} parcel(s) in {:?}",
                 window.guest_addr.offset(),
                 size,
-                handle,
+                nparcels,
                 started.elapsed(),
             );
 
-            let ho = handoff.guest_addr;
-            let parcel = abi::ShimParcel {
-                handle,
-                reserved: 0,
-                base: window.guest_addr.offset(),
-                size,
-            };
-            let at = ho
-                .checked_add(core::mem::offset_of!(abi::ShimHandoff, parcel) as u64)
-                .ok_or_else(|| Error::new(EINVAL))?;
-            // SAFETY: ShimParcel is repr(C) and made of integers; every byte pattern is valid.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &parcel as *const abi::ShimParcel as *const u8,
-                    core::mem::size_of::<abi::ShimParcel>(),
-                )
-            };
-            mem.write_all_at_addr(bytes, at)
-                .map_err(|_| Error::new(EINVAL))?;
             mem.write_obj_at_addr(
-                1u32,
+                nparcels as u32,
                 ho.checked_add(core::mem::offset_of!(abi::ShimHandoff, nparcels) as u64)
                     .ok_or_else(|| Error::new(EINVAL))?,
             )

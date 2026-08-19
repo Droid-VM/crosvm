@@ -277,6 +277,15 @@ pub struct MemoryRegionOptions {
     /// phone with it; 32-64 MiB is the range that leaves room.
     pub step_size: u64,
 
+    /// Whether this pool's memory comes out of the VM's system RAM rather than being added on
+    /// top of it.
+    ///
+    /// The pool region itself is unaffected -- same size, same place, same everything. All this
+    /// changes is the arithmetic that sizes system RAM: with it set, a 4 GiB VM with a 1 GiB pool
+    /// has 3 GiB of RAM and takes 4 GiB from the host, instead of 4 GiB of RAM and taking 5. The
+    /// point is being able to say in advance what a VM will cost: ask for 4 GiB, get 4 GiB.
+    pub alloc_from_vm_sys_ram: bool,
+
     /// Cap on this pool's simultaneously live grants. Zero means "as many as the window holds",
     /// which is only safe for a small window: the real limit is MAX_MEMPARCEL_PER_VM = 1024 for
     /// the entire VM, and it is shared with Android's own parcels, so several pools each sizing
@@ -315,6 +324,12 @@ impl MemoryRegionOptions {
     pub fn growable_pool(mut self, pre_alloc: u64, step: u64) -> Self {
         self.pre_alloc_size = Some(pre_alloc);
         self.step_size = step;
+        self
+    }
+
+    /// Take this pool out of the VM's system RAM rather than adding it on top. See the field.
+    pub fn alloc_from_vm_sys_ram(mut self, from_sys_ram: bool) -> Self {
+        self.alloc_from_vm_sys_ram = from_sys_ram;
         self
     }
 

@@ -102,7 +102,7 @@ fn uart_hex(mut v: u64) {
 /// hidden from the host behind a clean line it already holds. `dc civac` is broadcast within the
 /// shareability domain both CPUs are in, so one instruction fixes both directions: it pushes the
 /// host's dirty line out and drops its stale one.
-fn cache_flush(addr: u64, len: usize) {
+pub(crate) fn cache_flush(addr: u64, len: usize) {
     const LINE: u64 = 64;
     let mut p = addr & !(LINE - 1);
     let end = addr + len as u64;
@@ -248,6 +248,9 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
         let tx = fdt::be64(&reg[0..8]).unwrap_or(0);
         let rx = fdt::be64(&reg[8..16]).unwrap_or(0);
         let mut rm = rm::Rm::new(tx, rx);
+        uart_str("SHIM: queue had ");
+        uart_hex(rm.drain() as u64);
+        uart_str(" stale messages\r\n");
 
         uart_str("SHIM: rm tx ");
         uart_hex(tx);
@@ -270,7 +273,24 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
                     h.error = code as u64;
                     die(code as u64, "the resource manager refused MEM_ACCEPT")
                 }
-                Err(rm::Error::Timeout) => die(0, "MEM_ACCEPT never got a reply"),
+                Err(rm::Error::Timeout) => {
+                    // What the wait saw, because "no reply" and "a reply we threw away" are the
+                    // same silence from here and completely different problems.
+                    let t = rm.trace;
+                    uart_str("SHIM: waited: received=");
+                    uart_hex(t.received as u64);
+                    uart_str(" last_err=");
+                    uart_hex(t.last_err);
+                    uart_str(" last_len=");
+                    uart_hex(t.last_len);
+                    uart_str(" hdr=");
+                    for b in t.last_hdr {
+                        uart_hex(b as u64);
+                        uart(b' ');
+                    }
+                    uart_str("\r\n");
+                    die(0, "MEM_ACCEPT never got a reply")
+                }
                 Err(rm::Error::Send(e)) => die(e, "could not send MEM_ACCEPT to the resource manager"),
             }
         }
@@ -291,14 +311,24 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
         }
 
         if hdr.flags & SHIM_FLAG_NO_DT_REWRITE == 0 {
-            if tree.set_memory_window(h.parcel[0].base, h.parcel[0].size).is_err() {
+            // One window, however many parcels it arrived in. The host splits it in address
+            // order, so the total is the sum -- but only if they really do join up, and a gap
+            // would put memory in /memory that nobody accepted.
+            let mut total = 0u64;
+            for i in 0..h.nparcels as usize {
+                if h.parcel[i].base != h.parcel[0].base + total {
+                    die(h.parcel[i].base, "the parcels do not join up")
+                }
+                total += h.parcel[i].size;
+            }
+            if tree.set_memory_window(h.parcel[0].base, total).is_err() {
                 die(0, "could not point /memory at the window")
             }
             h.status = SHIM_STATUS_DT_DONE;
             uart_str("SHIM: /memory now ");
             uart_hex(h.parcel[0].base);
             uart_str("+");
-            uart_hex(h.parcel[0].size);
+            uart_hex(total);
             uart_str("\r\n");
         }
     }
