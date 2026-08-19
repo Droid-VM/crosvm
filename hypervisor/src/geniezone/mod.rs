@@ -616,6 +616,12 @@ impl GeniezoneVm {
                 // and its pre_alloc/step are ignored, same as every other pool on this backend.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 MemoryRegionPurpose::DynamicTestPool => GZVM_USER_MEM_REGION_GUEST_MEM,
+                // Pseudo-unprotected is a Gunyah shape; here guest RAM is guest RAM and the
+                // handoff page is a page nobody needs to hand anything over through.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::SharedGuestRam => GZVM_USER_MEM_REGION_GUEST_MEM,
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::ShimHandoff => GZVM_USER_MEM_REGION_GUEST_MEM,
                 MemoryRegionPurpose::GuestMemoryRegion => GZVM_USER_MEM_REGION_GUEST_MEM,
                 MemoryRegionPurpose::ProtectedFirmwareRegion => GZVM_USER_MEM_REGION_PROTECT_FW,
                 MemoryRegionPurpose::ReservedMemory => GZVM_USER_MEM_REGION_GUEST_MEM,

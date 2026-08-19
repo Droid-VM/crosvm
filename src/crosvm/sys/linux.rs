@@ -1570,7 +1570,15 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             size.checked_mul(1024 * 1024)
                 .ok_or_else(|| anyhow!("requested swiotlb size too large"))?,
         )
-    } else if matches!(cfg.protection_type, ProtectionType::Unprotected) {
+    } else if matches!(
+        cfg.protection_type,
+        // A pseudo-unprotected VM has no use for a bounce pool: its RAM is shared to it rather
+        // than lent, so the host can already reach every buffer the guest hands a device. Worse
+        // than useless, in fact -- crosvm defaults protected VMs to 64 MiB of it, and that puts a
+        // `restricted-dma-pool` node in the tree for a guest kernel that was never built to
+        // honour one, which is the whole reason this mode exists.
+        ProtectionType::Unprotected | ProtectionType::ProtectedPseudoUnprotected
+    ) {
         None
     } else {
         Some(64 * 1024 * 1024)

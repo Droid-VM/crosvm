@@ -2094,6 +2094,15 @@ pub struct RunCommand {
     /// prevent host access to guest memory
     pub protected_vm: Option<bool>,
 
+    #[argh(switch)]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// (EXPERIMENTAL, Gunyah only) run protected, but SHARE the guest's RAM to it at run time
+    /// instead of lending it before boot, so the host can still reach it. A boot shim inside the
+    /// VM accepts the memory before the payload runs. Removes the need for a bounce pool, and so
+    /// for a guest kernel built with CONFIG_RESTRICTED_DMA_POOL
+    protected_vm_pseudo_unprotected: Option<bool>,
+
     #[argh(option, arg_name = "PATH")]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = overwrite_option)]
@@ -3729,6 +3738,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             cmd.protected_vm.unwrap_or_default(),
             cmd.protected_vm_with_firmware.is_some(),
             cmd.protected_vm_without_firmware.unwrap_or_default(),
+            cmd.protected_vm_pseudo_unprotected.unwrap_or_default(),
             cmd.unprotected_vm_with_firmware.is_some(),
         ];
 
@@ -3740,6 +3750,8 @@ impl TryFrom<RunCommand> for super::config::Config {
             ProtectionType::Protected
         } else if cmd.protected_vm_without_firmware.unwrap_or_default() {
             ProtectionType::ProtectedWithoutFirmware
+        } else if cmd.protected_vm_pseudo_unprotected.unwrap_or_default() {
+            ProtectionType::ProtectedPseudoUnprotected
         } else if let Some(p) = cmd.protected_vm_with_firmware {
             if !p.exists() || !p.is_file() {
                 return Err(

@@ -3,4 +3,4 @@
 # directory's pin from applying to a bare-metal binary it was never meant to describe.
 [toolchain]
 channel = "stable"
-targets = ["aarch64-unknown-none"]
+targets = ["aarch64-unknown-none-softfloat"]

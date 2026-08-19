@@ -226,6 +226,13 @@ impl VmAArch64 for GunyahVm {
                         true
                     }
                 }
+                // The window gets no shm vdevice: nothing about it is handed over at VM
+                // creation, and a node describing memory the resource manager has not been given
+                // is exactly what it refuses to start a VM over.
+                MemoryRegionPurpose::SharedGuestRam => false,
+                // The handoff page does, like every other SHARE'd region: on android14-6.1 this
+                // node's `base` is what pins the memparcel at the address crosvm chose.
+                MemoryRegionPurpose::ShimHandoff => true,
                 MemoryRegionPurpose::GuestMemoryRegion => false,
                 // Described by the "firmware-address" property
                 MemoryRegionPurpose::ProtectedFirmwareRegion => false,

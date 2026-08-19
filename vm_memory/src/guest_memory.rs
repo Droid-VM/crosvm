@@ -183,6 +183,26 @@ pub enum MemoryRegionPurpose {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     SharedFramebuffer,
 
+    /// DroidVM: the guest's RAM in a pseudo-unprotected VM.
+    ///
+    /// Declared to crosvm like any region -- it is a memfd the host writes the payload into
+    /// before the VM starts -- but never handed to the hypervisor at boot. It appears in no
+    /// device tree node, so the resource manager has nothing to object to, and arrives in the
+    /// guest as a runtime memparcel the boot shim accepts. From then on it is ordinary memory
+    /// that both sides can reach, which is the point: no bounce pool, and a stock kernel with no
+    /// CONFIG_RESTRICTED_DMA_POOL boots.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    SharedGuestRam,
+
+    /// DroidVM: the page a pseudo-unprotected VM's host and shim talk through.
+    ///
+    /// SHARE'd at boot like a pool, because the memparcel handles it carries do not exist until
+    /// after GH_VM_START -- by which time the boot region is lent and the host can no longer
+    /// write to it. It is also the shim's only way to report: a failure written here is a log
+    /// line, and a failure with nowhere to go is a VM that hangs.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    ShimHandoff,
+
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     StaticSwiotlbRegion,
 
@@ -989,6 +1009,15 @@ impl GuestMemory {
             MemoryRegionPurpose::DynamicTestPool => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
+            // The window of a pseudo-unprotected VM, and the page the shim is told about it
+            // through. Both are SHARE'd rather than lent -- that is the whole of the mode -- so
+            // the host keeps its access, and needs it: the window IS the guest's RAM, and every
+            // virtqueue the guest publishes lives in it. Gating them here is what a protected VM
+            // needs and what this one exists to avoid.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::SharedGuestRam => Ok(()),
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::ShimHandoff => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::SharedFramebuffer => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

@@ -38,6 +38,7 @@ use rand::RngCore;
 use resources::AddressRange;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionPurpose;
 
 // These are GIC address-space location constants.
 use crate::AARCH64_GIC_CPUI_BASE;
@@ -103,9 +104,19 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     //
     // Non-growable pools stay in `/memory` exactly as before, marked no-map by their node -- the
     // arrangement every existing pool boots with.
-    let growable: HashSet<u64> = guest_mem
+    // A pseudo-unprotected VM's window is left out for the same reason and one more: nothing has
+    // been handed to the hypervisor for it yet, and the guest is not told it exists until the
+    // shim has accepted it and pointed `/memory` here itself. The handoff page is not the guest's
+    // RAM either -- it is the one place the host can still write once the boot region is lent.
+    let hidden: HashSet<u64> = guest_mem
         .regions()
-        .filter(|r| r.options.step_size != 0)
+        .filter(|r| {
+            r.options.step_size != 0
+                || matches!(
+                    r.options.purpose,
+                    MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::ShimHandoff
+                )
+        })
         .map(|r| r.guest_addr.offset())
         .collect();
     let mut regions = guest_mem.guest_memory_regions();
@@ -114,7 +125,7 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
         if region.0.offset() == AARCH64_PROTECTED_VM_FW_START {
             continue;
         }
-        if growable.contains(&region.0.offset()) {
+        if hidden.contains(&region.0.offset()) {
             continue;
         }
         // Merge with the previous region if possible.
@@ -734,7 +745,9 @@ fn create_rtc_node(fdt: &mut Fdt) -> Result<()> {
 
     let rtc_name = format!("rtc@{:x}", AARCH64_RTC_ADDR);
     let reg = [AARCH64_RTC_ADDR, AARCH64_RTC_SIZE];
-    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_RTC_IRQ, IRQ_TYPE_LEVEL_HIGH];
+    // Same as the PL061 below: the PL030 alarm is an IrqEdgeEvent, so declare the line edge-
+    // triggered instead of level (a level declaration on an edge doorbell storms after EOI).
+    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_RTC_IRQ, IRQ_TYPE_EDGE_RISING];
 
     let rtc_node = fdt.root_mut().subnode_mut(&rtc_name)?;
     rtc_node.set_prop("compatible", "arm,primecell")?;
@@ -759,7 +772,13 @@ fn create_gpio_node(fdt: &mut Fdt) -> Result<()> {
 
     let gpio_name = format!("gpio@{:x}", AARCH64_GPIO_ADDR);
     let reg = [AARCH64_GPIO_ADDR, AARCH64_GPIO_SIZE];
-    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_GPIO_IRQ, IRQ_TYPE_LEVEL_HIGH];
+    // The PL061 model injects its aggregate interrupt through an IrqEdgeEvent (one edge per
+    // rising transition of MIS -- the Gunyah irqchip only supports edge irqfds, and the doorbell
+    // vdevice behind it is declared IRQ_TYPE_EDGE_RISING in the hypervisor DT). Declaring it
+    // LEVEL_HIGH here made the guest GIC treat the doorbell as a level line that nobody ever
+    // deasserts: the first power-button press left vCPU0 spinning in the interrupt handler
+    // (RCU stalls, soft lockups, hung tasks -- a hard guest hang on every "Power" press).
+    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_GPIO_IRQ, IRQ_TYPE_EDGE_RISING];
 
     let gpio_node = fdt.root_mut().subnode_mut(&gpio_name)?;
     gpio_node.set_prop("compatible", &["arm,pl061", "arm,primecell"])?;
@@ -946,6 +965,7 @@ pub fn create_fdt(
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
     venus_resv: Option<(u64, u64)>,
     test_pool_resv: Vec<(u64, u64, u64, u64)>,
+    shim_handoff_resv: Option<(u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
@@ -1030,6 +1050,28 @@ pub fn create_fdt(
             None
         };
         create_pool_node(&mut fdt, "gpu_guest", gpa, size, None, growable)?;
+    }
+
+    // The shim's handoff page. It is a SHARE'd region like the pools, and it needs this node for
+    // the same reason they do: the resource manager blesses a memparcel by finding a
+    // `/reserved-memory` child whose `reg` matches it, and refuses to start a VM that was handed
+    // a parcel no node accounts for (measured on sm8650 / android14-6.1: without this node
+    // GH_VM_START answers NORESOURCE, and the whole VM never runs). The guest ignores it -- the
+    // compatible is a vendor string no Linux handler claims, and `no-map` keeps it out of the
+    // linear map -- and the shim does not read it either, since crosvm patches the address
+    // straight into the shim's header.
+    if let Some((gpa, size)) = shim_handoff_resv {
+        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+        resv.set_prop("#address-cells", 0x2u32)?;
+        resv.set_prop("#size-cells", 0x2u32)?;
+        resv.set_prop("ranges", ())?;
+        let node = resv.subnode_mut(&format!("shim_handoff@{:x}", gpa))?;
+        // Its own compatible rather than `droidvm,pool`: edk2's GunyahPoolAcpiDxe turns every
+        // pool node into an ACPI device, and this is not a pool -- it is one page of protocol
+        // between the host and the shim, finished with before anything else runs.
+        node.set_prop("compatible", "droidvm,shim-handoff")?;
+        node.set_prop("reg", &[gpa, size])?;
+        node.set_prop("no-map", ())?;
     }
 
     // The growable test pool: exists so the grow/shrink path can be exercised end to end without

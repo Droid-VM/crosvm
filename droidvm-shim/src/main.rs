@@ -62,6 +62,66 @@ fn handoff() -> Option<&'static mut ShimHandoff> {
     }
 }
 
+/// The console, for the shim.
+///
+/// crosvm puts an 8250 at 0x3f8 and the MMU is off, so a byte stored there is a Device write that
+/// leaves the VM on the spot and lands in the same log the guest's own console does. Everything
+/// else the shim could say has to travel through memory shared with a host that caches it; this
+/// does not, which is why the interesting moments are marked here as well as in the handoff page.
+fn uart(b: u8) {
+    // SAFETY: MMIO the VMM owns; a store there has no other effect than the device's.
+    unsafe { ptr::write_volatile(0x3f8 as *mut u8, b) }
+}
+
+fn uart_str(text: &str) {
+    for b in text.as_bytes() {
+        uart(*b);
+    }
+}
+
+fn uart_hex(mut v: u64) {
+    uart_str("0x");
+    let mut started = false;
+    for shift in (0..16).rev() {
+        let nib = ((v >> (shift * 4)) & 0xf) as u8;
+        if nib != 0 || started || shift == 0 {
+            started = true;
+            uart(if nib < 10 { b'0' + nib } else { b'a' + nib - 10 });
+        }
+    }
+    v = 0;
+    let _ = v;
+}
+
+/// Clean and invalidate the cache lines covering `addr..addr + len`, to the point of coherency.
+///
+/// The shim runs with the MMU off, so every access it makes is Device: it reads and writes real
+/// memory and never a cache line. The host does neither -- it talks to the handoff page through
+/// an ordinary cacheable mapping. Without this, a value the host wrote can still be sitting dirty
+/// in its cache when the shim reads straight past it from DRAM, and a value the shim wrote can be
+/// hidden from the host behind a clean line it already holds. `dc civac` is broadcast within the
+/// shareability domain both CPUs are in, so one instruction fixes both directions: it pushes the
+/// host's dirty line out and drops its stale one.
+fn cache_flush(addr: u64, len: usize) {
+    const LINE: u64 = 64;
+    let mut p = addr & !(LINE - 1);
+    let end = addr + len as u64;
+    while p < end {
+        // SAFETY: cache maintenance by VA on memory the guest owns; no side effect but coherency.
+        unsafe { core::arch::asm!("dc civac, {}", in(reg) p, options(nostack, preserves_flags)) };
+        p += LINE;
+    }
+    // SAFETY: a barrier.
+    unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
+}
+
+/// The handoff page, either way round: called before reading it and after writing it.
+fn handoff_sync() {
+    if let Some(h) = handoff() {
+        cache_flush(h as *const ShimHandoff as u64, core::mem::size_of::<ShimHandoff>());
+    }
+}
+
 fn say(text: &str) {
     if let Some(h) = handoff() {
         let n = text.len().min(h.msg.len() - 1);
@@ -71,11 +131,17 @@ fn say(text: &str) {
 }
 
 fn die(err: u64, text: &str) -> ! {
+    uart_str("\r\nSHIM DIED: ");
+    uart_str(text);
+    uart_str(" err=");
+    uart_hex(err);
+    uart_str("\r\n");
     if let Some(h) = handoff() {
         h.error = err;
         say(text);
         h.status = SHIM_STATUS_ERROR;
     }
+    handoff_sync();
     hang()
 }
 
@@ -101,33 +167,55 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
     let hdr = unsafe { ptr::read_volatile(ptr::addr_of!(shim_header)) };
     if hdr.magic != SHIM_HEADER_MAGIC || hdr.version != SHIM_ABI_VERSION {
         // Nothing to complain into: the handoff address is in the header we just failed to trust.
+        uart_str("\r\nSHIM: header magic is wrong\r\n");
         hang()
     }
+    uart_str("\r\nSHIM: payload ");
+    uart_hex(hdr.payload);
+    uart_str(" handoff ");
+    uart_hex(hdr.handoff);
 
     // SAFETY: the address came from the header; the region is shared with us for the VM's life.
     unsafe { HANDOFF = hdr.handoff as *mut ShimHandoff };
     let Some(h) = handoff() else { hang() };
+    // The host wrote the page before the VM existed, through a cacheable mapping. Nothing here is
+    // trustworthy until its lines have been pushed out of the host's cache.
+    handoff_sync();
     if h.magic != SHIM_HANDOFF_MAGIC || h.version != SHIM_ABI_VERSION {
+        uart_str(" -- handoff magic is wrong: ");
+        uart_hex(h.magic);
+        uart_str("\r\n");
         hang()
     }
     h.status = SHIM_STATUS_RUNNING;
+    handoff_sync();
 
     if hdr.payload == 0 {
         die(0, "no payload address in the header")
     }
 
+    // `ready` is written last by the host, so NOTHING else on the page -- the parcel count
+    // included -- means anything until it is set. The host sets it even when it has nothing to
+    // hand over, so this wait is unconditional and reading the count comes after it.
+    let mut spun = 0u64;
+    while unsafe { ptr::read_volatile(ptr::addr_of!(h.ready)) } == 0 {
+        spun += 1;
+        if spun % 4096 == 0 {
+            // The host's write is sitting in its own cache until something pushes it out, and
+            // this loop is the only thing running that can.
+            handoff_sync();
+        }
+        if spun > 200_000_000 {
+            die(0, "the host never finished sharing the window")
+        }
+    }
+    uart_str(" ready parcels=");
+    uart_hex(h.nparcels as u64);
+    uart_str("\r\n");
+
     if h.nparcels > 0 {
         if h.nparcels as usize > SHIM_MAX_PARCELS {
             die(h.nparcels as u64, "more parcels than the handoff page can hold")
-        }
-        // `ready` is written last by the host, so everything above it is only meaningful once it
-        // is set. Volatile because the host writes it from outside this CPU's view of the world.
-        let mut spun = 0u64;
-        while unsafe { ptr::read_volatile(ptr::addr_of!(h.ready)) } == 0 {
-            spun += 1;
-            if spun > 200_000_000 {
-                die(0, "the host never finished sharing the window")
-            }
         }
 
         // The device tree, for the two capability ids the accept needs. This is why the tree has
@@ -161,8 +249,21 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
         let rx = fdt::be64(&reg[8..16]).unwrap_or(0);
         let mut rm = rm::Rm::new(tx, rx);
 
+        uart_str("SHIM: rm tx ");
+        uart_hex(tx);
+        uart_str(" rx ");
+        uart_hex(rx);
+        uart_str("\r\n");
+
         for i in 0..h.nparcels as usize {
             let p = h.parcel[i];
+            uart_str("SHIM: accept handle ");
+            uart_hex(p.handle as u64);
+            uart_str(" at ");
+            uart_hex(p.base);
+            uart_str(" size ");
+            uart_hex(p.size);
+            uart_str("\r\n");
             match rm.mem_accept(p.handle, p.base, p.size) {
                 Ok(()) => {}
                 Err(rm::Error::Refused(code)) => {
@@ -174,9 +275,19 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
             }
         }
         h.status = SHIM_STATUS_ACCEPTED;
+        handoff_sync();
+        uart_str("SHIM: accepted\r\n");
 
         if hdr.flags & SHIM_FLAG_PROBE_EXEC != 0 {
-            h.exec_probe = probe_exec(h.parcel[0].base);
+            // The LAST page of the window, never the first: the payload is already sitting at the
+            // bottom of it, written there by the host before the VM started, and two instructions
+            // dropped on its head would be a boot failure with a very confusing signature.
+            let p = h.parcel[h.nparcels as usize - 1];
+            uart_str("SHIM: exec probe\r\n");
+            h.exec_probe = probe_exec(p.base + p.size - 4096);
+            uart_str("SHIM: exec probe returned ");
+            uart_hex(h.exec_probe);
+            uart_str("\r\n");
         }
 
         if hdr.flags & SHIM_FLAG_NO_DT_REWRITE == 0 {
@@ -184,11 +295,45 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
                 die(0, "could not point /memory at the window")
             }
             h.status = SHIM_STATUS_DT_DONE;
+            uart_str("SHIM: /memory now ");
+            uart_hex(h.parcel[0].base);
+            uart_str("+");
+            uart_hex(h.parcel[0].size);
+            uart_str("\r\n");
         }
     }
 
     h.status = SHIM_STATUS_JUMPING;
+    handoff_sync();
+    uart_str("SHIM: jumping to ");
+    uart_hex(hdr.payload);
+    uart_str("\r\n");
     hdr.payload
+}
+
+/// Every exception the shim can take, which is to say every one that means it is over.
+///
+/// Called from the vector table with the slot index and the three registers that say what
+/// happened. It prints them and stops: there is nothing here that could recover, and a shim that
+/// spins in a fault instead of stopping takes the host's CPU with it.
+#[no_mangle]
+pub extern "C" fn shim_exception(index: u64, esr: u64, elr: u64, far: u64) -> ! {
+    uart_str("\r\nSHIM EXCEPTION ");
+    uart_hex(index);
+    uart_str(" esr=");
+    uart_hex(esr);
+    uart_str(" elr=");
+    uart_hex(elr);
+    uart_str(" far=");
+    uart_hex(far);
+    uart_str("\r\n");
+    if let Some(h) = handoff() {
+        h.error = esr;
+        h.status = SHIM_STATUS_ERROR;
+        say("took an exception");
+    }
+    handoff_sync();
+    hang()
 }
 
 /// Can the guest execute out of the window?
@@ -198,12 +343,14 @@ pub extern "C" fn shim_main(dtb: *mut u8) -> u64 {
 /// with PXN cleared is refused by FEAT_PAN3. Here the MMU is off, so there is no stage-1
 /// permission to blame -- if this faults, stage 2 refused the fetch, and the VM dies loudly
 /// rather than a kernel crashing much later for reasons nobody can trace back.
-fn probe_exec(base: u64) -> u64 {
+///
+/// `at` is a page of the window nothing else is using; the caller keeps it away from the payload.
+fn probe_exec(at: u64) -> u64 {
     const MOV_X0_42: u32 = 0xd280_0540;
     const RET: u32 = 0xd65f_03c0;
     // SAFETY: the window was accepted above, so these addresses are real memory the guest owns.
     unsafe {
-        let code = base as *mut u32;
+        let code = at as *mut u32;
         ptr::write_volatile(code, MOV_X0_42);
         ptr::write_volatile(code.add(1), RET);
         core::arch::asm!("dsb sy", "ic iallu", "dsb sy", "isb", options(nostack));

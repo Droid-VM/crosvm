@@ -113,6 +113,25 @@ pub const AARCH64_PHYS_MEM_START: u64 = 0x80000000;
 const AARCH64_PLATFORM_MMIO_SIZE: u64 = 0x800000;
 const AARCH64_PFLASH_MAX_SIZE: u64 = AARCH64_PLATFORM_MMIO_SIZE;
 
+/// The lent region a pseudo-unprotected VM boots in: the shim, then the device tree.
+///
+/// It is as small as the two things in it allow. The shim is a few kilobytes and its stack is 16
+/// KiB, so what sets the size is the device tree: crosvm reserves AARCH64_FDT_MAX_SIZE for it at
+/// AARCH64_FDT_ALIGN, and it has to live here rather than in the window because the resource
+/// manager finds the guest's image through the parcel that contains the tree.
+///
+/// Everything above this is the window -- the guest's real RAM -- which is why this comes out of
+/// `--mem` rather than being added to it: the pools and the MMIO windows are placed relative to
+/// the top of `--mem`, so a VM in this mode has exactly the layout it would have had, with its
+/// RAM starting a few megabytes higher.
+const AARCH64_SHIM_BOOT_REGION_SIZE: u64 = AARCH64_FDT_ALIGN + AARCH64_FDT_MAX_SIZE;
+
+/// Where the device tree goes inside the boot region: after the shim's own 2 MiB.
+const AARCH64_SHIM_FDT_OFFSET: u64 = AARCH64_FDT_ALIGN;
+
+/// The page the host and the shim talk through. One folio, immediately above the boot region.
+const AARCH64_SHIM_HANDOFF_SIZE: u64 = 0x200000;
+
 const AARCH64_PROTECTED_VM_FW_MAX_SIZE: u64 = 0x400000;
 const AARCH64_PROTECTED_VM_FW_START: u64 =
     AARCH64_PHYS_MEM_START - AARCH64_PROTECTED_VM_FW_MAX_SIZE;
@@ -400,6 +419,11 @@ pub enum Error {
     PflashTooLarge(u64, u64),
     #[error("failed to prepare gpu blob arena: {0}")]
     PrepareBlobArena(base::Error),
+    #[error(
+        "--mem {0:#x} leaves no room for the guest's RAM: a pseudo-unprotected VM spends the \
+         bottom of it on the shim, the device tree and the handoff page"
+    )]
+    PseudoUnprotectedTooSmall(u64),
     #[error("pVM firmware could not be loaded: {0}")]
     PvmFwLoadFailure(base::Error),
     #[error("ramoops address is different from high_mmio_base: {0} vs {1}")]
@@ -428,6 +452,10 @@ pub enum Error {
     SetReg(base::Error),
     #[error("failed to set up guest memory: {0}")]
     SetupGuestMemory(GuestMemoryError),
+    #[error("the compiled-in boot shim does not start with the header magic ({0:#x})")]
+    ShimBadImage(u64),
+    #[error("boot shim could not be written to guest memory: {0}")]
+    ShimLoadFailure(vm_memory::GuestMemoryError),
     #[error("this function isn't supported")]
     Unsupported,
     #[error("failed to initialize VCPU: {0}")]
@@ -476,6 +504,97 @@ fn get_block_size() -> u64 {
     let block_size = page_size * ptes_per_page;
 
     block_size as u64
+}
+
+/// The boot shim, built before crosvm and compiled in.
+///
+/// A separate file would be one more thing that can be stale on the phone while looking right in
+/// the log, and the shim and crosvm share an ABI neither can check at run time: a mismatch is a VM
+/// that starts, hangs, and says nothing.
+const SHIM_IMAGE: &[u8] = include_bytes!("../../hypervisor/src/gunyah/shim.bin");
+
+/// Copy the shim to the base of the boot region and fill in the two addresses only the host knows.
+///
+/// Everything else in the shim is position-independent; these two are not, and there is no second
+/// chance to write them -- the region is lent immediately after this.
+fn load_shim(
+    mem: &GuestMemory,
+    at: GuestAddress,
+    payload: GuestAddress,
+    handoff: GuestAddress,
+    probe_exec: bool,
+) -> std::result::Result<(), Error> {
+    use hypervisor::gunyah_shim_abi as abi;
+
+    mem.write_all_at_addr(SHIM_IMAGE, at)
+        .map_err(Error::ShimLoadFailure)?;
+
+    let mut flags = 0u32;
+    if probe_exec {
+        flags |= abi::SHIM_FLAG_PROBE_EXEC;
+    }
+    let header = abi::ShimHeader {
+        magic: abi::SHIM_HEADER_MAGIC,
+        version: abi::SHIM_ABI_VERSION,
+        flags,
+        payload: payload.offset(),
+        handoff: handoff.offset(),
+        dtb_max_size: AARCH64_FDT_MAX_SIZE,
+        reserved: [0; 3],
+    };
+    // The magic the image was built with has to be the magic we are about to overwrite: if the
+    // blob compiled in is not the shim this crosvm was built against, better to say so here than
+    // to hand the hypervisor an entry point and watch it go quiet.
+    let built_magic = u64::from_le_bytes(
+        SHIM_IMAGE[abi::SHIM_HEADER_OFFSET..abi::SHIM_HEADER_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    if built_magic != abi::SHIM_HEADER_MAGIC {
+        return Err(Error::ShimBadImage(built_magic));
+    }
+    let header_at = at
+        .checked_add(abi::SHIM_HEADER_OFFSET as u64)
+        .ok_or(Error::ShimBadImage(0))?;
+    // SAFETY: ShimHeader is repr(C) and made only of integers, so every byte pattern is a valid
+    // one and there is no padding to leak.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const abi::ShimHeader as *const u8,
+            std::mem::size_of::<abi::ShimHeader>(),
+        )
+    };
+    mem.write_all_at_addr(bytes, header_at)
+        .map_err(Error::ShimLoadFailure)?;
+    base::info!(
+        "GH-SHIM: {} bytes at {:#x}; payload {:#x}, handoff {:#x}, flags {:#x}",
+        SHIM_IMAGE.len(),
+        at.offset(),
+        payload.offset(),
+        handoff.offset(),
+        flags,
+    );
+    Ok(())
+}
+
+/// Put the handoff page into the state the shim expects to find it in.
+///
+/// Only the magic and the version: the parcels are filled in after the VM has started, because
+/// their handles do not exist until then. `ready` stays zero until they are, which is what stops a
+/// shim that outruns the host from accepting a handle of zero.
+fn init_handoff(mem: &GuestMemory, at: GuestAddress) -> std::result::Result<(), Error> {
+    use hypervisor::gunyah_shim_abi as abi;
+
+    let handoff = abi::ShimHandoff::default();
+    // SAFETY: repr(C), integers and a byte array; no padding to leak and no invalid pattern.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &handoff as *const abi::ShimHandoff as *const u8,
+            std::mem::size_of::<abi::ShimHandoff>(),
+        )
+    };
+    mem.write_all_at_addr(bytes, at)
+        .map_err(Error::ShimLoadFailure)
 }
 
 fn get_vcpu_mpidr_aff<Vcpu: VcpuAArch64>(vcpus: &[Vcpu], index: usize) -> Option<u64> {
@@ -576,11 +695,52 @@ impl arch::LinuxArch for AArch64 {
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
         let main_memory_size = main_memory_size(components, hypervisor);
 
-        let mut memory_regions = vec![(
-            GuestAddress(AARCH64_PHYS_MEM_START),
-            main_memory_size,
-            MemoryRegionOptions::new().align(get_block_size()),
-        )];
+        // In a pseudo-unprotected VM the guest's RAM is not lent to it: the region at the bottom
+        // holds only the shim and the device tree, and everything above it is a window the host
+        // shares after the VM has started and the shim accepts before the payload runs. The
+        // handoff page sits between them because the host needs somewhere it can still write to
+        // once the boot region has been lent away.
+        let mut memory_regions = if components.hv_cfg.protection_type.shares_guest_ram() {
+            // The boot region is as small as it can be and still hold the shim and the device
+            // tree; DROIDVM_SHIM_BOOT_MB moves it, because "as small as it can be" is a claim
+            // about a payload nobody has met yet.
+            let boot = std::env::var("DROIDVM_SHIM_BOOT_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb << 20)
+                .unwrap_or(AARCH64_SHIM_BOOT_REGION_SIZE);
+            let handoff = AARCH64_SHIM_HANDOFF_SIZE;
+            let window = main_memory_size
+                .checked_sub(boot + handoff)
+                .ok_or(Error::PseudoUnprotectedTooSmall(main_memory_size))?;
+            vec![
+                (
+                    GuestAddress(AARCH64_PHYS_MEM_START),
+                    boot,
+                    MemoryRegionOptions::new().align(get_block_size()),
+                ),
+                (
+                    GuestAddress(AARCH64_PHYS_MEM_START + boot),
+                    handoff,
+                    MemoryRegionOptions::new()
+                        .purpose(MemoryRegionPurpose::ShimHandoff)
+                        .align(2 << 20),
+                ),
+                (
+                    GuestAddress(AARCH64_PHYS_MEM_START + boot + handoff),
+                    window,
+                    MemoryRegionOptions::new()
+                        .purpose(MemoryRegionPurpose::SharedGuestRam)
+                        .align(2 << 20),
+                ),
+            ]
+        } else {
+            vec![(
+                GuestAddress(AARCH64_PHYS_MEM_START),
+                main_memory_size,
+                MemoryRegionOptions::new().align(get_block_size()),
+            )]
+        };
 
         // Allocate memory for the pVM firmware.
         if components.hv_cfg.protection_type.runs_firmware() {
@@ -889,16 +1049,50 @@ impl arch::LinuxArch for AArch64 {
 
         let main_memory_size = main_memory_size(&components, vm.get_hypervisor());
 
+        // Where the guest's RAM begins. In a pseudo-unprotected VM the bottom of the address
+        // space is the shim's, the device tree's and the handoff page's; everything the payload
+        // will ever see starts above them.
+        let shares_guest_ram = components.hv_cfg.protection_type.shares_guest_ram();
+        let window_start = if shares_guest_ram {
+            mem.regions()
+                .find(|r| r.options.purpose == MemoryRegionPurpose::SharedGuestRam)
+                .map(|r| r.guest_addr.offset())
+                .ok_or(Error::PseudoUnprotectedTooSmall(main_memory_size))?
+        } else {
+            AARCH64_PHYS_MEM_START
+        };
+        // Where the handoff page ended up, read back off the layout for the same reason: one place
+        // decides it, everything else asks.
+        let handoff_addr = mem
+            .regions()
+            .find(|r| r.options.purpose == MemoryRegionPurpose::ShimHandoff)
+            .map(|r| r.guest_addr);
+
         let fdt_position = fdt_position.unwrap_or(if has_bios {
             FdtPosition::Start
         } else {
             FdtPosition::End
         });
-        let payload_address = match fdt_position {
-            // If FDT is at the start RAM, the payload needs to go somewhere after it.
-            FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_FDT_MAX_SIZE),
-            // Otherwise, put the payload at the start of RAM.
-            FdtPosition::End | FdtPosition::AfterPayload => GuestAddress(AARCH64_PHYS_MEM_START),
+        // The device tree stays in the lent boot region even in the pseudo-unprotected mode: the
+        // resource manager locates the guest's image through the parcel that carries the tree, so
+        // it cannot live in a window that does not exist yet. The payload goes to the bottom of
+        // the window instead, and the shim is what the hypervisor starts.
+        let fdt_position = if shares_guest_ram {
+            FdtPosition::Start
+        } else {
+            fdt_position
+        };
+        let payload_address = if shares_guest_ram {
+            GuestAddress(window_start)
+        } else {
+            match fdt_position {
+                // If FDT is at the start RAM, the payload needs to go somewhere after it.
+                FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_FDT_MAX_SIZE),
+                // Otherwise, put the payload at the start of RAM.
+                FdtPosition::End | FdtPosition::AfterPayload => {
+                    GuestAddress(AARCH64_PHYS_MEM_START)
+                }
+            }
         };
 
         // separate out image loading from other setup to get a specific error for
@@ -928,8 +1122,12 @@ impl arch::LinuxArch for AArch64 {
                         let mut initrd_file = initrd_file;
                         let initrd_addr = (kernel_end + 1 + (AARCH64_INITRD_ALIGN - 1))
                             & !(AARCH64_INITRD_ALIGN - 1);
+                        // Measured from where the payload actually lives: in the
+                        // pseudo-unprotected mode that is the window, which starts above the boot
+                        // region rather than at the bottom of the address space.
                         let initrd_max_size =
-                            main_memory_size.saturating_sub(initrd_addr - AARCH64_PHYS_MEM_START);
+                            (AARCH64_PHYS_MEM_START + main_memory_size)
+                                .saturating_sub(initrd_addr);
                         let initrd_addr = GuestAddress(initrd_addr);
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
@@ -949,6 +1147,11 @@ impl arch::LinuxArch for AArch64 {
         let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + main_memory_size);
 
         let fdt_address = match fdt_position {
+            // In the pseudo-unprotected mode the bottom of the boot region belongs to the shim,
+            // and the tree follows it; everywhere else "start" means the very bottom of RAM.
+            FdtPosition::Start if shares_guest_ram => {
+                GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_SHIM_FDT_OFFSET)
+            }
             FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START),
             FdtPosition::End => {
                 let addr = memory_end
@@ -1376,6 +1579,11 @@ impl arch::LinuxArch for AArch64 {
             }
             found
         };
+        // The handoff page, read back off the layout like every other region the tree describes.
+        let shim_handoff_resv: Option<(u64, u64)> = mem
+            .regions()
+            .find(|r| r.options.purpose == MemoryRegionPurpose::ShimHandoff)
+            .map(|r| (r.guest_addr.offset(), r.size as u64));
         let mut drm2kgsl_resv: Option<(u64, u64)> = None;
         let mut venus_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
@@ -1518,6 +1726,7 @@ impl arch::LinuxArch for AArch64 {
             gpu_guest_resv,
             venus_resv,
             test_pool_resv,
+            shim_handoff_resv,
             drm2kgsl_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,
@@ -1552,8 +1761,37 @@ impl arch::LinuxArch for AArch64 {
         )
         .map_err(Error::CreateFdt)?;
 
+        // The shim, and the entry point that goes with it.
+        //
+        // In a pseudo-unprotected VM the hypervisor does not start the payload: it starts the
+        // shim, at the base of the lent region, because the payload's memory does not exist yet.
+        // The shim is copied in here and its header patched with the two addresses only the host
+        // knows -- where the payload is, and where the page they talk through is -- since after
+        // this the region is lent and the host cannot write to it again.
+        let entry = if shares_guest_ram {
+            let handoff_addr = handoff_addr.unwrap_or(GuestAddress(0));
+            load_shim(
+                &mem,
+                GuestAddress(AARCH64_PHYS_MEM_START),
+                payload.entry(),
+                handoff_addr,
+                // DROIDVM_SHIM_PROBE_EXEC (diagnostic): have the shim execute two instructions
+                // out of the window before handing over. It is the only place the question can
+                // be asked -- the MMU is off there, so a fault is stage 2 and nothing else -- and
+                // it is off by default because a VM that dies proving a point is still a VM that
+                // died.
+                std::env::var_os("DROIDVM_SHIM_PROBE_EXEC").is_some_and(|v| v != "0"),
+            )?;
+            if handoff_addr.offset() != 0 {
+                init_handoff(&mem, handoff_addr)?;
+            }
+            GuestAddress(AARCH64_PHYS_MEM_START)
+        } else {
+            payload.entry()
+        };
+
         vm.init_arch(
-            payload.entry(),
+            entry,
             fdt_address,
             AARCH64_FDT_MAX_SIZE.try_into().unwrap(),
         )
