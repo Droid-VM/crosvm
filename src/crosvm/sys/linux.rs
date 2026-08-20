@@ -382,6 +382,7 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
     #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "gpu")] external_scanout_out: &mut Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -1170,6 +1171,7 @@ fn create_devices(
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
     #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "gpu")] external_scanout_out: &mut Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -1309,6 +1311,8 @@ fn create_devices(
         registered_evt_q,
         #[cfg(feature = "vnc")]
         simplefb_event_devices_out,
+        #[cfg(feature = "gpu")]
+        external_scanout_out,
     )?;
 
     for stub in stubs {
@@ -2446,6 +2450,8 @@ where
 
     #[cfg(feature = "vnc")]
     let mut simplefb_event_devices: Vec<EventDevice> = Vec::new();
+    #[cfg(feature = "gpu")]
+    let mut external_scanout: Option<Arc<virtio::ExternalScanout>> = None;
 
     let mut devices = create_devices(
         &cfg,
@@ -2465,6 +2471,8 @@ where
         &mut worker_process_pids,
         #[cfg(feature = "vnc")]
         &mut simplefb_event_devices,
+        #[cfg(feature = "gpu")]
+        &mut external_scanout,
     )?;
 
     #[cfg(feature = "pci-hotplug")]
@@ -2750,6 +2758,8 @@ where
         vcpu_domain_paths,
         #[cfg(feature = "vnc")]
         simplefb_event_devices,
+        #[cfg(feature = "gpu")]
+        external_scanout,
     )
 }
 
@@ -3863,6 +3873,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         PathBuf,
     >,
     #[cfg(feature = "vnc")] simplefb_event_devices: Vec<EventDevice>,
+    #[cfg(feature = "gpu")] external_scanout: Option<Arc<virtio::ExternalScanout>>,
 ) -> Result<ExitState> {
     // Split up `all_control_tubes`.
     #[cfg(feature = "balloon")]
@@ -4048,6 +4059,28 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         let android_service = cfg.android_display_service.clone();
         #[cfg(not(feature = "android_display"))]
         let android_service: Option<String> = None;
+
+        // With a GPU device present there is exactly one display and it belongs to that device;
+        // feed it instead of opening a second one (see ExternalScanout). Without a GPU the bridge
+        // presents on its own, as it always did.
+        #[cfg(feature = "gpu")]
+        if let Some(scanout) = external_scanout.clone() {
+            return match simplefb_display::start_simplefb_display_thread(
+                guest_mem,
+                params,
+                simplefb_display::SimplefbDisplayTarget::GpuDevice { scanout },
+                Vec::new(),
+            ) {
+                Ok(handle) => {
+                    info!("simplefb: frames go to the gpu device's display");
+                    Some(handle)
+                }
+                Err(e) => {
+                    error!("failed to start the simplefb feed: {:?}", e);
+                    None
+                }
+            };
+        }
 
         let target = match android_service {
             Some(service_name) => simplefb_display::SimplefbDisplayTarget::Android { service_name },
