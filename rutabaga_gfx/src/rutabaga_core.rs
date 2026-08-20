@@ -459,6 +459,14 @@ pub fn calculate_capset_names(capset_mask: u64) -> Vec<String> {
         .collect()
 }
 
+/// Whether the gfxstream route keeps a Rutabaga2D component for classic 2D resources.
+/// `GPU_GFXSTREAM_NO_2D_FALLBACK=1` sends them back to gfxstream, restoring the previous
+/// behaviour -- an un-provisioned guest with no display at all -- so the two can be compared on
+/// one build, and so a guest that somehow depends on the old routing has a way out.
+fn gfxstream_2d_fallback() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GPU_GFXSTREAM_NO_2D_FALLBACK").as_deref() != Ok("1"))
+}
 
 fn calculate_component(component_mask: u8) -> RutabagaResult<RutabagaComponentType> {
     if component_mask.count_ones() != 1 {
@@ -746,7 +754,7 @@ impl Rutabaga {
     /// The component that owns `resource_id`.
     ///
     /// Resources are normally created by the default component, but the gfxstream route also
-    /// may keep more than one component alive, so every
+    /// keeps a Rutabaga2D component for classic 2D resources (see `classic_component`), so every
     /// operation on a resource has to follow the component that created it rather than the
     /// default one. Falls back to the default component whenever the resource does not name
     /// exactly one live component, which is the pre-existing behaviour.
@@ -758,6 +766,24 @@ impl Rutabaga {
             .unwrap_or(self.default_component)
     }
 
+    /// The component that should own a newly created classic (non-blob) resource.
+    ///
+    /// gfxstream implements these only far enough to create them: the readback the display path
+    /// needs fails with EINVAL, so a guest that draws on the CPU -- fbcon, plymouth, or a whole
+    /// llvmpipe desktop on an un-provisioned image -- has no picture at all. Rutabaga2D keeps
+    /// such a resource's pixels in host memory and serves transfer_read from there. Provisioned
+    /// guests are unaffected: their scanout buffers are blobs, which still go to gfxstream.
+    fn classic_component(&self) -> RutabagaComponentType {
+        if self.default_component == RutabagaComponentType::Gfxstream
+            && self
+                .components
+                .contains_key(&RutabagaComponentType::Rutabaga2D)
+        {
+            RutabagaComponentType::Rutabaga2D
+        } else {
+            self.default_component
+        }
+    }
 
     /// Creates a resource with the `resource_create_3d` metadata.
     pub fn resource_create_3d(
@@ -765,7 +791,7 @@ impl Rutabaga {
         resource_id: u32,
         resource_create_3d: ResourceCreate3D,
     ) -> RutabagaResult<()> {
-        let component_type = self.default_component;
+        let component_type = self.classic_component();
         let component = self
             .components
             .get_mut(&component_type)
@@ -1508,7 +1534,13 @@ impl RutabagaBuilder {
             push_capset(RUTABAGA_CAPSET_CROSS_DOMAIN);
         }
 
+        // The gfxstream route gets a Rutabaga2D component too, as the owner of classic 2D
+        // resources (see `Rutabaga::classic_component`). virglrenderer routes need no equivalent:
+        // vrend implements the classic 2D path itself, which is why an un-provisioned guest has a
+        // (llvmpipe) desktop there and a frozen boot console under gfxstream.
         if self.default_component == RutabagaComponentType::Rutabaga2D
+            || (self.default_component == RutabagaComponentType::Gfxstream
+                && gfxstream_2d_fallback())
         {
             let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
             rutabaga_components.insert(RutabagaComponentType::Rutabaga2D, rutabaga_2d);
