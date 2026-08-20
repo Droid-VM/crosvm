@@ -22,6 +22,7 @@ use zerocopy::IntoBytes;
 // compressed L2 entries (which the qcow2 spec forbids).
 use super::CLUSTER_USED_FLAG;
 use super::COMPRESSED_FLAG;
+use super::ZERO_FLAG;
 
 /// A qcow file. Allows reading/writing clusters and appending clusters.
 #[derive(Debug)]
@@ -95,6 +96,9 @@ impl QcowRawFile {
                 // stray bit 63 that may have been ORed in by a prior buggy
                 // write, so we don't perpetuate the corruption.
                 *addr & !CLUSTER_USED_FLAG
+            } else if *addr & ZERO_FLAG != 0 {
+                // Zero cluster: no host offset, no OFLAG_COPIED.
+                ZERO_FLAG
             } else {
                 *addr | non_zero_flags
             };

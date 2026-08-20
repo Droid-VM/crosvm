@@ -174,6 +174,10 @@ const L2_TABLE_OFFSET_MASK: u64 = 0x00ff_ffff_ffff_fe00;
 // Flags
 const COMPRESSED_FLAG: u64 = 1 << 62;
 const CLUSTER_USED_FLAG: u64 = 1 << 63;
+// QCOW_OFLAG_ZERO (qcow2 v3, standard cluster descriptor bit 0): the cluster reads as all zeroes,
+// whatever the backing file holds there, without any host storage. In the L2 cache such a cluster
+// is kept as exactly `ZERO_FLAG` (offset 0).
+const ZERO_FLAG: u64 = 1 << 0;
 const COMPATIBLE_FEATURES_LAZY_REFCOUNTS: u64 = 1 << 0;
 
 // qcow2 "incompatible feature" bits (header offset 72). A bit set here that the implementation
@@ -636,6 +640,9 @@ enum ClusterData {
     // The cluster is stored compressed. The value is the raw (unmasked) L2 entry, which encodes
     // the host offset and size of the compressed data.
     Compressed(u64),
+    // The cluster is a qcow2 "zero cluster": it reads as zeroes even when a backing file is in
+    // use, and occupies no host storage.
+    Zero,
 }
 
 // The source of data for a single cluster-bounded read.
@@ -1096,9 +1103,10 @@ impl QcowFileInner {
                             for host in compressed_host_clusters(l2_entry, cluster_bits) {
                                 add_ref(refcounts, cluster_size, host)?;
                             }
-                        } else {
+                        } else if l2_entry & L2_TABLE_OFFSET_MASK != 0 {
                             add_ref(refcounts, cluster_size, l2_entry & L2_TABLE_OFFSET_MASK)?;
                         }
+                        // else: a zero cluster without preallocated storage references nothing.
                     }
                 }
             }
@@ -1353,6 +1361,9 @@ impl QcowFileInner {
         if cluster_addr & COMPRESSED_FLAG != 0 {
             return Ok(ClusterData::Compressed(cluster_addr));
         }
+        if cluster_addr & ZERO_FLAG != 0 {
+            return Ok(ClusterData::Zero);
+        }
         Ok(ClusterData::Plain(
             cluster_addr + self.raw_file.cluster_offset(address),
         ))
@@ -1447,6 +1458,19 @@ impl QcowFileInner {
                 self.update_cluster_addr(l1_index, l2_index, cluster_addr, &mut set_refcounts)?;
                 self.decompressed_clusters.retain(|(key, _)| *key != entry);
                 self.unref_compressed_cluster(entry)?;
+                cluster_addr
+            }
+            // COMPRESSED is tested before ZERO, everywhere this pair is matched. A compressed
+            // L2 descriptor encodes a BYTE offset in its low bits, so bit 0 -- which is all
+            // ZERO_FLAG is -- is set for about half of all compressed clusters. Test ZERO first
+            // and such a cluster is mistaken for a zero cluster: here that hands back a freshly
+            // zeroed cluster instead of decompressing, which loses the data outright.
+            entry if entry & ZERO_FLAG != 0 => {
+                // Writing into a zero cluster: it has no storage, so allocate a fresh cluster.
+                // Newly allocated clusters read back as zeroes, which is exactly what the zero
+                // cluster held, so no initial contents are needed either way.
+                let cluster_addr = self.append_data_cluster(None)?;
+                self.update_cluster_addr(l1_index, l2_index, cluster_addr, &mut set_refcounts)?;
                 cluster_addr
             }
             a => a,
@@ -1567,7 +1591,9 @@ impl QcowFileInner {
             // This cluster is already unallocated; nothing to do.
             return Ok(());
         }
-
+        // COMPRESSED before ZERO: a compressed descriptor encodes a byte offset in its low bits,
+        // so bit 0 (ZERO_FLAG) is set for about half of them. Testing ZERO first drops the mapping
+        // without releasing the compressed host storage -- a leak that grows with every discard.
         if cluster_addr & COMPRESSED_FLAG != 0 {
             // Drop the mapping so the range reads back as zeroes, then release the compressed host
             // storage so it doesn't leak. Refcounts are per host cluster, so storage shared with a
@@ -1576,6 +1602,12 @@ impl QcowFileInner {
             self.decompressed_clusters
                 .retain(|(key, _)| *key != cluster_addr);
             self.unref_compressed_cluster(cluster_addr)?;
+            return Ok(());
+        }
+
+        if cluster_addr & ZERO_FLAG != 0 {
+            // A zero cluster owns no storage; just drop the mapping.
+            self.l2_cache.get_mut(&l1_index).unwrap()[l2_index] = 0;
             return Ok(());
         }
 
@@ -1607,6 +1639,55 @@ impl QcowFileInner {
         Ok(())
     }
 
+    // Turns the cluster containing `address` into a qcow2 zero cluster: its host storage (plain or
+    // compressed) is released and the L2 entry becomes `ZERO_FLAG`, so the cluster reads back as
+    // zeroes regardless of the backing file. Allocates the L2 table if the address has none yet
+    // (an unallocated cluster would otherwise still show the backing file's contents).
+    fn mark_cluster_zero(&mut self, address: u64) -> std::io::Result<()> {
+        if address >= self.virtual_size() {
+            return Err(std::io::Error::from_raw_os_error(EINVAL));
+        }
+        // Release whatever storage the cluster has and drop the mapping to 0 (a no-op for
+        // unallocated clusters).
+        self.deallocate_cluster(address)?;
+
+        let l1_index = self.l1_table_index(address) as usize;
+        let l2_addr_disk = *self
+            .l1_table
+            .get(l1_index)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(EINVAL))?;
+        let l2_index = self.l2_table_index(address) as usize;
+        let mut set_refcounts = Vec::new();
+
+        if !self.l2_cache.contains_key(&l1_index) {
+            let l2_table = if l2_addr_disk == 0 {
+                let new_addr: u64 = self.get_new_cluster(None)?;
+                set_refcounts.push((new_addr, 1));
+                self.l1_table[l1_index] = new_addr;
+                VecCache::new(self.l2_entries as usize)
+            } else {
+                VecCache::from_vec(Self::read_l2_cluster(&mut self.raw_file, l2_addr_disk)?)
+            };
+            let l1_table = &self.l1_table;
+            let raw_file = &mut self.raw_file;
+            self.l2_cache.insert(l1_index, l2_table, |index, evicted| {
+                raw_file.write_pointer_table(
+                    l1_table[index],
+                    evicted.get_values(),
+                    CLUSTER_USED_FLAG,
+                )
+            })?;
+        }
+
+        self.update_cluster_addr(l1_index, l2_index, ZERO_FLAG, &mut set_refcounts)?;
+
+        for (addr, count) in set_refcounts {
+            let mut newly_unref = self.set_cluster_refcount(addr, count)?;
+            self.unref_clusters.append(&mut newly_unref);
+        }
+        Ok(())
+    }
+
     // Fill a range of `length` bytes starting at `address` with zeroes.
     // Any future reads of this range will return all zeroes.
     // If there is no backing file, this will deallocate cluster storage when possible.
@@ -1618,9 +1699,18 @@ impl QcowFileInner {
             let curr_addr = address + nwritten as u64;
             let count = self.limit_range_cluster(curr_addr, write_count - nwritten);
 
-            if self.backing_file.is_none() && count == self.raw_file.cluster_size() as usize {
-                // Full cluster and no backing file in use - deallocate the storage.
-                self.deallocate_cluster(curr_addr)?;
+            if count == self.raw_file.cluster_size() as usize {
+                if self.backing_file.is_none() {
+                    // Full cluster and no backing file in use - deallocate the storage.
+                    self.deallocate_cluster(curr_addr)?;
+                } else {
+                    // Full cluster with a backing file: the range must read as zeroes rather than
+                    // the backing contents, but that does not need a host cluster full of zeroes.
+                    // Writing zeroes here is what turned every guest discard (fstrim of a mostly
+                    // empty 40 GB root fs) into ~33 GB of allocated overlay. Use a qcow2 zero
+                    // cluster instead: no storage, reads back as zeroes.
+                    self.mark_cluster_zero(curr_addr)?;
+                }
             } else {
                 // Partial cluster - zero out the relevant bytes.
                 let offset = if self.backing_file.is_some() {
@@ -1634,6 +1724,8 @@ impl QcowFileInner {
                         // Any space in unallocated clusters can be left alone, since
                         // unallocated clusters already read back as zeroes.
                         ClusterData::Unallocated => None,
+                        // Zero clusters already read back as zeroes.
+                        ClusterData::Zero => None,
                         // Materialize the compressed cluster to an uncompressed one so the
                         // requested bytes can be zeroed in place.
                         ClusterData::Compressed(_) => {
@@ -1668,6 +1760,10 @@ impl QcowFileInner {
             .map(|entry| {
                 if entry & COMPRESSED_FLAG != 0 {
                     *entry
+                } else if entry & ZERO_FLAG != 0 {
+                    // Zero cluster. A preallocated host offset (qemu `preallocation=`) is not
+                    // tracked here; the cluster reads as zeroes either way.
+                    ZERO_FLAG
                 } else {
                     *entry & L2_TABLE_OFFSET_MASK
                 }
@@ -2031,6 +2127,9 @@ impl QcowFileInner {
                     } else {
                         cb(nread, count, ReadSource::Zero)?;
                     }
+                }
+                ClusterData::Zero => {
+                    cb(nread, count, ReadSource::Zero)?;
                 }
             }
 
