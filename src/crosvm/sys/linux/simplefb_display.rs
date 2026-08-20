@@ -182,6 +182,7 @@ fn simplefb_display_loop(
     let guest_addr = GuestAddress(params.addr);
     let fb_size = (params.stride as usize) * (params.height as usize);
     let mut read_buf = vec![0u8; fb_size];
+    let mut no_framebuffer: u64 = 0;
 
     info!(
         "simplefb display bridge: {}x{} stride={} bpp={} addr={:#x} @ {}fps",
@@ -223,6 +224,20 @@ fn simplefb_display_loop(
             let dst = fb.as_volatile_slice();
             let copy_len = dst.size().min(read_buf.len());
             dst.copy_from(&read_buf[..copy_len]);
+            no_framebuffer = 0;
+        } else {
+            // No framebuffer to write into: the sink never gave us one (an Android display whose
+            // service lost the name race hands out a surface with no window behind it) or it is
+            // transiently locked. Silence here cost a whole debugging session -- the bridge looked
+            // perfectly healthy while presenting nothing -- so say it, backing off so a permanent
+            // condition does not fill the log.
+            no_framebuffer += 1;
+            if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
+                warn!(
+                    "simplefb: no framebuffer from the display sink ({} frame(s) dropped)",
+                    no_framebuffer
+                );
+            }
         }
         display.flip(surface_id);
 
