@@ -458,13 +458,37 @@ fn create_virtio_devices(
             let event_devices =
                 create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
 
+            // Whoever owns the display owns the input that arrives through it. The simplefb
+            // bridge owns it only when it presents to its own sink (VNC); with the app's Surface
+            // it feeds the GPU device's display instead (ExternalScanout), so the events belong
+            // where they already are.
             #[cfg(feature = "vnc")]
             let event_devices = if cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
-                log::info!("GPU: simplefb+VNC mode — event_devices go to simplefb bridge");
+                log::info!("GPU: simplefb owns the display sink — event_devices go to the bridge");
                 *simplefb_event_devices_out = event_devices;
                 Vec::new()
             } else {
                 event_devices
+            };
+
+            // With `--simplefb` there are two things that can produce a picture and only one
+            // Surface to put it on. Rather than opening a second display (two registrations of
+            // one Android service name, with the app's Surface going to whichever won), the
+            // bridge hands its frames to this device, which shows them whenever the guest is not
+            // displaying through virtio-gpu itself. See ExternalScanout.
+            let external_scanout = match cfg.simplefb.as_ref() {
+                Some(sfb) => {
+                    let bpp: u32 = match sfb.format.as_str() {
+                        "r8g8b8" => 3,
+                        "r5g6b5" => 2,
+                        _ => 4,
+                    };
+                    let scanout = virtio::ExternalScanout::new(sfb.width, sfb.height, sfb.width * bpp)
+                        .context("failed to create the simplefb scanout")?;
+                    *external_scanout_out = Some(scanout.clone());
+                    Some(scanout)
+                }
+                None => None,
             };
 
             let (gpu_control_host_tube, gpu_control_device_tube) =
@@ -478,12 +502,13 @@ fn create_virtio_devices(
                 render_server_fd,
                 has_vfio_gfx_device,
                 event_devices,
+                external_scanout,
             )?);
         }
     }
 
     #[cfg(feature = "vnc")]
-    if cfg.gpu_parameters.is_none() && cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
+    if cfg.gpu_parameters.is_none() && cfg.simplefb.is_some() {  // bridge owns its own sink
         // Same device set as the virtio-gpu display path above, so a VNC session gets
         // identical guest input devices (including the `input=tablet` absolute mouse)
         // regardless of which display backend serves it.
