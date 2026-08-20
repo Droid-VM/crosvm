@@ -250,6 +250,7 @@ pub fn run_gpu_device(opts: Options) -> anyhow::Result<()> {
         &channels,
         /* gpu_cgroup_path */
         None,
+    None,
     )));
 
     let (platform_worker_tx, platform_worker_rx) = futures::channel::mpsc::unbounded();

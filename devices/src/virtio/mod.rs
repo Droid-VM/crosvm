@@ -57,6 +57,8 @@ pub use self::descriptor_utils::Writer;
 #[cfg(feature = "gpu")]
 pub use self::gpu::DisplayBackend;
 #[cfg(feature = "gpu")]
+pub use self::gpu::ExternalScanout;
+#[cfg(feature = "gpu")]
 pub use self::gpu::Gpu;
 #[cfg(feature = "gpu")]
 pub use self::gpu::GpuDisplayMode;

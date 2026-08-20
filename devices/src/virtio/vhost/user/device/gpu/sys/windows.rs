@@ -310,6 +310,7 @@ pub fn run_gpu_device_worker(
         base_features,
         /* channels= */ &Default::default(),
         wndproc_thread,
+    None,
     )));
 
     let ex = Executor::new().context("failed to create executor")?;

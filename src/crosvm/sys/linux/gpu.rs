@@ -7,6 +7,7 @@
 static_assertions::assert_cfg!(feature = "gpu");
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::env;
 use std::path::PathBuf;
 
@@ -90,6 +91,9 @@ pub fn create_gpu_device(
     render_server_fd: Option<SafeDescriptor>,
     has_vfio_gfx_device: bool,
     event_devices: Vec<EventDevice>,
+    // Frames from the VMM's simplefb bridge, presented through this device's display whenever
+    // the guest is not driving it itself. See `ExternalScanout`.
+    external_scanout: Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
@@ -187,6 +191,12 @@ pub fn create_gpu_device(
 
     #[cfg(feature = "android_display")]
     if let Some(service_name) = &cfg.android_display_service {
+        // The GPU device owns this sink even when `--simplefb` is also configured: it registers
+        // the one ICrosvmAndroidDisplayService the app hands its Surface to, and the simplefb
+        // bridge feeds its frames through the same device (ExternalScanout) instead of opening a
+        // second display under the same name. Two registrations under one name is what made the
+        // app's Surface go to whichever producer won the race, with the loser drawing into
+        // nothing for the rest of the VM's life.
         display_backends.insert(0, virtio::DisplayBackend::Android(service_name.to_string()));
     }
 
@@ -233,6 +243,7 @@ pub fn create_gpu_device(
         virtio::base_features(cfg.protection_type),
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
+        external_scanout,
     );
 
     let jail = if let Some(jail_config) = cfg.jail_config.as_ref() {

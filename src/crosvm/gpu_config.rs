@@ -124,14 +124,26 @@ pub(crate) fn validate_gpu_config(cfg: &mut Config) -> Result<(), String> {
             ));
         }
 
-        // Add a default display if no display is specified.
+        // A GPU with no display of its own is a real configuration -- the device reports zero
+        // scanouts and the guest driver then keeps only the render node (virtgpu_kms.c:
+        // `if (!vgdev->num_scanouts)`), i.e. "render here, display somewhere else". Nothing
+        // asks for it today (the simplefb path shares the GPU's display instead, see
+        // ExternalScanout), so an unspecified display still means one default display.
         if gpu_parameters.display_params.is_empty() {
             gpu_parameters.display_params.push(Default::default());
         }
 
         let is_4k_uhd_enabled = false;
-        let (width, height) =
-            gpu_parameters.display_params[0].get_virtual_display_size_4k_uhd(is_4k_uhd_enabled);
+        let (width, height) = match gpu_parameters.display_params.first() {
+            Some(params) => params.get_virtual_display_size_4k_uhd(is_4k_uhd_enabled),
+            // No display of its own: the input devices still need a coordinate space, and the
+            // one the guest actually sees is the simplefb framebuffer.
+            None => cfg
+                .simplefb
+                .as_ref()
+                .map(|sfb| (sfb.width, sfb.height))
+                .unwrap_or((1280, 720)),
+        };
         cfg.display_input_width = Some(width);
         cfg.display_input_height = Some(height);
     }

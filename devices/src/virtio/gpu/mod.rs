@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 mod edid;
+mod external_scanout;
 mod parameters;
 mod protocol;
 mod snapshot;
@@ -51,6 +52,7 @@ use base::VmEventType;
 use base::WaitContext;
 use base::WorkerThread;
 use data_model::*;
+pub use external_scanout::ExternalScanout;
 pub use gpu_display::EventDevice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
@@ -1056,6 +1058,8 @@ enum WorkerToken {
     /// A zero-copy flip's completion fence signaled; one token covers every pending fence and
     /// the handler polls each to find the signaled ones (they are few and short-lived).
     FlipFence,
+    /// The VMM's simplefb bridge offered a frame (see `ExternalScanout`).
+    ExternalFrame,
     #[cfg(windows)]
     DisplayDescriptorRequest,
 }
@@ -1151,6 +1155,9 @@ struct Worker {
     #[cfg(windows)]
     gpu_display_wait_descriptor_ctrl_rd: RecvTube,
     activation_resources: Option<GpuActivationResources>,
+    /// Frames from the VMM's simplefb bridge, shown while the guest is not displaying through
+    /// this device (see `ExternalScanout`).
+    external_scanout: Option<Arc<ExternalScanout>>,
 }
 
 #[derive(Copy, Clone)]
@@ -1188,6 +1195,7 @@ impl Worker {
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_rd: RecvTube,
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
         snapshot_scratch_directory: Option<PathBuf>,
+        external_scanout: Option<Arc<ExternalScanout>>,
     ) -> anyhow::Result<Worker> {
         let fence_state = Arc::new(Mutex::new(Default::default()));
         let fence_handler_resources = Arc::new(Mutex::new(None));
@@ -1232,6 +1240,7 @@ impl Worker {
             #[cfg(windows)]
             gpu_display_wait_descriptor_ctrl_rd,
             activation_resources: None,
+            external_scanout,
         })
     }
 
@@ -1424,6 +1433,13 @@ impl Worker {
                 .context("failed adding poll event to WaitContext")?;
         }
 
+        let external_evt = self.external_scanout.as_ref().map(|e| e.event().try_clone());
+        if let Some(Ok(evt)) = &external_evt {
+            event_manager
+                .add(evt, WorkerToken::ExternalFrame)
+                .context("failed adding the external scanout event to WaitContext")?;
+        }
+
         self.resource_bridges
             .add_to_wait_context(&mut event_manager.wait_ctx);
 
@@ -1477,6 +1493,24 @@ impl Worker {
 
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
+                    WorkerToken::ExternalFrame => {
+                        // The simplefb bridge has a frame. It only offers one while the guest is
+                        // not displaying through this device, and `present_external` checks that
+                        // again here, in the thread that owns the display -- so the two sources
+                        // can never be mid-frame at the same time.
+                        if let Some(external) = self.external_scanout.clone() {
+                            let _ = external.event().wait();
+                            let (w, h, stride) =
+                                (external.width(), external.height(), external.stride());
+                            let virtio_gpu = &mut self.state.virtio_gpu;
+                            external.take_frame(|frame| {
+                                if let Err(e) = virtio_gpu.present_external(w, h, stride, frame) {
+                                    error!("failed to present an external frame: {:?}", e);
+                                }
+                            });
+                            external.set_guest_owns(virtio_gpu.guest_owns_display());
+                        }
+                    }
                     WorkerToken::CtrlQueue => {
                         let _ = ctrl_evt.wait();
                         // Set flag that control queue is available to be read, but defer reading
@@ -1689,6 +1723,10 @@ pub struct Gpu {
     worker_thread: Option<WorkerThread<()>>,
     display_backends: Vec<DisplayBackend>,
     display_params: Vec<GpuDisplayParameters>,
+    /// What the guest is told in `virtio_gpu_config.num_scanouts`. Zero means render-only.
+    num_scanouts: u32,
+    /// Frames from the VMM's simplefb bridge, if this VM has one (see `ExternalScanout`).
+    external_scanout: Option<Arc<ExternalScanout>>,
     display_event: Arc<AtomicBool>,
     rutabaga_builder: RutabagaBuilder,
     pci_address: Option<PciAddress>,
@@ -1795,8 +1833,18 @@ impl Gpu {
         channels: &BTreeMap<String, PathBuf>,
         #[cfg(windows)] wndproc_thread: WindowProcedureThread,
         #[cfg(any(target_os = "android", target_os = "linux"))] gpu_cgroup_path: Option<&PathBuf>,
+        external_scanout: Option<Arc<ExternalScanout>>,
     ) -> Gpu {
         let mut display_params = gpu_parameters.display_params.clone();
+        // Zero configured displays is a real configuration, not an oversight: the picture comes
+        // from somewhere else (crosvm's simplefb bridge) and this device is here to render. Keep
+        // a nominal size for the internal bookkeeping below, but report no scanouts to the guest
+        // (`num_scanouts` in build_config) so it never picks this device to display on.
+        let num_scanouts = if display_params.is_empty() {
+            0
+        } else {
+            VIRTIO_GPU_MAX_SCANOUTS as u32
+        };
         if display_params.is_empty() {
             display_params.push(Default::default());
         }
@@ -1962,6 +2010,8 @@ impl Gpu {
             worker_thread: None,
             display_backends,
             display_params,
+            num_scanouts,
+            external_scanout,
             display_event: Arc::new(AtomicBool::new(false)),
             rutabaga_builder,
             pci_address: gpu_parameters.pci_address,
@@ -2097,6 +2147,7 @@ impl Gpu {
         let (worker_request_sender, worker_request_receiver) = mpsc::channel();
         let (worker_response_sender, worker_response_receiver) = mpsc::channel();
 
+        let external_scanout = self.external_scanout.clone();
         let worker_thread = WorkerThread::start("v_gpu", move |kill_evt| {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             if let Some(cgroup_path) = gpu_cgroup_path {
@@ -2129,6 +2180,7 @@ impl Gpu {
                 #[cfg(windows)]
                 gpu_display_wait_descriptor_ctrl_wr,
                 snapshot_scratch_directory,
+                external_scanout,
             )
             .expect("Failed to create virtio gpu worker thread");
 
@@ -2204,7 +2256,7 @@ impl Gpu {
         virtio_gpu_config {
             events_read: Le32::from(events_read),
             events_clear: Le32::from(0),
-            num_scanouts: Le32::from(VIRTIO_GPU_MAX_SCANOUTS as u32),
+            num_scanouts: Le32::from(self.num_scanouts),
             num_capsets: Le32::from(num_capsets),
         }
     }
