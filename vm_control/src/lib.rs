@@ -963,13 +963,19 @@ impl VmMemoryRequest {
                             let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
                             return VmMemoryResponse::Err(SysError::new(ENODEV));
                         };
-                        if let Err(e) = drive_guest_accept(
+                        let accepted = drive_guest_accept(
                             accept_tube,
                             GunyahAcceptOp::Accept,
                             handle,
                             guest_addr.offset(),
                             size,
-                        ) {
+                        );
+                        // The VMM's own pin over this region has done its job either way: the
+                        // hypervisor owns the memory now, and on the failure path we are about
+                        // to hand it back. Release it before the unshare so the reclaim has a
+                        // single owner to wait for.
+                        vm.release_share_pin(guest_addr);
+                        if let Err(e) = accepted {
                             // The guest never accepted; reclaim the SHARE and fail the attach.
                             let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
                             return VmMemoryResponse::Err(e);
@@ -982,7 +988,13 @@ impl VmMemoryRequest {
                         return VmMemoryResponse::Err(SysError::new(ENOTSUP));
                     }
                     // Off (caller-driven), or no handle needed (plain memslot hypervisors).
-                    (_, handle) => (handle, false, None),
+                    // The caller drives the accept out of band, so there is no point at which we
+                    // could release the pin later; the hypervisor already holds its own from the
+                    // SHARE, which is what the probe existed to guarantee.
+                    (_, handle) => {
+                        vm.release_share_pin(guest_addr);
+                        (handle, false, None)
+                    }
                 };
 
                 let region_id = VmMemoryRegionId(guest_addr);
