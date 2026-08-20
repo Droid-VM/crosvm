@@ -8,6 +8,7 @@ use std::convert::TryInto;
 use std::io::IoSliceMut;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -458,6 +459,7 @@ pub fn calculate_capset_names(capset_mask: u64) -> Vec<String> {
         .collect()
 }
 
+
 fn calculate_component(component_mask: u8) -> RutabagaResult<RutabagaComponentType> {
     if component_mask.count_ones() != 1 {
         return Err(RutabagaError::SpecViolation("can't infer single component"));
@@ -741,15 +743,32 @@ impl Rutabaga {
         component.poll_descriptor()
     }
 
+    /// The component that owns `resource_id`.
+    ///
+    /// Resources are normally created by the default component, but the gfxstream route also
+    /// may keep more than one component alive, so every
+    /// operation on a resource has to follow the component that created it rather than the
+    /// default one. Falls back to the default component whenever the resource does not name
+    /// exactly one live component, which is the pre-existing behaviour.
+    fn component_of(&self, resource_id: u32) -> RutabagaComponentType {
+        self.resources
+            .get(&resource_id)
+            .and_then(|resource| calculate_component(resource.component_mask).ok())
+            .filter(|component| self.components.contains_key(component))
+            .unwrap_or(self.default_component)
+    }
+
+
     /// Creates a resource with the `resource_create_3d` metadata.
     pub fn resource_create_3d(
         &mut self,
         resource_id: u32,
         resource_create_3d: ResourceCreate3D,
     ) -> RutabagaResult<()> {
+        let component_type = self.default_component;
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         if self.resources.contains_key(&resource_id) {
@@ -794,9 +813,10 @@ impl Rutabaga {
         resource_id: u32,
         mut vecs: Vec<RutabagaIovec>,
     ) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -811,9 +831,10 @@ impl Rutabaga {
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -828,9 +849,10 @@ impl Rutabaga {
 
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         self.resources
@@ -849,9 +871,10 @@ impl Rutabaga {
         resource_id: u32,
         transfer: Transfer3D,
     ) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -873,9 +896,10 @@ impl Rutabaga {
         transfer: Transfer3D,
         buf: Option<IoSliceMut>,
     ) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -887,9 +911,10 @@ impl Rutabaga {
     }
 
     pub fn resource_flush(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::Unsupported)?;
 
         let resource = self
@@ -1398,13 +1423,13 @@ impl RutabagaBuilder {
                 | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_MAGMA)
                 | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_GLES)
                 | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_COMPOSER);
-            let supports_virglrenderer = capset_enabled(RUTABAGA_CAPSET_VIRGL2)
-                | capset_enabled(RUTABAGA_CAPSET_VENUS)
-                | capset_enabled(RUTABAGA_CAPSET_DRM);
 
             if supports_gfxstream {
                 self.default_component = RutabagaComponentType::Gfxstream;
-            } else if supports_virglrenderer {
+            } else if capset_enabled(RUTABAGA_CAPSET_VIRGL2)
+                | capset_enabled(RUTABAGA_CAPSET_VENUS)
+                | capset_enabled(RUTABAGA_CAPSET_DRM)
+            {
                 self.default_component = RutabagaComponentType::VirglRenderer;
             } else {
                 self.default_component = RutabagaComponentType::CrossDomain;
@@ -1483,7 +1508,8 @@ impl RutabagaBuilder {
             push_capset(RUTABAGA_CAPSET_CROSS_DOMAIN);
         }
 
-        if self.default_component == RutabagaComponentType::Rutabaga2D {
+        if self.default_component == RutabagaComponentType::Rutabaga2D
+        {
             let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
             rutabaga_components.insert(RutabagaComponentType::Rutabaga2D, rutabaga_2d);
         }
