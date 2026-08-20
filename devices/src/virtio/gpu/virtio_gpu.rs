@@ -12,9 +12,12 @@ use std::rc::Rc;
 use std::result::Result;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 use std::sync::Arc;
 
 use anyhow::Context;
+use data_model::Le32;
 use base::error;
 use base::info;
 use base::linux::MemoryMappingBuilderUnix;
@@ -680,6 +683,9 @@ impl VirtioGpuScanout {
                         "pool scanout res={} needs {:?} bytes but the blob gathers {}",
                         resource.resource_id, last_row_end, total
                     );
+                    // The window buffer is locked (framebuffer_region above): release it, or
+                    // every later lock fails and the display is dead for the rest of the VM.
+                    display.flip(surface_id);
                     return Err(ErrUnspec);
                 }
             }
@@ -859,20 +865,25 @@ impl VirtioGpuScanout {
                     fb_stride,
                     self.height,
                 );
+                let mut copy_result: VirtioGpuResult = Ok(OkNoData);
                 for row in 0..self.height as usize {
                     let s = src_offset + row * src_stride;
                     if s + packed_stride > src.len() {
                         break;
                     }
-                    fb_slice
-                        .sub_slice(row * fb_stride, packed_stride)
-                        .map_err(|_| ErrUnspec)?
-                        .copy_from(&src[s..s + packed_stride]);
+                    match fb_slice.sub_slice(row * fb_stride, packed_stride) {
+                        Ok(dst) => dst.copy_from(&src[s..s + packed_stride]),
+                        Err(_) => {
+                            copy_result = Err(ErrUnspec);
+                            break;
+                        }
+                    }
                 }
                 strace!("flush.blob.copy.end");
+                // Always release the locked window buffer, even when the copy failed above.
                 display.flip(surface_id);
                 strace!("flush.blob.flip.end");
-                return Ok(OkNoData);
+                return copy_result;
             }
         }
 
@@ -890,80 +901,89 @@ impl VirtioGpuScanout {
             .framebuffer_region(surface_id, 0, 0, self.width, self.height)
             .ok_or(ErrUnspec)?;
 
-        let packed_stride = self.width as usize * 4;
-        let fb_stride = fb.stride() as usize;
-        if fb_stride == packed_stride {
-            let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
-            transfer.stride = fb.stride();
-            let fb_slice = fb.as_volatile_slice();
-            let buf = IoSliceMut::new(
-                // SAFETY: trivially safe
-                unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
-            );
-            rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
-            // Whether the readback produced anything, every 64th frame: a black display can mean
-            // the copy went to the wrong place or that these bytes were zero to begin with, and
-            // nothing else distinguishes the two.
-            self.flush_probe_counter = self.flush_probe_counter.wrapping_add(1);
-            if self.flush_probe_counter % 64 == 1 {
-                let probe = unsafe {
-                    std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, 4096.min(fb_slice.size()))
-                };
-                // Count only the color channels: XRGB frames carry 0xff in every fourth byte,
-                // which made an all-black frame read as "25% nonzero" and pass for content.
-                let rgb_nz = probe
-                    .chunks_exact(4)
-                    .flat_map(|px| &px[..3])
-                    .filter(|b| **b != 0)
-                    .count();
-                let head: Vec<String> = probe[..16.min(probe.len())]
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect();
-                strace!(
-                    "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
-                    resource.resource_id,
-                    rgb_nz,
-                    head.join(" ")
+        // Everything from here to the flip runs with the window buffer LOCKED
+        // (framebuffer_region above). A readback error used to `?`-return past the flip and leave
+        // the ANativeWindow locked, after which every later lock failed ("Failed to lock window")
+        // and the display was dead until the VM was closed -- seen on every stock (unprovisioned)
+        // guest the moment KDE started (transfer_read -> ComponentError(-22)). Do the readback in
+        // a closure and release the buffer on both paths.
+        let readback: VirtioGpuResult = (|| {
+            let packed_stride = self.width as usize * 4;
+            let fb_stride = fb.stride() as usize;
+            if fb_stride == packed_stride {
+                let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
+                transfer.stride = fb.stride();
+                let fb_slice = fb.as_volatile_slice();
+                let buf = IoSliceMut::new(
+                    // SAFETY: trivially safe
+                    unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
                 );
-                if rgb_nz == 0 {
-                    note_flush_route("transfer_read: readback is black");
-                } else {
-                    note_flush_route("transfer_read: readback has color");
+                rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
+                // Whether the readback produced anything, every 64th frame: a black display can mean
+                // the copy went to the wrong place or that these bytes were zero to begin with, and
+                // nothing else distinguishes the two.
+                self.flush_probe_counter = self.flush_probe_counter.wrapping_add(1);
+                if self.flush_probe_counter % 64 == 1 {
+                    let probe = unsafe {
+                        std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, 4096.min(fb_slice.size()))
+                    };
+                    // Count only the color channels: XRGB frames carry 0xff in every fourth byte,
+                    // which made an all-black frame read as "25% nonzero" and pass for content.
+                    let rgb_nz = probe
+                        .chunks_exact(4)
+                        .flat_map(|px| &px[..3])
+                        .filter(|b| **b != 0)
+                        .count();
+                    let head: Vec<String> = probe[..16.min(probe.len())]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    strace!(
+                        "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
+                        resource.resource_id,
+                        rgb_nz,
+                        head.join(" ")
+                    );
+                    if rgb_nz == 0 {
+                        note_flush_route("transfer_read: readback is black");
+                    } else {
+                        note_flush_route("transfer_read: readback has color");
+                    }
+                }
+            } else {
+                // The window buffer rows are padded (gralloc stride alignment), and the readback
+                // backend writes tightly-packed rows no matter what Transfer3D::stride says (observed
+                // with gfxstream at widths whose row size isn't aligned, e.g. 1440x900) -- every row
+                // lands progressively shifted and the image smears. Read into a packed staging buffer
+                // and re-stride into the window buffer by row.
+                let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
+                transfer.stride = packed_stride as u32;
+                let size = packed_stride * self.height as usize;
+                if self.flush_staging.len() < size {
+                    self.flush_staging.resize(size, 0);
+                }
+                let staging = &mut self.flush_staging[..size];
+                rutabaga.transfer_read(
+                    0,
+                    resource.resource_id,
+                    transfer,
+                    Some(IoSliceMut::new(staging)),
+                )?;
+                let fb_slice = fb.as_volatile_slice();
+                for row in 0..self.height as usize {
+                    fb_slice
+                        .sub_slice(row * fb_stride, packed_stride)
+                        .map_err(|_| ErrUnspec)?
+                        .copy_from(&staging[row * packed_stride..][..packed_stride]);
                 }
             }
-        } else {
-            // The window buffer rows are padded (gralloc stride alignment), and the readback
-            // backend writes tightly-packed rows no matter what Transfer3D::stride says (observed
-            // with gfxstream at widths whose row size isn't aligned, e.g. 1440x900) -- every row
-            // lands progressively shifted and the image smears. Read into a packed staging buffer
-            // and re-stride into the window buffer by row.
-            let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
-            transfer.stride = packed_stride as u32;
-            let size = packed_stride * self.height as usize;
-            if self.flush_staging.len() < size {
-                self.flush_staging.resize(size, 0);
-            }
-            let staging = &mut self.flush_staging[..size];
-            rutabaga.transfer_read(
-                0,
-                resource.resource_id,
-                transfer,
-                Some(IoSliceMut::new(staging)),
-            )?;
-            let fb_slice = fb.as_volatile_slice();
-            for row in 0..self.height as usize {
-                fb_slice
-                    .sub_slice(row * fb_stride, packed_stride)
-                    .map_err(|_| ErrUnspec)?
-                    .copy_from(&staging[row * packed_stride..][..packed_stride]);
-            }
-        }
 
+            Ok(OkNoData)
+        })();
         strace!("flush.transfer_read.copy.end");
         display.flip(surface_id);
         strace!("flush.transfer_read.flip.end");
-        Ok(OkNoData)
+        readback
     }
 
     fn import_resource_to_display(
