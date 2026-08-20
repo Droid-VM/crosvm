@@ -461,8 +461,7 @@ pub fn calculate_capset_names(capset_mask: u64) -> Vec<String> {
 
 /// Whether the gfxstream route keeps a Rutabaga2D component for classic 2D resources.
 /// `GPU_GFXSTREAM_NO_2D_FALLBACK=1` sends them back to gfxstream, restoring the previous
-/// behaviour -- an un-provisioned guest with no display at all -- so the two can be compared on
-/// one build, and so a guest that somehow depends on the old routing has a way out.
+/// behaviour (an un-provisioned guest with no display at all) for a one-build comparison.
 fn gfxstream_2d_fallback() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("GPU_GFXSTREAM_NO_2D_FALLBACK").as_deref() != Ok("1"))
@@ -1449,13 +1448,13 @@ impl RutabagaBuilder {
                 | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_MAGMA)
                 | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_GLES)
                 | capset_enabled(RUTABAGA_CAPSET_GFXSTREAM_COMPOSER);
+            let supports_virglrenderer = capset_enabled(RUTABAGA_CAPSET_VIRGL2)
+                | capset_enabled(RUTABAGA_CAPSET_VENUS)
+                | capset_enabled(RUTABAGA_CAPSET_DRM);
 
             if supports_gfxstream {
                 self.default_component = RutabagaComponentType::Gfxstream;
-            } else if capset_enabled(RUTABAGA_CAPSET_VIRGL2)
-                | capset_enabled(RUTABAGA_CAPSET_VENUS)
-                | capset_enabled(RUTABAGA_CAPSET_DRM)
-            {
+            } else if supports_virglrenderer {
                 self.default_component = RutabagaComponentType::VirglRenderer;
             } else {
                 self.default_component = RutabagaComponentType::CrossDomain;
@@ -1463,7 +1462,16 @@ impl RutabagaBuilder {
 
             self.virglrenderer_flags = self
                 .virglrenderer_flags
-                .use_virgl(capset_enabled(RUTABAGA_CAPSET_VIRGL2))
+                // Keep vrend (the classic renderer) initialised for every virglrenderer
+                // configuration, not only when the VIRGL2 capset is advertised: vrend is also
+                // what implements classic 2D resources and their transfers (fbcon, dumb
+                // buffers, llvmpipe scanout). With NO_VIRGL the very first RESOURCE_CREATE_2D
+                // fails with EINVAL and the guest has no display at all. Advertising VIRGL2 to
+                // the guest is a separate decision (the capset list above): a stock guest that
+                // sees VIRGL2 picks host-GL virgl and our CPU-copy scanout cannot read those
+                // frames back (black screen); without it stock Mesa falls back to llvmpipe,
+                // which the 2D path displays fine.
+                .use_virgl(supports_virglrenderer)
                 .use_venus(capset_enabled(RUTABAGA_CAPSET_VENUS))
                 // Gunyah protected VM: venus without guest-allocated VkDeviceMemory cannot
                 // work here (host pages are not injectable), so venus implies guest_vram.
