@@ -1248,12 +1248,37 @@ impl Worker {
         // This loop effectively only runs while the worker is inactive. Once activated via
         // a `WorkerRequest::Activate`, the worker will remain in `run_until_sleep_or_exit()`
         // until suspended via `kill_evt` or `suspend_evt` being signaled.
+        //
+        // "Inactive" is not the same as "nothing to display". A guest with no virtio-gpu driver
+        // resets the device on its way out of the firmware and never activates it again -- that
+        // is exactly what Windows does, whose Basic Display Driver only knows the linear
+        // framebuffer the firmware left behind -- and the simplefb bridge feeding that
+        // framebuffer to this device is still running. Waiting on the request channel alone would
+        // park this thread for the rest of the VM's life with the firmware's last frame frozen on
+        // screen, which is the one case the whole arbitration exists for. So while there is a
+        // bridge, wait with a timeout and serve it in between.
         loop {
-            let request = match self.request_receiver.recv() {
-                Ok(r) => r,
-                Err(_) => {
-                    info!("virtio gpu worker connection ended, exiting.");
-                    return;
+            let request = if self.external_scanout.is_some() {
+                match self.request_receiver.recv_timeout(EXTERNAL_IDLE_POLL) {
+                    Ok(r) => r,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(external) = self.external_scanout.clone() {
+                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("virtio gpu worker connection ended, exiting.");
+                        return;
+                    }
+                }
+            } else {
+                match self.request_receiver.recv() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        info!("virtio gpu worker connection ended, exiting.");
+                        return;
+                    }
                 }
             };
 
@@ -1500,15 +1525,7 @@ impl Worker {
                         // can never be mid-frame at the same time.
                         if let Some(external) = self.external_scanout.clone() {
                             let _ = external.event().wait();
-                            let (w, h, stride) =
-                                (external.width(), external.height(), external.stride());
-                            let virtio_gpu = &mut self.state.virtio_gpu;
-                            external.take_frame(|frame| {
-                                if let Err(e) = virtio_gpu.present_external(w, h, stride, frame) {
-                                    error!("failed to present an external frame: {:?}", e);
-                                }
-                            });
-                            external.set_guest_owns(virtio_gpu.guest_owns_display());
+                            serve_external_scanout(&external, &mut self.state.virtio_gpu);
                         }
                     }
                     WorkerToken::CtrlQueue => {
@@ -1607,6 +1624,18 @@ impl Worker {
                     .process_queue(&activation_resources.mem, &activation_resources.ctrl_queue)
             {
                 signal_used_ctrl = true;
+            }
+
+            // Republish who owns the display after every batch of guest commands. This is where
+            // ownership actually changes -- a scanout bound or unbound, a device reset at OS
+            // handover -- and the bridge reads the flag to decide whether to bother producing a
+            // frame at all. Updating it only when a frame arrives would make the first "the guest
+            // owns it" observation permanent: the bridge stops offering, nothing wakes this
+            // thread, and the flag can never go back. That is exactly the handover this exists
+            // for (firmware paints through virtio-gpu, then Windows, which has no virtio-gpu
+            // driver, never binds a scanout again).
+            if let Some(external) = &self.external_scanout {
+                external.set_guest_owns(self.state.virtio_gpu.guest_owns_display());
             }
 
             // Process the entire control queue before the resource bridge in case a resource is
@@ -1708,6 +1737,27 @@ impl DisplayBackend {
             }
         }
     }
+}
+
+/// How long the worker parks on the request channel before looking at the simplefb bridge again,
+/// while no driver has the device activated. The bridge produces at 30 fps, so this is one frame:
+/// long enough that a device nobody is displaying through costs nothing, short enough that a
+/// Windows desktop is not a third of a second behind itself.
+const EXTERNAL_IDLE_POLL: Duration = Duration::from_millis(33);
+
+/// Take whatever the simplefb bridge is offering and put it on the display.
+///
+/// Both callers are the gpu worker thread: the event loop while the device is active, and the
+/// request loop while it is not. Ownership is re-evaluated on the way out, because this is the
+/// only place it is evaluated at all -- the bridge only ever reads the flag.
+fn serve_external_scanout(external: &ExternalScanout, virtio_gpu: &mut VirtioGpu) {
+    let (w, h, stride) = (external.width(), external.height(), external.stride());
+    external.take_frame(|frame| {
+        if let Err(e) = virtio_gpu.present_external(w, h, stride, frame) {
+            error!("failed to present an external frame: {:?}", e);
+        }
+    });
+    external.set_guest_owns(virtio_gpu.guest_owns_display());
 }
 
 pub struct Gpu {

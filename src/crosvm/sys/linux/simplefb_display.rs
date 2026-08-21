@@ -81,9 +81,28 @@ fn simplefb_feed_loop(
         params.width, params.height, params.stride, params.addr, DEFAULT_FPS,
     );
 
+    let mut idle_pokes: u32 = 0;
     loop {
         let frame_start = Instant::now();
-        if !scanout.guest_owns() {
+        if scanout.guest_owns() {
+            // Nothing to send while the guest is driving the display -- but ownership can also
+            // lapse on a clock (a guest that bound a scanout and stopped presenting), and that is
+            // only ever re-evaluated on the worker's side of this event. Poke it about once a
+            // second so a lapse is noticed without copying a frame nobody will look at.
+            idle_pokes += 1;
+            if idle_pokes >= DEFAULT_FPS {
+                idle_pokes = 0;
+                scanout.poke();
+            }
+        } else {
+            if idle_pokes != 0 {
+                // Just took the display back. The framebuffer may not have changed a byte since
+                // we last looked at it (a Windows guest that has been sitting on the same picture
+                // since the firmware handed over), and "unchanged" must not mean "not shown" on
+                // the frame where the display became ours.
+                idle_pokes = 0;
+                last_buf.clear();
+            }
             if guest_mem
                 .read_exact_at_addr(&mut read_buf, guest_addr)
                 .is_err()

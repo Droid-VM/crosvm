@@ -202,7 +202,12 @@ pub fn create_gpu_device(
 
     #[cfg(feature = "vnc")]
     if let Some(ref vnc_cfg) = cfg.vnc_server {
-        if cfg.simplefb.is_none() {
+        {
+            // Taken even with `--simplefb`, for the same reason as the Android sink above: there
+            // is one display and the GPU device owns it, with the bridge feeding its frames in
+            // through ExternalScanout. This used to stand down for simplefb, from when the bridge
+            // presented on its own -- leaving nobody to open the VNC server once the bridge
+            // started handing frames over instead.
             let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
             let port = vnc_cfg.port.unwrap_or(5900);
             let addr = format!("{}:{}", host, port);

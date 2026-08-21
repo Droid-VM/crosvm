@@ -120,6 +120,17 @@ impl ExternalScanout {
         let _ = self.event.signal();
     }
 
+    /// Wakes the worker without offering anything.
+    ///
+    /// The producer needs this because ownership can also expire on a clock: a guest that bound a
+    /// scanout and then stopped presenting loses the display after a grace period, and that is
+    /// decided on the worker's side. While the guest owns it the producer has nothing to submit,
+    /// so without an occasional poke there would be no event, no re-evaluation, and the display
+    /// would stay with a guest that had stopped drawing.
+    pub fn poke(&self) {
+        let _ = self.event.signal();
+    }
+
     /// Hands the newest unpainted frame to `f`. Returns false when there is nothing new.
     pub(crate) fn take_frame<F: FnOnce(&[u8])>(&self, f: F) -> bool {
         let seq = self.seq.load(Ordering::Acquire);

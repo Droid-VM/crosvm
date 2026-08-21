@@ -458,18 +458,11 @@ fn create_virtio_devices(
             let event_devices =
                 create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
 
-            // Whoever owns the display owns the input that arrives through it. The simplefb
-            // bridge owns it only when it presents to its own sink (VNC); with the app's Surface
-            // it feeds the GPU device's display instead (ExternalScanout), so the events belong
-            // where they already are.
-            #[cfg(feature = "vnc")]
-            let event_devices = if cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
-                log::info!("GPU: simplefb owns the display sink — event_devices go to the bridge");
-                *simplefb_event_devices_out = event_devices;
-                Vec::new()
-            } else {
-                event_devices
-            };
+            // Input arrives through whichever display is being presented on, and with a GPU
+            // device present that display is always this one -- VNC and the app's Surface alike,
+            // with the simplefb bridge feeding frames in rather than presenting. The bridge keeps
+            // its own event devices only when there is no GPU device at all, which is handled
+            // where it opens its own display (below).
 
             // With `--simplefb` there are two things that can produce a picture and only one
             // Surface to put it on. Rather than opening a second display (two registrations of
