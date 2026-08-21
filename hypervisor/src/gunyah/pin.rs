@@ -84,6 +84,13 @@ const IORING_UNREGISTER_BUFFERS: libc::c_uint = 1;
 /// so this costs nothing in round trips.
 const CHUNK_BYTES: u64 = 512 << 20;
 
+/// How many times a pre-boot region is re-probed while the reserve catches up, and how long to
+/// wait between looks. The reserve returns a stopped VM's pages in about two seconds, so five
+/// looks a second apart covers the relaunch case with room to spare without making a genuinely
+/// short pool take noticeably longer to refuse.
+const PREBOOT_PROBE_ATTEMPTS: u32 = 5;
+const PREBOOT_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Which call site a probe belongs to. Only used for logging and `GUNYAH_PIN_FAIL`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PinSite {
@@ -205,9 +212,68 @@ fn probe_range(host_addr: u64, size: u64) -> Option<ProbeVerdict> {
     })
 }
 
-/// `GUNYAH_PIN_POLICY=fix`: migrate what the probe found instead of refusing it.
-fn policy_is_fix() -> bool {
-    matches!(std::env::var("GUNYAH_PIN_POLICY").as_deref(), Ok("fix"))
+/// Share of sampled 2 MB folios that may be off-pool before migration stops being the cheap
+/// answer. A handful is the ordinary case -- populate can fall back to 4 KB faults under
+/// fragmentation and those pages can land in CMA, which the collapse pass then mostly repairs;
+/// measured on device, the one failure in a 96-boot sweep was 151 of 1725 samples, 8.8%. A large
+/// share means something else is wrong (the reserve is genuinely empty), and migrating a
+/// gigabyte to find that out is worse than saying so.
+const AUTO_FIX_MAX_BAD_PCT: u64 = 10;
+
+/// What to do when the probe finds pages that would have to be migrated.
+#[derive(PartialEq)]
+enum PinPolicy {
+    /// Migrate a small share, refuse a large one. The default.
+    Auto,
+    /// Always migrate, however much there is.
+    Fix,
+    /// Never migrate; refuse as soon as the probe finds anything. The pre-threshold behaviour,
+    /// kept for bisecting.
+    Refuse,
+}
+
+/// Share of sampled folios the probe could not pin, as a percentage.
+fn bad_pct(v: &ProbeVerdict) -> u64 {
+    if v.samples == 0 {
+        return 0;
+    }
+    v.bad.saturating_mul(100) / v.samples
+}
+
+/// Whether to migrate rather than refuse, given what the probe found.
+fn migrate_wanted(v: &ProbeVerdict) -> bool {
+    match policy() {
+        PinPolicy::Fix => true,
+        PinPolicy::Refuse => false,
+        PinPolicy::Auto => bad_pct(v) <= AUTO_FIX_MAX_BAD_PCT,
+    }
+}
+
+/// What the collapse pass managed, in a form that can be appended to a one-line message.
+///
+/// This is the number that tells the two failure modes apart, and it is already in hand: the
+/// preparation that ran immediately before this counted how much of the region it could get into
+/// 2 MB folios. Coverage well under 100% means populate fell back to 4 KB faults and the collapse
+/// could not repair them, which is where off-pool pages come from; coverage at 100% with off-pool
+/// pages means the reserve did not serve the allocation at all, which is a different problem.
+fn collapse_note(prep: Option<&crate::gunyah::mthp::LendPrepResult>, size: u64) -> String {
+    match prep {
+        Some(p) if size > 0 => format!(
+            ", collapse covered {} of {} MB ({:.1}%)",
+            p.large_page_bytes >> 20,
+            size >> 20,
+            p.large_page_bytes as f64 * 100.0 / size as f64
+        ),
+        _ => String::new(),
+    }
+}
+
+fn policy() -> PinPolicy {
+    match std::env::var("GUNYAH_PIN_POLICY").as_deref() {
+        Ok("fix") => PinPolicy::Fix,
+        Ok("refuse") => PinPolicy::Refuse,
+        _ => PinPolicy::Auto,
+    }
 }
 
 fn pin_enabled() -> bool {
@@ -258,7 +324,12 @@ impl LongtermPin {
     /// come from the reserve pool: refuse, unless `GUNYAH_PIN_POLICY=fix` asks us to migrate them
     /// by pinning. If the probe node is missing we cannot tell, so we pin -- the safe, slower
     /// answer.
-    pub fn ensure_pinnable(host_addr: u64, size: u64, site: PinSite) -> Result<Option<LongtermPin>> {
+    pub fn ensure_pinnable(
+        host_addr: u64,
+        size: u64,
+        site: PinSite,
+        prep: Option<&crate::gunyah::mthp::LendPrepResult>,
+    ) -> Result<Option<LongtermPin>> {
         if size == 0 || !pin_enabled() {
             return Ok(None);
         }
@@ -270,6 +341,32 @@ impl LongtermPin {
                 host_addr
             );
             return Err(Error::new(libc::ENOMEM));
+        }
+
+        // A pre-boot region that is not pool-served is usually a VM starting into the couple of
+        // seconds the reserve takes to reclaim the previous one's pages -- a guest reboot relaunches
+        // crosvm about two seconds after the old one exited, which lands exactly there. Refusing on
+        // the first look turns that into "reboot kills the VM", so wait for the reserve before
+        // giving up. Runtime blobs never wait: they are on the allocation hot path and a caller
+        // that gets an error simply allocates elsewhere.
+        let attempts = if site == PinSite::PreBoot { PREBOOT_PROBE_ATTEMPTS } else { 1 };
+        for attempt in 1..attempts {
+            match probe_range(host_addr, size) {
+                Some(v) if v.bad > 0 => {
+                    info!(
+                        "GH-PIN[{}]: {}/{} samples not pool-served, waiting {:?} for the reserve \
+                         (attempt {}/{})",
+                        site.as_str(),
+                        v.bad,
+                        v.samples,
+                        PREBOOT_PROBE_WAIT,
+                        attempt,
+                        attempts
+                    );
+                    std::thread::sleep(PREBOOT_PROBE_WAIT);
+                }
+                _ => break,
+            }
         }
 
         match probe_range(host_addr, size) {
@@ -286,37 +383,41 @@ impl LongtermPin {
                 }
                 Ok(None)
             }
-            Some(v) if policy_is_fix() => {
+            Some(v) if migrate_wanted(&v) => {
                 info!(
-                    "GH-PIN[{}]: {} MB at {:#x}: {}/{} samples need migrating \
-                     (cma={} isolate={} movable={}); GUNYAH_PIN_POLICY=fix -- migrating",
+                    "GH-PIN[{}]: {} MB at {:#x}: {}/{} samples ({}%) need migrating \
+                     (cma={} isolate={} movable={}){} -- migrating",
                     site.as_str(),
                     size >> 20,
                     host_addr,
                     v.bad,
                     v.samples,
+                    bad_pct(&v),
                     v.cma,
                     v.isolate,
-                    v.movable
+                    v.movable,
+                    collapse_note(prep, size),
                 );
-                Self::pin(host_addr, size, site)
+                Self::migrate_and_hold(host_addr, size, site, prep)
             }
             Some(v) => {
                 error!(
-                    "GH-PIN[{}]: refusing {} MB at {:#x}: {}/{} 2MB samples cannot be \
-                     long-term pinned (cma={} isolate={} movable={}, first at +{:#x}) -- this \
+                    "GH-PIN[{}]: refusing {} MB at {:#x}: {}/{} 2MB samples ({}%) cannot be \
+                     long-term pinned (cma={} isolate={} movable={}, first at +{:#x}){} -- this \
                      memory did not come from the reserve pool. Handing it to the hypervisor \
-                     stalls the host or resets the phone; set GUNYAH_PIN_POLICY=fix to migrate \
-                     it instead. CmaFree {} kB.",
+                     stalls the host or resets the phone; GUNYAH_PIN_POLICY=fix migrates it \
+                     instead of refusing, at any size. CmaFree {} kB.",
                     site.as_str(),
                     size >> 20,
                     host_addr,
                     v.bad,
                     v.samples,
+                    bad_pct(&v),
                     v.cma,
                     v.isolate,
                     v.movable,
                     v.first_bad_offset,
+                    collapse_note(prep, size),
                     cma_free_kb(),
                 );
                 Err(Error::new(libc::ENOMEM))
@@ -326,6 +427,45 @@ impl LongtermPin {
     }
 
     /// Takes the `FOLL_LONGTERM` pin for real, which migrates whatever needs migrating.
+    /// Migrate the off-pool pages by pinning them, and keep the pin.
+    ///
+    /// Migration is not something this process performs; it is what the kernel does inside a
+    /// `FOLL_LONGTERM` pin, so taking the pin ourselves is how it is asked for -- and the pin is
+    /// also the answer: if the migration could not find anywhere to move a page to, the pin
+    /// fails, and that error is this function's error.
+    ///
+    /// The pin is then HELD, all the way through the hypervisor call the caller is about to make.
+    /// That is not just convenience. Measured on device: unpinning first, collapsing the region
+    /// again to repair any folio the migration had split, and re-probing, left 57 of 1728 samples
+    /// back in CMA when the reserve was empty -- the repair pass allocated fresh pages, the
+    /// reserve had none, and the buddy allocator handed back exactly the memory that had just
+    /// been migrated away from. Holding the pin makes that impossible: a pinned page cannot be
+    /// migrated, by us or by anyone else.
+    ///
+    /// What is therefore not verified is the folio order after migration. The kernel allocates a
+    /// same-order target where it can and falls back to 4 KB pages where it cannot, so a region
+    /// can in principle come back more fragmented than the collapse pass left it, and the parcel
+    /// shape the caller computes is from the pre-migration map. Nothing observed has needed that
+    /// yet -- the coverage logged below is what to check first if an RM call ever fails after a
+    /// migration.
+    fn migrate_and_hold(
+        host_addr: u64,
+        size: u64,
+        site: PinSite,
+        prep: Option<&crate::gunyah::mthp::LendPrepResult>,
+    ) -> Result<Option<LongtermPin>> {
+        let pin = Self::pin(host_addr, size, site)?;
+        info!(
+            "GH-PIN[{}]: migrated {} MB at {:#x} and holding the pin through the hypervisor \
+             call{}",
+            site.as_str(),
+            size >> 20,
+            host_addr,
+            collapse_note(prep, size),
+        );
+        Ok(pin)
+    }
+
     fn pin(host_addr: u64, size: u64, site: PinSite) -> Result<Option<LongtermPin>> {
         let mut params = IoUringParams::default();
         // SAFETY: passing a properly sized, zeroed params struct; the kernel writes it back.

@@ -361,24 +361,6 @@ impl GunyahVm {
                 let host_ptr = region.host_addr as *mut u8;
                 let guest_base = region.guest_addr.offset();
 
-                // Take the FOLL_LONGTERM pin ourselves before the LEND ioctl does (see pin.rs):
-                // it migrates the region out of CMA and turns "these pages cannot be pinned"
-                // into a refusal here, instead of a hypervisor call that has been observed to
-                // stall the whole host for minutes or reset the phone. Dropped at the end of
-                // this block, once the LEND has returned and gunyah holds its own pin.
-                let _pin = pin::LongtermPin::ensure_pinnable(
-                    host_ptr as u64,
-                    region_size,
-                    pin::PinSite::PreBoot,
-                )
-                .map_err(|e| {
-                    error!(
-                        "GH: refusing to LEND gpa={:#x} size={:#x} -- the host cannot pin it",
-                        guest_base, region_size
-                    );
-                    e
-                })?;
-
                 if let Some(mthp_mode) = cfg.prepare_lend_mthp {
                     // Full mTHP preparation: drop caches, enable mTHP,
                     // populate in batches, cascading MADV_COLLAPSE, mlock.
@@ -392,6 +374,37 @@ impl GunyahVm {
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
+
+                    // Take the FOLL_LONGTERM pin ourselves before the LEND ioctl does (see
+                    // pin.rs): it migrates the region out of CMA and turns "these pages cannot be
+                    // pinned" into a refusal here, instead of a hypervisor call that has been
+                    // observed to stall the whole host for minutes or reset the phone. Dropped at
+                    // the end of this block, once the LEND has returned and gunyah holds its own.
+                    //
+                    // After the preparation, not before it, and that ordering is the whole
+                    // difference between measuring this region and inventing it: the probe reads
+                    // one page per 2 MB through an ordinary get_user_pages, which FAULTS AN
+                    // ABSENT PAGE IN. Run first, it therefore populated the region itself, one
+                    // 4 KB page per 2 MB, order-0 -- allocations the reserve's hook does not
+                    // intercept (it only replaces order-9), so they came from the buddy allocator
+                    // and could land in CMA. The probe then reported those pages as unpinnable,
+                    // and re-probing could never clear them, because they were already there.
+                    // Prepared first, the region is populated, collapsed to 2 MB folios and
+                    // pool-served before anyone looks at it, and the probe answers about the
+                    // memory the hypervisor is actually being handed.
+                    let _pin = pin::LongtermPin::ensure_pinnable(
+                        host_ptr as u64,
+                        region_size,
+                        pin::PinSite::PreBoot,
+                        Some(&prep),
+                    )
+                    .map_err(|e| {
+                        error!(
+                            "GH: refusing to LEND gpa={:#x} size={:#x} -- the host cannot pin it",
+                            guest_base, region_size
+                        );
+                        e
+                    })?;
 
                     let chunks = match mthp_mode {
                         // Single-parcel: keep the whole prepared region in one
@@ -443,7 +456,23 @@ impl GunyahVm {
                         }
                     }
                 } else {
-                    // No mTHP preparation – simple single-slot LEND.
+                    // No mTHP preparation – simple single-slot LEND. Nothing has populated this
+                    // region, so the probe would fault it in itself (see the note above); ask
+                    // anyway, because without the preparation there is nothing else standing
+                    // between an unpinnable region and the hypervisor call.
+                    let _pin = pin::LongtermPin::ensure_pinnable(
+                        host_ptr as u64,
+                        region_size,
+                        pin::PinSite::PreBoot,
+                        None,
+                    )
+                    .map_err(|e| {
+                        error!(
+                            "GH: refusing to LEND gpa={:#x} size={:#x} -- the host cannot pin it",
+                            guest_base, region_size
+                        );
+                        e
+                    })?;
                     // SAFETY: guest regions are guaranteed not to overlap.
                     unsafe {
                         android_lend_user_memory_region(
@@ -631,6 +660,7 @@ impl GunyahVm {
                         region.host_addr as u64,
                         share_len,
                         pin::PinSite::PreBoot,
+                        None,
                     )
                     .map_err(|e| {
                         error!(
@@ -1271,6 +1301,7 @@ impl GunyahVm {
             mem_region.as_ptr() as u64,
             size,
             pin::PinSite::Share,
+            None,
         )?;
 
         // SAFETY: the ioctl reads the request and writes back mem_handle into `blob`; the return
