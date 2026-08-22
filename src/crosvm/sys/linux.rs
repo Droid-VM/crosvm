@@ -4032,9 +4032,21 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     // If simplefb and a display backend are configured, spawn a bridge thread that polls guest
     // memory and pushes frames to that display -- VNC, or the Android Surface from the display
     // service when one is configured (the bridge itself is backend-agnostic).
-    // In protected VM mode, the simplefb region is backed by a DMA-BUF from
-    // the DMA heap and shared via map_cma_region (same as MMIO devices).
-    // The display bridge reads from the host mmap of the same DMA-BUF.
+    // The region is a slice of the guest's own memfd, not a separate buffer. On Gunyah it takes
+    // the swiotlb sharing path -- lend=false, so set_user_memory_region leaves the host with read
+    // access, and create_shm_node=true has RM build a memparcel so the guest gets its stage-2
+    // mapping (see aarch64/src/lib.rs, `SharedFramebuffer`). The bridge therefore reads it
+    // straight out of the host mmap of guest memory at the region's offset.
+    //
+    // Measured on device under --protected-vm-without-firmware: crosvm holds zero dmabuf fds and
+    // one `memfd:crosvm_guest`, with no separate mapping the size of the framebuffer. An earlier
+    // version of this comment claimed a DMA-heap DMA-BUF shared via map_cma_region; that is not
+    // what happens, and it matters because it makes a GPU import look free. Anything wanting an
+    // importable fd for this region has to build a udmabuf over the memfd first, the way
+    // `resource_create_blob` already does for the guest pool.
+    //
+    // The guest maps it with ioremap_wc(), so it is write-combining: visibility of guest writes to
+    // a GPU reader is a real question here, not a formality.
     #[cfg(any(feature = "vnc", feature = "android_display"))]
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
