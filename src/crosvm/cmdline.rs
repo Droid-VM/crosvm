@@ -2799,8 +2799,10 @@ pub struct RunCommand {
     /// Possible key values:
     ///     capture=(false,true) - Disable/enable audio capture.
     ///         Default is false.
-    ///     backend=(null,file,[cras]) - Which backend to use for
-    ///         virtio-snd.
+    ///     backend=(null,file,[cras],[aaudio]) - Which backend to
+    ///         use for virtio-snd. Note that the default is null,
+    ///         i.e. silence: an aaudio build still needs
+    ///         backend=aaudio spelled out.
     ///     client_type=(crosvm,arcvm,borealis) - Set specific
     ///         client type for cras backend. Default is crosvm.
     ///     socket_type=(legacy,unified) Set specific socket type
@@ -2816,6 +2818,13 @@ pub struct RunCommand {
     ///         streams per device.
     ///     num_input_streams=INT - Set number of input PCM streams
     ///         per device.
+    ///     output_device_config=[[KEY=VAL,..],..] - Per output PCM
+    ///         device settings, one [] per device.
+    ///     input_device_config=[[KEY=VAL,..],..] - Same for input
+    ///         PCM devices.
+    ///         Keys: effects=[..] (cras), device_id=INT (aaudio:
+    ///         the AudioDeviceInfo id to pin that PCM device to,
+    ///         0 = let the platform route it).
     pub virtio_snd: Vec<SndParameters>,
 
     #[cfg(feature = "vnc")]

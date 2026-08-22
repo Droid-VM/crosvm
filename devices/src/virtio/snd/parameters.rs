@@ -87,6 +87,11 @@ pub struct PCMDeviceParameters {
     #[cfg(all(unix, feature = "audio_cras"))]
     pub stream_type: Option<CrasStreamType>,
     pub effects: Option<Vec<StreamEffect>>,
+    /// Host endpoint this PCM device plays to / records from, as an Android `AudioDeviceInfo`
+    /// id. Only the aaudio backend honours it; `None` (or 0) leaves the routing to the
+    /// platform. The ids are assigned per boot, so whoever writes this has to resolve a stable
+    /// descriptor to a live id at VM start.
+    pub device_id: Option<i32>,
 }
 
 /// Holds the parameters for a cras sound device
@@ -366,11 +371,13 @@ mod tests {
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_CROSVM),
                     stream_type: None,
                     effects: None,
+                    device_id: None,
                 },
                 PCMDeviceParameters{
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_ARCVM),
                     stream_type: Some(CrasStreamType::CRAS_STREAM_TYPE_PRO_AUDIO),
                     effects: None,
+                    device_id: None,
                 },
                 Default::default(),
                 ],
@@ -387,16 +394,19 @@ mod tests {
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_CROSVM),
                     stream_type: None,
                     effects: None,
+                    device_id: None,
                 },
                 PCMDeviceParameters{
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_ARCVM),
                     stream_type: Some(CrasStreamType::CRAS_STREAM_TYPE_PRO_AUDIO),
                     effects: Some(vec![StreamEffect::EchoCancellation]),
+                    device_id: None,
                 },
                 PCMDeviceParameters{
                     client_type: None,
                     stream_type: None,
                     effects: Some(vec![StreamEffect::EchoCancellation]),
+                    device_id: None,
                 },
                 Default::default(),
                 ],

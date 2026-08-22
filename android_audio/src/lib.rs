@@ -66,6 +66,8 @@ struct AAudioStreamBuilder {
 type AaudioFormatT = i32;
 type AaudioResultT = i32;
 const AAUDIO_OK: AaudioResultT = 0;
+/// `AAUDIO_UNSPECIFIED`: let the platform pick the device (the AAudio default).
+pub const AAUDIO_DEVICE_UNSPECIFIED: i32 = 0;
 
 extern "C" {
     fn AAudio_createStreamBuilder(builder: *mut *mut AAudioStreamBuilder) -> AaudioResultT;
@@ -78,6 +80,7 @@ extern "C" {
     fn AAudioStreamBuilder_setFormat(builder: *mut AAudioStreamBuilder, format: AaudioFormatT);
     fn AAudioStreamBuilder_setSampleRate(builder: *mut AAudioStreamBuilder, sample_rate: i32);
     fn AAudioStreamBuilder_setChannelCount(builder: *mut AAudioStreamBuilder, channel_count: i32);
+    fn AAudioStreamBuilder_setDeviceId(builder: *mut AAudioStreamBuilder, device_id: i32);
     fn AAudioStreamBuilder_openStream(
         builder: *mut AAudioStreamBuilder,
         stream: *mut *mut AAudioStream,
@@ -174,6 +177,7 @@ impl AudioStream {
         frame_rate: u32,
         buffer_size: usize,
         direction: AndroidAudioStreamDirection,
+        device_id: i32,
     ) -> Result<Self, BoxError> {
         let frame_size = format.sample_bytes() * num_channels;
 
@@ -191,6 +195,9 @@ impl AudioStream {
             AAudioStreamBuilder_setFormat(builder, format as AaudioFormatT);
             AAudioStreamBuilder_setSampleRate(builder, frame_rate as i32);
             AAudioStreamBuilder_setChannelCount(builder, num_channels as i32);
+            // AAUDIO_UNSPECIFIED (0) keeps the platform's own routing; anything else pins the
+            // stream to one host endpoint (a specific speaker, headset, mic, ...).
+            AAudioStreamBuilder_setDeviceId(builder, device_id);
             if AAudioStreamBuilder_openStream(builder, &mut stream_ptr) != AAUDIO_OK {
                 return Err(Box::new(AAudioError::StreamOpen));
             }
@@ -345,7 +352,11 @@ impl Drop for AAudioStreamPtr {
 }
 
 #[derive(Default)]
-struct AndroidAudioStreamSource;
+struct AndroidAudioStreamSource {
+    /// Host endpoint every stream from this source opens on; see
+    /// [`AAUDIO_DEVICE_UNSPECIFIED`].
+    device_id: i32,
+}
 
 impl StreamSource for AndroidAudioStreamSource {
     #[allow(clippy::type_complexity)]
@@ -375,6 +386,7 @@ impl StreamSource for AndroidAudioStreamSource {
             frame_rate,
             buffer_size,
             AndroidAudioStreamDirection::Output,
+            self.device_id,
         )?;
         Ok((Box::new(NoopStreamControl::new()), Box::new(audio_stream)))
     }
@@ -409,17 +421,22 @@ impl StreamSource for AndroidAudioStreamSource {
             frame_rate,
             buffer_size,
             AndroidAudioStreamDirection::Input,
+            self.device_id,
         )?;
         Ok((Box::new(NoopStreamControl::new()), Box::new(audio_stream)))
     }
 }
 
 #[derive(Default)]
-pub struct AndroidAudioStreamSourceGenerator;
+pub struct AndroidAudioStreamSourceGenerator {
+    device_id: i32,
+}
 
 impl AndroidAudioStreamSourceGenerator {
-    pub fn new() -> Self {
-        AndroidAudioStreamSourceGenerator {}
+    /// `device_id` is an `AAudioDeviceInfo` id as reported by Android's `AudioManager`, or
+    /// [`AAUDIO_DEVICE_UNSPECIFIED`] to follow whatever the platform would route to anyway.
+    pub fn new(device_id: i32) -> Self {
+        AndroidAudioStreamSourceGenerator { device_id }
     }
 }
 
@@ -427,6 +444,8 @@ impl AndroidAudioStreamSourceGenerator {
 /// for `AndroidAudioStreamSource`.
 impl StreamSourceGenerator for AndroidAudioStreamSourceGenerator {
     fn generate(&self) -> Result<Box<dyn StreamSource>, BoxError> {
-        Ok(Box::new(AndroidAudioStreamSource))
+        Ok(Box::new(AndroidAudioStreamSource {
+            device_id: self.device_id,
+        }))
     }
 }

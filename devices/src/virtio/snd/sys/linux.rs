@@ -4,6 +4,8 @@
 
 #[cfg(feature = "audio_aaudio")]
 use android_audio::AndroidAudioStreamSourceGenerator;
+#[cfg(feature = "audio_aaudio")]
+use android_audio::AAUDIO_DEVICE_UNSPECIFIED;
 use async_trait::async_trait;
 use audio_streams::capture::AsyncCaptureBuffer;
 use audio_streams::capture::AsyncCaptureBufferStream;
@@ -86,13 +88,21 @@ impl TryFrom<&str> for StreamSourceBackend {
 
 #[cfg(feature = "audio_aaudio")]
 pub(crate) fn create_aaudio_stream_source_generators(
+    params: &Parameters,
     snd_data: &SndData,
 ) -> Vec<SysAudioStreamSourceGenerator> {
     let mut generators: Vec<Box<dyn StreamSourceGenerator>> =
         Vec::with_capacity(snd_data.pcm_info_len());
     for pcm_info in snd_data.pcm_info_iter() {
         assert_eq!(pcm_info.features, 0); // Should be 0. Android audio backend does not support any features.
-        generators.push(Box::new(AndroidAudioStreamSourceGenerator::new()));
+        // Per-PCM-device host routing: output_device_config[i]/input_device_config[i] may pin
+        // device i to one AAudio endpoint. Anything unset stays on the platform's own routing.
+        let device_id = params
+            .get_device_params(pcm_info)
+            .unwrap_or_default()
+            .device_id
+            .unwrap_or(AAUDIO_DEVICE_UNSPECIFIED);
+        generators.push(Box::new(AndroidAudioStreamSourceGenerator::new(device_id)));
     }
     generators
 }
@@ -129,7 +139,7 @@ pub(crate) fn create_stream_source_generators(
 ) -> Vec<Box<dyn StreamSourceGenerator>> {
     match backend {
         #[cfg(feature = "audio_aaudio")]
-        StreamSourceBackend::AAUDIO => create_aaudio_stream_source_generators(snd_data),
+        StreamSourceBackend::AAUDIO => create_aaudio_stream_source_generators(params, snd_data),
         #[cfg(feature = "audio_cras")]
         StreamSourceBackend::CRAS => create_cras_stream_source_generators(params, snd_data),
     }
