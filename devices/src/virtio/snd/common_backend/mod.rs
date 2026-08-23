@@ -42,7 +42,11 @@ use serde::Serialize;
 use snapshot::AnySnapshot;
 use thiserror::Error as ThisError;
 use vm_memory::GuestMemory;
+use data_model::Le32;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
 use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 
 use crate::virtio::async_utils;
 use crate::virtio::copy_config;
@@ -56,6 +60,7 @@ use crate::virtio::snd::file_backend::create_file_stream_source_generators;
 use crate::virtio::snd::file_backend::Error as FileError;
 use crate::virtio::snd::layout::*;
 use crate::virtio::snd::null_backend::create_null_stream_source_generators;
+use crate::virtio::snd::parameters::PCMDeviceParameters;
 use crate::virtio::snd::parameters::Parameters;
 use crate::virtio::snd::parameters::StreamSourceBackend;
 use crate::virtio::snd::sys::create_stream_source_generators as sys_create_stream_source_generators;
@@ -69,6 +74,7 @@ use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 use crate::virtio::VirtioDevice;
 
+pub mod underrun;
 pub mod async_funcs;
 pub mod stream_info;
 
@@ -202,7 +208,7 @@ pub struct PcmResponse {
 
 pub struct VirtioSnd {
     control_tube: Option<Tube>,
-    cfg: virtio_snd_config,
+    cfg: DroidVmSndConfig,
     snd_data: SndData,
     stream_info_builders: Vec<StreamInfoBuilder>,
     avail_features: u64,
@@ -230,7 +236,7 @@ impl VirtioSnd {
         control_tube: Tube,
     ) -> Result<VirtioSnd, Error> {
         let params = resize_parameters_pcm_device_config(params);
-        let cfg = hardcoded_virtio_snd_config(&params);
+        let cfg = droidvm_snd_config(&params);
         let snd_data = hardcoded_snd_data(&params);
         let avail_features = base_features;
         let mut keep_rds: Vec<RawDescriptor> = Vec::new();
@@ -290,11 +296,168 @@ pub(crate) fn create_stream_info_builders(
             let device_params = params.get_device_params(pcm_info).unwrap_or_default();
             StreamInfo::builder(generator, card_index)
                 .effects(device_params.effects.unwrap_or_default())
+                .underrun(params.underrun)
         })
         .collect())
 }
 
 // To be used with hardcoded_snd_data
+/// Offset of the DroidVM vendor block within the device config space.
+///
+/// The spec's layout is four u32s -- jacks, streams, chmaps, controls -- ending at 16, and a
+/// stock driver reads exactly those by `offsetof`, so anything past 16 is already invisible to
+/// it. The block sits at 64 rather than 16 anyway, because "invisible today" is not the same as
+/// "safe": if a future virtio-snd revision grows the config, a vendor field parked immediately
+/// after the current end would be read as whatever the spec put there. 48 bytes of room is
+/// cheap insurance, and the magic below is the second line of defence.
+pub const DROIDVM_SND_CFG_OFFSET: usize = 64;
+/// Magic for the DroidVM vendor block: "DVMS".
+pub const DROIDVM_SND_CFG_MAGIC: u32 = 0x534d5644;
+/// Version of the vendor block layout. Bumped when fields are appended; a driver that knows
+/// only an older version reads the prefix it understands and ignores the rest, so this never
+/// needs to break one.
+pub const DROIDVM_SND_CFG_VERSION: u32 = 2;
+/// Per-direction cap on the `preferred_*` arrays. Fixed so the block stays a plain struct the
+/// guest can read at a known offset; devices past it simply get no hint.
+pub const DROIDVM_SND_CFG_MAX_DEVICES: usize = 8;
+
+/// The config space this device publishes: the spec's fields, reserved room for the spec to
+/// grow into, then a DroidVM vendor block carrying the settings that belong to the guest driver
+/// but are chosen host-side.
+///
+/// `controls` is the spec's fourth field, valid only with VIRTIO_SND_F_CTLS and zero otherwise;
+/// crosvm's `virtio_snd_config` stops at `chmaps`, so publishing it explicitly also stops a
+/// spec-conformant driver from reading whatever happened to be past the end.
+#[derive(Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C, packed)]
+pub struct DroidVmSndConfig {
+    pub spec: virtio_snd_config,
+    pub controls: Le32,
+    /// Reserved for future spec fields. Never interpreted here.
+    pub spec_reserved: [u8; DROIDVM_SND_CFG_OFFSET - 16],
+    pub magic: Le32,
+    pub version: Le32,
+    /// Periods the guest driver should try to keep in flight; 0 = driver's own default.
+    pub outstanding_packets: Le32,
+    /// Preferred period size in bytes; 0 = no preference.
+    pub period_bytes: Le32,
+    /// Valid entries in `preferred_output` / `preferred_input`.
+    pub preferred_output_count: Le32,
+    pub preferred_input_count: Le32,
+    /// What each output PCM device's host endpoint runs at natively, indexed the same way as
+    /// `output_device_config` -- that is, by the device's `hda_fn_nid`.
+    ///
+    /// The spec's `formats`/`rates` are bitmasks with no way to say which entry the device would
+    /// rather have, so a guest that supports several has no reason to pick the one the host runs
+    /// at natively -- and every mismatch is a resample the host then has to do. Naming the host's
+    /// rate here lets the guest's mixer land on it directly. It stays a hint: everything in
+    /// `rates` still works, it just costs a conversion.
+    ///
+    /// Per device rather than per card because one card can carry several endpoints and they
+    /// need not share a host device, let alone its rate. Output and input are separate arrays
+    /// because their `hda_fn_nid`s are numbered independently -- output device 0 and input
+    /// device 0 both report nid 0.
+    pub preferred_output: [DroidVmSndPreferred; DROIDVM_SND_CFG_MAX_DEVICES],
+    pub preferred_input: [DroidVmSndPreferred; DROIDVM_SND_CFG_MAX_DEVICES],
+}
+
+/// What one host endpoint is and what it runs at natively. Zero in any field means "not known";
+/// a driver that sees zero should fall back to whatever it would have chosen anyway.
+#[derive(Copy, Clone, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C, packed)]
+pub struct DroidVmSndPreferred {
+    pub rate: Le32,
+    pub channels: Le32,
+    /// What kind of thing the host endpoint is, as a [`DroidVmSndEndpointKind`].
+    ///
+    /// A guest driver has no other way to tell a speaker from a headset: virtio-snd's jacks
+    /// would carry it, but they describe connectors on the emulated card, not the host endpoint
+    /// behind it, and nothing populates them here. Naming it lets the guest present the endpoint
+    /// as what it actually is -- which on Windows also settles the name the user reads and the
+    /// icon next to it.
+    pub kind: Le32,
+}
+
+/// Endpoint kinds, kept deliberately coarse: this has to mean the same thing to every guest, so
+/// it names the sort of thing a listener would recognise rather than the host's own device
+/// taxonomy.
+#[repr(u32)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum DroidVmSndEndpointKind {
+    Unknown = 0,
+    Speaker = 1,
+    Headphones = 2,
+    Headset = 3,
+    LineOut = 4,
+    Digital = 5,
+    Microphone = 6,
+    Telephony = 7,
+}
+
+impl Default for DroidVmSndConfig {
+    fn default() -> Self {
+        // `[u8; 48]` has no Default of its own -- the std impls stop at 32 -- so this cannot be
+        // derived.
+        DroidVmSndConfig {
+            spec: virtio_snd_config::default(),
+            controls: 0.into(),
+            spec_reserved: [0u8; DROIDVM_SND_CFG_OFFSET - 16],
+            magic: 0.into(),
+            version: 0.into(),
+            outstanding_packets: 0.into(),
+            period_bytes: 0.into(),
+            preferred_output_count: 0.into(),
+            preferred_input_count: 0.into(),
+            preferred_output: [DroidVmSndPreferred::default(); DROIDVM_SND_CFG_MAX_DEVICES],
+            preferred_input: [DroidVmSndPreferred::default(); DROIDVM_SND_CFG_MAX_DEVICES],
+        }
+    }
+}
+
+pub fn droidvm_snd_config(params: &Parameters) -> DroidVmSndConfig {
+    let (preferred_output, preferred_output_count) =
+        collect_preferred(&params.output_device_config);
+    let (preferred_input, preferred_input_count) = collect_preferred(&params.input_device_config);
+    DroidVmSndConfig {
+        spec: hardcoded_virtio_snd_config(params),
+        controls: 0.into(),
+        spec_reserved: [0u8; DROIDVM_SND_CFG_OFFSET - 16],
+        magic: DROIDVM_SND_CFG_MAGIC.into(),
+        version: DROIDVM_SND_CFG_VERSION.into(),
+        outstanding_packets: params.guest_outstanding_packets.into(),
+        period_bytes: params.guest_period_bytes.into(),
+        preferred_output_count: preferred_output_count.into(),
+        preferred_input_count: preferred_input_count.into(),
+        preferred_output,
+        preferred_input,
+    }
+}
+
+/// Copies the per-device host hints into the fixed-size array the vendor block publishes.
+/// Devices past the cap are dropped with a warning rather than silently: a hint that is missing
+/// and a hint that is zero look the same to the guest, and only one of them is intentional.
+fn collect_preferred(
+    devices: &[PCMDeviceParameters],
+) -> ([DroidVmSndPreferred; DROIDVM_SND_CFG_MAX_DEVICES], u32) {
+    let mut out = [DroidVmSndPreferred::default(); DROIDVM_SND_CFG_MAX_DEVICES];
+    let count = devices.len().min(DROIDVM_SND_CFG_MAX_DEVICES);
+    if devices.len() > DROIDVM_SND_CFG_MAX_DEVICES {
+        warn!(
+            "virtio-snd: {} PCM devices configured but the vendor block carries hints for {}; \
+             devices {}.. get none",
+            devices.len(),
+            DROIDVM_SND_CFG_MAX_DEVICES,
+            DROIDVM_SND_CFG_MAX_DEVICES
+        );
+    }
+    for (slot, dev) in out.iter_mut().zip(devices.iter()).take(count) {
+        slot.rate = dev.preferred_rate.unwrap_or(0).into();
+        slot.channels = u32::from(dev.preferred_channels.unwrap_or(0)).into();
+        slot.kind = dev.endpoint_kind.unwrap_or(0).into();
+    }
+    (out, count as u32)
+}
+
 pub fn hardcoded_virtio_snd_config(params: &Parameters) -> virtio_snd_config {
     virtio_snd_config {
         jacks: 0.into(),
@@ -975,9 +1138,9 @@ mod tests {
         assert_eq!(res.worker_thread.is_none(), true);
 
         assert_eq!(res.avail_features, 123); // avail_features must be equal to the input
-        assert_eq!(res.cfg.jacks.to_native(), 0);
-        assert_eq!(res.cfg.streams.to_native(), 13); // (Output = 3*3) + (Input = 2*2)
-        assert_eq!(res.cfg.chmaps.to_native(), 11); // (Output = 3*3) + (Input = 2*1)
+        assert_eq!(res.cfg.spec.jacks.to_native(), 0);
+        assert_eq!(res.cfg.spec.streams.to_native(), 13); // (Output = 3*3) + (Input = 2*2)
+        assert_eq!(res.cfg.spec.chmaps.to_native(), 11); // (Output = 3*3) + (Input = 2*1)
 
         // Check snd_data.pcm_info
         assert_eq!(res.snd_data.pcm_info.len(), 13);

@@ -44,6 +44,7 @@ use crate::virtio::snd::common_backend::stream_info::SetParams;
 use crate::virtio::snd::common_backend::stream_info::StreamInfo;
 use crate::virtio::snd::common_backend::DirectionalStream;
 use crate::virtio::snd::common_backend::PcmResponse;
+use crate::virtio::snd::common_backend::underrun::UnderrunConcealer;
 use crate::virtio::snd::constants::*;
 use crate::virtio::snd::layout::*;
 use crate::virtio::DescriptorChain;
@@ -221,11 +222,28 @@ async fn write_data(
     mut dst_buf: AsyncPlaybackBuffer<'_>,
     reader: Option<&mut Reader>,
     buffer_writer: &mut Box<dyn PlaybackBufferWriter>,
+    concealer: Option<&mut UnderrunConcealer>,
 ) -> Result<u32, Error> {
-    let transferred = match reader {
-        Some(reader) => buffer_writer.copy_to_buffer(&mut dst_buf, reader)?,
-        None => dst_buf
-            .copy_from(&mut io::repeat(0).take(buffer_writer.endpoint_period_bytes() as u64))
+    let period = buffer_writer.endpoint_period_bytes();
+    let transferred = match (reader, concealer) {
+        // Concealment needs a copy of what went to the endpoint, and the descriptor is
+        // consumed by the copy, so the period lands in the concealer's own buffer first. That
+        // buffer is reused and becomes the history by a swap, so the steady state costs one
+        // extra memcpy per period and no allocation at all.
+        (Some(reader), Some(concealer)) => {
+            let n = reader.read(concealer.scratch_mut()).map_err(Error::Io)?;
+            let pcm = concealer.commit_good_period(n);
+            dst_buf.copy_from(&mut &pcm[..]).map_err(Error::Io)?
+        }
+        (Some(reader), None) => buffer_writer.copy_to_buffer(&mut dst_buf, reader)?,
+        (None, Some(concealer)) => match concealer.conceal() {
+            Some(pcm) => dst_buf.copy_from(&mut &pcm[..]).map_err(Error::Io)?,
+            None => dst_buf
+                .copy_from(&mut io::repeat(0).take(period as u64))
+                .map_err(Error::Io)?,
+        },
+        (None, None) => dst_buf
+            .copy_from(&mut io::repeat(0).take(period as u64))
             .map_err(Error::Io)?,
     };
 
@@ -393,10 +411,15 @@ async fn pcm_worker_loop(
             #[cfg(windows)]
             let buffer_writer = &mut buffer_writer_lock;
             #[cfg(any(target_os = "android", target_os = "linux"))]
-            let (stream, buffer_writer) = (
+            let (stream, buffer_writer, concealer) = (
                 &mut sys_direction_output.async_playback_buffer_stream,
                 &mut sys_direction_output.buffer_writer,
+                sys_direction_output.concealer.as_mut(),
             );
+            // Windows has no concealer; the parameter exists for both so write_data stays one
+            // function.
+            #[cfg(windows)]
+            let concealer: Option<&mut UnderrunConcealer> = None;
 
             let next_buf = stream.next_playback_buffer(&ex).fuse();
             pin_mut!(next_buf);
@@ -412,7 +435,7 @@ async fn pcm_worker_loop(
             match *worker_status {
                 WorkerStatus::Quit => {
                     drain_desc_receiver(desc_receiver, sender).await?;
-                    if let Err(e) = write_data(dst_buf, None, buffer_writer).await {
+                    if let Err(e) = write_data(dst_buf, None, buffer_writer, concealer).await {
                         error!(
                             "[Card {}] Error on write_data after worker quit: {}",
                             card_index, e
@@ -421,7 +444,7 @@ async fn pcm_worker_loop(
                     break Ok(());
                 }
                 WorkerStatus::Pause => {
-                    write_data(dst_buf, None, buffer_writer).await?;
+                    write_data(dst_buf, None, buffer_writer, concealer).await?;
                 }
                 WorkerStatus::Running => match desc_receiver.try_next() {
                     Err(e) => {
@@ -429,11 +452,11 @@ async fn pcm_worker_loop(
                             "[Card {}] Underrun. No new DescriptorChain while running: {}",
                             card_index, e
                         );
-                        write_data(dst_buf, None, buffer_writer).await?;
+                        write_data(dst_buf, None, buffer_writer, concealer).await?;
                     }
                     Ok(None) => {
                         error!("[Card {}] Unreachable. status should be Quit when the channel is closed", card_index);
-                        write_data(dst_buf, None, buffer_writer).await?;
+                        write_data(dst_buf, None, buffer_writer, concealer).await?;
                         return Err(Error::InvalidPCMWorkerState);
                     }
                     Ok(Some(mut desc_chain)) => {
@@ -443,7 +466,7 @@ async fn pcm_worker_loop(
                             // stream_id was already read in handle_pcm_queue
                             Some(&mut desc_chain.reader)
                         };
-                        let status = write_data(dst_buf, reader, buffer_writer).await.into();
+                        let status = write_data(dst_buf, reader, buffer_writer, concealer).await.into();
                         sender
                             .send(PcmResponse {
                                 desc_chain,

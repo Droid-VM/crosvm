@@ -551,7 +551,15 @@ pub fn create_virtio_snd_device(
     jail_config: Option<&JailConfig>,
     snd_params: SndParameters,
     snd_device_tube: Tube,
+    worker_process_pids: &mut BTreeSet<Pid>,
 ) -> DeviceResult {
+    if snd_params.uid.is_some() {
+        return create_unprivileged_virtio_snd_device(
+            protection_type,
+            snd_params,
+            worker_process_pids,
+        );
+    }
     let backend = snd_params.backend;
     let dev = virtio::snd::common_backend::VirtioSnd::new(
         virtio::base_features(protection_type),
@@ -596,6 +604,41 @@ pub fn create_virtio_snd_device(
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
         jail,
+    })
+}
+
+/// Builds a virtio-snd device whose audio backend runs as `uid` in a child process.
+///
+/// The guest cannot tell this apart from the in-process device: vhost-user moves the virtqueue
+/// handling to the other side of a socket, but the device the guest enumerates is the same one.
+/// See `snd_helper` for why the backend cannot simply stay here.
+fn create_unprivileged_virtio_snd_device(
+    protection_type: ProtectionType,
+    snd_params: SndParameters,
+    worker_process_pids: &mut BTreeSet<Pid>,
+) -> DeviceResult {
+    let (vmm_end, pid) = crate::crosvm::sys::linux::snd_helper::launch(snd_params)
+        .context("failed to launch the unprivileged snd backend")?;
+    // So that the child exiting is not reported as a device crashing.
+    worker_process_pids.insert(pid);
+
+    let connection = vmm_end
+        .try_into()
+        .context("failed to create a vhost-user connection to the snd backend")?;
+
+    let dev = VhostUserFrontend::new(
+        virtio::DeviceType::Sound,
+        virtio::base_features(protection_type),
+        connection,
+        None,
+        None,
+    )
+    .context("failed to set up the vhost-user frontend for snd")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // No sandbox here: virtqueue handling happens in the backend process.
+        jail: None,
     })
 }
 
@@ -1291,6 +1334,7 @@ pub fn create_fs_device(
     ugid: (Option<u32>, Option<u32>),
     uid_map: &str,
     gid_map: &str,
+    supp_gids: &[u32],
     src: &Path,
     tag: &str,
     fs_cfg: virtio::fs::Config,
@@ -1313,7 +1357,33 @@ pub fn create_fs_device(
         };
         create_sandbox_minijail(src, max_open_files, &config)?
     } else {
-        create_base_minijail(src, max_open_files)?
+        // Sandboxing off still forks and pivot_roots this device (fs and 9p always do), so the
+        // identity it runs as is still ours to choose -- and `uid`/`gid` used to be quietly
+        // ignored on this path, which made them look like sandbox-only options when what they
+        // describe is a real host uid. Honour them here too, so a file server can serve as
+        // somebody other than root without dragging in seccomp and user namespaces (neither of
+        // which this build has: EMBEDDED_BPFS is empty on Android, b/246968493).
+        //
+        // minijail_enter() applies these after the pivot_root and in exactly this order --
+        // setgroups, then setresgid, then setresuid -- which is the only order that works: each
+        // step needs the privilege the next one gives away.
+        //
+        // Supplementary groups are set only here. The sandboxed path runs inside a user namespace
+        // with setgroups denied (`namespace_user_disable_setgroups`), where the setgroups(2) this
+        // asks for would fail and take the process down with it.
+        let mut jail = create_base_minijail(src, max_open_files)?;
+        if !supp_gids.is_empty() {
+            jail.set_supplementary_gids(supp_gids);
+        }
+        // libminijail treats a change to 0 as a caller mistake and aborts the process, so a
+        // caller that means "stay root" has to say it by leaving these unset.
+        if let Some(gid) = ugid.1.filter(|g| *g != 0) {
+            jail.change_gid(gid);
+        }
+        if let Some(uid) = ugid.0.filter(|u| *u != 0) {
+            jail.change_uid(uid);
+        }
+        jail
     };
 
     let features = virtio::base_features(protection_type);
