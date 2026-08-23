@@ -49,6 +49,7 @@ extern "C" {
     ) -> *mut std::ffi::c_void;
     fn vnc_server_start(server: *mut std::ffi::c_void);
     fn vnc_server_has_input_events(server: *mut std::ffi::c_void) -> c_int;
+    fn vnc_server_has_clients(server: *mut std::ffi::c_void) -> c_int;
     fn vnc_server_resize(
         server: *mut std::ffi::c_void,
         width: c_int,
@@ -95,6 +96,18 @@ struct VncServerHandle {
 
 unsafe impl Send for VncServerHandle {}
 unsafe impl Sync for VncServerHandle {}
+
+impl VncServerHandle {
+    /// Whether any RFB client is connected. Asked once per frame: it is a NULL check on
+    /// LibVNCServer's client list, and it decides whether the frame's copies are worth making.
+    fn has_clients(&self) -> bool {
+        if self.ptr.is_null() {
+            return false;
+        }
+        // SAFETY: ptr is a live server handle owned by this VncServerHandle.
+        unsafe { vnc_server_has_clients(self.ptr) != 0 }
+    }
+}
 
 impl Drop for VncServerHandle {
     fn drop(&mut self) {
@@ -194,6 +207,24 @@ impl GpuDisplaySurface for VncSurface {
 
     fn flip(&mut self) {
         if let Ok(mut fb) = self.shared_fb.lock() {
+            // There is deliberately no "skip this frame if nobody is connected" here, even though
+            // the two full-frame copies below are provably wasted when there is no client.
+            //
+            // This flip is driven by the guest's virtio-gpu flush, not by a clock, so a frame
+            // dropped here is not offered again. If the guest then goes idle there is no next
+            // flush, and a client connecting afterwards has nothing to arrive to -- it is served
+            // whatever the server framebuffer held when the last consumer left. Measured, not
+            // feared: a client detached across a guest resolution change came back to a
+            // permanently black screen at 0 bytes/s, while the same binary with a client held
+            // across the same change was correct.
+            //
+            // Skipping is safe under a producer that returns on its own, which is why it lives in
+            // simplefb_display_loop instead (GpuDisplay::has_consumer): that one is a 30 fps timer,
+            // so a client arriving is noticed on the next tick and the frame is rebuilt within
+            // 33 ms. Reinstating it here needs a way to re-present on consumer arrival -- the
+            // frame is already retained in the bridge's last_clean, so a LibVNCServer
+            // newClientHook restoring from it would serve -- and that belongs with the transport
+            // work, not with this fix.
             let copy_len = fb.data.len().min(self.local_buffer.len());
             if fb.data.len() != self.local_buffer.len() {
                 base::error!(
@@ -530,6 +561,22 @@ impl DisplayVnc {
 }
 
 impl DisplayT for DisplayVnc {
+    /// This backend has no GPU half: `import_resource` is not implemented, so every import a
+    /// caller attempts fails and is cached as CpuFallback. The trait's default answer is `true`,
+    /// which made the probe say the opposite of the truth -- virtio-gpu paid a real export plus a
+    /// refused import for every resource before learning what this could have told it up front.
+    fn is_dmabuf_import_supported(&mut self) -> bool {
+        false
+    }
+
+    /// No RFB client means no consumer at all: LibVNCServer's mark-as-modified walks an empty
+    /// client list, so a frame pushed now is encoded for nobody and sent to nobody. Producers ask
+    /// this before building a frame; the surface's own flip and the C bridge both check again, so
+    /// a producer that ignores the answer is still correct, only wasteful.
+    fn has_consumer(&self) -> bool {
+        self.server.has_clients()
+    }
+
     fn pending_events(&self) -> bool {
         !self.input_queue.is_empty()
             || unsafe { vnc_server_has_input_events(self.server.ptr) != 0 }

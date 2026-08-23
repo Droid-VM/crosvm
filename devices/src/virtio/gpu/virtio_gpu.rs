@@ -747,8 +747,12 @@ impl VirtioGpuScanout {
             // it must NOT be swapped or its colours invert. This mirrors the zero-copy path, which
             // is fourcc-correct by construction (the fd's fourcc picks the VkFormat). No
             // scanout_data means the legacy SET_SCANOUT desktop path: default to swapping, the
-            // pre-fourcc behaviour. gfxstream never reaches this branch. Kill-switch:
-            // GPU_POOL_SCANOUT_NO_SWIZZLE=1.
+            // pre-fourcc behaviour. gfxstream DOES reach this branch -- a host-visible colorbuffer
+            // whose export returns EINVAL falls through to the pool copy like any other, and it
+            // arrives carrying whatever fourcc the guest compositor picked. So the swap stays
+            // keyed on the fourcc here too: a guest whose declared fourcc disagrees with the byte
+            // order it actually wrote is a bug to fix where the two diverge, not to special-case
+            // here. Kill-switch: GPU_POOL_SCANOUT_NO_SWIZZLE=1.
             let needs_swizzle = match resource.scanout_data.map(|d| d.drm_format.0) {
                 Some(fourcc) => fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_XBGR8888,
                 None => true,

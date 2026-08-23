@@ -379,6 +379,21 @@ trait DisplayT: AsRawDescriptor {
         true
     }
 
+    /// Whether anything is currently positioned to see a frame pushed to this backend.
+    ///
+    /// A producer that has to build a frame before it can offer one -- the simplefb bridge copies
+    /// a whole framebuffer out of guest memory on a timer, whether or not the far end exists --
+    /// can ask this first and skip the work entirely. `false` must mean "a frame pushed now
+    /// reaches nobody", never "probably idle": a producer is entitled to drop the frame outright
+    /// on the strength of this answer.
+    ///
+    /// The default is `true`, which is the answer for any backend whose output always has a
+    /// destination. Only a backend that can genuinely have none -- VNC with no client connected --
+    /// should override it.
+    fn has_consumer(&self) -> bool {
+        true
+    }
+
     /// Creates a surface with the given parameters.  The display backend is given a non-zero
     /// `surface_id` as a handle for subsequent operations.
     fn create_surface(
@@ -778,6 +793,11 @@ impl GpuDisplay {
     /// Returns whether the display backend can import DMA-BUF resources.
     pub fn is_dmabuf_import_supported(&mut self) -> bool {
         self.inner.is_dmabuf_import_supported()
+    }
+
+    /// Whether anything is currently positioned to see a frame. See `DisplayT::has_consumer`.
+    pub fn has_consumer(&self) -> bool {
+        self.inner.has_consumer()
     }
 
     /// Releases a previously imported resource identified by the given handle.

@@ -32,6 +32,14 @@ struct vnc_server {
     /* Rectangle the composited cursor currently occupies, so a move knows what to restore from
      * the clean frame. w==0 means nothing is drawn. */
     int drawn_x, drawn_y, drawn_w, drawn_h;
+    /* The last cursor-free frame we pushed, kept so the next one can be compared against it.
+     * screen->frameBuffer cannot serve: it has the cursor blended in, so the pointer's rectangle
+     * would read as changed on every frame no matter what the guest drew. `valid` is separate
+     * from the pointer because a freshly allocated buffer says nothing about what is on screen --
+     * an all-black guest frame would compare equal to a zeroed buffer and nothing would be sent. */
+    uint8_t* last_clean;
+    uint32_t last_clean_size;
+    int last_clean_valid;
 };
 
 struct keysym_entry {
@@ -303,6 +311,21 @@ int vnc_server_resize(vnc_server_t* server, int width, int height) {
     rfbNewFramebuffer(server->screen, new_fb, width, height, 8, 3, 4);
     vnc_server_set_bgrx_format(server->screen);
     free(old_fb);
+
+    /* The framebuffer handed over above is freshly zeroed, which makes every "this band is already
+     * on screen" verdict recorded in last_clean false. push_damaged_bands would then skip exactly
+     * the bands the guest is not repainting and leave them black -- marking nothing, so not one
+     * byte goes out to report it. It shows up as a permanently black client at 0 bytes/s, and only
+     * sometimes: ensure_last_clean already reallocates (and invalidates) when the pixel count
+     * changes, so the hole is a resize that lands back on a size seen before with no composite in
+     * between. The display does exactly that while booting -- 1400x1050 -> 640x480 -> 1280x800 ->
+     * 1400x1050 inside 200 ms, against a 33 ms producer.
+     *
+     * drawn_* is dropped for the same reason: it locates the cursor in the OLD geometry, and there
+     * is nothing of the old frame left underneath it to restore. */
+    server->last_clean_valid = 0;
+    server->drawn_x = 0; server->drawn_y = 0;
+    server->drawn_w = 0; server->drawn_h = 0;
     return 0;
 }
 
@@ -313,6 +336,15 @@ void vnc_server_update_framebuffer(vnc_server_t* server, const uint8_t* data, ui
     if (size > fb_size)
         size = fb_size;
     memcpy(server->screen->frameBuffer, data, size);
+    /* This path writes the server framebuffer without going through last_clean, so the band
+     * comparison in push_damaged_bands would afterwards skip every band whose *source* did not
+     * change -- leaving those regions showing whatever was written here, permanently, with
+     * nothing reporting a fault. Invalidating forces the next composite to refresh everything.
+     *
+     * There is no caller today (the Rust side declares this symbol and never uses it), so this
+     * is not a live bug. It is one line because the function existing at all is an invitation:
+     * whoever wires it up will not know a caching assumption depends on them. */
+    server->last_clean_valid = 0;
     rfbMarkRectAsModified(server->screen, 0, 0, server->screen->width, server->screen->height);
 }
 
@@ -440,15 +472,93 @@ static void blend_cursor(rfbScreenInfoPtr screen, const uint8_t* cur, int cw, in
 }
 
 /* Copy one rectangle of the clean guest frame back over the outgoing framebuffer. */
-static void restore_rect(rfbScreenInfoPtr screen, const uint8_t* clean,
+/* The rectangle is clamped to the CURRENT screen, because it does not necessarily describe the
+ * current screen: drawn_* is written by the previous frame, and vnc_server_resize can replace the
+ * framebuffer with a smaller one in between. Unclamped, a rectangle left over from a taller screen
+ * indexes past the end of the new buffer -- a heap write out of bounds, not a wrong pixel. That was
+ * survivable while only the cursor-move path came here; the full-frame path calls it every frame
+ * now. clean_size bounds the source for the same reason: `clean` is the producer's buffer and is
+ * not required to be as large as the screen. */
+static void restore_rect(rfbScreenInfoPtr screen, const uint8_t* clean, uint32_t clean_size,
                          int x, int y, int w, int h) {
+    int sw = screen->width, sh = screen->height;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x >= sw || y >= sh)
+        return;
+    if (x + w > sw) w = sw - x;
+    if (y + h > sh) h = sh - y;
     if (w <= 0 || h <= 0)
         return;
-    int sw = screen->width;
     for (int r = 0; r < h; r++) {
         size_t off = ((size_t)(y + r) * sw + x) * 4;
-        memcpy((uint8_t*)screen->frameBuffer + off, clean + off, (size_t)w * 4);
+        size_t len = (size_t)w * 4;
+        if (off >= clean_size)
+            break;
+        if (off + len > clean_size)
+            len = clean_size - off;
+        memcpy((uint8_t*)screen->frameBuffer + off, clean + off, len);
     }
+}
+
+/* Rows compared as one unit. Small enough that a pointer-sized change marks a small rectangle,
+ * large enough that the per-band bookkeeping stays negligible against the memcmp. */
+#define DAMAGE_BAND_ROWS 32
+
+/* Makes last_clean usable for a frame of `size` bytes. Returns 0 if it cannot, in which case the
+ * caller must fall back to refreshing the whole frame. */
+static int ensure_last_clean(vnc_server_t* server, uint32_t size) {
+    if (server->last_clean && server->last_clean_size == size)
+        return 1;
+    free(server->last_clean);
+    server->last_clean = (uint8_t*)malloc(size);
+    if (!server->last_clean) {
+        server->last_clean_size = 0;
+        server->last_clean_valid = 0;
+        return 0;
+    }
+    server->last_clean_size = size;
+    server->last_clean_valid = 0;   /* contents unknown: the next pass must refresh everything */
+    return 1;
+}
+
+/* Pushes only the horizontal bands of `clean` that differ from the previous frame, marking each
+ * as modified, and keeps last_clean in step.
+ *
+ * Without this the bridge marked the whole screen on every frame, so LibVNCServer re-encoded and
+ * re-sent 1400x1050 whether or not a single pixel had moved: measured at 0.4-0.6 MB/s to a
+ * connected client watching a completely static desktop, plus the encode behind it. A memcmp of
+ * the frame is a fraction of that and skips both.
+ *
+ * Bands rather than a single whole-frame compare because the answer has to be a rectangle to mark,
+ * and rather than tiles because the encoder's own unit is a row range -- a taller, full-width
+ * rectangle costs it nothing extra. */
+static void push_damaged_bands(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size) {
+    rfbScreenInfoPtr screen = server->screen;
+    int w = screen->width, h = screen->height;
+    size_t row_bytes = (size_t)w * 4;
+    int force = !server->last_clean_valid;
+    for (int y0 = 0; y0 < h; y0 += DAMAGE_BAND_ROWS) {
+        int rows = (y0 + DAMAGE_BAND_ROWS <= h) ? DAMAGE_BAND_ROWS : (h - y0);
+        size_t off = (size_t)y0 * row_bytes;
+        if (off >= clean_size)
+            break;
+        size_t len = (size_t)rows * row_bytes;
+        if (off + len > clean_size)
+            len = clean_size - off;
+        if (!force && memcmp(server->last_clean + off, clean + off, len) == 0)
+            continue;
+        memcpy(screen->frameBuffer + off, clean + off, len);
+        memcpy(server->last_clean + off, clean + off, len);
+        rfbMarkRectAsModified(screen, 0, y0, w, y0 + rows);
+    }
+    server->last_clean_valid = 1;
+}
+
+int vnc_server_has_clients(vnc_server_t* server) {
+    if (!server || !server->screen)
+        return 0;
+    return server->screen->clientHead != NULL;
 }
 
 void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
@@ -457,6 +567,16 @@ void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t c
     if (!server || !server->screen || !server->screen->frameBuffer || !clean)
         return;
     rfbScreenInfoPtr screen = server->screen;
+
+    /* No early return for "there are no clients" here, though everything below is work done for
+     * nobody when the client list is empty. This is only reached from the producer's flip, and on
+     * the virtio-gpu route that producer is the guest's own flush: a frame skipped here is never
+     * offered again, so a client connecting to a guest that has since gone idle is served whatever
+     * the framebuffer held when the last consumer left. That was measured as a permanently black
+     * screen after a guest resolution change -- the resize zeroes the framebuffer, so the stale
+     * content was black rather than merely old -- and it went away with a client held across the
+     * same change. The skip belongs to the timer-driven producer, which picks a new client up on
+     * its next tick; see simplefb_display_loop. */
     uint32_t fb_size = (uint32_t)screen->width * screen->height * 4;
     if (clean_size > fb_size)
         clean_size = fb_size;
@@ -470,12 +590,31 @@ void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t c
     int nx = 0, ny = 0, nw = 0, nh = 0;
 
     if (full) {
-        memcpy(screen->frameBuffer, clean, clean_size);
+        /* The cursor is handled exactly as in the incremental path below -- erase where it was,
+         * draw where it is, mark both -- because banded copying no longer refreshes the whole
+         * frame. A band that did not change is not rewritten, so the pointer's old pixels would
+         * survive there unless restore_rect takes them out. */
+        int ox = server->drawn_x, oy = server->drawn_y;
+        int ow = server->drawn_w, oh = server->drawn_h;
+        if (ensure_last_clean(server, clean_size)) {
+            push_damaged_bands(server, clean, clean_size);
+        } else {
+            /* No memory for the comparison buffer: the old behaviour is still correct, only
+             * wasteful. Nothing is left of the previous cursor to restore after a whole-frame
+             * refresh, so the rectangle is cleared. */
+            memcpy(screen->frameBuffer, clean, clean_size);
+            rfbMarkRectAsModified(screen, 0, 0, screen->width, screen->height);
+            ox = oy = ow = oh = 0;
+        }
+        restore_rect(screen, clean, clean_size, ox, oy, ow, oh);
         if (visible && cursor_argb && cw > 0 && ch > 0)
             blend_cursor(screen, cursor_argb, cw, ch, dx, dy, &nx, &ny, &nw, &nh);
         server->drawn_x = nx; server->drawn_y = ny;
         server->drawn_w = nw; server->drawn_h = nh;
-        rfbMarkRectAsModified(screen, 0, 0, screen->width, screen->height);
+        if (ow > 0 && oh > 0)
+            rfbMarkRectAsModified(screen, ox, oy, ox + ow, oy + oh);
+        if (nw > 0 && nh > 0)
+            rfbMarkRectAsModified(screen, nx, ny, nx + nw, ny + nh);
         return;
     }
 
@@ -484,7 +623,7 @@ void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t c
      * static desktop without pushing a whole frame for every step. */
     int ox = server->drawn_x, oy = server->drawn_y;
     int ow = server->drawn_w, oh = server->drawn_h;
-    restore_rect(screen, clean, ox, oy, ow, oh);
+    restore_rect(screen, clean, clean_size, ox, oy, ow, oh);
     if (visible && cursor_argb && cw > 0 && ch > 0)
         blend_cursor(screen, cursor_argb, cw, ch, dx, dy, &nx, &ny, &nw, &nh);
     server->drawn_x = nx; server->drawn_y = ny;
@@ -499,6 +638,10 @@ void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t c
 void vnc_server_destroy(vnc_server_t* server) {
     if (!server)
         return;
+    free(server->last_clean);
+    server->last_clean = NULL;
+    server->last_clean_size = 0;
+    server->last_clean_valid = 0;
     if (server->screen) {
         rfbShutdownServer(server->screen, TRUE);
         free(server->screen->frameBuffer);

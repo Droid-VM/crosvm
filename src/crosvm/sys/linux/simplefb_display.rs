@@ -231,6 +231,23 @@ fn simplefb_display_loop(
             }
         }
 
+        // Nothing downstream is positioned to see this frame -- VNC with no client is the case
+        // that exists today. Everything below is then work done for nobody: a full framebuffer
+        // read out of guest memory, a copy into the surface, and whatever the sink does with it,
+        // repeated DEFAULT_FPS times a second for as long as the VM is up. dispatch_events above
+        // still runs, which is what notices a client arriving, so this recovers by itself on the
+        // next iteration.
+        //
+        // Deliberately after dispatch_events and before the read: the read is the expensive part
+        // and it is the first thing that can be skipped without losing the ability to come back.
+        if !display.has_consumer() {
+            let elapsed = frame_start.elapsed();
+            if elapsed < frame_duration {
+                thread::sleep(frame_duration - elapsed);
+            }
+            continue;
+        }
+
         if guest_mem
             .read_exact_at_addr(&mut read_buf, guest_addr)
             .is_err()

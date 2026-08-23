@@ -34,6 +34,11 @@ int vnc_server_resize(vnc_server_t* server, int width, int height);
 void vnc_server_update_framebuffer(vnc_server_t* server, const uint8_t* data, uint32_t size);
 void vnc_server_destroy(vnc_server_t* server);
 
+/* Whether any RFB client is connected. Non-zero means a frame pushed now will actually be
+ * encoded and sent; zero means every copy on the way there is wasted. Cheap enough to ask per
+ * frame -- it is a NULL check on the client list head. */
+int vnc_server_has_clients(vnc_server_t* server);
+
 /* Publish the guest's hardware cursor.
  *
  * `argb` is width*height pixels of the guest's cursor resource in the same BGRX byte order as the
