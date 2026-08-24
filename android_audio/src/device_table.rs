@@ -67,6 +67,37 @@ pub fn attr<'a>(attrs: &'a str, name: &str) -> Option<&'a str> {
 ///
 /// Lines are `<id>\t<in|out>\t<TYPE|address>`; anything else is skipped, so a partially written
 /// file costs at most a failed lookup and never a wrong one.
+/// What the endpoint itself runs at: its native rate in Hz, its channel count, and what kind of
+/// thing it is (the `VIOSND_ENDPOINT_KIND_*` numbering the guest driver uses). A zero in any of
+/// them means the platform did not say, which is distinct from a value.
+///
+/// Published in the same table as the ids, in columns after them, so a reader that only wants an
+/// id is unaffected and an older table without the columns simply says nothing.
+pub fn properties(table_path: &Path, key: &str, input: bool) -> Option<(u32, u8, u32)> {
+    let (key, _) = split_key(key);
+    if key.is_empty() {
+        return None;
+    }
+    let text = fs::read_to_string(table_path).ok()?;
+    for line in text.lines() {
+        let mut fields = line.split('\t');
+        let _id = fields.next()?;
+        let dir = fields.next();
+        let entry = fields.next();
+        let (Some(dir), Some(entry)) = (dir, entry) else {
+            continue;
+        };
+        if (dir == "in") != input || entry.trim() != key {
+            continue;
+        }
+        let rate = fields.next().and_then(|f| f.trim().parse::<u32>().ok());
+        let channels = fields.next().and_then(|f| f.trim().parse::<u8>().ok());
+        let kind = fields.next().and_then(|f| f.trim().parse::<u32>().ok());
+        return Some((rate.unwrap_or(0), channels.unwrap_or(0), kind.unwrap_or(0)));
+    }
+    None
+}
+
 pub fn resolve(table_path: &Path, key: &str, input: bool) -> Option<i32> {
     let (key, _) = split_key(key);
     if key.is_empty() || key == SYSTEM_DEFAULT_KEY {
@@ -105,6 +136,42 @@ mod tests {
         let path = dir.path().join("devices");
         fs::write(&path, body).unwrap();
         path
+    }
+
+    #[test]
+    fn properties_come_from_the_columns_after_the_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = write(&dir, "7\tout\tBLUETOOTH_A2DP|AA:BB\t44100\t2\t5\n");
+        assert_eq!(
+            properties(&path, "BLUETOOTH_A2DP|AA:BB", false),
+            Some((44100, 2, 5))
+        );
+        // Same row, wrong direction: not this endpoint.
+        assert_eq!(properties(&path, "BLUETOOTH_A2DP|AA:BB", true), None);
+        // The attributes say what the stream is for, not which endpoint it is.
+        assert_eq!(
+            properties(&path, "BLUETOOTH_A2DP|AA:BB#usage=media", false),
+            Some((44100, 2, 5))
+        );
+    }
+
+    #[test]
+    fn a_table_without_the_columns_states_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // Written by an older launcher: the endpoint is there, its properties are not. Zero is
+        // the answer that leaves the guest with its own default, which is what it had before
+        // these columns existed.
+        let path = write(&dir, "7\tout\tBUILTIN_SPEAKER|\n");
+        assert_eq!(properties(&path, "BUILTIN_SPEAKER|", false), Some((0, 0, 0)));
+        // A half-written row states nothing rather than a fraction of something.
+        let path = write(&dir, "7\tout\tBUILTIN_SPEAKER|\t48000\n");
+        assert_eq!(
+            properties(&path, "BUILTIN_SPEAKER|", false),
+            Some((48000, 0, 0))
+        );
+        // Negative control: a name that is not in the table has no properties, which is a
+        // different answer from having blank ones.
+        assert_eq!(properties(&path, "USB_DEVICE|card=2", false), None);
     }
 
     #[test]

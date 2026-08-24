@@ -374,6 +374,19 @@ fn set_creds(
     let olduid = THREAD_EUID.with(|uid| *uid);
     let oldgid = THREAD_EGID.with(|gid| *gid);
 
+    // A server that has given up root cannot become anyone else, and the uid the guest names is
+    // a claim it is in no position to honour: the setresgid below would fail with EPERM and take
+    // the whole operation down with it. That is not a hypothetical -- `--shared-dir uid=` runs
+    // the device as an ordinary user precisely so that the guest reaches only what that user
+    // reaches, and every create/mkdir/symlink then arrives asking to be somebody.
+    //
+    // Its own identity is the answer. Everything this process does is done as that user, which
+    // is the whole point of having dropped, so keep the credentials we have instead of failing
+    // to change them. A root server is unaffected and still switches per request.
+    if olduid != 0 {
+        return Ok((None, None));
+    }
+
     // We have to change the gid before we change the uid because if we change the uid first then we
     // lose the capability to change the gid.  However changing back can happen in any order.
     ScopedGid::new(gid, oldgid).and_then(|gid| Ok((ScopedUid::new(uid, olduid)?, gid)))

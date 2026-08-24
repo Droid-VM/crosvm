@@ -416,8 +416,9 @@ impl Default for DroidVmSndConfig {
 
 pub fn droidvm_snd_config(params: &Parameters) -> DroidVmSndConfig {
     let (preferred_output, preferred_output_count) =
-        collect_preferred(&params.output_device_config);
-    let (preferred_input, preferred_input_count) = collect_preferred(&params.input_device_config);
+        collect_preferred(&params.output_device_config, &params.device_table, false);
+    let (preferred_input, preferred_input_count) =
+        collect_preferred(&params.input_device_config, &params.device_table, true);
     DroidVmSndConfig {
         spec: hardcoded_virtio_snd_config(params),
         controls: 0.into(),
@@ -436,8 +437,29 @@ pub fn droidvm_snd_config(params: &Parameters) -> DroidVmSndConfig {
 /// Copies the per-device host hints into the fixed-size array the vendor block publishes.
 /// Devices past the cap are dropped with a warning rather than silently: a hint that is missing
 /// and a hint that is zero look the same to the guest, and only one of them is intentional.
+/// What the host says the endpoint is, from the table the launcher publishes: `(rate, channels,
+/// kind)`, any of them zero for "not stated".
+///
+/// Only the Android backend has a table to read; elsewhere there is nothing to ask, and the
+/// configuration is the only source.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn endpoint_properties(device_table: &str, key: &str, input: bool) -> (u32, u8, u32) {
+    if device_table.is_empty() {
+        return (0, 0, 0);
+    }
+    android_audio::device_table::properties(std::path::Path::new(device_table), key, input)
+        .unwrap_or((0, 0, 0))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn endpoint_properties(_device_table: &str, _key: &str, _input: bool) -> (u32, u8, u32) {
+    (0, 0, 0)
+}
+
 fn collect_preferred(
     devices: &[PCMDeviceParameters],
+    device_table: &str,
+    input: bool,
 ) -> ([DroidVmSndPreferred; DROIDVM_SND_CFG_MAX_DEVICES], u32) {
     let mut out = [DroidVmSndPreferred::default(); DROIDVM_SND_CFG_MAX_DEVICES];
     let count = devices.len().min(DROIDVM_SND_CFG_MAX_DEVICES);
@@ -451,9 +473,32 @@ fn collect_preferred(
         );
     }
     for (slot, dev) in out.iter_mut().zip(devices.iter()).take(count) {
-        slot.rate = dev.preferred_rate.unwrap_or(0).into();
-        slot.channels = u32::from(dev.preferred_channels.unwrap_or(0)).into();
-        slot.kind = dev.endpoint_kind.unwrap_or(0).into();
+        // Whoever wrote the configuration wins; otherwise ask the table, which is where the only
+        // process that can enumerate Android's audio devices publishes what it found. Leaving
+        // this empty is not neutral: the guest then picks a format of its own, and the host
+        // converts every sample to reach the endpoint's real one.
+        let (rate, channels, kind) = match (
+            dev.preferred_rate,
+            dev.preferred_channels,
+            dev.endpoint_kind,
+        ) {
+            (Some(r), Some(c), Some(k)) => (r, c, k),
+            _ => {
+                let looked_up = dev
+                    .host_device
+                    .as_deref()
+                    .map(|key| endpoint_properties(device_table, key, input))
+                    .unwrap_or((0, 0, 0));
+                (
+                    dev.preferred_rate.unwrap_or(looked_up.0),
+                    dev.preferred_channels.unwrap_or(looked_up.1),
+                    dev.endpoint_kind.unwrap_or(looked_up.2),
+                )
+            }
+        };
+        slot.rate = rate.into();
+        slot.channels = u32::from(channels).into();
+        slot.kind = kind.into();
     }
     (out, count as u32)
 }
