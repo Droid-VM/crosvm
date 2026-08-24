@@ -92,6 +92,12 @@ pub enum UnderrunMode {
     Silence,
     /// Repeat the tail of the last good period, pitch-aligned and fading out.
     Repeat,
+    /// Waveform Similarity Overlap-Add: re-splice at the best match for each chunk, so a long
+    /// hole wanders through the history rather than looping one period of it.
+    Wsola,
+    /// Fit an all-pole filter to the last good period and run it on, continuing the spectrum
+    /// rather than reusing samples.
+    Lpc,
 }
 
 impl From<UnderrunMode> for String {
@@ -99,6 +105,8 @@ impl From<UnderrunMode> for String {
         match mode {
             UnderrunMode::Silence => "silence".to_owned(),
             UnderrunMode::Repeat => "repeat".to_owned(),
+            UnderrunMode::Wsola => "wsola".to_owned(),
+            UnderrunMode::Lpc => "lpc".to_owned(),
         }
     }
 }
@@ -110,9 +118,11 @@ impl TryFrom<&str> for UnderrunMode {
         match s {
             "silence" => Ok(UnderrunMode::Silence),
             "repeat" => Ok(UnderrunMode::Repeat),
+            "wsola" => Ok(UnderrunMode::Wsola),
+            "lpc" => Ok(UnderrunMode::Lpc),
             _ => Err(Error::InvalidParameterValue(
                 s.to_owned(),
-                "expected silence or repeat".to_owned(),
+                "expected silence, repeat, wsola or lpc".to_owned(),
             )),
         }
     }

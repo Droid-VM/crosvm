@@ -337,6 +337,15 @@ pub trait AsyncPlaybackBufferStream: Send {
         &'a mut self,
         _ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError>;
+
+    /// Lets go of whatever the host holds for this stream while nothing is being played or
+    /// recorded through it, without ending the stream itself: the next buffer takes it again.
+    ///
+    /// A stream the guest started and then stopped feeding is still a started stream, and on
+    /// Android holding its endpoint open costs power on the way out and keeps the recording
+    /// indicator lit on the way in -- for a guest that is no longer there to be recording.
+    /// Backends with nothing to let go of need not implement it.
+    fn set_idle(&mut self, _idle: bool) {}
 }
 
 #[async_trait(?Send)]
@@ -346,6 +355,10 @@ impl<S: AsyncPlaybackBufferStream + ?Sized> AsyncPlaybackBufferStream for &mut S
         ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError> {
         (**self).next_playback_buffer(ex).await
+    }
+
+    fn set_idle(&mut self, idle: bool) {
+        (**self).set_idle(idle)
     }
 }
 

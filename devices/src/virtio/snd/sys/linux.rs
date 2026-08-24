@@ -32,7 +32,6 @@ use crate::virtio::snd::common_backend::async_funcs::CaptureBufferReader;
 use crate::virtio::snd::common_backend::async_funcs::PlaybackBufferWriter;
 use crate::virtio::snd::common_backend::stream_info::StreamInfo;
 use crate::virtio::snd::common_backend::underrun::UnderrunConcealer;
-use crate::virtio::snd::parameters::UnderrunMode;
 use crate::virtio::snd::common_backend::DirectionalStream;
 use crate::virtio::snd::common_backend::Error;
 use crate::virtio::snd::common_backend::PcmResponse;
@@ -247,15 +246,13 @@ impl StreamInfo {
 
         // Built here because this is where the stream's geometry is known. None when the mode is
         // Silence, or when the format is one the concealer will not guess at.
-        let concealer = match self.underrun {
-            UnderrunMode::Silence => None,
-            UnderrunMode::Repeat => UnderrunConcealer::new(
-                self.channels as usize,
-                self.frame_rate,
-                self.period_bytes,
-                self.format.sample_bytes(),
-            ),
-        };
+        let concealer = UnderrunConcealer::new(
+            self.underrun,
+            self.channels as usize,
+            self.frame_rate,
+            self.period_bytes,
+            self.format,
+        );
 
         Ok(DirectionalStream::Output(SysDirectionOutput {
             async_playback_buffer_stream,
@@ -288,6 +285,10 @@ impl CaptureBufferReader for UnixBufferReader {
             .next_capture_buffer(ex)
             .await
             .map_err(Error::FetchBuffer)?)
+    }
+
+    fn set_idle(&mut self, idle: bool) {
+        self.async_stream.set_idle(idle);
     }
 }
 

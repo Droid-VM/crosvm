@@ -191,6 +191,11 @@ struct AAudioStreamPtr {
     retry_at: Instant,
     /// So the log says it once per outage rather than once per period.
     reported_lost: bool,
+    /// Set while the guest has a started stream it is not feeding. The endpoint is let go and not
+    /// taken again until there is something to put through it -- an idle stream is still a stream
+    /// as far as the platform is concerned, and on the capture side that means the recording
+    /// indicator stays lit for a guest that has stopped recording.
+    idle: bool,
 }
 
 impl AAudioStreamPtr {
@@ -223,8 +228,29 @@ impl AAudioStreamPtr {
     }
 
     /// Opens the endpoint again if it is time to try. Cheap to call on every period.
+    /// Lets the endpoint go, or allows it to be taken again. Idle is not an outage: it says
+    /// nothing to the log and leaves no "lost" state behind, because nothing was lost.
+    fn set_idle(&mut self, idle: bool) {
+        if idle == self.idle {
+            return;
+        }
+        self.idle = idle;
+        if idle && !self.stream_ptr.is_null() {
+            // SAFETY: the pointer came from AAudioStreamBuilder_openStream and is closed once.
+            unsafe {
+                AAudioStream_close(self.stream_ptr);
+            }
+            self.stream_ptr = std::ptr::null_mut();
+        }
+        if !idle {
+            // Take it again at the next period rather than after the reconnect interval: there
+            // is audio waiting, and nothing was wrong with the endpoint.
+            self.retry_at = Instant::now();
+        }
+    }
+
     fn try_reconnect(&mut self) {
-        if self.connected() || Instant::now() < self.retry_at {
+        if self.idle || self.connected() || Instant::now() < self.retry_at {
             return;
         }
         self.retry_at = Instant::now() + RECONNECT_INTERVAL;
@@ -621,6 +647,7 @@ impl AudioStream {
             open,
             retry_at: Instant::now(),
             reported_lost: false,
+            idle: false,
         };
         let buffer_drop = AndroidAudioStreamCommit {
             stream,
@@ -701,6 +728,10 @@ impl AudioStream {
 
 #[async_trait(?Send)]
 impl AsyncPlaybackBufferStream for AudioStream {
+    fn set_idle(&mut self, idle: bool) {
+        self.buffer_drop.stream.set_idle(idle);
+    }
+
     async fn next_playback_buffer<'a>(
         &'a mut self,
         ex: &dyn AudioStreamsExecutor,
@@ -727,6 +758,10 @@ impl CaptureBufferStream for AudioStream {
 
 #[async_trait(?Send)]
 impl AsyncCaptureBufferStream for AudioStream {
+    fn set_idle(&mut self, idle: bool) {
+        self.buffer_drop.stream.set_idle(idle);
+    }
+
     async fn next_capture_buffer<'a>(
         &'a mut self,
         ex: &dyn AudioStreamsExecutor,
