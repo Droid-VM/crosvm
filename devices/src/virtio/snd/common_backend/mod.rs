@@ -608,21 +608,27 @@ fn rates_up_to(hz: u32) -> u64 {
     }
 }
 
-/// Why the format axis is not narrowed, though the others are.
+/// The formats in the same family as `format`, out of the ones this device can carry.
 ///
-/// Measured: offering only the endpoint's own family -- float, on this phone -- left every
-/// existing endpoint unable to open at all. waveOut refused with MMSYSERR_BADDEVICEID and MCI
-/// with an error of its own, and the driver recorded no request having reached it, so both failed
-/// before the format was ever negotiated.
+/// By family rather than down to the single native format: within a family the conversion is a
+/// widening or narrowing of the same representation, and crossing between integer and float is
+/// the expensive one -- a guest that wants 16-bit should not have to go through float to get it.
 ///
-/// Windows caches the format it settled on for an endpoint in that endpoint's own registry key,
-/// and does not renegotiate when it stops being offered: the endpoints here had cached 16- and
-/// 32-bit integer, so removing the integer formats left them describing a device that no longer
-/// existed. Nothing in the driver can clear that cache -- the key belongs to the audio service --
-/// and an endpoint is only rebuilt from scratch under a subdevice name Windows has never seen.
+/// Not narrowed, though the other two axes are, and not for want of trying.
 ///
-/// So the format the guest should prefer is expressed as an order rather than as an omission: the
-/// driver ranks float first, which steers a new endpoint without stranding an old one.
+/// Ranking does not decide the format: offered float and 32-bit integer at the same width,
+/// Windows takes the integer one, measured on an endpoint built from scratch with float first in
+/// the range list. So the only way to choose float is to offer nothing else.
+///
+/// Offering nothing else does not work. A device advertising only float leaves the audio endpoint
+/// builder with no endpoints at all -- the PCI device starts, the driver registers every
+/// subdevice, and not one endpoint is created, on a subdevice name Windows had never seen and so
+/// with nothing cached to blame. An earlier attempt broke only the pre-existing endpoints and the
+/// cached format looked like the explanation; a slot that had never existed failing the same way
+/// says the format set itself is what Windows will not take.
+///
+/// So the format the guest should prefer is expressed as an order instead, which steers nothing
+/// today but costs nothing either, and the samples are converted on the way to the endpoint.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn device_caps(
     devices: &[PCMDeviceParameters],
