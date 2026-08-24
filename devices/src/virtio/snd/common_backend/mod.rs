@@ -12,7 +12,6 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::Context;
 use audio_streams::BoxError;
-use audio_streams::SampleFormat;
 use base::debug;
 use base::error;
 use base::warn;
@@ -609,19 +608,21 @@ fn rates_up_to(hz: u32) -> u64 {
     }
 }
 
-/// The formats in the same family as `format`, out of the ones this device can carry.
+/// Why the format axis is not narrowed, though the others are.
 ///
-/// By family rather than down to the single native format: within a family the conversion is a
-/// widening or narrowing of the same representation, and crossing between integer and float is
-/// the expensive one. Leaving the family intact keeps a guest that wants 16-bit from being sent
-/// through float to get it.
-fn format_family(format: SampleFormat) -> u64 {
-    match format {
-        SampleFormat::F32LE => 1u64 << VIRTIO_SND_PCM_FMT_FLOAT,
-        _ => (1u64 << VIRTIO_SND_PCM_FMT_S16) | (1u64 << VIRTIO_SND_PCM_FMT_S32),
-    }
-}
-
+/// Measured: offering only the endpoint's own family -- float, on this phone -- left every
+/// existing endpoint unable to open at all. waveOut refused with MMSYSERR_BADDEVICEID and MCI
+/// with an error of its own, and the driver recorded no request having reached it, so both failed
+/// before the format was ever negotiated.
+///
+/// Windows caches the format it settled on for an endpoint in that endpoint's own registry key,
+/// and does not renegotiate when it stops being offered: the endpoints here had cached 16- and
+/// 32-bit integer, so removing the integer formats left them describing a device that no longer
+/// existed. Nothing in the driver can clear that cache -- the key belongs to the audio service --
+/// and an endpoint is only rebuilt from scratch under a subdevice name Windows has never seen.
+///
+/// So the format the guest should prefer is expressed as an order rather than as an omission: the
+/// driver ranks float first, which steers a new endpoint without stranding an old one.
 #[cfg(any(target_os = "android", target_os = "linux"))]
 fn device_caps(
     devices: &[PCMDeviceParameters],
@@ -637,7 +638,7 @@ fn device_caps(
     };
     match endpoint_native(device_table, devices.get(index as usize), input) {
         Some(native) => DeviceCaps {
-            formats: format_family(native.format),
+            formats: SUPPORTED_FORMATS,
             rates: rates_up_to(native.frame_rate),
             channels_max: native.num_channels.max(1),
         },
