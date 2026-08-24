@@ -15,9 +15,12 @@ use base::warn;
 use base::AsRawDescriptor;
 use base::SafeDescriptor;
 use base::WaitContext;
+use gpu_display::Damage;
 use gpu_display::EventDevice;
 use gpu_display::GpuDisplay;
 use gpu_display::GpuDisplayExt;
+use gpu_display::PresentOutcome;
+use gpu_display::ScanoutFrame;
 use gpu_display::SurfaceType;
 use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
@@ -33,6 +36,33 @@ pub struct SimplefbDisplayParams {
     pub stride: u32,
     pub bpp: u32,
     pub size: u64,
+    /// DRM fourcc of the framebuffer, from the same DT `format` string the guest is handed.
+    pub fourcc: u32,
+}
+
+const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+
+/// The DRM fourcc named by a simplefb device-tree `format` string.
+///
+/// The DT string is the only statement anyone makes about this framebuffer's byte order, and the
+/// host has been acting on it implicitly: the default `a8r8g8b8` is ARGB8888, which in memory is
+/// B,G,R,A -- the CPU pipeline's canonical order -- which is precisely why the bridge's plain copy
+/// has always produced the right colours without a swizzle anywhere on this route. Naming it turns
+/// that from a coincidence nobody wrote down into a field a sink can read, which is what the GPU
+/// path will need when it picks a VkFormat from the fourcc instead of assuming BGRX.
+///
+/// The fallback matches the one the bpp lookup uses on an unrecognised string, for the same reason:
+/// `a8r8g8b8` is what the device tree defaults to when nobody says otherwise.
+pub fn simplefb_format_fourcc(format: &str) -> u32 {
+    match format {
+        "x8r8g8b8" => drm_fourcc(b'X', b'R', b'2', b'4'),
+        "a8b8g8r8" => drm_fourcc(b'A', b'B', b'2', b'4'),
+        "r8g8b8" => drm_fourcc(b'R', b'G', b'2', b'4'),
+        "r5g6b5" => drm_fourcc(b'R', b'G', b'1', b'6'),
+        _ => drm_fourcc(b'A', b'R', b'2', b'4'),
+    }
 }
 
 /// Where simplefb frames go. Everything past opening the display is
@@ -256,26 +286,34 @@ fn simplefb_display_loop(
             break;
         }
 
-        if let Some(fb) = display.framebuffer(surface_id) {
-            let dst = fb.as_volatile_slice();
-            let copy_len = dst.size().min(read_buf.len());
-            dst.copy_from(&read_buf[..copy_len]);
-            no_framebuffer = 0;
-        } else {
-            // No framebuffer to write into: the sink never gave us one (an Android display whose
-            // service lost the name race hands out a surface with no window behind it) or it is
-            // transiently locked. Silence here cost a whole debugging session -- the bridge looked
-            // perfectly healthy while presenting nothing -- so say it, backing off so a permanent
-            // condition does not fill the log.
-            no_framebuffer += 1;
-            if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
-                warn!(
-                    "simplefb: no framebuffer from the display sink ({} frame(s) dropped)",
-                    no_framebuffer
-                );
+        let frame = ScanoutFrame {
+            bytes: &read_buf,
+            stride: params.stride,
+            width: params.width,
+            height: params.height,
+            fourcc: params.fourcc,
+            damage: Damage::Full,
+        };
+        match display.present_frame(surface_id, &frame) {
+            PresentOutcome::Flipped => no_framebuffer = 0,
+            PresentOutcome::NoFramebuffer => {
+                // No framebuffer to write into: the sink never gave us one (an Android display
+                // whose service lost the name race hands out a surface with no window behind it)
+                // or it is transiently locked. Silence here cost a whole debugging session -- the
+                // bridge looked perfectly healthy while presenting nothing -- so say it, backing
+                // off so a permanent condition does not fill the log.
+                no_framebuffer += 1;
+                if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
+                    warn!(
+                        "simplefb: no framebuffer from the display sink ({} frame(s) dropped)",
+                        no_framebuffer
+                    );
+                }
+                // The flip on this path is not presenting anything -- it is what releases a sink
+                // that handed back nothing, and it has been here since before the copy moved out.
+                display.flip(surface_id);
             }
         }
-        display.flip(surface_id);
 
         let elapsed = frame_start.elapsed();
         if elapsed < frame_duration {

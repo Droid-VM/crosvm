@@ -655,13 +655,6 @@ impl VirtioGpuScanout {
                 note_flush_route("pool: display buffer busy, frame dropped");
                 return Ok(OkNoData);
             }
-            let fb = match display.framebuffer_region(surface_id, 0, 0, self.width, self.height) {
-                Some(fb) => fb,
-                None => {
-                    note_flush_route("pool: no framebuffer region for the surface");
-                    return Err(ErrUnspec);
-                }
-            };
             // Gather the (possibly fragmented) pool run segments into a contiguous staging buffer.
             let segs = resource.pool_scanout_iovecs.as_ref().unwrap();
             let total: usize = segs.iter().map(|&(_, l)| l).sum();
@@ -683,9 +676,10 @@ impl VirtioGpuScanout {
                         "pool scanout res={} needs {:?} bytes but the blob gathers {}",
                         resource.resource_id, last_row_end, total
                     );
-                    // The window buffer is locked (framebuffer_region above): release it, or
-                    // every later lock fails and the display is dead for the rest of the VM.
-                    display.flip(surface_id);
+                    // No flip to release a window buffer here any more: the lock is taken inside
+                    // present_frame, which this path never reaches. It used to be taken before the
+                    // check, and leaving it held was what killed the display for the rest of the
+                    // VM's life.
                     return Err(ErrUnspec);
                 }
             }
@@ -697,8 +691,6 @@ impl VirtioGpuScanout {
                 self.flush_staging[off..off + len].copy_from_slice(src);
                 off += len;
             }
-            let fb_stride = fb.stride() as usize;
-            let fb_slice = fb.as_volatile_slice();
             // Whether the pool actually holds a frame. `transfer_read` has had this probe for a
             // while and reports colour, but that is a different branch on a different resource --
             // nothing has ever looked at the bytes this branch copies, so "the host can read the
@@ -724,15 +716,17 @@ impl VirtioGpuScanout {
                     .iter()
                     .map(|b| format!("{b:02x}"))
                     .collect();
+                // fb_stride is gone from this line: the destination is not fetched here any more,
+                // and locking a window buffer to put a number in a diagnostic would be a worse
+                // trade than losing the number.
                 base::warn!(
-                    "POOL-SCANOUT#{} res={} {}x{} src_stride={} src_off={} fb_stride={} total={} segs={} rgb_nonzero={} head=[{}]",
+                    "POOL-SCANOUT#{} res={} {}x{} src_stride={} src_off={} total={} segs={} rgb_nonzero={} head=[{}]",
                     self.pool_probe_counter,
                     resource.resource_id,
                     self.width,
                     self.height,
                     src_stride,
                     src_offset,
-                    fb_stride,
                     total,
                     segs.len(),
                     rgb_nz,
@@ -762,18 +756,32 @@ impl VirtioGpuScanout {
                     px.swap(0, 2);
                 }
             }
-            let staging = &self.flush_staging[..total];
-            for row in 0..self.height as usize {
-                let s = src_offset + row * src_stride;
-                if s + packed_stride > staging.len() {
-                    break;
-                }
-                fb_slice
-                    .sub_slice(row * fb_stride, packed_stride)
-                    .map_err(|_| ErrUnspec)?
-                    .copy_from(&staging[s..s + packed_stride]);
+            // The swizzle above stays where it is: keeping the CPU pipeline in BGRX is the
+            // producer's job, and the frame is built out of bytes that already satisfy it. The
+            // fourcc travelling with the frame is the guest's declared one, which is the same
+            // fourcc that just decided the swap -- XR24 for the legacy SET_SCANOUT path, where a
+            // guest that never declared anything is taken at its pre-fourcc word.
+            //
+            // `bytes` starts at the guest's scanout offset rather than carrying it separately, so
+            // the row walk downstream is the same walk it was here.
+            let frame = ScanoutFrame {
+                bytes: &self.flush_staging[src_offset.min(total)..total],
+                stride: src_stride as u32,
+                width: self.width,
+                height: self.height,
+                fourcc: resource
+                    .scanout_data
+                    .map(|d| d.drm_format.0)
+                    .unwrap_or(DRM_FORMAT_XRGB8888),
+                damage: Damage::Full,
+            };
+            if matches!(
+                display.present_frame(surface_id, &frame),
+                PresentOutcome::NoFramebuffer
+            ) {
+                note_flush_route("pool: no framebuffer for the surface");
+                return Err(ErrUnspec);
             }
-            display.flip(surface_id);
             return Ok(OkNoData);
         }
 
@@ -1695,25 +1703,26 @@ impl VirtioGpu {
             // bridge will offer another one in 33 ms.
             return Ok(OkNoData);
         }
-        let copy_height = std::cmp::min(height, scanout.height);
-        let fb = display
-            .framebuffer_region(surface_id, 0, 0, scanout.width, copy_height)
-            .ok_or(ErrUnspec)?;
-        let fb_stride = fb.stride() as usize;
-        let src_stride = stride as usize;
-        let row_bytes = std::cmp::min(fb_stride, src_stride);
-        let fb_slice = fb.as_volatile_slice();
-        for row in 0..copy_height as usize {
-            let src = row * src_stride;
-            if src + row_bytes > data.len() {
-                break;
-            }
-            fb_slice
-                .sub_slice(row * fb_stride, row_bytes)
-                .map_err(|_| ErrUnspec)?
-                .copy_from(&data[src..src + row_bytes]);
+        // XR24 states the invariant this route has always relied on without saying so: the frames
+        // arriving here are the simplefb bridge's, and simplefb's own declared format is already
+        // the pipeline's canonical BGRX, which is why nothing on this path has ever swizzled them.
+        // The bridge knows the real fourcc from the device tree, but there is no room on
+        // ExternalScanout to carry it and no point building one -- that machinery goes away when
+        // the two sources stop sharing a display.
+        let frame = ScanoutFrame {
+            bytes: data,
+            stride,
+            width,
+            height,
+            fourcc: DRM_FORMAT_XRGB8888,
+            damage: Damage::Full,
+        };
+        if matches!(
+            display.present_frame(surface_id, &frame),
+            PresentOutcome::NoFramebuffer
+        ) {
+            return Err(ErrUnspec);
         }
-        display.flip(surface_id);
         drop(display);
         self.external_had_display = true;
         Ok(OkNoData)
