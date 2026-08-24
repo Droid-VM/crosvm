@@ -148,6 +148,11 @@ extern "C" {
 
     fn android_display_is_vulkan_blit_available(ctx: *mut AndroidDisplayContext) -> bool;
 
+    /// Whether the app has a native window attached to the scanout surface, i.e. whether a frame
+    /// posted now can reach a screen. The native side reads the current state under its surface
+    /// lock and never waits for one to arrive: this is asked once per frame from a timer thread.
+    fn android_display_has_consumer(ctx: *mut AndroidDisplayContext) -> bool;
+
     /// `out_completion_fence_fd` is written by the callee and is mandatory: the C side rejects a
     /// null pointer outright, and on the async-blit path it hands back an owned sync_file fd that
     /// this side must close. Keep the arity in step with the definition in
@@ -378,6 +383,22 @@ impl DisplayT for DisplayAndroid {
     fn is_dmabuf_import_supported(&mut self) -> bool {
         // SAFETY: context is a live opaque handle owned by this DisplayAndroid.
         unsafe { android_display_is_vulkan_blit_available(self.context.0.as_ptr()) }
+    }
+
+    /// The app already tells this side when nobody is watching: leaving the display view destroys
+    /// the SurfaceView, and the `removeSurface(forCursor=false)` that follows clears the native
+    /// window behind the scanout. That knowledge stopped at the C bridge -- the trait default
+    /// answered `true` regardless -- so the simplefb bridge went on reading a whole framebuffer out
+    /// of guest memory 30 times a second and copying it into a sink buffer that is never displayed.
+    ///
+    /// Answering honestly is only useful because the consumer of the answer is
+    /// `simplefb_display_loop`, and it is only safe there for the same reason: a frame may be
+    /// skipped on a `false` where the producer is a timer that will offer the next one anyway, so a
+    /// consumer that comes back is picked up on the following tick. A producer driven by the guest
+    /// (virtio-gpu's flush) never gets a second chance at a dropped frame and must not gate on this.
+    fn has_consumer(&self) -> bool {
+        // SAFETY: context is a live opaque handle owned by this DisplayAndroid.
+        unsafe { android_display_has_consumer(self.context.0.as_ptr()) }
     }
 
     fn create_surface(

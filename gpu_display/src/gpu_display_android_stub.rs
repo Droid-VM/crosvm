@@ -102,6 +102,13 @@ extern "C" fn android_display_is_vulkan_blit_available(_ctx: *mut AndroidDisplay
     false
 }
 
+// Nothing can be attached to a display that does not exist, so `false` is the honest answer here
+// as well as the one that keeps this stub free of a panic on a per-frame path.
+#[no_mangle]
+extern "C" fn android_display_has_consumer(_ctx: *mut AndroidDisplayContext) -> bool {
+    false
+}
+
 #[no_mangle]
 extern "C" fn android_display_flip_to(
     _ctx: *mut AndroidDisplayContext,
