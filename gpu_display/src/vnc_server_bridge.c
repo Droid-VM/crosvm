@@ -555,6 +555,44 @@ static void push_damaged_bands(vnc_server_t* server, const uint8_t* clean, uint3
     server->last_clean_valid = 1;
 }
 
+/* The acceptance instrument for a byte-identical refactor of the display pipeline (see the plan's
+ * §6 step 4 and §9): the three CPU copy sites that feed this sink are being consolidated behind one
+ * function, and "the sink receives the same bytes" is not an acceptance condition until something
+ * measures it. It sits deliberately below everything that refactor touches -- and is the same hash,
+ * over the same thing, in the same line shape as the native sink's -- so the two frame sequences
+ * can simply be compared, to each other and across binaries.
+ *
+ * `clean` is packed to screen->width, but the row loop is written against the stride anyway: the
+ * number must describe the visible pixels and nothing else, or a padded producer would make two
+ * identical frames disagree. Off unless CROSVM_DISPLAY_HASH_FRAMES=1, read once. */
+static int frame_hash_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* value = getenv("CROSVM_DISPLAY_HASH_FRAMES");
+        cached = (value && (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 ||
+                            strcmp(value, "on") == 0))
+                ? 1
+                : 0;
+    }
+    return cached;
+}
+
+static void log_frame_hash(const char* kind, const uint8_t* clean, uint32_t clean_size, int width,
+                           int height) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    size_t row_bytes = (size_t)width * 4;
+    size_t stride = row_bytes;
+    for (int y = 0; y < height; y++) {
+        size_t off = (size_t)y * stride;
+        if (off + row_bytes > clean_size)
+            break;
+        for (size_t i = 0; i < row_bytes; i++)
+            hash = (hash ^ clean[off + i]) * 0x100000001b3ULL;
+    }
+    fprintf(stderr, "VNC: FRAMEHASH surface=%s %dx%d fnv1a64=0x%016llx\n", kind, width, height,
+            (unsigned long long)hash);
+}
+
 int vnc_server_has_clients(vnc_server_t* server) {
     if (!server || !server->screen)
         return 0;
@@ -567,6 +605,14 @@ void vnc_server_composite(vnc_server_t* server, const uint8_t* clean, uint32_t c
     if (!server || !server->screen || !server->screen->frameBuffer || !clean)
         return;
     rfbScreenInfoPtr screen = server->screen;
+
+    if (frame_hash_enabled()) {
+        uint32_t hashable = (uint32_t)screen->width * screen->height * 4;
+        if (clean_size < hashable)
+            hashable = clean_size;
+        log_frame_hash(full ? "scanout" : "scanout-cursoronly", clean, hashable, screen->width,
+                       screen->height);
+    }
 
     /* No early return for "there are no clients" here, though everything below is work done for
      * nobody when the client list is empty. This is only reached from the producer's flip, and on
