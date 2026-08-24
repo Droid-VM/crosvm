@@ -650,25 +650,64 @@ impl PlaybackBufferStream for AudioStream {
     }
 }
 
+impl AudioStream {
+    /// Waits until this period is due, and returns the anchor the schedule is measured from.
+    ///
+    /// The schedule is absolute -- period `n` is due `n` periods after the anchor -- so that the
+    /// stream neither drifts nor accumulates rounding. The part that matters is what happens when
+    /// a period comes late, which on a phone it eventually will: the naive reading is that the
+    /// stream owes the difference and should deliver the backlog as fast as it can. It must not.
+    /// Delivering faster than real time hands the guest completions for audio that has not been
+    /// heard yet, and a guest writing into a cyclic buffer against those completions overruns the
+    /// part the audio engine is still filling. What that sounds like is a tear at a period
+    /// boundary -- measured, at eight per second, exactly on the boundaries.
+    ///
+    /// So a period that is merely a little late is absorbed by the schedule, and one that is late
+    /// by more than a whole period re-anchors it: the backlog is abandoned rather than chased.
+    async fn pace(
+        &mut self,
+        ex: &dyn AudioStreamsExecutor,
+        buffer_size: usize,
+    ) -> Result<Instant, BoxError> {
+        let now = Instant::now();
+        let anchor = match self.start_time {
+            None => now,
+            Some(anchor) => {
+                if let Some(wait) = self.next_frame.checked_duration_since(now) {
+                    ex.delay(wait).await?;
+                    anchor
+                } else if now.duration_since(self.next_frame) >= self.period_duration(buffer_size) {
+                    // More than a period behind. Start counting again from here; the audio that
+                    // should have been delivered in the gap is gone either way, and racing to
+                    // deliver it now would only put the guest ahead of the endpoint.
+                    self.total_frames = buffer_size as i32;
+                    now
+                } else {
+                    anchor
+                }
+            }
+        };
+        self.start_time = Some(anchor);
+        Ok(anchor)
+    }
+
+    fn period_duration(&self, buffer_size: usize) -> Duration {
+        if self.frame_rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_nanos(buffer_size as u64 * NANOS_PER_SEC as u64 / self.frame_rate as u64)
+    }
+}
+
 #[async_trait(?Send)]
 impl AsyncPlaybackBufferStream for AudioStream {
     async fn next_playback_buffer<'a>(
         &'a mut self,
         ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError> {
-        self.total_frames += (self.buffer.len() / self.frame_size) as i32;
-        let start_time = match self.start_time {
-            Some(time) => {
-                ex.delay(self.next_frame.saturating_duration_since(Instant::now()))
-                    .await?;
-                time
-            }
-            None => {
-                let now = Instant::now();
-                self.start_time = Some(now);
-                now
-            }
-        };
+        let buffer_size = self.buffer.len() / self.frame_size;
+        self.total_frames += buffer_size as i32;
+        let start_time = self.pace(ex, buffer_size).await?;
         self.next_frame = start_time
             + Duration::from_millis(self.total_frames as u64 * 1000 / self.frame_rate as u64);
         Ok(
@@ -695,18 +734,7 @@ impl AsyncCaptureBufferStream for AudioStream {
         let buffer_size = self.buffer.len() / self.frame_size;
         self.read_count += 1;
         self.total_frames += buffer_size as i32;
-        let start_time = match self.start_time {
-            Some(time) => {
-                ex.delay(self.next_frame.saturating_duration_since(Instant::now()))
-                    .await?;
-                time
-            }
-            None => {
-                let now = Instant::now();
-                self.start_time = Some(now);
-                now
-            }
-        };
+        let start_time = self.pace(ex, buffer_size).await?;
         self.next_frame = start_time
             + Duration::from_millis(self.total_frames as u64 * 1000 / self.frame_rate as u64);
 
