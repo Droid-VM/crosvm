@@ -214,6 +214,11 @@ pub fn get_serial_cmdline(
                     .insert("console", &format!("hvc{}", num - 1))
                     .map_err(GetSerialCmdlineError::KernelCmdline)?;
             }
+            (SerialHardware::Sbsa, num) => {
+                cmdline
+                    .insert("console", &format!("ttyAMA{}", num - 1))
+                    .map_err(GetSerialCmdlineError::KernelCmdline)?;
+            }
             (SerialHardware::Debugcon, _) => {}
         }
     }
@@ -233,6 +238,10 @@ pub fn get_serial_cmdline(
                     )
                     .map_err(GetSerialCmdlineError::KernelCmdline)?;
             }
+        }
+        Some((SerialHardware::Sbsa, _num)) => {
+            // The SBSA UART is wired up separately (not in `serial_devices`);
+            // skip Linux earlycon here. Windows discovers it via ACPI SPCR.
         }
         Some((hw, _num)) => {
             return Err(GetSerialCmdlineError::UnsupportedEarlyconHardware(*hw));

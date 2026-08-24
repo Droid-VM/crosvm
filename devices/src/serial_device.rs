@@ -89,6 +89,16 @@ pub enum SerialType {
     // Use the same Unix domain socket for input and output.
     #[cfg(unix)]
     UnixStream,
+    // Allocate a pseudo-terminal: crosvm holds the master (both directions) and
+    // external consumers open the slave (/dev/pts/N). `path`, if given, becomes a
+    // symlink to the slave.
+    #[cfg(unix)]
+    Pty,
+    // Open an existing character device (e.g. a USB gadget serial port such as
+    // /dev/ttyGS0) raw and non-blocking for both directions. Output is dropped
+    // when the device can't accept it, so the guest console never stalls.
+    #[cfg(unix)]
+    Dev,
 }
 
 impl Default for SerialType {
@@ -107,6 +117,10 @@ impl Display for SerialType {
             SerialType::SystemSerialType => SYSTEM_SERIAL_TYPE_NAME.to_string(),
             #[cfg(unix)]
             SerialType::UnixStream => "UnixStream".to_string(),
+            #[cfg(unix)]
+            SerialType::Pty => "Pty".to_string(),
+            #[cfg(unix)]
+            SerialType::Dev => "Dev".to_string(),
         };
 
         write!(f, "{}", s)
@@ -126,6 +140,9 @@ pub enum SerialHardware {
 
     /// Bochs style debug port
     Debugcon,
+
+    /// ARM SBSA / PL011-subset UART (bound by Windows-on-ARM SerPL011.sys)
+    Sbsa,
 }
 
 impl Default for SerialHardware {
@@ -140,6 +157,7 @@ impl Display for SerialHardware {
             SerialHardware::Serial => "serial".to_string(),
             SerialHardware::VirtioConsole => "virtio-console".to_string(),
             SerialHardware::Debugcon => "debugcon".to_string(),
+            SerialHardware::Sbsa => "sbsa".to_string(),
         };
 
         write!(f, "{}", s)
@@ -287,6 +305,20 @@ impl SerialParameters {
                 let output = UnixStream::connect(path).map_err(Error::SocketConnect)?;
                 keep_rds.push(output.as_raw_descriptor());
                 (Some(Box::new(output)), None)
+            }
+            #[cfg(unix)]
+            SerialType::Pty => {
+                if input.is_some() {
+                    return Err(Error::InvalidConfig(
+                        "type=pty provides its own input; 'input' and 'stdin' are not allowed"
+                            .to_string(),
+                    ));
+                }
+                return create_pty_serial_device(self, protection_type, evt, keep_rds);
+            }
+            #[cfg(unix)]
+            SerialType::Dev => {
+                return create_dev_serial_device(self, protection_type, evt, input, keep_rds);
             }
         };
         Ok(T::new(

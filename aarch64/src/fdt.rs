@@ -476,6 +476,29 @@ fn create_serial_nodes(fdt: &mut Fdt, serial_devices: &[SerialDeviceInfo]) -> Re
     Ok(())
 }
 
+/// Emit an `arm,sbsa-uart` node for the standalone SBSA UART. EDK2's dynamic
+/// tables turn this into an ACPI SPCR (SBSA subtype) + an `ARMHB000` SSDT device
+/// that Windows-on-ARM's `SerPL011.sys` binds to. The interrupt is declared
+/// EDGE_RISING to match crosvm's edge irqfd (register_edge_irq_event); the device
+/// emulates a level line over that edge via its `irq_asserted` latch. A LEVEL
+/// declaration here would leave the GIC line asserted after EOI (crosvm never
+/// deasserts an edge irqfd) and storm the guest with "irq N: nobody cared".
+fn create_sbsa_uart_node(fdt: &mut Fdt, base: u64, irq: u32) -> Result<()> {
+    let reg = [base, 0x1000u64];
+    let interrupts = [GIC_FDT_IRQ_TYPE_SPI, irq, IRQ_TYPE_EDGE_RISING];
+    let node = fdt.root_mut().subnode_mut(&format!("pl011@{:x}", base))?;
+    // Both compatibles on purpose: EDK2 (patched SerialPortParser) classifies
+    // "arm,pl011" as the PL011 DBG2 subtype, so the SSDT device gets _HID ARMH0011 --
+    // the only ID Windows' inbox serpl011.inf binds. Linux ignores the pl011 entry
+    // (no "arm,primecell", so no AMBA device) and binds its sbsa-uart platform
+    // driver via the second string, which needs no clocks property.
+    node.set_prop("compatible", &["arm,pl011", "arm,sbsa-uart"][..])?;
+    node.set_prop("reg", &reg)?;
+    node.set_prop("interrupts", &interrupts)?;
+    node.set_prop("current-speed", 115200u32)?;
+    Ok(())
+}
+
 fn psci_compatible(version: &PsciVersion) -> Vec<&str> {
     // The PSCI kernel driver only supports compatible strings for the following
     // backward-compatible versions.
@@ -979,6 +1002,7 @@ pub fn create_fdt(
     is_kvm: bool,
     smbios: &SmbiosOptions,
     pflash_cfg: Option<PflashDtConfig>,
+    sbsa_uart_cfg: Option<(u64, u32, bool)>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -994,9 +1018,15 @@ pub fn create_fdt(
     if let Some(android_fstab) = android_fstab {
         arch::android::create_android_fdt(&mut fdt, android_fstab)?;
     }
-    let stdout_path = serial_devices
-        .first()
-        .map(|first_serial| format!("/U6_16550A@{:x}", first_serial.address));
+    let stdout_path = if let Some((base, _irq, true)) = sbsa_uart_cfg {
+        // The SBSA UART is the console: point the guest bootloader (and thus the
+        // EDK2-synthesised ACPI SPCR) at it instead of COM1.
+        Some(format!("/pl011@{:x}", base))
+    } else {
+        serial_devices
+            .first()
+            .map(|first_serial| format!("/U6_16550A@{:x}", first_serial.address))
+    };
     create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref(), smbios)?;
     create_config_node(&mut fdt, kernel_region)?;
     create_memory_node(&mut fdt, guest_mem)?;
@@ -1135,6 +1165,9 @@ pub fn create_fdt(
         create_pmu_node(&mut fdt, num_cpus)?;
     }
     create_serial_nodes(&mut fdt, serial_devices)?;
+    if let Some((base, irq, _is_console)) = sbsa_uart_cfg {
+        create_sbsa_uart_node(&mut fdt, base, irq)?;
+    }
     create_psci_node(&mut fdt, &psci_version)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges, dma_pool_phandle)?;
     create_rtc_node(&mut fdt)?;
