@@ -12,6 +12,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use anyhow::Context;
 use audio_streams::BoxError;
+use audio_streams::SampleFormat;
 use base::debug;
 use base::error;
 use base::warn;
@@ -187,10 +188,16 @@ impl SndData {
     }
 }
 
-const SUPPORTED_FORMATS: u64 = 1 << VIRTIO_SND_PCM_FMT_U8
-    | 1 << VIRTIO_SND_PCM_FMT_S16
-    | 1 << VIRTIO_SND_PCM_FMT_S24
-    | 1 << VIRTIO_SND_PCM_FMT_S32;
+// Only the ones an Android endpoint can be handed byte for byte. U8 has no AAudio equivalent,
+// and virtio's S24 -- 24 significant bits in a four-byte container -- is not AAudio's 24-bit
+// format, which packs them into three. Offering either meant the guest could pick a layout the
+// host would then have to describe as some other layout of a different frame size.
+//
+// FLOAT is here because it is what the endpoints natively run at: without it every sample is
+// converted on the way to the device no matter what the guest chose.
+const SUPPORTED_FORMATS: u64 = 1 << VIRTIO_SND_PCM_FMT_S16
+    | 1 << VIRTIO_SND_PCM_FMT_S32
+    | 1 << VIRTIO_SND_PCM_FMT_FLOAT;
 const SUPPORTED_FRAME_RATES: u64 = 1 << VIRTIO_SND_PCM_RATE_8000
     | 1 << VIRTIO_SND_PCM_RATE_11025
     | 1 << VIRTIO_SND_PCM_RATE_16000
@@ -447,8 +454,50 @@ fn endpoint_properties(device_table: &str, key: &str, input: bool) -> (u32, u8, 
     if device_table.is_empty() {
         return (0, 0, 0);
     }
-    android_audio::device_table::properties(std::path::Path::new(device_table), key, input)
-        .unwrap_or((0, 0, 0))
+    let path = std::path::Path::new(device_table);
+    // The table says what the endpoint will accept and what kind of thing it is; only the
+    // endpoint itself can say what it runs at, and it is asked once here rather than guessed
+    // from a list of accepted values.
+    let (table_rate, table_channels, kind) =
+        android_audio::device_table::properties(path, key, input).unwrap_or((0, 0, 0));
+    match probe_once(path, key, input) {
+        Some(native) => (native.frame_rate, native.num_channels, kind),
+        None => (table_rate, table_channels, kind),
+    }
+}
+
+/// What the endpoint runs at, for a device that names one. `None` where there is nothing to ask.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn endpoint_native(
+    device_table: &str,
+    device: Option<&PCMDeviceParameters>,
+    input: bool,
+) -> Option<android_audio::NativeConfig> {
+    if device_table.is_empty() {
+        return None;
+    }
+    let key = device?.host_device.as_deref()?;
+    probe_once(std::path::Path::new(device_table), key, input)
+}
+
+/// One probe per endpoint per process. Opening a stream is cheap but not free, and both the PCM
+/// descriptors and the vendor block want the same answer.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn probe_once(
+    path: &std::path::Path,
+    key: &str,
+    input: bool,
+) -> Option<android_audio::NativeConfig> {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static CACHE: OnceLock<Mutex<BTreeMap<(String, bool), Option<android_audio::NativeConfig>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cache = cache.lock().unwrap();
+    *cache
+        .entry((key.to_string(), input))
+        .or_insert_with(|| android_audio::probe_native(path, key, input))
 }
 
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
@@ -512,10 +561,117 @@ pub fn hardcoded_virtio_snd_config(params: &Parameters) -> virtio_snd_config {
 }
 
 // To be used with hardcoded_virtio_snd_config
+/// What one device should advertise, narrowed to what its host endpoint actually runs.
+///
+/// Wider is not free. The guest treats the widest thing it is shown as a reasonable default, and
+/// every sample outside the endpoint's own layout is converted on the way through. Narrowing is
+/// not a claim that the rest would be refused -- Android converts whatever it is given -- it is a
+/// way of not asking it to.
+struct DeviceCaps {
+    formats: u64,
+    rates: u64,
+    channels_max: u8,
+}
+
+/// Every rate this device would otherwise offer, up to and including the endpoint's own.
+///
+/// A ceiling rather than a single value: the guest resamples in one step to reach the endpoint,
+/// so a source already at 16kHz is better sent as 16kHz than upsampled here and downsampled
+/// again there.
+fn rates_up_to(hz: u32) -> u64 {
+    const RATES: [(u8, u32); 14] = [
+        (VIRTIO_SND_PCM_RATE_5512, 5512),
+        (VIRTIO_SND_PCM_RATE_8000, 8000),
+        (VIRTIO_SND_PCM_RATE_11025, 11025),
+        (VIRTIO_SND_PCM_RATE_16000, 16000),
+        (VIRTIO_SND_PCM_RATE_22050, 22050),
+        (VIRTIO_SND_PCM_RATE_32000, 32000),
+        (VIRTIO_SND_PCM_RATE_44100, 44100),
+        (VIRTIO_SND_PCM_RATE_48000, 48000),
+        (VIRTIO_SND_PCM_RATE_64000, 64000),
+        (VIRTIO_SND_PCM_RATE_88200, 88200),
+        (VIRTIO_SND_PCM_RATE_96000, 96000),
+        (VIRTIO_SND_PCM_RATE_176400, 176400),
+        (VIRTIO_SND_PCM_RATE_192000, 192000),
+        (VIRTIO_SND_PCM_RATE_384000, 384000),
+    ];
+    let mut mask = 0u64;
+    for (bit, rate) in RATES {
+        if rate <= hz && (SUPPORTED_FRAME_RATES & (1u64 << bit)) != 0 {
+            mask |= 1u64 << bit;
+        }
+    }
+    // An empty mask is a stream the guest cannot configure at all, which is worse than a wide one.
+    if mask == 0 {
+        SUPPORTED_FRAME_RATES
+    } else {
+        mask
+    }
+}
+
+/// The formats in the same family as `format`, out of the ones this device can carry.
+///
+/// By family rather than down to the single native format: within a family the conversion is a
+/// widening or narrowing of the same representation, and crossing between integer and float is
+/// the expensive one. Leaving the family intact keeps a guest that wants 16-bit from being sent
+/// through float to get it.
+fn format_family(format: SampleFormat) -> u64 {
+    match format {
+        SampleFormat::F32LE => 1u64 << VIRTIO_SND_PCM_FMT_FLOAT,
+        _ => (1u64 << VIRTIO_SND_PCM_FMT_S16) | (1u64 << VIRTIO_SND_PCM_FMT_S32),
+    }
+}
+
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn device_caps(
+    devices: &[PCMDeviceParameters],
+    device_table: &str,
+    index: u32,
+    input: bool,
+    fallback_channels: u8,
+) -> DeviceCaps {
+    let wide = DeviceCaps {
+        formats: SUPPORTED_FORMATS,
+        rates: SUPPORTED_FRAME_RATES,
+        channels_max: fallback_channels,
+    };
+    match endpoint_native(device_table, devices.get(index as usize), input) {
+        Some(native) => DeviceCaps {
+            formats: format_family(native.format),
+            rates: rates_up_to(native.frame_rate),
+            channels_max: native.num_channels.max(1),
+        },
+        None => wide,
+    }
+}
+
+/// Nothing to ask on a platform with no endpoint table, so nothing is narrowed.
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn device_caps(
+    _devices: &[PCMDeviceParameters],
+    _device_table: &str,
+    _index: u32,
+    _input: bool,
+    fallback_channels: u8,
+) -> DeviceCaps {
+    DeviceCaps {
+        formats: SUPPORTED_FORMATS,
+        rates: SUPPORTED_FRAME_RATES,
+        channels_max: fallback_channels,
+    }
+}
+
 pub fn hardcoded_snd_data(params: &Parameters) -> SndData {
     let jack_info: Vec<virtio_snd_jack_info> = Vec::new();
     let mut pcm_info: Vec<virtio_snd_pcm_info> = Vec::new();
     let mut chmap_info: Vec<virtio_snd_chmap_info> = Vec::new();
+
+    let output_caps: Vec<DeviceCaps> = (0..params.num_output_devices)
+        .map(|dev| device_caps(&params.output_device_config, &params.device_table, dev, false, 6))
+        .collect();
+    let input_caps: Vec<DeviceCaps> = (0..params.num_input_devices)
+        .map(|dev| device_caps(&params.input_device_config, &params.device_table, dev, true, 2))
+        .collect();
 
     for dev in 0..params.num_output_devices {
         for _ in 0..params.num_output_streams {
@@ -524,11 +680,13 @@ pub fn hardcoded_snd_data(params: &Parameters) -> SndData {
                     hda_fn_nid: dev.into(),
                 },
                 features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
-                formats: SUPPORTED_FORMATS.into(),
-                rates: SUPPORTED_FRAME_RATES.into(),
+                formats: output_caps[dev as usize].formats.into(),
+                rates: output_caps[dev as usize].rates.into(),
                 direction: VIRTIO_SND_D_OUTPUT,
+                // Never zero: the Linux driver rejects a stream whose minimum is zero or whose
+                // minimum exceeds its maximum, and a rejected stream is a device with no audio.
                 channels_min: 1,
-                channels_max: 6,
+                channels_max: output_caps[dev as usize].channels_max.max(1),
                 padding: [0; 5],
             });
         }
@@ -540,64 +698,78 @@ pub fn hardcoded_snd_data(params: &Parameters) -> SndData {
                     hda_fn_nid: dev.into(),
                 },
                 features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
-                formats: SUPPORTED_FORMATS.into(),
-                rates: SUPPORTED_FRAME_RATES.into(),
+                formats: input_caps[dev as usize].formats.into(),
+                rates: input_caps[dev as usize].rates.into(),
                 direction: VIRTIO_SND_D_INPUT,
                 channels_min: 1,
-                channels_max: 2,
+                channels_max: input_caps[dev as usize].channels_max.max(1),
                 padding: [0; 5],
             });
         }
     }
-    // Use stereo channel map.
-    let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
-    positions[0] = VIRTIO_SND_CHMAP_FL;
-    positions[1] = VIRTIO_SND_CHMAP_FR;
+    // A channel map says how a given channel count is laid out, so only the counts a device can
+    // actually carry get one. Publishing a six-channel map for a stereo endpoint would describe
+    // a layout its stream cannot be configured for -- Linux hands the widest map it finds to
+    // ALSA, so the inconsistency is visible in the guest rather than harmless.
+    const LAYOUTS: [(u8, [u8; 6]); 3] = [
+        (
+            2,
+            [
+                VIRTIO_SND_CHMAP_FL,
+                VIRTIO_SND_CHMAP_FR,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+            ],
+        ),
+        (
+            4,
+            [
+                VIRTIO_SND_CHMAP_FL,
+                VIRTIO_SND_CHMAP_FR,
+                VIRTIO_SND_CHMAP_RL,
+                VIRTIO_SND_CHMAP_RR,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+            ],
+        ),
+        (
+            6,
+            [
+                VIRTIO_SND_CHMAP_FL,
+                VIRTIO_SND_CHMAP_FR,
+                VIRTIO_SND_CHMAP_FC,
+                VIRTIO_SND_CHMAP_LFE,
+                VIRTIO_SND_CHMAP_RL,
+                VIRTIO_SND_CHMAP_RR,
+            ],
+        ),
+    ];
+
+    let mut push_chmaps = |dev: u32, direction: u8, max_channels: u8| {
+        for (channels, layout) in LAYOUTS {
+            if channels > max_channels {
+                continue;
+            }
+            let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
+            positions[..layout.len()].copy_from_slice(&layout);
+            chmap_info.push(virtio_snd_chmap_info {
+                hdr: virtio_snd_info {
+                    hda_fn_nid: dev.into(),
+                },
+                direction,
+                channels,
+                positions,
+            });
+        }
+    };
+
     for dev in 0..params.num_output_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_OUTPUT,
-            channels: 2,
-            positions,
-        });
+        push_chmaps(dev, VIRTIO_SND_D_OUTPUT, output_caps[dev as usize].channels_max.max(1));
     }
     for dev in 0..params.num_input_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_INPUT,
-            channels: 2,
-            positions,
-        });
-    }
-    positions[2] = VIRTIO_SND_CHMAP_RL;
-    positions[3] = VIRTIO_SND_CHMAP_RR;
-    for dev in 0..params.num_output_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_OUTPUT,
-            channels: 4,
-            positions,
-        });
-    }
-    positions[2] = VIRTIO_SND_CHMAP_FC;
-    positions[3] = VIRTIO_SND_CHMAP_LFE;
-    positions[4] = VIRTIO_SND_CHMAP_RL;
-    positions[5] = VIRTIO_SND_CHMAP_RR;
-    for dev in 0..params.num_output_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_OUTPUT,
-            channels: 6,
-            positions,
-        });
+        push_chmaps(dev, VIRTIO_SND_D_INPUT, input_caps[dev as usize].channels_max.max(1));
     }
 
     SndData {

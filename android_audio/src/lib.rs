@@ -31,6 +31,9 @@ use audio_streams::StreamControl;
 use audio_streams::StreamEffect;
 use audio_streams::StreamSource;
 use audio_streams::StreamSourceGenerator;
+use std::path::Path;
+
+use base::error;
 use base::warn;
 use thiserror::Error;
 
@@ -69,6 +72,32 @@ struct AAudioStreamBuilder {
 type AaudioFormatT = i32;
 type AaudioResultT = i32;
 const AAUDIO_OK: AaudioResultT = 0;
+
+// aaudio_format_t, as the NDK header numbers them. Written out rather than derived from the
+// SampleFormat discriminant: those two happen to agree on 16-bit and on nothing else, so casting
+// one to the other described S32 as 24-bit-packed and S24 as float -- a frame size the stream
+// does not have, which is silence or noise rather than an error.
+const AAUDIO_FORMAT_UNSPECIFIED: AaudioFormatT = 0;
+/// `AAUDIO_UNSPECIFIED`, which is what the rate and channel-count setters take to mean "you
+/// choose". Distinct from the format constant of the same name only in type.
+const AAUDIO_UNSPECIFIED_VALUE: i32 = 0;
+const AAUDIO_FORMAT_PCM_I16: AaudioFormatT = 1;
+const AAUDIO_FORMAT_PCM_FLOAT: AaudioFormatT = 2;
+const AAUDIO_FORMAT_PCM_I32: AaudioFormatT = 4;
+
+/// The AAudio format that carries this one byte for byte, or `None` when there is none.
+///
+/// U8 has no AAudio equivalent at all. Neither does virtio's S24, which is 24 significant bits in
+/// a four-byte container: AAudio's only 24-bit format packs them into three bytes, so the two
+/// describe different frame sizes and cannot be substituted for one another.
+fn aaudio_format(format: SampleFormat) -> Option<AaudioFormatT> {
+    match format {
+        SampleFormat::S16LE => Some(AAUDIO_FORMAT_PCM_I16),
+        SampleFormat::S32LE => Some(AAUDIO_FORMAT_PCM_I32),
+        SampleFormat::F32LE => Some(AAUDIO_FORMAT_PCM_FLOAT),
+        SampleFormat::U8 | SampleFormat::S24LE => None,
+    }
+}
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 /// `AAUDIO_UNSPECIFIED`: let the platform pick the device (the AAudio default).
 pub const AAUDIO_DEVICE_UNSPECIFIED: i32 = 0;
@@ -96,6 +125,9 @@ extern "C" {
     fn AAudioStreamBuilder_setInputPreset(builder: *mut AAudioStreamBuilder, input_preset: i32);
     /// Which endpoint the platform actually gave us, which need not be the one asked for.
     fn AAudioStream_getDeviceId(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getFormat(stream: *mut AAudioStream) -> AaudioFormatT;
+    fn AAudioStream_getSampleRate(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getChannelCount(stream: *mut AAudioStream) -> i32;
     fn AAudioStreamBuilder_openStream(
         builder: *mut AAudioStreamBuilder,
         stream: *mut *mut AAudioStream,
@@ -276,7 +308,98 @@ fn apply_attr(attrs: &str, name: &str, lookup: fn(&str) -> Option<i32>, set: imp
 }
 
 /// Opens one AAudio stream for `open`, resolving the endpoint by name when it has one.
+/// What an endpoint natively runs at, as opposed to what it will accept.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NativeConfig {
+    pub frame_rate: u32,
+    pub num_channels: u8,
+    pub format: SampleFormat,
+}
+
+/// Asks the endpoint what it runs at, by opening a stream that specifies nothing and reading
+/// back what the platform chose.
+///
+/// This is the only authoritative answer available: `AudioDeviceInfo` reports the rates and
+/// channel counts an endpoint will *accept*, which on a real device is a list, and a list does
+/// not say which entry costs no conversion.
+///
+/// The stream is opened but never started, which is what keeps this from being a recording: an
+/// open input stream raises no event in the platform's recording activity and no track in the
+/// mixer, where starting one does both. Measured, because the difference decides whether probing
+/// a microphone lights the indicator on the user's phone.
+pub fn probe_native(table_path: &Path, host_key: &str, input: bool) -> Option<NativeConfig> {
+    let device_id = device_table::resolve(table_path, host_key, input)
+        .unwrap_or(AAUDIO_DEVICE_UNSPECIFIED);
+
+    let mut builder: *mut AAudioStreamBuilder = std::ptr::null_mut();
+    let mut stream_ptr: *mut AAudioStream = std::ptr::null_mut();
+    // SAFETY: interfacing with the AAudio C API; the pointers are ours and checked.
+    unsafe {
+        if AAudio_createStreamBuilder(&mut builder) != AAUDIO_OK {
+            return None;
+        }
+        AAudioStreamBuilder_setDirection(
+            builder,
+            if input {
+                AndroidAudioStreamDirection::Input as u32
+            } else {
+                AndroidAudioStreamDirection::Output as u32
+            },
+        );
+        AAudioStreamBuilder_setDeviceId(builder, device_id);
+        // Everything else left unspecified on purpose: that is what makes the platform answer
+        // with the endpoint's own configuration instead of converting to a request.
+        AAudioStreamBuilder_setFormat(builder, AAUDIO_FORMAT_UNSPECIFIED);
+        AAudioStreamBuilder_setSampleRate(builder, AAUDIO_UNSPECIFIED_VALUE);
+        AAudioStreamBuilder_setChannelCount(builder, AAUDIO_UNSPECIFIED_VALUE);
+        let opened = AAudioStreamBuilder_openStream(builder, &mut stream_ptr);
+        AAudioStreamBuilder_delete(builder);
+        if opened != AAUDIO_OK {
+            warn!(
+                "host audio endpoint {}: cannot be opened to ask what it runs at",
+                host_key
+            );
+            return None;
+        }
+
+        let rate = AAudioStream_getSampleRate(stream_ptr);
+        let channels = AAudioStream_getChannelCount(stream_ptr);
+        let format = AAudioStream_getFormat(stream_ptr);
+        AAudioStream_close(stream_ptr);
+
+        let format = match format {
+            AAUDIO_FORMAT_PCM_I16 => SampleFormat::S16LE,
+            AAUDIO_FORMAT_PCM_I32 => SampleFormat::S32LE,
+            AAUDIO_FORMAT_PCM_FLOAT => SampleFormat::F32LE,
+            // A layout with no virtio equivalent. Saying nothing is better than naming a format
+            // the guest would then be encouraged to pick.
+            _ => return None,
+        };
+        if rate <= 0 || channels <= 0 || channels > u8::MAX as i32 {
+            return None;
+        }
+        Some(NativeConfig {
+            frame_rate: rate as u32,
+            num_channels: channels as u8,
+            format,
+        })
+    }
+}
+
 fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> {
+    // Refused here rather than at the builder: a format with no AAudio equivalent would
+    // otherwise be sent as whichever one happened to share its number.
+    let format = match aaudio_format(open.format) {
+        Some(f) => f,
+        None => {
+            error!(
+                "host audio endpoint {}: {} has no AAudio equivalent",
+                open.host_key, open.format
+            );
+            return Err(Box::new(AAudioError::StreamOpen));
+        }
+    };
+
     // Resolved per attempt, not once: the number an endpoint has changes every time it is
     // reconnected, and following it is the whole reason the name is carried.
     let device_id = if open.host_key.is_empty() {
@@ -297,7 +420,7 @@ fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> 
         }
         AAudioStreamBuilder_setDirection(builder, open.direction as u32);
         AAudioStreamBuilder_setBufferCapacityInFrames(builder, open.buffer_size as i32 * 2);
-        AAudioStreamBuilder_setFormat(builder, open.format as AaudioFormatT);
+        AAudioStreamBuilder_setFormat(builder, format);
         AAudioStreamBuilder_setSampleRate(builder, open.frame_rate as i32);
         AAudioStreamBuilder_setChannelCount(builder, open.num_channels as i32);
         // AAUDIO_UNSPECIFIED (0) keeps the platform's own routing; anything else pins the
@@ -334,6 +457,32 @@ fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> 
             AAudioStream_close(stream_ptr);
             return Err(Box::new(AAudioError::StreamStart));
         }
+    }
+
+    // Every frame written from here on is laid out the way the guest declared in SET_PARAMS, so a
+    // stream that came back with a different layout would be fed frames of the wrong size --
+    // audio at the wrong speed or noise, with nothing anywhere saying why.
+    // SAFETY: the stream was opened just above.
+    let (got_format, got_rate, got_channels) = unsafe {
+        (
+            AAudioStream_getFormat(stream_ptr),
+            AAudioStream_getSampleRate(stream_ptr),
+            AAudioStream_getChannelCount(stream_ptr),
+        )
+    };
+    if got_format != format
+        || got_rate != open.frame_rate as i32
+        || got_channels != open.num_channels as i32
+    {
+        error!(
+            "host audio endpoint {}: asked for {}Hz/{}ch/format {}, the platform gave \
+             {}Hz/{}ch/format {}; refusing rather than writing frames of the wrong size",
+            open.host_key, open.frame_rate, open.num_channels, format,
+            got_rate, got_channels, got_format
+        );
+        // SAFETY: the stream was opened just above and is closed once.
+        unsafe { AAudioStream_close(stream_ptr) };
+        return Err(Box::new(AAudioError::StreamOpen));
     }
 
     // Asking for an endpoint and getting one are different things: the platform routes by the

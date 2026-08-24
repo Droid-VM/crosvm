@@ -71,6 +71,9 @@ pub enum SampleFormat {
     S16LE,
     S24LE,
     S32LE,
+    /// 32-bit IEEE float, which is what Android endpoints natively run at: leaving it out means
+    /// every sample is converted on the way to the device however the guest formats it.
+    F32LE,
 }
 
 impl SampleFormat {
@@ -81,6 +84,7 @@ impl SampleFormat {
             S16LE => 2,
             S24LE => 4, // Not a typo, S24_LE samples are stored in 4 byte chunks.
             S32LE => 4,
+            F32LE => 4,
         }
     }
 }
@@ -93,6 +97,7 @@ impl Display for SampleFormat {
             S16LE => write!(f, "Signed 16 bit Little Endian"),
             S24LE => write!(f, "Signed 24 bit Little Endian"),
             S32LE => write!(f, "Signed 32 bit Little Endian"),
+            F32LE => write!(f, "32 bit Float Little Endian"),
         }
     }
 }
@@ -105,6 +110,7 @@ impl FromStr for SampleFormat {
             "S16_LE" => Ok(SampleFormat::S16LE),
             "S24_LE" => Ok(SampleFormat::S24LE),
             "S32_LE" => Ok(SampleFormat::S32LE),
+            "FLOAT_LE" => Ok(SampleFormat::F32LE),
             _ => Err(SampleFormatError::InvalidSampleFormat),
         }
     }
@@ -114,7 +120,7 @@ impl FromStr for SampleFormat {
 #[sorted]
 #[derive(Error, Debug)]
 pub enum SampleFormatError {
-    #[error("Must be in [U8, S16_LE, S24_LE, S32_LE]")]
+    #[error("Must be in [U8, S16_LE, S24_LE, S32_LE, FLOAT_LE]")]
     InvalidSampleFormat,
 }
 
