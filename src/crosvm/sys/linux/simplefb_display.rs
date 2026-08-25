@@ -28,6 +28,7 @@ use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
 use vm_memory::udmabuf::UdmabufDriver;
 use vm_memory::udmabuf::UdmabufDriverTrait;
+use vm_memory::FramebufferPrep;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
@@ -272,6 +273,30 @@ fn build_gpu_transport(
     }
     if !display.is_dmabuf_import_supported() {
         return Err("the bound sink imports no dmabufs".to_string());
+    }
+
+    // Whether the pages under this region are somewhere the host can leave them, as established by
+    // the backend that laid the region out (see `vm_memory::FramebufferPrep`). This is the one
+    // question that has to be asked before the udmabuf below and not after: the udmabuf takes a
+    // page reference on every page of the region, a referenced page cannot be migrated, and if any
+    // of those pages is in CMA the guest's first touch of the framebuffer kills the vcpu --
+    // `page fault at <gpa>, attempt: -12`, because gunyah's pin has nowhere to move it to. There is
+    // no recovery from that and no way to notice it from here; the failure lands on the guest.
+    //
+    // Anything short of a positive answer means the CPU path, including "nobody said". A partial
+    // answer would be the same lottery with better odds, and the floor -- copying the bytes -- costs
+    // a memcpy per frame and cannot fail this way at all.
+    match guest_mem.framebuffer_prep() {
+        FramebufferPrep::PoolBacked => {}
+        FramebufferPrep::NotPoolBacked(why) => {
+            return Err(format!("framebuffer pages not pool-backed: {why}"));
+        }
+        FramebufferPrep::Unclaimed => {
+            return Err("framebuffer pages not pool-backed: no hypervisor backend prepared the \
+                        region, so nothing can say the guest's first fault will find a page it \
+                        can pin"
+                .to_string());
+        }
     }
 
     // udmabuf windows are made of whole pages, and it rejects anything else with `NotPageAligned`

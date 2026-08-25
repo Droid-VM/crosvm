@@ -1068,10 +1068,18 @@ impl arch::LinuxArch for AArch64 {
         if let Some(ref sfb) = components.simplefb {
             let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, hypervisor);
             let fb_alloc = get_simplefb_size(sfb, components.memory_size, components.swiotlb, hypervisor);
+            // 2 MiB-aligned like the pools, and for the pool reason: GunyahVm::new folds this
+            // region into 2 MiB folios through its own mapping before anything can reference a
+            // page, and MADV_COLLAPSE only forms a PMD where the virtual address and the file
+            // offset are congruent mod 2 MiB. The offset already is (the region is a 2 MiB-granular
+            // slice at the top of the memfd); this is the other half, so the fold is guaranteed
+            // rather than dependent on where mmap happened to land the mapping.
             memory_regions.push((
                 GuestAddress(fb_addr),
                 fb_alloc,
-                MemoryRegionOptions::new().purpose(MemoryRegionPurpose::SharedFramebuffer),
+                MemoryRegionOptions::new()
+                    .purpose(MemoryRegionPurpose::SharedFramebuffer)
+                    .align(2 << 20),
             ));
         }
 

@@ -122,6 +122,34 @@ impl AsRef<dyn AsRawDescriptor + Sync + Send> for BackingObject {
     }
 }
 
+/// What the hypervisor backend was able to promise about the pages behind the `SharedFramebuffer`
+/// region, recorded at VM creation and read much later by whoever wants to hand those pages to
+/// someone who will hold a reference on them.
+///
+/// The one consumer is the simplefb bridge's GPU transport. A udmabuf over this region takes a
+/// plain page reference on every page (`shmem_read_mapping_page` on GKI 6.6 -- a reference, not a
+/// pin), and a referenced page cannot be migrated. If the page is sitting in a CMA pageblock when
+/// the guest first touches it, gunyah's fault-time `FOLL_LONGTERM` pin has to migrate it out and
+/// cannot, and the guest takes `page fault at <gpa>, attempt: -12` -- a vcpu OOM seconds after the
+/// bridge announces `transport=gpu-blit`. So the question the GPU path has to ask first is not
+/// "can I make a dmabuf" but "is this memory somewhere the host can leave it", and only the
+/// backend that laid the region out knows the answer.
+///
+/// `Unclaimed` is not "probably fine": it is "nobody has said", and the GPU path treats it exactly
+/// like a refusal. A backend that wants the fast path has to earn it by recording `PoolBacked`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FramebufferPrep {
+    /// No hypervisor backend has spoken for this region.
+    #[default]
+    Unclaimed,
+    /// Every 2 MiB of the region is a present, non-movable folio, and will still be one when the
+    /// guest faults on it.
+    PoolBacked,
+    /// It is not, and this is why. Carried as prose because the only thing done with it is to put
+    /// it in the line that explains why the bridge is on the CPU path.
+    NotPoolBacked(String),
+}
+
 /// For MemoryRegion::regions
 pub struct MemoryRegionInformation<'a> {
     pub index: usize,
@@ -503,6 +531,10 @@ pub struct GuestMemory {
     /// Empty unless a region declared a non-zero `step_size`, so nothing that exists today pays
     /// for it. See pool_grants.rs for why the host has to keep this rather than deriving it.
     grants: Arc<Mutex<BTreeMap<u64, PoolGrants>>>,
+    /// What the hypervisor backend promised about the `SharedFramebuffer` region's pages. Written
+    /// once while the VM is being built, read by the simplefb bridge long afterwards; it lives
+    /// here rather than in a process global because it is a fact about one VM's memory.
+    fb_prep: Arc<Mutex<FramebufferPrep>>,
 }
 
 impl AsRawDescriptors for GuestMemory {
@@ -664,6 +696,7 @@ impl GuestMemory {
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
             grants: Arc::new(Mutex::new(grants)),
+            fb_prep: Arc::new(Mutex::new(FramebufferPrep::Unclaimed)),
         })
     }
 
@@ -727,6 +760,7 @@ impl GuestMemory {
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
             grants: Arc::new(Mutex::new(grants)),
+            fb_prep: Arc::new(Mutex::new(FramebufferPrep::Unclaimed)),
         })
     }
 
@@ -741,6 +775,21 @@ impl GuestMemory {
     /// `Error::ProtectedMemoryAccess` instead of risking a SIGBUS.
     pub fn set_protected(&self) {
         self.protected.store(true, Ordering::Release);
+    }
+
+    /// Record what the hypervisor backend managed to promise about the `SharedFramebuffer`
+    /// region's pages. Called once, while the VM is being built.
+    pub fn set_framebuffer_prep(&self, prep: FramebufferPrep) {
+        *self.fb_prep.lock().expect("framebuffer prep record poisoned") = prep;
+    }
+
+    /// What was recorded. `Unclaimed` when no backend said anything, which is the answer the
+    /// framebuffer's GPU transport must refuse on -- see [`FramebufferPrep`].
+    pub fn framebuffer_prep(&self) -> FramebufferPrep {
+        self.fb_prep
+            .lock()
+            .expect("framebuffer prep record poisoned")
+            .clone()
     }
 
     /// Base address of the `pool_id`-th growable pool, ordered by address.
