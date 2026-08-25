@@ -47,6 +47,8 @@ mod gpu_display_x;
 #[cfg(any(windows, feature = "x"))]
 mod keycode_converter;
 mod sys;
+#[cfg(feature = "vnc")]
+mod vnc_blit;
 #[cfg(feature = "vulkan_display")]
 pub mod vulkan;
 
@@ -307,9 +309,11 @@ trait GpuDisplaySurface {
     ///
     /// A `Some` fd is a sync_file that signals when the display is done *reading* the flipped
     /// buffer, i.e. when the guest may safely render into it again. Backends whose flip consumes
-    /// the buffer synchronously (VNC and the CPU-copy paths never even reach `flip_to`; wayland
-    /// commits are decoupled by wl_buffer semantics) return `None`, and the caller must then
-    /// complete the flush synchronously exactly as before.
+    /// the buffer synchronously return `None`, and the caller must then complete the flush
+    /// synchronously exactly as before: the CPU-copy paths, which never reach `flip_to` at all;
+    /// wayland, whose commits are decoupled by wl_buffer semantics; and the VNC sink, which does
+    /// reach `flip_to` but has finished reading its source by the time it returns -- deliberately,
+    /// because a `Some` there would put a network service in the guest's vblank loop.
     fn take_flip_completion_fence(&mut self) -> Option<SafeDescriptor> {
         None
     }

@@ -1672,8 +1672,11 @@ impl VirtioGpu {
                 // signals when the display's async blit has finished READING the flipped buffer.
                 // Park it for the frontend, which defers this RESOURCE_FLUSH's virtio fence until
                 // it fires -- that is what orders the guest's next render into this dmabuf against
-                // the blit. The CPU-copy paths (VNC, CpuFallback) never reach flip_to and leave
-                // this None, keeping their synchronous completion.
+                // the blit. A CpuFallback resource never reaches flip_to at all, and the VNC sink
+                // reaches it but has finished reading the source before returning, so both leave
+                // this None and keep their synchronous completion. That the VNC sink leaves it None
+                // is deliberate and load-bearing: a fence from a network sink would gate the
+                // guest's vblank on whoever happens to be watching (plan §7).
                 if let Some(id) = scanout.surface_id {
                     if let Some(fence) = self.display.borrow_mut().take_flip_completion_fence(id) {
                         self.pending_flip_fence = Some(fence);

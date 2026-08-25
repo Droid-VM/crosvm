@@ -2,9 +2,12 @@
 // Copyright DroidVM contributors
 // Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::os::raw::c_char;
 use std::os::raw::c_int;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -15,6 +18,8 @@ use base::VolatileSlice;
 use linux_input_sys::virtio_input_event;
 use vm_control::gpu::DisplayParameters;
 
+use crate::vnc_blit::BlitMapping;
+use crate::vnc_blit::VncBlitContext;
 use crate::DisplayT;
 use crate::EventDeviceKind;
 use crate::GpuDisplayError;
@@ -22,6 +27,7 @@ use crate::GpuDisplayEvents;
 use crate::GpuDisplayFramebuffer;
 use crate::GpuDisplayResult;
 use crate::GpuDisplaySurface;
+use crate::SemaphoreTimepoint;
 use crate::SurfaceType;
 use crate::SysDisplayT;
 
@@ -123,9 +129,24 @@ struct SharedFramebuffer {
     /// The guest scanout with NO cursor composited into it. Kept pristine: it is the source the
     /// bridge restores from when the pointer moves off a pixel, which is why this design needs no
     /// save-under-cursor buffer at all.
+    ///
+    /// This is where the frame lives on the CPU transport, and also on the GPU transport whenever
+    /// the blit target's rows turn out to be padded (see `VncSurface::flip_to`). `gpu_frame` says
+    /// which.
     data: Vec<u8>,
+    /// Set while the clean frame lives in the blit target rather than in `data`: the target is
+    /// mapped for CPU reading and stays mapped until the next blit, so the pointer is good for
+    /// cursor-only offers as well as the frame that produced it.
+    gpu_frame: Option<GpuFrame>,
     server: Arc<VncServerHandle>,
     cursor: CursorState,
+}
+
+/// The last frame the GPU blitted, borrowed from the blit context that owns the mapping.
+struct GpuFrame {
+    /// Held so the mapping cannot outlive what it points into.
+    ctx: Arc<VncBlitContext>,
+    mapping: BlitMapping,
 }
 
 /// The guest's hardware cursor, as last reported by virtio-gpu.
@@ -143,6 +164,23 @@ struct CursorState {
 }
 
 impl SharedFramebuffer {
+    /// Where the current clean frame is, whichever transport put it there.
+    ///
+    /// `None` means there is no frame to offer. Only the GPU transport can produce that: a mapping
+    /// is invalidated by the next blit, and a surface that has been replaced but not yet released
+    /// can still be holding one. Falling back to `data` there would be worse than doing nothing --
+    /// on the GPU transport `data` was never written, so a cursor-only offer would repaint the
+    /// rectangle the pointer left with black and report nothing.
+    fn clean(&self) -> Option<(*const u8, u32)> {
+        match &self.gpu_frame {
+            Some(gpu) if gpu.ctx.mapping_is_current(&gpu.mapping) => {
+                Some((gpu.mapping.pixels, gpu.mapping.size))
+            }
+            Some(_) => None,
+            None => Some((self.data.as_ptr(), self.data.len() as u32)),
+        }
+    }
+
     /// Offer the frame to the bridge's consumers. `full` means the guest produced a new frame;
     /// otherwise not one guest pixel changed and only the pointer moved, which is what lets a
     /// cursor travel over a static desktop without costing a frame.
@@ -150,14 +188,19 @@ impl SharedFramebuffer {
     /// What each consumer makes of the offer is the bridge's business (vnc_frame_consumer.h);
     /// today there is one, the LibVNCServer path.
     fn offer_frame(&mut self, full: bool) {
+        let Some((pixels, size)) = self.clean() else {
+            return;
+        };
         let c = &self.cursor;
         let has_img = !c.pixels.is_empty() && c.width > 0 && c.height > 0;
-        // SAFETY: both buffers outlive the call; the bridge only reads them.
+        // SAFETY: both buffers outlive the call; the bridge only reads them. `pixels` is either
+        // `data` or a mapping `clean()` has just confirmed is the current one, and this thread is
+        // the only one that can blit and so invalidate it.
         unsafe {
             vnc_server_offer_frame(
                 self.server.ptr,
-                self.data.as_ptr(),
-                self.data.len() as u32,
+                pixels,
+                size,
                 if has_img { c.pixels.as_ptr() } else { std::ptr::null() },
                 c.width as c_int,
                 c.height as c_int,
@@ -170,23 +213,155 @@ impl SharedFramebuffer {
     }
 }
 
+/// A source the sink has imported: the context that holds it, the native handle, and the geometry
+/// it was declared with.
+///
+/// The context travels with the import rather than with the surface, and that is not tidiness. A
+/// surface is created before any producer asks whether this sink can import anything -- the
+/// simplefb bridge builds its transport against a surface it already has, and virtio-gpu imports on
+/// its first flush -- so a surface handed a context at construction would always be handed `None`.
+/// Attaching it here says the same thing more accurately anyway: an import cannot exist without the
+/// context that made it.
+///
+/// The geometry is kept because it is what the blit is sized by: the Vulkan bridge allocates its
+/// target to the SOURCE image's dimensions and refuses a target of any other size, so the number
+/// has to travel from the import to the flip.
+#[derive(Clone)]
+struct VncImport {
+    ctx: Arc<VncBlitContext>,
+    handle: i64,
+    width: u32,
+    height: u32,
+}
+
 struct VncSurface {
     width: u32,
-    #[allow(dead_code)]
     height: u32,
     shared_fb: Arc<Mutex<SharedFramebuffer>>,
     local_buffer: Vec<u8>,
+    /// Shared with the `DisplayVnc` that owns the import id space, exactly as the Android backend
+    /// shares its own: imports are made through the display and used through the surface. Empty on
+    /// a display with no GPU half -- including every display capped to `transport-cap=cpu`, whose
+    /// import attempts are refused in `GpuDisplay` before they reach this backend at all.
+    imports: Rc<RefCell<BTreeMap<u32, VncImport>>>,
 }
 
 impl VncSurface {
-    fn new(width: u32, height: u32, shared_fb: Arc<Mutex<SharedFramebuffer>>) -> Self {
+    fn new(
+        width: u32,
+        height: u32,
+        shared_fb: Arc<Mutex<SharedFramebuffer>>,
+        imports: Rc<RefCell<BTreeMap<u32, VncImport>>>,
+    ) -> Self {
         let buf_size = (width as usize) * (height as usize) * 4;
         VncSurface {
             width,
             height,
             shared_fb,
             local_buffer: vec![0u8; buf_size],
+            imports,
         }
+    }
+
+    /// The GPU transport: blit the guest's dmabuf into a CPU-readable buffer and offer THAT to the
+    /// bridge, instead of a frame the producer copied for us.
+    ///
+    /// What this replaces is not one copy but a chain of them. On the virtio-gpu route the producer
+    /// was mapping the resource, swizzling red and blue by hand to keep the CPU pipeline's BGRX
+    /// invariant, and copying it into `local_buffer` for `flip` to copy again into `data`. Here the
+    /// GPU reads the guest pages directly, the channel exchange rides along inside the blit
+    /// (`blitSourceFourcc`, C++ side), and what the CPU touches afterwards is ordinary cached host
+    /// memory instead of a write-combining guest mapping.
+    ///
+    /// It deliberately does NOT ask whether a client is connected. The frame arrives on the guest's
+    /// own flush, so one skipped here is never offered again -- the same rule that keeps `flip` from
+    /// short-circuiting. It also means the work a flush costs the guest is identical whether or not
+    /// anybody is watching, which is what §7 wanted verified.
+    fn blit_and_offer(&mut self, import_id: u32) -> anyhow::Result<()> {
+        let import = self
+            .imports
+            .borrow()
+            .get(&import_id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("invalid VNC display import id {}", import_id))?;
+
+        // The blit target is sized to the source, and the offer is read as a screen-sized picture
+        // packed to the screen's width, so a source of some other size cannot be offered at all --
+        // it would be published as a sheared frame with nothing to say so. Refusing sends this
+        // resource to the CPU path, which clips properly.
+        if import.width != self.width || import.height != self.height {
+            return Err(anyhow::anyhow!(
+                "import is {}x{} but this VNC screen is {}x{}",
+                import.width,
+                import.height,
+                self.width,
+                self.height
+            ));
+        }
+
+        let mut fb = self
+            .shared_fb
+            .lock()
+            .map_err(|_| anyhow::anyhow!("VNC shared framebuffer lock poisoned"))?;
+        // Before the blit, not after: the blit unmaps the target, so anything still pointing into
+        // it is stale from that moment.
+        fb.gpu_frame = None;
+
+        if !import.ctx.blit(import.handle, import.width, import.height) {
+            return Err(anyhow::anyhow!("Vulkan blit into the readback target failed"));
+        }
+        let mapping = import
+            .ctx
+            .map()
+            .ok_or_else(|| anyhow::anyhow!("failed to map the readback target for CPU read"))?;
+        // Closes the loop between what was asked for and what gralloc handed back. It follows from
+        // the check above -- the target is allocated to the import's geometry -- so this is not
+        // expected to fire; it is here because everything downstream indexes by `self.width` and a
+        // disagreement would be published as a picture rather than reported.
+        if mapping.width != self.width || mapping.height != self.height {
+            return Err(anyhow::anyhow!(
+                "readback target came back {}x{} for a {}x{} screen",
+                mapping.width,
+                mapping.height,
+                self.width,
+                self.height
+            ));
+        }
+
+        let packed_stride = (self.width as usize) * 4;
+        if mapping.stride_bytes as usize == packed_stride {
+            // The bridge's offer is a pointer plus a size and its bands are offsets into it, all
+            // computed from `width * 4`: it has no stride. When gralloc gives back exactly that, the
+            // mapping IS the offer and nothing is copied on the way -- which is also what keeps step
+            // 12's property intact, because ingest is handed the same shape of thing it has always
+            // been handed and cannot tell the two transports apart.
+            fb.gpu_frame = Some(GpuFrame {
+                ctx: import.ctx.clone(),
+                mapping,
+            });
+        } else {
+            // Padded rows. The alternative -- give the offer a stride field -- was rejected: every
+            // producer in the tree is packed, so it would add a case to the one function whose
+            // byte-for-byte behaviour step 12 froze, in exchange for a copy that only a padded
+            // gralloc pays. Repack into `data`, which exists and is exactly the right size, and
+            // leave `gpu_frame` unset so cursor-only offers read the repacked frame too.
+            let rows = (mapping.height as usize).min(self.height as usize);
+            // SAFETY: the mapping is current (nothing has blitted since `map`) and describes
+            // `size` readable bytes at `pixels`.
+            let src = unsafe { std::slice::from_raw_parts(mapping.pixels, mapping.size as usize) };
+            for y in 0..rows {
+                let src_off = y * mapping.stride_bytes as usize;
+                let dst_off = y * packed_stride;
+                if src_off + packed_stride > src.len() || dst_off + packed_stride > fb.data.len() {
+                    break;
+                }
+                fb.data[dst_off..dst_off + packed_stride]
+                    .copy_from_slice(&src[src_off..src_off + packed_stride]);
+            }
+        }
+
+        fb.offer_frame(true);
+        Ok(())
     }
 }
 
@@ -236,9 +411,43 @@ impl GpuDisplaySurface for VncSurface {
                 );
             }
             fb.data[..copy_len].copy_from_slice(&self.local_buffer[..copy_len]);
+            // The CPU transport owns the frame again -- drop any mapping a previous GPU flip left,
+            // so `clean()` reads what was just written rather than the last blit.
+            fb.gpu_frame = None;
             // fb.data stays cursor-free; the bridge blends the pointer on its way out.
             fb.offer_frame(true);
         }
+    }
+
+    fn flip_to(
+        &mut self,
+        import_id: u32,
+        _acquire_timepoint: Option<SemaphoreTimepoint>,
+        _release_timepoint: Option<SemaphoreTimepoint>,
+        _extra_info: Option<crate::FlipToExtraInfo>,
+    ) -> anyhow::Result<sync::Waitable> {
+        self.blit_and_offer(import_id)?;
+        Ok(sync::Waitable::signaled())
+    }
+
+    /// Always `None`, and that is the acceptance condition of this whole step rather than an
+    /// omission (plan §7).
+    ///
+    /// A `Some` here is a release fence, and the caller's contract for one is specific: virtio-gpu
+    /// defers the RESOURCE_FLUSH virtio fence until it signals, so the guest's compositor does not
+    /// get its buffer back -- does not complete its page flip, does not see a vblank -- until the
+    /// sink says it is finished reading. That is right for the native sink, whose reader is
+    /// SurfaceFlinger. It would be catastrophic here, because it would put a NETWORK service in the
+    /// guest's vblank loop: a slow RFB client, or one on a congested link, would pace the guest's
+    /// rendering, and a client that stopped reading would stop the guest.
+    ///
+    /// Nothing has to be deferred, either. By the time `flip_to` returns, the blit is complete (its
+    /// fence was waited on), the pixels have been read out of the target, and the offer has been
+    /// made -- the guest's dmabuf is not referenced by anything any more. The flip really is
+    /// finished when the producer is told it is, so `None` is not a promise being dodged, it is the
+    /// truth about a transport that reads its source synchronously.
+    fn take_flip_completion_fence(&mut self) -> Option<base::SafeDescriptor> {
+        None
     }
 }
 
@@ -356,6 +565,14 @@ pub struct DisplayVnc {
     prev_button_mask: u8,
     /// Inject pointer events as multi-touch (legacy) instead of the absolute mouse.
     touch_input: bool,
+    /// The GPU half, once something has asked for it. `None` before the probe and after a probe
+    /// that came back empty -- `blit_probed` tells those two apart, because "there is no blit
+    /// driver on this machine" must be answered once and not re-attempted per resource.
+    blit: Option<Arc<VncBlitContext>>,
+    blit_probed: bool,
+    /// Imports made against `blit`, keyed by the id `GpuDisplay` handed out. Shared with the
+    /// surfaces, which are where flips happen.
+    imports: Rc<RefCell<BTreeMap<u32, VncImport>>>,
 }
 
 /// The VNC pointer/touch devices advertise this fixed absolute-axis maximum. Every injected
@@ -426,7 +643,33 @@ impl DisplayVnc {
             next_tracking_id: 0,
             prev_button_mask: 0,
             touch_input,
+            blit: None,
+            blit_probed: false,
+            imports: Rc::new(RefCell::new(BTreeMap::new())),
         })
+    }
+
+    /// Brings up the GPU half once, on the first producer that asks whether it exists.
+    ///
+    /// Once, because the answer cannot change: it is "was a Vulkan blit driver named for this
+    /// process, and did it come up". Lazily rather than in `new_tcp`, because a display capped to
+    /// `transport-cap=cpu` must never load a driver at all -- `GpuDisplay::is_dmabuf_import_supported`
+    /// answers the cap without asking the backend, so a capped display never reaches this and the
+    /// measured behaviour (a capped run does not even dlopen turnip) is preserved.
+    fn blit_context(&mut self) -> Option<&Arc<VncBlitContext>> {
+        if !self.blit_probed {
+            self.blit_probed = true;
+            self.blit = VncBlitContext::open(self.width, self.height);
+            match &self.blit {
+                Some(_) => base::info!(
+                    "VNC: GPU transport available ({}x{} readback target)",
+                    self.width,
+                    self.height
+                ),
+                None => base::info!("VNC: no GPU transport; frames will be copied by the CPU"),
+            }
+        }
+        self.blit.as_ref()
     }
 
     fn drain_c_events(&mut self) {
@@ -564,12 +807,15 @@ impl DisplayVnc {
 }
 
 impl DisplayT for DisplayVnc {
-    /// This backend has no GPU half: `import_resource` is not implemented, so every import a
-    /// caller attempts fails and is cached as CpuFallback. The trait's default answer is `true`,
-    /// which made the probe say the opposite of the truth -- virtio-gpu paid a real export plus a
-    /// refused import for every resource before learning what this could have told it up front.
+    /// Whether this sink has a GPU half, which is whether a Vulkan blit context came up.
+    ///
+    /// The answer used to be a flat `false`, which was honest while there was no `import_resource`
+    /// here at all. It is a probe now, and it is still the same kind of statement: a `true` costs
+    /// the caller a real export and import attempt, so it must not be optimistic. The trait default
+    /// -- `true` for every backend -- is exactly the failure this replaced, and the reason a probe
+    /// answering from a trait default is worse than no probe.
     fn is_dmabuf_import_supported(&mut self) -> bool {
-        false
+        self.blit_context().is_some()
     }
 
     /// No RFB client means no consumer at all: LibVNCServer's mark-as-modified walks an empty
@@ -666,6 +912,7 @@ impl DisplayT for DisplayVnc {
             width,
             height,
             data: vec![0u8; buf_size],
+            gpu_frame: None,
             server: self.server.clone(),
             cursor: CursorState::default(),
         }));
@@ -673,7 +920,86 @@ impl DisplayT for DisplayVnc {
         self.shared_fb = Some(shared_fb.clone());
 
         base::info!("VNC: created surface {}x{}", width, height);
-        Ok(Box::new(VncSurface::new(width, height, shared_fb)))
+        Ok(Box::new(VncSurface::new(
+            width,
+            height,
+            shared_fb,
+            self.imports.clone(),
+        )))
+    }
+
+    /// Imports a guest dmabuf as a blit source.
+    ///
+    /// The `fourcc` handed on is the guest's own declaration and stays that way across the FFI.
+    /// The correction that makes the blit land in the byte order LibVNCServer serves lives beside
+    /// the target it has to agree with, in the C++ (`blitSourceFourcc`) -- keeping it there means
+    /// the rule is stated once, next to the AHardwareBuffer format that is half of it, rather than
+    /// as a swizzle that two files each have to remember.
+    fn import_resource(
+        &mut self,
+        import_id: u32,
+        _surface_id: u32,
+        external_display_resource: crate::DisplayExternalResourceImport,
+    ) -> anyhow::Result<()> {
+        let crate::DisplayExternalResourceImport::Dmabuf {
+            descriptor,
+            offset,
+            stride,
+            modifiers,
+            linear_layout_verified,
+            width,
+            height,
+            fourcc,
+        } = external_display_resource
+        else {
+            return Err(anyhow::anyhow!("the VNC sink only imports DMA-BUFs"));
+        };
+
+        let ctx = self
+            .blit_context()
+            .ok_or_else(|| anyhow::anyhow!("this VNC display has no GPU half"))?
+            .clone();
+        let handle = ctx
+            .import_dmabuf(
+                descriptor.as_raw_descriptor(),
+                offset,
+                stride,
+                modifiers,
+                linear_layout_verified,
+                width,
+                height,
+                fourcc,
+            )
+            .ok_or_else(|| anyhow::anyhow!("Turnip DMA-BUF import failed"))?;
+        self.imports.borrow_mut().insert(
+            import_id,
+            VncImport {
+                ctx,
+                handle,
+                width,
+                height,
+            },
+        );
+        Ok(())
+    }
+
+    fn release_import(&mut self, import_id: u32, _surface_id: u32) {
+        let Some(import) = self.imports.borrow_mut().remove(&import_id) else {
+            return;
+        };
+        import.ctx.release_import(import.handle);
+    }
+}
+
+impl Drop for DisplayVnc {
+    fn drop(&mut self) {
+        // The bridge frees whatever is left when it is destroyed, so this is not a leak fix -- it
+        // is that a release is the display's to do while the display still exists, the same shape
+        // the Android backend has. Surfaces are already gone by here (GpuDisplay drops them before
+        // the backend), so nothing can be mid-flip.
+        for import in std::mem::take(&mut *self.imports.borrow_mut()).into_values() {
+            import.ctx.release_import(import.handle);
+        }
     }
 }
 
