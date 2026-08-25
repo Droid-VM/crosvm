@@ -546,6 +546,15 @@ pub struct GpuDisplay {
     next_id: u32,
     event_devices: BTreeMap<u32, EventDevice>,
     surfaces: BTreeMap<u32, Box<dyn GpuDisplaySurface>>,
+    /// Whether this display has been capped to the CPU transport (`cap_transport_to_cpu`).
+    ///
+    /// Deliberately here and not in the backends. The cap is a property of one *binding* -- this
+    /// exporter, on this screen -- while a backend type is a property of a kind of sink, and every
+    /// backend would otherwise have to grow the same field and remember to consult it. Holding it
+    /// on the wrapper puts it at the two places a producer can learn about or use dmabuf import,
+    /// `is_dmabuf_import_supported` and `import_resource`, which is what makes it impossible to
+    /// route around: a producer that skips the probe still cannot get an import id.
+    dmabuf_import_capped: bool,
     wait_ctx: WaitContext<DisplayEventToken>,
     // `inner` must be after `surfaces` to ensure those objects are dropped before
     // the display context. The drop order for fields inside a struct is the order in which they
@@ -572,6 +581,7 @@ impl GpuDisplay {
                 next_id: 1,
                 event_devices: Default::default(),
                 surfaces: Default::default(),
+                dmabuf_import_capped: false,
                 wait_ctx,
             })
         }
@@ -593,6 +603,7 @@ impl GpuDisplay {
                 next_id: 1,
                 event_devices: Default::default(),
                 surfaces: Default::default(),
+                dmabuf_import_capped: false,
                 wait_ctx,
             })
         }
@@ -610,6 +621,7 @@ impl GpuDisplay {
             next_id: 1,
             event_devices: Default::default(),
             surfaces: Default::default(),
+            dmabuf_import_capped: false,
             wait_ctx,
         })
     }
@@ -633,6 +645,7 @@ impl GpuDisplay {
             next_id: 1,
             event_devices: Default::default(),
             surfaces: Default::default(),
+            dmabuf_import_capped: false,
             wait_ctx,
         })
     }
@@ -874,6 +887,21 @@ impl GpuDisplay {
             .unwrap_or(true)
     }
 
+    /// Refuses dmabuf import on this display for the rest of its life, whatever the backend can
+    /// actually do.
+    ///
+    /// This is the enforcement point for a binding's `transport-cap=cpu`. Capping only ever
+    /// removes an option from a negotiation whose floor is a CPU copy, so it cannot fail and there
+    /// is no matching "uncap": a caller that wants the negotiated answer simply never calls this.
+    ///
+    /// One-way on purpose. The value it enforces is fixed when the exporter is configured, and a
+    /// display that could be uncapped mid-run would mean a producer's cached verdict (both the
+    /// virtio-gpu `CpuFallback` cache and the simplefb bridge's `Transport`) could disagree with
+    /// the display about which transport is in force, with no event to reconcile them.
+    pub fn cap_transport_to_cpu(&mut self) {
+        self.dmabuf_import_capped = true;
+    }
+
     /// Imports a resource to the display backend. This resource may be an image for the compositor
     /// or a synchronization object.
     pub fn import_resource(
@@ -881,6 +909,15 @@ impl GpuDisplay {
         surface_id: u32,
         external_display_resource: DisplayExternalResourceImport,
     ) -> anyhow::Result<u32> {
+        // Checked here and not only in the probe below, so that the cap holds against a producer
+        // that never probed. A refusal is what every caller of this already knows how to handle --
+        // it is the same answer a backend without a GPU half gives -- so the cap needs no new path
+        // anywhere upstream.
+        if self.dmabuf_import_capped {
+            return Err(anyhow!(
+                "dmabuf import is capped off on this display (transport-cap=cpu)"
+            ));
+        }
         let import_id = self.next_id;
 
         self.inner
@@ -892,7 +929,10 @@ impl GpuDisplay {
 
     /// Returns whether the display backend can import DMA-BUF resources.
     pub fn is_dmabuf_import_supported(&mut self) -> bool {
-        self.inner.is_dmabuf_import_supported()
+        // The cap answers first, and the backend is not asked at all: on the Android sink the
+        // honest answer costs a Vulkan capability probe, and the point of the cap is that nothing
+        // downstream is going to act on it.
+        !self.dmabuf_import_capped && self.inner.is_dmabuf_import_supported()
     }
 
     /// Whether anything is currently positioned to see a frame. See `DisplayT::has_consumer`.

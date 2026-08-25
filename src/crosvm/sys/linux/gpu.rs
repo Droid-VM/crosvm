@@ -202,9 +202,18 @@ pub fn create_gpu_device(
     // `insert(0, Android)` followed by `insert(0, VncTcp)` put VNC in front and left
     // `AServiceManager_addService` uncalled, so the app's native display waited on a binder that
     // was never registered.
+    //
+    // The exporter also carries this binding's transport ceiling, collected alongside the backend
+    // it belongs to. At most one of the two arms below runs (config rejects two exporters on one
+    // screen), so there is exactly one answer here, and no binding at all means the default: take
+    // whatever gets negotiated.
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    let mut transport_cap = crate::crosvm::config::TransportCap::Auto;
+
     #[cfg(feature = "android_display")]
     if let Some(service) = cfg.android_display_service_for(DisplayScreen::Gpu0) {
         display_backends.insert(0, virtio::DisplayBackend::Android(service.name.clone()));
+        transport_cap = service.transport_cap;
     }
 
     #[cfg(feature = "vnc")]
@@ -225,6 +234,7 @@ pub fn create_gpu_device(
             0,
             virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone(), touch_input),
         );
+        transport_cap = vnc_cfg.transport_cap;
     }
 
     // Use the unnamed socket for GPU display screens.
@@ -235,7 +245,8 @@ pub fn create_gpu_device(
         );
     }
 
-    let dev = virtio::Gpu::new(
+    #[allow(unused_mut)]
+    let mut dev = virtio::Gpu::new(
         exit_evt_wrtube
             .try_clone()
             .context("failed to clone tube")?,
@@ -249,6 +260,10 @@ pub fn create_gpu_device(
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
     );
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    if transport_cap == crate::crosvm::config::TransportCap::Cpu {
+        dev.cap_transport_to_cpu();
+    }
 
     let jail = if let Some(jail_config) = cfg.jail_config.as_ref() {
         let mut config = SandboxConfig::new(jail_config, "gpu_device");

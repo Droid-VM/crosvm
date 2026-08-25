@@ -304,6 +304,7 @@ fn build(
     udmabuf: bool,
     #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
     snapshot_scratch_directory: Option<PathBuf>,
+    dmabuf_import_capped: bool,
 ) -> Option<VirtioGpu> {
     // `display_backends` is a try-in-turn chain, so a backend declining is how it is meant to
     // work, not a fault: `--gpu` on an Android host carries an X entry that no Android host has
@@ -330,13 +331,22 @@ fn build(
         };
     }
 
-    let (chosen, display) = match display_opt {
+    let (chosen, mut display) = match display_opt {
         Some(d) => d,
         None => {
             error!("failed to open any display backend ({})", declined.join("; "));
             return None;
         }
     };
+
+    // The ceiling the exporter bound to this device's screen was configured with. Applied before
+    // anything asks the display what it can do, so `try_import_resource_to_display`'s probe sees a
+    // display that refuses dmabufs and caches `CpuFallback` on the first resource, exactly as it
+    // does against a sink that genuinely has no GPU half.
+    if dmabuf_import_capped {
+        info!("gpu: transport capped to cpu copy on this screen (transport-cap=cpu)");
+        display.cap_transport_to_cpu();
+    }
 
     // One line, and it names the outcome rather than the attempts. Landing on the stub is the
     // case worth spelling out: it is what a GPU device does when no exporter is bound to its
@@ -1237,6 +1247,7 @@ impl Worker {
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_rd: RecvTube,
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
         snapshot_scratch_directory: Option<PathBuf>,
+        dmabuf_import_capped: bool,
     ) -> anyhow::Result<Worker> {
         let fence_state = Arc::new(Mutex::new(Default::default()));
         let fence_handler_resources = Arc::new(Mutex::new(None));
@@ -1257,6 +1268,7 @@ impl Worker {
             #[cfg(windows)]
             gpu_display_wait_descriptor_ctrl_wr,
             snapshot_scratch_directory,
+            dmabuf_import_capped,
         )
         .ok_or_else(|| anyhow!("failed to build virtio gpu"))?;
 
@@ -1793,6 +1805,14 @@ pub struct Gpu {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     gpu_cgroup_path: Option<PathBuf>,
     snapshot_scratch_directory: Option<PathBuf>,
+    /// Whether the exporter bound to this device's screen capped its transport to a CPU copy.
+    ///
+    /// Not a `GpuParameters` field, and that is the point: the ceiling belongs to the *binding*
+    /// between one exporter and one screen (`--vnc-server ...,transport-cap=`, `
+    /// --android-display-service ...,transport-cap=`), not to the GPU device, which has no opinion
+    /// about how its frames leave. Set after construction because that is where a caller can read
+    /// the binding -- `Gpu::new` takes the display backends but not the config they came from.
+    dmabuf_import_capped: bool,
 }
 
 /// Default real time priority for the virtio-gpu worker thread.
@@ -2071,7 +2091,19 @@ impl Gpu {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             gpu_cgroup_path: gpu_cgroup_path.cloned(),
             snapshot_scratch_directory: gpu_parameters.snapshot_scratch_path.clone(),
+            dmabuf_import_capped: false,
         }
+    }
+
+    /// Caps this device's screen to the CPU transport, for a binding configured
+    /// `transport-cap=cpu`.
+    ///
+    /// Must be called before the device is activated, which is when the display is opened and the
+    /// cap applied; there is no way to change it afterwards, deliberately (see
+    /// `GpuDisplay::cap_transport_to_cpu`). Ceilings only remove options from a negotiation whose
+    /// floor is a CPU copy, so this cannot fail and there is nothing to report.
+    pub fn cap_transport_to_cpu(&mut self) {
+        self.dmabuf_import_capped = true;
     }
 
     /// Initializes the internal device state so that it can begin processing virtqueues.
@@ -2109,6 +2141,7 @@ impl Gpu {
                 .try_clone()
                 .expect("failed to clone wait context control channel"),
             self.snapshot_scratch_directory.clone(),
+            self.dmabuf_import_capped,
         )?;
 
         for event_device in self.event_devices.take().expect("missing event_devices") {
@@ -2155,6 +2188,7 @@ impl Gpu {
         let fixed_blob_mapping = self.fixed_blob_mapping;
         let udmabuf = self.udmabuf;
         let snapshot_scratch_directory = self.snapshot_scratch_directory.clone();
+        let dmabuf_import_capped = self.dmabuf_import_capped;
 
         #[cfg(windows)]
         let mut wndproc_thread = self.wndproc_thread.take();
@@ -2218,6 +2252,7 @@ impl Gpu {
                 #[cfg(windows)]
                 gpu_display_wait_descriptor_ctrl_wr,
                 snapshot_scratch_directory,
+                dmabuf_import_capped,
             )
             .expect("Failed to create virtio gpu worker thread");
 

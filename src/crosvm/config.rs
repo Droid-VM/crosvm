@@ -189,6 +189,31 @@ impl DisplayScreen {
     }
 }
 
+/// How far up the transport ladder a screen's exporter is allowed to go.
+///
+/// A CAP, never a request, and the distinction is the whole reason this is expressible at all.
+/// Which transport a frame actually takes is negotiated at run time between what the source can
+/// export and what the sink can import (CPU copy always available, GPU copy when both ends manage
+/// a dmabuf), and a user who *asks* for GPU copy on a source that cannot export one gets either a
+/// silent downgrade or a loud refusal -- the first is the "looks like it worked" failure this
+/// project keeps running into, the second turns a preference into a boot failure. A ceiling has
+/// neither problem: every value is satisfiable, because lowering the ceiling can only remove
+/// options from a negotiation that always has CPU copy at the bottom.
+///
+/// This is a debugging control, not a product setting (plan §4.6). What a panel shows the user is
+/// the negotiated *result*, read-only.
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransportCap {
+    /// Take whatever the two ends negotiate.
+    #[default]
+    Auto,
+    /// Refuse dmabuf import on this binding, so the negotiation can only land on a CPU copy. The
+    /// per-binding equivalent of the process-wide `GPU_SCANOUT_FORCE_TRANSFER=1`.
+    Cpu,
+}
+
 /// Address a VNC server listens on when the option does not say. Kept here rather than repeated at
 /// each consumer because validation has to compare the same effective port the server will bind.
 #[cfg(feature = "vnc")]
@@ -215,6 +240,17 @@ pub struct VncConfig {
     /// resolves it and writes the answer back, so nothing downstream ever sees `None`.
     #[serde(default)]
     pub screen: Option<DisplayScreen>,
+    /// Ceiling on this binding's transport (see `TransportCap`).
+    ///
+    /// Accepted here for the same reason both exporters take `screen=`: the two options describe
+    /// the same kind of thing and a caller should not have to remember which half of the surface
+    /// exists on which one. It is currently moot -- this sink has no GPU half at all, so the
+    /// negotiation lands on a CPU copy whatever the ceiling says (`is_dmabuf_import_supported`
+    /// returns false unconditionally, gpu_display_vnc.rs) -- and it is stored and enforced
+    /// regardless, so that the day step 11 gives VNC a GPU half the knob is already the one
+    /// callers have been passing.
+    #[serde(default)]
+    pub transport_cap: TransportCap,
 }
 
 /// One Android display service: the name crosvm registers with the service manager, and which
@@ -235,6 +271,10 @@ pub struct AndroidDisplayServiceConfig {
     /// Which screen this service shows. `None` on the wire means "not said"; see `VncConfig`.
     #[serde(default)]
     pub screen: Option<DisplayScreen>,
+    /// Ceiling on this binding's transport (see `TransportCap`). This is the sink where the cap
+    /// currently changes anything: it is the one with a Vulkan blit behind it.
+    #[serde(default)]
+    pub transport_cap: TransportCap,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, FromKeyValues)]
@@ -3121,6 +3161,7 @@ mod tests {
             AndroidDisplayServiceConfig {
                 name: "droidvm_disp_1".to_string(),
                 screen: None,
+                transport_cap: TransportCap::Auto,
             }
         );
     }
@@ -3133,6 +3174,7 @@ mod tests {
             AndroidDisplayServiceConfig {
                 name: "win_fb".to_string(),
                 screen: Some(DisplayScreen::Simplefb),
+                transport_cap: TransportCap::Auto,
             }
         );
         // The two forms mix: the name keeps its implicit first position with a `screen=` after it.
@@ -3141,6 +3183,7 @@ mod tests {
             AndroidDisplayServiceConfig {
                 name: "droidvm_disp_1".to_string(),
                 screen: Some(DisplayScreen::Gpu0),
+                transport_cap: TransportCap::Auto,
             }
         );
     }
@@ -3157,6 +3200,62 @@ mod tests {
 
         let vnc = from_key_values::<VncConfig>("port=5901,screen=gpu-0").unwrap();
         assert_eq!(vnc.screen, Some(DisplayScreen::Gpu0));
+    }
+
+    /// The transport ceiling, on both exporters, spelled the same way on both.
+    ///
+    /// The key is a contract with the app, so what is pinned here is the surface as typed --
+    /// `transport-cap=cpu` -- and not merely that some field ends up set.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn parse_vnc_server_transport_cap() {
+        // Unsaid means auto, which is what "let the two ends negotiate" is called.
+        let vnc = from_key_values::<VncConfig>("port=5900").unwrap();
+        assert_eq!(vnc.transport_cap, TransportCap::Auto);
+
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=cpu").unwrap();
+        assert_eq!(vnc.transport_cap, TransportCap::Cpu);
+
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=auto").unwrap();
+        assert_eq!(vnc.transport_cap, TransportCap::Auto);
+
+        // It combines with the other per-binding key rather than replacing it.
+        let vnc = from_key_values::<VncConfig>("port=5901,screen=simplefb,transport-cap=cpu")
+            .unwrap();
+        assert_eq!(vnc.screen, Some(DisplayScreen::Simplefb));
+        assert_eq!(vnc.transport_cap, TransportCap::Cpu);
+    }
+
+    #[test]
+    #[cfg(feature = "android_display")]
+    fn parse_android_display_service_transport_cap() {
+        let svc = from_key_values::<AndroidDisplayServiceConfig>("droidvm_disp_1").unwrap();
+        assert_eq!(svc.transport_cap, TransportCap::Auto);
+
+        let svc = from_key_values::<AndroidDisplayServiceConfig>(
+            "name=win_fb,screen=simplefb,transport-cap=cpu",
+        )
+        .unwrap();
+        assert_eq!(svc.screen, Some(DisplayScreen::Simplefb));
+        assert_eq!(svc.transport_cap, TransportCap::Cpu);
+
+        // The bare-name form keeps working with the key appended, same as `screen=`.
+        let svc =
+            from_key_values::<AndroidDisplayServiceConfig>("droidvm_disp_1,transport-cap=cpu")
+                .unwrap();
+        assert_eq!(svc.name, "droidvm_disp_1");
+        assert_eq!(svc.transport_cap, TransportCap::Cpu);
+    }
+
+    /// A ceiling nobody defined is a refusal, not a fallback to auto. `gpu` is a plausible thing
+    /// to type -- it is the rung above the one that exists -- and accepting it silently would be
+    /// the caller believing they had asked for something.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn parse_transport_cap_rejects_unknown_value() {
+        assert!(from_key_values::<VncConfig>("port=5900,transport-cap=gpu").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,transport-cap=zero-copy").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,transport_cap=cpu").is_err());
     }
 
     /// A single `--vnc-server` with no `screen=` and a GPU present: the shape of every VNC command

@@ -31,6 +31,8 @@ use vm_memory::udmabuf::UdmabufDriverTrait;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
+use crate::crosvm::config::TransportCap;
+
 pub struct SimplefbDisplayParams {
     pub addr: u64,
     pub width: u32,
@@ -70,9 +72,9 @@ pub fn simplefb_format_fourcc(format: &str) -> u32 {
     }
 }
 
-/// Where simplefb frames go. Everything past opening the display is
-/// backend-agnostic: the bridge only uses framebuffer()/flip(), so any
-/// GpuDisplay backend works.
+/// Where simplefb frames go. Everything past opening the display is backend-agnostic: the bridge
+/// asks the `GpuDisplay` what it can take and uses whichever half it has -- import + `flip_to`, or
+/// `framebuffer()` + `flip()` -- so any backend works and none of them are named below this point.
 pub enum SimplefbDisplayTarget {
     Vnc {
         addr: String,
@@ -98,6 +100,7 @@ pub fn start_simplefb_display_thread(
     guest_mem: GuestMemory,
     params: SimplefbDisplayParams,
     target: SimplefbDisplayTarget,
+    transport_cap: TransportCap,
     event_devices: Vec<EventDevice>,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
@@ -127,6 +130,14 @@ pub fn start_simplefb_display_thread(
                 }
             };
 
+            // The ceiling this binding was configured with, applied to the display before anything
+            // asks it a question. Doing it here rather than at the import attempt is what makes the
+            // cap a property of the display for its whole life: nothing downstream has to remember
+            // to consult it, and the probe never even reaches the backend.
+            if transport_cap == TransportCap::Cpu {
+                display.cap_transport_to_cpu();
+            }
+
             // Routes VNC input to the guest. The Android backend has no input of its own (the
             // app drives the `--input` evdev sockets instead), so this is a no-op there.
             for ed in event_devices {
@@ -135,7 +146,7 @@ pub fn start_simplefb_display_thread(
                 }
             }
 
-            if let Err(e) = simplefb_display_loop(guest_mem, &params, &mut display) {
+            if let Err(e) = simplefb_display_loop(guest_mem, &params, &mut display, transport_cap) {
                 error!("simplefb display thread exited with error: {:?}", e);
             }
         })
@@ -243,7 +254,15 @@ fn build_gpu_transport(
     params: &SimplefbDisplayParams,
     display: &mut GpuDisplay,
     surface_id: u32,
+    transport_cap: TransportCap,
 ) -> std::result::Result<GpuTransport, String> {
+    // The cap is already in force on the display, so the probe below would refuse anyway. Asked
+    // separately only so the startup line names the ceiling instead of blaming the sink: "the sink
+    // imports no dmabufs" would be a false statement about a perfectly capable sink, and the whole
+    // value of that line is that somebody reading it can tell why they are on the slow path.
+    if transport_cap == TransportCap::Cpu {
+        return Err("capped by transport-cap=cpu".to_string());
+    }
     if !display.is_dmabuf_import_supported() {
         return Err("the bound sink imports no dmabufs".to_string());
     }
@@ -602,6 +621,7 @@ fn simplefb_display_loop(
     guest_mem: GuestMemory,
     params: &SimplefbDisplayParams,
     display: &mut GpuDisplay,
+    transport_cap: TransportCap,
 ) -> Result<()> {
     let display_params = DisplayParameters::default_with_mode(DisplayMode::Windowed(
         params.width,
@@ -626,7 +646,13 @@ fn simplefb_display_loop(
 
     // Decided here, before the loop and before any consumer can exist, so that the outcome is on
     // record for every run. A failure is permanent by design: see `Transport::Cpu`.
-    let mut transport = match build_gpu_transport(&guest_mem, params, display, surface_id) {
+    let mut transport = match build_gpu_transport(
+        &guest_mem,
+        params,
+        display,
+        surface_id,
+        transport_cap,
+    ) {
         Ok(gpu) => {
             info!(
                 "simplefb: transport=gpu-blit {}x{} stride={} fourcc={:#x} import={}",

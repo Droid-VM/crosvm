@@ -4110,28 +4110,37 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         #[cfg(feature = "android_display")]
         let android_service = cfg
             .android_display_service_for(DisplayScreen::Simplefb)
-            .map(|s| s.name.clone());
+            .map(|s| (s.name.clone(), s.transport_cap));
         #[cfg(not(feature = "android_display"))]
-        let android_service: Option<String> = None;
+        let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
 
         // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
         // and there is no longer anywhere for its frames to go by default: they used to be handed
         // to the GPU device's display, which is what the exporter bindings replace. (The step-5
         // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
         // client -- not for one nothing has bound at all.)
-        let target = match android_service {
-            Some(service_name) => simplefb_display::SimplefbDisplayTarget::Android { service_name },
+        // The transport ceiling travels with the binding, not with the screen: it says how far this
+        // one exporter may go, so it is read off whichever entry bound to `simplefb` and handed to
+        // the bridge alongside the target it describes.
+        let (target, transport_cap) = match android_service {
+            Some((service_name, transport_cap)) => (
+                simplefb_display::SimplefbDisplayTarget::Android { service_name },
+                transport_cap,
+            ),
             None => {
                 #[cfg(feature = "vnc")]
                 {
                     let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
                     let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
                     let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
-                    simplefb_display::SimplefbDisplayTarget::Vnc {
-                        addr: format!("{}:{}", host, port),
-                        password: vnc_cfg.password.clone(),
-                        touch_input: vnc_touch_input(vnc_cfg.input.as_deref()),
-                    }
+                    (
+                        simplefb_display::SimplefbDisplayTarget::Vnc {
+                            addr: format!("{}:{}", host, port),
+                            password: vnc_cfg.password.clone(),
+                            touch_input: vnc_touch_input(vnc_cfg.input.as_deref()),
+                        },
+                        vnc_cfg.transport_cap,
+                    )
                 }
                 #[cfg(not(feature = "vnc"))]
                 return None;
@@ -4142,6 +4151,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             guest_mem,
             params,
             target,
+            transport_cap,
             simplefb_event_devices,
         ) {
             Ok(handle) => {
