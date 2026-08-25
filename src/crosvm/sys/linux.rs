@@ -398,7 +398,6 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
     #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
-    #[cfg(feature = "gpu")] external_scanout_out: &mut Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -474,17 +473,16 @@ fn create_virtio_devices(
             let event_devices =
                 create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
 
-            // Input arrives through whichever display is being presented on, and with a GPU
-            // device present that display is always this one -- VNC and the app's Surface alike,
-            // with the simplefb bridge feeding frames in rather than presenting. The bridge keeps
-            // its own event devices only when there is no GPU device at all, which is handled
-            // where it opens its own display (below).
+            // This device set belongs to this device's display: one keyboard, one relative
+            // pointer, one absolute device, routed by guest focus. The simplefb bridge keeps its
+            // own event devices where it makes them, and it makes them only when there is no GPU
+            // device at all -- a simplefb screen exported alongside a GPU one therefore has no
+            // input of its own, which is a per-screen device set and so step 9's to give it.
 
-            // With `--simplefb` there are two things that can produce a picture and only one
-            // Surface to put it on. Rather than opening a second display (two registrations of
-            // one Android service name, with the app's Surface going to whichever won), the
-            // bridge hands its frames to this device, which shows them whenever the guest is not
-            // displaying through virtio-gpu itself. See ExternalScanout.
+            // Nothing offers this a frame any more: the simplefb bridge presents on its own
+            // display now, so the source it used to arbitrate against is gone and this is the
+            // arbitration of one source. It comes out together with everything that reads it,
+            // which is a large enough deletion to be worth its own change.
             let external_scanout = match cfg.simplefb.as_ref() {
                 Some(sfb) => {
                     let bpp: u32 = match sfb.format.as_str() {
@@ -494,7 +492,6 @@ fn create_virtio_devices(
                     };
                     let scanout = virtio::ExternalScanout::new(sfb.width, sfb.height, sfb.width * bpp)
                         .context("failed to create the simplefb scanout")?;
-                    *external_scanout_out = Some(scanout.clone());
                     Some(scanout)
                 }
                 None => None,
@@ -1213,7 +1210,6 @@ fn create_devices(
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
     #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
-    #[cfg(feature = "gpu")] external_scanout_out: &mut Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -1353,8 +1349,6 @@ fn create_devices(
         registered_evt_q,
         #[cfg(feature = "vnc")]
         simplefb_event_devices_out,
-        #[cfg(feature = "gpu")]
-        external_scanout_out,
     )?;
 
     for stub in stubs {
@@ -2492,8 +2486,6 @@ where
 
     #[cfg(feature = "vnc")]
     let mut simplefb_event_devices: Vec<EventDevice> = Vec::new();
-    #[cfg(feature = "gpu")]
-    let mut external_scanout: Option<Arc<virtio::ExternalScanout>> = None;
 
     let mut devices = create_devices(
         &cfg,
@@ -2513,8 +2505,6 @@ where
         &mut worker_process_pids,
         #[cfg(feature = "vnc")]
         &mut simplefb_event_devices,
-        #[cfg(feature = "gpu")]
-        &mut external_scanout,
     )?;
 
     #[cfg(feature = "pci-hotplug")]
@@ -2800,8 +2790,6 @@ where
         vcpu_domain_paths,
         #[cfg(feature = "vnc")]
         simplefb_event_devices,
-        #[cfg(feature = "gpu")]
-        external_scanout,
     )
 }
 
@@ -3915,7 +3903,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         PathBuf,
     >,
     #[cfg(feature = "vnc")] simplefb_event_devices: Vec<EventDevice>,
-    #[cfg(feature = "gpu")] external_scanout: Option<Arc<virtio::ExternalScanout>>,
 ) -> Result<ExitState> {
     // Split up `all_control_tubes`.
     #[cfg(feature = "balloon")]
@@ -4115,9 +4102,13 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         };
 
         // This device provides the `simplefb` screen, so it takes the exporter bound to that
-        // screen. The app display path still takes precedence over VNC when both are somehow
-        // present, but config now rejects that pairing outright (one exporter per screen), so the
-        // ordering below is a leftover tie-break rather than a decision anyone can reach.
+        // screen -- and opens it, whether or not this VM also has a GPU device. Which of the two
+        // screens the user is looking at is the user's answer to give, not something the VMM
+        // decides by merging them into one display and guessing which source is live.
+        //
+        // The app display path still takes precedence over VNC below when both are somehow
+        // present, but config rejects that pairing outright (one exporter per screen), so the
+        // ordering is a leftover tie-break rather than a decision anyone can reach.
         #[cfg(feature = "android_display")]
         let android_service = cfg
             .android_display_service_for(DisplayScreen::Simplefb)
@@ -4125,48 +4116,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         #[cfg(not(feature = "android_display"))]
         let android_service: Option<String> = None;
 
-        // With a GPU device present there is still exactly one display and it belongs to that
-        // device; feed it instead of opening a second one (see ExternalScanout). Without a GPU the
-        // bridge presents on its own, as it always did -- and that is where the `simplefb` screen's
-        // exporter is honoured today.
-        #[cfg(feature = "gpu")]
-        if let Some(scanout) = external_scanout.clone() {
-            // step 6b: this is where an exporter bound to `simplefb` attaches once this screen has
-            // a display of its own instead of feeding the GPU device's. Until then a binding made
-            // here is real config -- resolved and validated -- with nowhere to go, so say so
-            // rather than let it look like it worked.
-            #[cfg(feature = "android_display")]
-            if let Some(service) = cfg.android_display_service_for(DisplayScreen::Simplefb) {
-                warn!(
-                    "simplefb: display service `{}` is bound to the simplefb screen, which has no \
-                     display of its own yet; its frames go to the gpu device instead",
-                    service.name
-                );
-            }
-            #[cfg(feature = "vnc")]
-            if cfg.vnc_server_for(DisplayScreen::Simplefb).is_some() {
-                warn!(
-                    "simplefb: a vnc server is bound to the simplefb screen, which has no display \
-                     of its own yet; its frames go to the gpu device instead"
-                );
-            }
-            return match simplefb_display::start_simplefb_display_thread(
-                guest_mem,
-                params,
-                simplefb_display::SimplefbDisplayTarget::GpuDevice { scanout },
-                Vec::new(),
-            ) {
-                Ok(handle) => {
-                    info!("simplefb: frames go to the gpu device's display");
-                    Some(handle)
-                }
-                Err(e) => {
-                    error!("failed to start the simplefb feed: {:?}", e);
-                    None
-                }
-            };
-        }
-
+        // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
+        // and there is no longer anywhere for its frames to go by default: they used to be handed
+        // to the GPU device's display, which is what the exporter bindings replace. (The step-5
+        // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
+        // client -- not for one nothing has bound at all.)
         let target = match android_service {
             Some(service_name) => simplefb_display::SimplefbDisplayTarget::Android { service_name },
             None => {
