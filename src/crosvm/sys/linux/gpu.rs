@@ -232,7 +232,18 @@ pub fn create_gpu_device(
         let touch_input = super::vnc_touch_input(vnc_cfg.input.as_deref());
         display_backends.insert(
             0,
-            virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone(), touch_input),
+            virtio::DisplayBackend::VncTcp {
+                addr,
+                width: w,
+                height: h,
+                password: vnc_cfg.password.clone(),
+                touch_input,
+                // Resolved from the ceiling here rather than inside the sink, so that a binding
+                // capped below `gpu-hw` never binds the port -- the difference between "there is
+                // no side channel" and "there is one and it refuses you" is the difference between
+                // a client falling back and a client waiting.
+                h264_port: vnc_cfg.h264_listen_port(),
+            },
         );
         transport_cap = vnc_cfg.transport_cap;
     }
@@ -261,7 +272,7 @@ pub fn create_gpu_device(
         cfg.gpu_cgroup_path.as_ref(),
     );
     #[cfg(any(feature = "vnc", feature = "android_display"))]
-    if transport_cap == crate::crosvm::config::TransportCap::Cpu {
+    if !transport_cap.allows_gpu_copy() {
         dev.cap_transport_to_cpu();
     }
 

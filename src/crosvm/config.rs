@@ -212,6 +212,38 @@ pub enum TransportCap {
     /// Refuse dmabuf import on this binding, so the negotiation can only land on a CPU copy. The
     /// per-binding equivalent of the process-wide `GPU_SCANOUT_FORCE_TRANSFER=1`.
     Cpu,
+    /// Allow the GPU blit and stop there: no hardware video encoder on this binding, whatever the
+    /// device could do. This is the rung the app has been able to say since before there was
+    /// anything above it, and it means what it always meant -- the difference is that there is now
+    /// a rung above it for it to be below.
+    Gpu,
+    /// Allow the GPU blit and the hardware encoder above it: the VNC sink's H.264 side channel may
+    /// come up on this binding. Distinct from `auto` only in intent -- `auto` also permits it --
+    /// so that a caller can pin the ceiling here and have the meaning survive a future rung being
+    /// added on top.
+    GpuHw,
+}
+
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+impl TransportCap {
+    /// Whether this ceiling leaves the dmabuf import available at all.
+    ///
+    /// Every value except `cpu` does. Written as a question rather than as `!= Cpu` at each call
+    /// site so that adding a rung does not mean auditing the comparisons for the ones that meant
+    /// "anything above the floor".
+    pub fn allows_gpu_copy(self) -> bool {
+        !matches!(self, TransportCap::Cpu)
+    }
+
+    /// Whether this ceiling leaves the hardware encoder available.
+    ///
+    /// `gpu` caps below it, which is the whole reason the value had to be spellable: the app
+    /// already sends `transport-cap=gpu` for bindings that should blit but not encode, and if that
+    /// were read as "anything the negotiation can reach" the side channel would come up on every
+    /// one of them.
+    pub fn allows_hw_encode(self) -> bool {
+        matches!(self, TransportCap::Auto | TransportCap::GpuHw)
+    }
 }
 
 /// Address a VNC server listens on when the option does not say. Kept here rather than repeated at
@@ -244,13 +276,46 @@ pub struct VncConfig {
     ///
     /// Accepted here for the same reason both exporters take `screen=`: the two options describe
     /// the same kind of thing and a caller should not have to remember which half of the surface
-    /// exists on which one. It is currently moot -- this sink has no GPU half at all, so the
-    /// negotiation lands on a CPU copy whatever the ceiling says (`is_dmabuf_import_supported`
-    /// returns false unconditionally, gpu_display_vnc.rs) -- and it is stored and enforced
-    /// regardless, so that the day step 11 gives VNC a GPU half the knob is already the one
-    /// callers have been passing.
+    /// exists on which one. Both of its upper rungs mean something on this sink now -- `gpu` is
+    /// the Vulkan blit that step 11 gave it, `gpu-hw` the H.264 side channel above that.
     #[serde(default)]
     pub transport_cap: TransportCap,
+    /// TCP port for the hardware-encoded H.264 side channel, when the ceiling allows one.
+    ///
+    /// `None` means the default, which is this server's RFB port plus
+    /// [`gpu_display::H264_PORT_OFFSET`]. A default rather than a required key because a client
+    /// has to be able to find the stream from the one address it was given, and an offset it can
+    /// compute is the cheapest way to say where it is. The key exists for the case the offset
+    /// lands on something already taken.
+    ///
+    /// Saying it does not turn the side channel on: `transport-cap` decides that, and a port on a
+    /// binding capped below `gpu-hw` is simply never bound.
+    #[serde(default)]
+    pub h264_port: Option<u32>,
+}
+
+#[cfg(feature = "vnc")]
+impl VncConfig {
+    /// This server's effective RFB port.
+    pub fn effective_port(&self) -> u32 {
+        self.port.unwrap_or(DEFAULT_VNC_PORT)
+    }
+
+    /// Where the H.264 side channel should listen, or `None` if this binding may not have one.
+    ///
+    /// The one place the ceiling and the offset meet, so that "is hardware encoding allowed here"
+    /// and "what port would it use" cannot answer differently anywhere downstream. A `None` from
+    /// here means the port is never bound at all -- not bound and then refused -- which is what
+    /// keeps a capped binding from showing an open port that answers nothing.
+    pub fn h264_listen_port(&self) -> Option<u16> {
+        if !self.transport_cap.allows_hw_encode() {
+            return None;
+        }
+        let port = self
+            .h264_port
+            .unwrap_or(self.effective_port() + gpu_display::H264_PORT_OFFSET as u32);
+        u16::try_from(port).ok()
+    }
 }
 
 /// One Android display service: the name crosvm registers with the service manager, and which
@@ -1510,16 +1575,36 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     // than as a screen conflict.
     #[cfg(feature = "vnc")]
     {
-        let mut ports: Vec<u32> = Vec::with_capacity(cfg.vnc_server.len());
+        // The RFB port and the side channel's are in one list, not two, because they are two
+        // listeners in one process and a collision between them is exactly as fatal as a collision
+        // between two RFB ports -- and rather more surprising, since the second one is usually
+        // derived rather than typed. The default offset makes it hard to reach by accident and the
+        // arithmetic makes it trivial to reach on purpose (`--vnc-server port=5900` beside
+        // `--vnc-server port=6000`), which is why it is checked rather than reasoned about.
+        let mut ports: Vec<(u32, &'static str)> = Vec::with_capacity(cfg.vnc_server.len() * 2);
         for vnc in cfg.vnc_server.iter() {
-            let port = vnc.port.unwrap_or(DEFAULT_VNC_PORT);
-            if ports.contains(&port) {
-                return Err(format!(
-                    "two `vnc-server` options use port {}; each needs its own",
-                    port
-                ));
+            if let Some(port) = vnc.h264_port {
+                if port == 0 || u16::try_from(port).is_err() {
+                    return Err(format!(
+                        "`vnc-server` `h264-port={}` is not a TCP port number",
+                        port
+                    ));
+                }
             }
-            ports.push(port);
+            let mut claim = |port: u32, what: &'static str| -> Result<(), String> {
+                if let Some((_, held_by)) = ports.iter().find(|(p, _)| *p == port) {
+                    return Err(format!(
+                        "port {} is claimed by two listeners ({} and {}); each needs its own",
+                        port, held_by, what
+                    ));
+                }
+                ports.push((port, what));
+                Ok(())
+            };
+            claim(vnc.effective_port(), "a `vnc-server` RFB port")?;
+            if let Some(h264) = vnc.h264_listen_port() {
+                claim(h264 as u32, "a `vnc-server` H.264 side channel")?;
+            }
         }
     }
     #[cfg(feature = "android_display")]
@@ -3247,15 +3332,80 @@ mod tests {
         assert_eq!(svc.transport_cap, TransportCap::Cpu);
     }
 
-    /// A ceiling nobody defined is a refusal, not a fallback to auto. `gpu` is a plausible thing
-    /// to type -- it is the rung above the one that exists -- and accepting it silently would be
-    /// the caller believing they had asked for something.
+    /// A ceiling nobody defined is a refusal, not a fallback to auto. Accepting an unknown value
+    /// silently would be the caller believing they had asked for something.
+    ///
+    /// `gpu` used to be in this list, as the plausible-but-unimplemented rung above `cpu`. It is
+    /// not any more, and that is the whole change: the rungs below are what exist, so `zero-copy`
+    /// -- the one that is still only a design (plan §4.7) -- takes its place here.
     #[test]
     #[cfg(feature = "vnc")]
     fn parse_transport_cap_rejects_unknown_value() {
-        assert!(from_key_values::<VncConfig>("port=5900,transport-cap=gpu").is_err());
         assert!(from_key_values::<VncConfig>("port=5900,transport-cap=zero-copy").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hardware").is_err());
         assert!(from_key_values::<VncConfig>("port=5900,transport_cap=cpu").is_err());
+    }
+
+    /// The two rungs step 13 adds, and the meaning that separates them.
+    ///
+    /// `gpu` is the one that has to be got right: the app has been sending it, and reading it as
+    /// "whatever the negotiation can reach" would turn the hardware encoder on for every binding
+    /// that only ever asked to blit.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn parse_transport_cap_gpu_rungs() {
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu").unwrap();
+        assert_eq!(vnc.transport_cap, TransportCap::Gpu);
+        assert!(vnc.transport_cap.allows_gpu_copy());
+        assert!(!vnc.transport_cap.allows_hw_encode());
+
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hw").unwrap();
+        assert_eq!(vnc.transport_cap, TransportCap::GpuHw);
+        assert!(vnc.transport_cap.allows_gpu_copy());
+        assert!(vnc.transport_cap.allows_hw_encode());
+
+        // The two ends of the ladder keep the meanings they had before it grew.
+        assert!(!TransportCap::Cpu.allows_gpu_copy());
+        assert!(!TransportCap::Cpu.allows_hw_encode());
+        assert!(TransportCap::Auto.allows_gpu_copy());
+        assert!(TransportCap::Auto.allows_hw_encode());
+    }
+
+    /// Where the side channel listens, and when it does not.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn parse_vnc_server_h264_port() {
+        // Unsaid means the offset from the RFB port, so a client that knows one knows the other.
+        let vnc = from_key_values::<VncConfig>("port=5900").unwrap();
+        assert_eq!(vnc.h264_port, None);
+        assert_eq!(vnc.h264_listen_port(), Some(6000));
+
+        // The offset follows the port it is an offset from, including the default one.
+        let vnc = from_key_values::<VncConfig>("host=0.0.0.0").unwrap();
+        assert_eq!(vnc.h264_listen_port(), Some(6000));
+        let vnc = from_key_values::<VncConfig>("port=5931").unwrap();
+        assert_eq!(vnc.h264_listen_port(), Some(6031));
+
+        // Said means said.
+        let vnc = from_key_values::<VncConfig>("port=5900,h264-port=7100").unwrap();
+        assert_eq!(vnc.h264_port, Some(7100));
+        assert_eq!(vnc.h264_listen_port(), Some(7100));
+
+        // A ceiling below the rung means no port at all -- not a port that answers nothing.
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu").unwrap();
+        assert_eq!(vnc.h264_listen_port(), None);
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=cpu,h264-port=7100")
+            .unwrap();
+        assert_eq!(vnc.h264_port, Some(7100));
+        assert_eq!(vnc.h264_listen_port(), None);
+
+        // And it combines with the keys that were already there.
+        let vnc = from_key_values::<VncConfig>(
+            "port=5901,screen=simplefb,transport-cap=gpu-hw,h264-port=6001",
+        )
+        .unwrap();
+        assert_eq!(vnc.screen, Some(DisplayScreen::Simplefb));
+        assert_eq!(vnc.h264_listen_port(), Some(6001));
     }
 
     /// A single `--vnc-server` with no `screen=` and a GPU present: the shape of every VNC command

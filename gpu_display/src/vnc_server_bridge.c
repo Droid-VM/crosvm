@@ -532,8 +532,9 @@ static void restore_rect(rfbScreenInfoPtr screen, const uint8_t* clean, uint32_t
     }
 }
 
-/* THE CONSUMER: the LibVNCServer path, and the only one there is. blend_cursor and restore_rect
- * above are its alone -- nothing on the ingest side of the seam calls them.
+/* THE CLASSIC CONSUMER: the LibVNCServer path. blend_cursor and restore_rect above are its alone
+ * -- nothing on the ingest side of the seam calls them, and the H.264 consumer that joined it does
+ * its own blending into its own canvas.
  *
  * Copies the bands ingest says are new into the outgoing framebuffer, marks them, and puts the
  * cursor back on top -- erase where it was, draw where it is, mark both -- because banded copying
@@ -575,9 +576,12 @@ static void libvncserver_on_frame(vnc_server_t* server, void* ctx,
         rfbMarkRectAsModified(screen, nx, ny, nx + nw, ny + nh);
 }
 
-/* Where consumers are named. One line long, deliberately: this is the only place that has to
- * change to grow a second consumer, and neither ingest nor the LibVNCServer path above has to
- * hear about it. Unconditional and compiled in -- there is no configuration surface here. */
+/* Where the compiled-in consumers are named. Unconditional -- there is no configuration surface
+ * here, because whether LibVNCServer should be served is not a question this file gets to ask.
+ *
+ * The H.264 consumer is not in this list and could not be: whether it exists depends on the
+ * binding's transport ceiling and on an encoder coming up, neither of which is known here. It
+ * registers itself through vnc_server_attach_consumer before the server starts. */
 static void attach_frame_consumers(vnc_server_t* server) {
     static const struct vnc_frame_consumer libvncserver = {
         .name = "libvncserver",
@@ -717,7 +721,8 @@ int vnc_server_has_clients(vnc_server_t* server) {
 
 void vnc_server_offer_frame(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
                             const uint8_t* cursor_argb, int cw, int ch,
-                            int cx, int cy, int visible, int full) {
+                            int cx, int cy, int visible, int full,
+                            void* gpu_blit_ctx, int64_t gpu_import_id) {
     if (!server || !server->screen || !server->screen->frameBuffer || !clean)
         return;
     rfbScreenInfoPtr screen = server->screen;
@@ -764,6 +769,8 @@ void vnc_server_offer_frame(vnc_server_t* server, const uint8_t* clean, uint32_t
     offer.cursor_x = cx;
     offer.cursor_y = cy;
     offer.cursor_visible = visible;
+    offer.gpu_blit_ctx = gpu_blit_ctx;
+    offer.gpu_import_id = gpu_import_id;
 
     if (full) {
         if (ensure_ingest_buffers(server, clean_size, screen->height)) {

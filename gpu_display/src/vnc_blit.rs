@@ -56,6 +56,7 @@ mod ffi {
             width: u32,
             height: u32,
             fourcc: u32,
+            exchange_red_blue: bool,
         ) -> i64;
         pub fn android_blit_ctx_release_import(ctx: *mut c_void, import_id: i64);
         pub fn android_blit_ctx_blit(
@@ -102,6 +103,7 @@ mod ffi {
         _width: u32,
         _height: u32,
         _fourcc: u32,
+        _exchange_red_blue: bool,
     ) -> i64 {
         0
     }
@@ -189,6 +191,13 @@ impl VncBlitContext {
     /// `fourcc` is what the GUEST declared. The correction that makes the blit land in VNC's byte
     /// order is applied on the other side of this call, next to the target it has to agree with;
     /// see `blitSourceFourcc` in `crosvm_android_display_client.cpp`.
+    ///
+    /// `exchange_red_blue` chooses which of the two corrections applies, and it is a property of
+    /// the import rather than of the blit because the lever is the source image's declared format,
+    /// fixed when the image is made. `true` gives the CPU pipeline's B,G,R,X, which is what
+    /// LibVNCServer serves; `false` gives the R,G,B,A an RGBA_8888 buffer claims to hold, which is
+    /// what a video encoder reads. A frame that has to go to both consumers is imported twice --
+    /// two `VkImage`s over one set of guest pages, no copy either way.
     #[allow(clippy::too_many_arguments)]
     pub fn import_dmabuf(
         &self,
@@ -200,6 +209,7 @@ impl VncBlitContext {
         width: u32,
         height: u32,
         fourcc: u32,
+        exchange_red_blue: bool,
     ) -> Option<i64> {
         // SAFETY: `fd` is borrowed for the duration of the call; the native side dups what it keeps.
         let handle = unsafe {
@@ -213,9 +223,20 @@ impl VncBlitContext {
                 width,
                 height,
                 fourcc,
+                exchange_red_blue,
             )
         };
         (handle != 0).then_some(handle)
+    }
+
+    /// The native context pointer, for handing to something on the far side of the FFI that has to
+    /// blit through it.
+    ///
+    /// Exposed only for the H.264 consumer, whose encoder lives in the same C++ library as this
+    /// context and takes it as an argument to the frame call. Nothing on the Rust side may
+    /// dereference it, and the `Arc` this comes from is what keeps it alive for the call.
+    pub fn as_native_ptr(&self) -> *mut c_void {
+        self.ptr
     }
 
     pub fn release_import(&self, import_id: i64) {

@@ -4138,6 +4138,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                             addr: format!("{}:{}", host, port),
                             password: vnc_cfg.password.clone(),
                             touch_input: vnc_touch_input(vnc_cfg.input.as_deref()),
+                            h264_port: vnc_cfg.h264_listen_port(),
                         },
                         vnc_cfg.transport_cap,
                     )

@@ -20,6 +20,7 @@ use vm_control::gpu::DisplayParameters;
 
 use crate::vnc_blit::BlitMapping;
 use crate::vnc_blit::VncBlitContext;
+use crate::vnc_h264::H264Consumer;
 use crate::DisplayT;
 use crate::EventDeviceKind;
 use crate::GpuDisplayError;
@@ -93,6 +94,8 @@ extern "C" {
         cy: c_int,
         visible: c_int,
         full: c_int,
+        gpu_blit_ctx: *mut std::ffi::c_void,
+        gpu_import_id: i64,
     );
 }
 
@@ -185,17 +188,23 @@ impl SharedFramebuffer {
     /// otherwise not one guest pixel changed and only the pointer moved, which is what lets a
     /// cursor travel over a static desktop without costing a frame.
     ///
-    /// What each consumer makes of the offer is the bridge's business (vnc_frame_consumer.h);
-    /// today there is one, the LibVNCServer path.
-    fn offer_frame(&mut self, full: bool) {
+    /// `gpu` is the same picture while it is still a GPU object -- the blit context and the import
+    /// the frame was blitted FROM -- for a consumer that would rather blit it again than read it.
+    /// `None` on the CPU transport and on every cursor-only offer, where the import that produced
+    /// the last frame may already have been released and `pixels` is the honest answer anyway.
+    ///
+    /// What each consumer makes of the offer is the bridge's business (vnc_frame_consumer.h).
+    fn offer_frame(&mut self, full: bool, gpu: Option<(*mut std::ffi::c_void, i64)>) {
         let Some((pixels, size)) = self.clean() else {
             return;
         };
         let c = &self.cursor;
         let has_img = !c.pixels.is_empty() && c.width > 0 && c.height > 0;
+        let (gpu_ctx, gpu_import) = gpu.unwrap_or((std::ptr::null_mut(), 0));
         // SAFETY: both buffers outlive the call; the bridge only reads them. `pixels` is either
         // `data` or a mapping `clean()` has just confirmed is the current one, and this thread is
-        // the only one that can blit and so invalidate it.
+        // the only one that can blit and so invalidate it. `gpu_ctx`/`gpu_import` are the caller's
+        // live import, which is not released while this call is on its stack.
         unsafe {
             vnc_server_offer_frame(
                 self.server.ptr,
@@ -208,6 +217,8 @@ impl SharedFramebuffer {
                 c.y as c_int,
                 (c.visible && has_img) as c_int,
                 full as c_int,
+                gpu_ctx,
+                gpu_import,
             )
         }
     }
@@ -230,6 +241,14 @@ impl SharedFramebuffer {
 struct VncImport {
     ctx: Arc<VncBlitContext>,
     handle: i64,
+    /// The same dmabuf, imported a second time in the byte order a video encoder reads.
+    ///
+    /// 0 when there is no H.264 side channel on this display, which is the usual case. It is a
+    /// separate import rather than a flag on the blit because the channel exchange is performed by
+    /// the SOURCE image's declared format (`blitSourceFourcc`, C++ side), and that is fixed when
+    /// the image is created -- so a frame that has to reach two consumers in two byte orders needs
+    /// two source images. Neither of them copies anything: both are views of the guest's pages.
+    encoder_handle: i64,
     width: u32,
     height: u32,
 }
@@ -360,7 +379,15 @@ impl VncSurface {
             }
         }
 
-        fb.offer_frame(true);
+        // The offer carries the GPU source as well as the pixels, so a consumer that wants the
+        // picture in some other form -- the H.264 encoder wants it in a MediaCodec input buffer --
+        // can blit it a second time from the same import instead of reading back what this one
+        // just produced. Handing over `encoder_handle` rather than `handle` is what makes that
+        // second blit land in R,G,B,A; see the field's own note.
+        fb.offer_frame(
+            true,
+            Some((import.ctx.as_native_ptr(), import.encoder_handle)),
+        );
         Ok(())
     }
 }
@@ -415,7 +442,7 @@ impl GpuDisplaySurface for VncSurface {
             // so `clean()` reads what was just written rather than the last blit.
             fb.gpu_frame = None;
             // fb.data stays cursor-free; the bridge blends the pointer on its way out.
-            fb.offer_frame(true);
+            fb.offer_frame(true, None);
         }
     }
 
@@ -492,7 +519,7 @@ impl GpuDisplaySurface for VncCursorSurface {
             fb.cursor.width = self.width;
             fb.cursor.height = self.height;
             fb.cursor.visible = true;
-            fb.offer_frame(false);
+            fb.offer_frame(false, None);
         }
         // And as an RFB cursor, which is what a client with the Cursor pseudo-encoding draws
         // itself. Unlike the composited copy this one carries the hotspot, because LibVNCServer
@@ -527,7 +554,7 @@ impl GpuDisplaySurface for VncCursorSurface {
             fb.cursor.y = y;
             // Partial: only the rectangles the pointer left and entered. Without this the pointer
             // would only move when the guest happened to send a frame.
-            fb.offer_frame(false);
+            fb.offer_frame(false, None);
         }
         // LibVNCServer wants the POINTER, not the image: it draws the cursor at
         // cursorX - hot_x. (x,y) is the image origin, so the hotspot goes back on here.
@@ -544,7 +571,7 @@ impl GpuDisplaySurface for VncCursorSurface {
     fn set_cursor_visible(&mut self, visible: bool) {
         if let Ok(mut fb) = self.shared_fb.lock() {
             fb.cursor.visible = visible;
-            fb.offer_frame(false);
+            fb.offer_frame(false, None);
         }
         if !visible {
             // SAFETY: null pixels is the bridge's hide request.
@@ -573,6 +600,12 @@ pub struct DisplayVnc {
     /// Imports made against `blit`, keyed by the id `GpuDisplay` handed out. Shared with the
     /// surfaces, which are where flips happen.
     imports: Rc<RefCell<BTreeMap<u32, VncImport>>>,
+    /// The hardware-encode rung: a second consumer on the frame bus with a socket of its own.
+    ///
+    /// Declared last so it is dropped last. Field order is drop order, and this one has to outlive
+    /// `server`: destroying the server is what stops offers arriving, and an offer arriving after
+    /// this was freed would be a callback into nothing.
+    h264: Option<Arc<H264Consumer>>,
 }
 
 /// The VNC pointer/touch devices advertise this fixed absolute-axis maximum. Every injected
@@ -591,12 +624,18 @@ fn vnc_norm_abs(v: i32, extent: u32) -> i32 {
 }
 
 impl DisplayVnc {
+    /// `h264_port` is the side channel's TCP port, or `None` when this binding may not have one --
+    /// which is what a transport ceiling below `gpu-hw` means, and also what a build with no
+    /// encoder behind it ends up doing anyway. It is resolved by the caller rather than derived
+    /// here so that the default (`vnc port + 100`) and an explicit `h264-port=` arrive the same
+    /// way, and so a sink that is not allowed one never binds the port at all.
     pub fn new_tcp(
         addr: &str,
         width: u32,
         height: u32,
         password: Option<String>,
         touch_input: bool,
+        h264_port: Option<u16>,
     ) -> GpuDisplayResult<DisplayVnc> {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
 
@@ -628,6 +667,11 @@ impl DisplayVnc {
             vnc_server_set_input_event_fd(server_ptr, event.as_raw_descriptor());
         }
 
+        // Between create and start, because that is the window the bus's registration contract
+        // names: the consumer list is read without a lock from the producer's thread, so it has to
+        // be finished before any frame can be offered.
+        let h264 = h264_port.and_then(|port| H264Consumer::start(server_ptr, port));
+
         unsafe { vnc_server_start(server_ptr) };
         base::info!("VNC server started on TCP port {}", port);
 
@@ -646,6 +690,7 @@ impl DisplayVnc {
             blit: None,
             blit_probed: false,
             imports: Rc::new(RefCell::new(BTreeMap::new())),
+            h264,
         })
     }
 
@@ -818,12 +863,41 @@ impl DisplayT for DisplayVnc {
         self.blit_context().is_some()
     }
 
-    /// No RFB client means no consumer at all: LibVNCServer's mark-as-modified walks an empty
-    /// client list, so a frame pushed now is encoded for nobody and sent to nobody. Producers ask
+    /// Whether anything is waiting for frames -- an RFB client, or a side-channel one.
+    ///
+    /// No RFB client used to be the whole answer: LibVNCServer's mark-as-modified walks an empty
+    /// client list, so a frame pushed then is encoded for nobody and sent to nobody. Producers ask
     /// this before building a frame; the surface's own flip and the C bridge both check again, so
     /// a producer that ignores the answer is still correct, only wasteful.
+    ///
+    /// The H.264 consumer has to be part of the answer now, and it is not a refinement -- it is
+    /// the difference between working and not. The simplefb producer builds no frame at all when
+    /// this is false, so a VM watched over the side channel alone would deadlock on itself: no
+    /// offers because nothing is watching, and nothing counted as watching because the only client
+    /// is on the other socket.
     fn has_consumer(&self) -> bool {
         self.server.has_clients()
+            || self
+                .h264
+                .as_ref()
+                .map(|h264| h264.wants_frames())
+                .unwrap_or(false)
+    }
+
+    /// Both kinds of client folded into one number, so a producer can see either of them arrive.
+    ///
+    /// The RFB half is the bool it always was. The side-channel half is a counter, because a client
+    /// arriving there is exactly the case the bool cannot report: it goes true while the RFB flag
+    /// is already true, and the producer would then re-supply nothing and leave the new stream
+    /// showing a screen that had stopped moving before it connected.
+    fn consumer_generation(&self) -> u64 {
+        let rfb = self.server.has_clients() as u64;
+        let h264 = self
+            .h264
+            .as_ref()
+            .map(|h264| h264.connect_generation())
+            .unwrap_or(0);
+        rfb | (h264 << 1)
     }
 
     fn pending_events(&self) -> bool {
@@ -955,6 +1029,7 @@ impl DisplayT for DisplayVnc {
             return Err(anyhow::anyhow!("the VNC sink only imports DMA-BUFs"));
         };
 
+        let wants_encoder_source = self.h264.is_some();
         let ctx = self
             .blit_context()
             .ok_or_else(|| anyhow::anyhow!("this VNC display has no GPU half"))?
@@ -969,13 +1044,45 @@ impl DisplayT for DisplayVnc {
                 width,
                 height,
                 fourcc,
+                /* exchange_red_blue= */ true,
             )
             .ok_or_else(|| anyhow::anyhow!("Turnip DMA-BUF import failed"))?;
+        // The second view of the same pages, in the byte order the encoder reads. Only when there
+        // is an encoder to read it: an import is a VkImage and an imported allocation, so making
+        // one nothing will ever blit from is a cost with no reader. A failure here is not fatal --
+        // the side channel falls to uploading the pixels the first import produces -- so it is
+        // reported and the frame path carries on.
+        let encoder_handle = if wants_encoder_source {
+            match ctx.import_dmabuf(
+                descriptor.as_raw_descriptor(),
+                offset,
+                stride,
+                modifiers,
+                linear_layout_verified,
+                width,
+                height,
+                fourcc,
+                /* exchange_red_blue= */ false,
+            ) {
+                Some(handle) => handle,
+                None => {
+                    base::error!(
+                        "VNC h264: the encoder's view of resource {} could not be imported; \
+                         its frames will be uploaded by the CPU",
+                        import_id
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
         self.imports.borrow_mut().insert(
             import_id,
             VncImport {
                 ctx,
                 handle,
+                encoder_handle,
                 width,
                 height,
             },
@@ -988,17 +1095,29 @@ impl DisplayT for DisplayVnc {
             return;
         };
         import.ctx.release_import(import.handle);
+        if import.encoder_handle != 0 {
+            import.ctx.release_import(import.encoder_handle);
+        }
     }
 }
 
 impl Drop for DisplayVnc {
     fn drop(&mut self) {
+        // Before the imports are released, and before the server is destroyed: it tells the two
+        // side-channel threads to stop and closes the client, so nothing is left that could ask
+        // for a blit from an import that is about to go.
+        if let Some(h264) = &self.h264 {
+            h264.shutdown();
+        }
         // The bridge frees whatever is left when it is destroyed, so this is not a leak fix -- it
         // is that a release is the display's to do while the display still exists, the same shape
         // the Android backend has. Surfaces are already gone by here (GpuDisplay drops them before
         // the backend), so nothing can be mid-flip.
         for import in std::mem::take(&mut *self.imports.borrow_mut()).into_values() {
             import.ctx.release_import(import.handle);
+            if import.encoder_handle != 0 {
+                import.ctx.release_import(import.encoder_handle);
+            }
         }
     }
 }

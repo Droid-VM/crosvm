@@ -64,8 +64,13 @@ void vnc_server_set_cursor_pos(vnc_server_t* server, int x, int y);
  *
  * This is the sink's ingest point. It works out what changed since the last offer and then hands
  * the frame to each registered consumer; compositing the cursor into an outgoing framebuffer is
- * one consumer's job, not this function's. See vnc_frame_consumer.h -- there is exactly one
- * consumer today, LibVNCServer, and it is compiled in.
+ * one consumer's job, not this function's. See vnc_frame_consumer.h.
+ *
+ * `gpu_blit_ctx`/`gpu_import_id` describe the same picture as `clean` while it is still a GPU
+ * object -- the guest dmabuf the producer imported -- for a consumer that would rather blit it
+ * than read it. NULL/0 says there is no such thing for this frame, which is the answer on the CPU
+ * transport and on every cursor-only update. They are arguments rather than state on the server
+ * because the handle is only valid for the length of this call.
  *
  * `clean` is the guest scanout with NO cursor in it, and stays that way -- keeping a pristine
  * copy is what removes the need for LibVNCServer's save-under-cursor bookkeeping entirely: the
@@ -77,7 +82,8 @@ void vnc_server_set_cursor_pos(vnc_server_t* server, int x, int y);
  * moving over a completely static desktop without pushing a whole frame. */
 void vnc_server_offer_frame(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
                             const uint8_t* cursor_argb, int cw, int ch,
-                            int cx, int cy, int visible, int full);
+                            int cx, int cy, int visible, int full,
+                            void* gpu_blit_ctx, int64_t gpu_import_id);
 void vnc_server_set_input_event_fd(vnc_server_t* server, int fd);
 int vnc_server_poll_input_event(vnc_server_t* server, struct vnc_input_event* out);
 

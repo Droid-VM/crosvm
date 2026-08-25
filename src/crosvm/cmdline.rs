@@ -1011,6 +1011,11 @@ pub struct RunCommand {
     ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
     ///         "simplefb". Defaults to gpu-0 when a GPU device is
     ///         configured, otherwise simplefb.
+    ///     transport-cap=CAP - ceiling on how the frame gets here,
+    ///         never a request: "auto" (default), "cpu", "gpu" or
+    ///         "gpu-hw". Only the first three change anything on
+    ///         this exporter -- the hardware encoder is the VNC
+    ///         sink's side channel and this one presents instead.
     /// Examples:
     ///   --android-display-service droidvm_disp_1
     ///   --android-display-service name=win_fb,screen=simplefb
@@ -2901,10 +2906,20 @@ pub struct RunCommand {
     ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
     ///         "simplefb". Defaults to gpu-0 when a GPU device is
     ///         configured, otherwise simplefb.
+    ///     transport-cap=CAP - ceiling on how the frame gets here,
+    ///         never a request: "auto" (default, whatever the two
+    ///         ends negotiate), "cpu" (refuse dmabuf import),
+    ///         "gpu" (Vulkan blit, no hardware encoder) or
+    ///         "gpu-hw" (also allow the H.264 side channel).
+    ///     h264-port=PORT - where the hardware-encoded H.264 side
+    ///         channel listens. Defaults to the RFB port plus 100,
+    ///         so a client that knows one knows the other. Only
+    ///         bound when transport-cap allows it.
     /// Examples:
     ///   --vnc-server port=5900
     ///   --vnc-server host=127.0.0.1,port=5900,password=secret
     ///   --vnc-server port=5901,screen=simplefb
+    ///   --vnc-server port=5900,transport-cap=gpu-hw,h264-port=7100
     pub vnc_server: Vec<VncConfig>,
 
     #[argh(option, arg_name = "cid=CID[,device=VHOST_DEVICE]")]
