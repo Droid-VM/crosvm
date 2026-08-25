@@ -2,7 +2,6 @@
 // Copyright DroidVM contributors
 // Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
 
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -28,8 +27,6 @@ use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
-
-use devices::virtio::ExternalScanout;
 
 pub struct SimplefbDisplayParams {
     pub addr: u64,
@@ -85,11 +82,6 @@ pub enum SimplefbDisplayTarget {
     /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
     /// the virtio-gpu native-display path.
     Android { service_name: String },
-    /// The virtio-gpu device's own display. Used whenever this VM has a GPU: there is one
-    /// Surface, so there must be one writer, and the device is it -- we hand frames over and it
-    /// shows them while the guest is not displaying through virtio-gpu itself. See
-    /// `devices::virtio::ExternalScanout`.
-    GpuDevice { scanout: Arc<ExternalScanout> },
 }
 
 /// Turns the configured poll rate into the interval between ticks. The rate is validated at parse
@@ -97,71 +89,6 @@ pub enum SimplefbDisplayTarget {
 /// value means.
 fn tick_duration(poll_hz: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / poll_hz.max(1) as u64)
-}
-
-/// Feeds guest framebuffer frames to the GPU device, which owns the one display.
-///
-/// Skips the copy entirely while the guest is displaying through virtio-gpu (the device tells us
-/// so), and only submits when the framebuffer actually changed -- a frozen firmware framebuffer
-/// behind a live guest desktop must not keep waking the worker, and an unchanged frame is not a
-/// reason to take the display away from anyone.
-fn simplefb_feed_loop(
-    guest_mem: GuestMemory,
-    params: &SimplefbDisplayParams,
-    scanout: Arc<ExternalScanout>,
-) -> Result<()> {
-    let frame_duration = tick_duration(params.poll_hz);
-    let guest_addr = GuestAddress(params.addr);
-    let fb_size = (params.stride as usize) * (params.height as usize);
-    let mut read_buf = vec![0u8; fb_size];
-    let mut last_buf: Vec<u8> = Vec::new();
-
-    info!(
-        "simplefb: feeding the gpu display: {}x{} stride={} addr={:#x} @ {}fps",
-        params.width, params.height, params.stride, params.addr, params.poll_hz,
-    );
-
-    let mut idle_pokes: u32 = 0;
-    loop {
-        let frame_start = Instant::now();
-        if scanout.guest_owns() {
-            // Nothing to send while the guest is driving the display -- but ownership can also
-            // lapse on a clock (a guest that bound a scanout and stopped presenting), and that is
-            // only ever re-evaluated on the worker's side of this event. Poke it about once a
-            // second so a lapse is noticed without copying a frame nobody will look at.
-            idle_pokes += 1;
-            if idle_pokes >= params.poll_hz.max(1) {
-                idle_pokes = 0;
-                scanout.poke();
-            }
-        } else {
-            if idle_pokes != 0 {
-                // Just took the display back. The framebuffer may not have changed a byte since
-                // we last looked at it (a Windows guest that has been sitting on the same picture
-                // since the firmware handed over), and "unchanged" must not mean "not shown" on
-                // the frame where the display became ours.
-                idle_pokes = 0;
-                last_buf.clear();
-            }
-            if guest_mem
-                .read_exact_at_addr(&mut read_buf, guest_addr)
-                .is_err()
-            {
-                info!("simplefb: guest memory no longer readable, exiting");
-                break;
-            }
-            if last_buf != read_buf {
-                last_buf.clear();
-                last_buf.extend_from_slice(&read_buf);
-                scanout.submit(&read_buf);
-            }
-        }
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_duration {
-            thread::sleep(frame_duration - elapsed);
-        }
-    }
-    Ok(())
 }
 
 pub fn start_simplefb_display_thread(
@@ -173,15 +100,6 @@ pub fn start_simplefb_display_thread(
     thread::Builder::new()
         .name("simplefb_display".into())
         .spawn(move || {
-            // Handing frames to the GPU device needs no display of our own -- it owns the one
-            // Surface, so this thread is a producer, not a presenter.
-            if let SimplefbDisplayTarget::GpuDevice { scanout } = &target {
-                if let Err(e) = simplefb_feed_loop(guest_mem, &params, scanout.clone()) {
-                    error!("simplefb feed thread exited with error: {:?}", e);
-                }
-                return;
-            }
-
             let display_result = match &target {
                 SimplefbDisplayTarget::Vnc {
                     addr,
@@ -197,8 +115,6 @@ pub fn start_simplefb_display_thread(
                 SimplefbDisplayTarget::Android { service_name } => {
                     GpuDisplay::open_android(service_name)
                 }
-                // Handled above; it never opens a display.
-                SimplefbDisplayTarget::GpuDevice { .. } => unreachable!(),
             };
             let mut display = match display_result {
                 Ok(d) => d,

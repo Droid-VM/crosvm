@@ -126,9 +126,8 @@ pub(crate) fn validate_gpu_config(cfg: &mut Config) -> Result<(), String> {
 
         // A GPU with no display of its own is a real configuration -- the device reports zero
         // scanouts and the guest driver then keeps only the render node (virtgpu_kms.c:
-        // `if (!vgdev->num_scanouts)`), i.e. "render here, display somewhere else". Nothing
-        // asks for it today (the simplefb path shares the GPU's display instead, see
-        // ExternalScanout), so an unspecified display still means one default display.
+        // `if (!vgdev->num_scanouts)`), i.e. "render here, display somewhere else". Nothing asks
+        // for it today, so an unspecified display still means one default display.
         if gpu_parameters.display_params.is_empty() {
             gpu_parameters.display_params.push(Default::default());
         }

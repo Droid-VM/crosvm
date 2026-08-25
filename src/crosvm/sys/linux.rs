@@ -479,24 +479,6 @@ fn create_virtio_devices(
             // device at all -- a simplefb screen exported alongside a GPU one therefore has no
             // input of its own, which is a per-screen device set and so step 9's to give it.
 
-            // Nothing offers this a frame any more: the simplefb bridge presents on its own
-            // display now, so the source it used to arbitrate against is gone and this is the
-            // arbitration of one source. It comes out together with everything that reads it,
-            // which is a large enough deletion to be worth its own change.
-            let external_scanout = match cfg.simplefb.as_ref() {
-                Some(sfb) => {
-                    let bpp: u32 = match sfb.format.as_str() {
-                        "r8g8b8" => 3,
-                        "r5g6b5" => 2,
-                        _ => 4,
-                    };
-                    let scanout = virtio::ExternalScanout::new(sfb.width, sfb.height, sfb.width * bpp)
-                        .context("failed to create the simplefb scanout")?;
-                    Some(scanout)
-                }
-                None => None,
-            };
-
             let (gpu_control_host_tube, gpu_control_device_tube) =
                 Tube::pair().context("failed to create gpu tube")?;
             add_control_tube(DeviceControlTube::Gpu(gpu_control_host_tube).into());
@@ -508,7 +490,6 @@ fn create_virtio_devices(
                 render_server_fd,
                 has_vfio_gfx_device,
                 event_devices,
-                external_scanout,
             )?);
         }
     }

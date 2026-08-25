@@ -7,7 +7,6 @@
 static_assertions::assert_cfg!(feature = "gpu");
 
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::env;
 use std::path::PathBuf;
 
@@ -97,9 +96,6 @@ pub fn create_gpu_device(
     render_server_fd: Option<SafeDescriptor>,
     has_vfio_gfx_device: bool,
     event_devices: Vec<EventDevice>,
-    // Frames from the VMM's simplefb bridge, presented through this device's display whenever
-    // the guest is not driving it itself. See `ExternalScanout`.
-    external_scanout: Option<Arc<virtio::ExternalScanout>>,
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
@@ -196,9 +192,8 @@ pub fn create_gpu_device(
     ];
 
     // This device provides one screen, `gpu-0`, so it takes the one exporter bound to that screen
-    // and nothing else. An exporter bound to `simplefb` belongs to the simplefb device's screen
-    // and is none of this device's business, even though the simplefb bridge currently feeds its
-    // frames through here (ExternalScanout).
+    // and nothing else. An exporter bound to `simplefb` belongs to the simplefb device's screen,
+    // which presents on its own display and is no part of this.
     //
     // `display_backends` remains an ordered try-in-turn list, but the two entries that used to
     // race for the front of it can no longer both be here: config rejects two exporters on one
@@ -253,7 +248,6 @@ pub fn create_gpu_device(
         virtio::base_features(cfg.protection_type),
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
-        external_scanout,
     );
 
     let jail = if let Some(jail_config) = cfg.jail_config.as_ref() {

@@ -245,7 +245,6 @@ pub(super) fn create_gpu(
         features,
         &BTreeMap::new(),
         wndproc_thread,
-    None,
     ))
 }
 

@@ -12,8 +12,6 @@ use std::rc::Rc;
 use std::result::Result;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::time::Instant;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -1256,26 +1254,7 @@ pub struct VirtioGpu {
     /// Deliberately NOT snapshot'd: a fence outstanding across a snapshot degrades to the
     /// synchronous completion the pre-fence code always had.
     pending_flip_fence: Option<base::SafeDescriptor>,
-    /// The guest has a scanout bound to a resource, i.e. it intends to display through this
-    /// device. Set by SET_SCANOUT, cleared when the guest unbinds it or resets the device.
-    guest_scanout_bound: bool,
-    /// When the guest last actually presented (RESOURCE_FLUSH on a scanout resource).
-    last_guest_present: Option<Instant>,
-    /// A guest that bound a scanout and then went quiet for this long is treated as having
-    /// stopped displaying, so another source (`ExternalScanout`) may take over. Long enough that
-    /// an idle desktop -- which still presents its blinking cursor every second or so -- never
-    /// crosses it.
-    guest_idle_grace: Duration,
-    /// An external source has painted since the guest last did.
-    external_had_display: bool,
 }
-
-/// First takeover: the guest bound a scanout but has shown nothing for this long.
-const GUEST_IDLE_GRACE: Duration = Duration::from_secs(5);
-/// After the guest has taken the display back from an external source once, be much more
-/// reluctant to hand it over again -- that pattern is a slow guest, not a dead one, and swapping
-/// back and forth is worse than being late.
-const GUEST_IDLE_GRACE_AFTER_RECLAIM: Duration = Duration::from_secs(30);
 
 // Only the 2D mode is supported. Notes on `VirtioGpu` fields:
 //
@@ -1426,10 +1405,6 @@ impl VirtioGpu {
             udmabuf_driver,
             deferred_snapshot_load: None,
             pending_flip_fence: None,
-            guest_scanout_bound: false,
-            last_guest_present: None,
-            guest_idle_grace: GUEST_IDLE_GRACE,
-            external_had_display: false,
             snapshot_scratch_directory,
         })
     }
@@ -1639,93 +1614,8 @@ impl VirtioGpu {
             scanout_data,
             resource_id,
         );
-        // Binding a resource to a scanout is the guest saying "I display through this device".
-        // It is a state, not an event, which is what makes it a usable owner signal: it holds
-        // while the guest is merely idle, and only a guest that unbinds (or resets) gives it up.
-        if r.is_ok() {
-            self.guest_scanout_bound = resource_id != 0;
-            if resource_id != 0 {
-                self.last_guest_present = Some(Instant::now());
-            }
-        }
         strace!("set_scanout.exit ok={}", r.is_ok());
         r
-    }
-
-    /// Whether the guest is the one putting a picture on the display right now.
-    ///
-    /// True while it has a scanout bound and has presented within the grace period. A guest that
-    /// never binds one (Windows: no virtio-gpu driver, it only writes the firmware framebuffer)
-    /// is never the owner, so the simplefb bridge can have the display from the start.
-    pub fn guest_owns_display(&self) -> bool {
-        if !self.guest_scanout_bound {
-            return false;
-        }
-        match self.last_guest_present {
-            Some(t) => t.elapsed() < self.guest_idle_grace,
-            None => true,
-        }
-    }
-
-    /// Presents a frame that did not come from the guest's virtio-gpu driver -- the VMM's simplefb
-    /// bridge. Does nothing while the guest owns the display.
-    ///
-    /// Reuses scanout 0's surface: there is only one Surface to draw on, and this is what keeps
-    /// the two sources from fighting over it (they are both this thread).
-    pub fn present_external(
-        &mut self,
-        width: u32,
-        height: u32,
-        stride: u32,
-        data: &[u8],
-    ) -> VirtioGpuResult {
-        if self.guest_owns_display() {
-            return Ok(OkNoData);
-        }
-        let scanout = self.scanouts.get_mut(&0).ok_or(ErrInvalidScanoutId)?;
-        if scanout.surface_id.is_none() {
-            let rect = virtio_gpu_rect {
-                x: Le32::from(0),
-                y: Le32::from(0),
-                width: Le32::from(width),
-                height: Le32::from(height),
-            };
-            scanout.create_surface(&self.display, None, Some(rect))?;
-        }
-        let surface_id = match scanout.surface_id {
-            Some(id) => id,
-            None => return Err(ErrUnspec),
-        };
-
-        let mut display = self.display.borrow_mut();
-        if display.next_buffer_in_use(surface_id) {
-            // The compositor still holds the last buffer; dropping this frame is right -- the
-            // bridge will offer another one in 33 ms.
-            return Ok(OkNoData);
-        }
-        // XR24 states the invariant this route has always relied on without saying so: the frames
-        // arriving here are the simplefb bridge's, and simplefb's own declared format is already
-        // the pipeline's canonical BGRX, which is why nothing on this path has ever swizzled them.
-        // The bridge knows the real fourcc from the device tree, but there is no room on
-        // ExternalScanout to carry it and no point building one -- that machinery goes away when
-        // the two sources stop sharing a display.
-        let frame = ScanoutFrame {
-            bytes: data,
-            stride,
-            width,
-            height,
-            fourcc: DRM_FORMAT_XRGB8888,
-            damage: Damage::Full,
-        };
-        if matches!(
-            display.present_frame(surface_id, &frame),
-            PresentOutcome::NoFramebuffer
-        ) {
-            return Err(ErrUnspec);
-        }
-        drop(display);
-        self.external_had_display = true;
-        Ok(OkNoData)
     }
 
     /// If the resource is the scanout resource, flush it to the display.
@@ -1755,15 +1645,6 @@ impl VirtioGpu {
 
         for scanout in self.scanouts.values_mut() {
             if scanout.resource_id == resource_id {
-                if self.external_had_display {
-                    // The guest is presenting again after an external source had the display:
-                    // give it back at once, but raise the bar for handing it over a second time.
-                    // Swapping back and forth costs a surface reconfigure and a visible jump
-                    // each way, so a slow guest must not be able to trigger it repeatedly.
-                    self.external_had_display = false;
-                    self.guest_idle_grace = GUEST_IDLE_GRACE_AFTER_RECLAIM;
-                }
-                self.last_guest_present = Some(Instant::now());
                 scanout.flush(&self.display, resource, &mut self.rutabaga)?;
                 // A zero-copy flip may leave a completion fence on the surface: a sync_file that
                 // signals when the display's async blit has finished READING the flipped buffer.
@@ -2628,14 +2509,6 @@ impl VirtioGpu {
     /// over from another one (UEFI firmware -> OS) recreate resource ids from scratch -- rutabaga
     /// rejects a duplicate resource id otherwise.
     pub fn reset(&mut self) -> anyhow::Result<()> {
-        // A device reset is the guest handing the display back -- the firmware finishing, or an
-        // OS taking over from it. Whether the new guest wants to display through this device is
-        // its own decision, made by binding a scanout; until it does, another source may have the
-        // display immediately rather than after the idle grace period. This is the moment a
-        // Windows guest (no virtio-gpu driver, so it never binds one) hands over to the simplefb
-        // bridge for good.
-        self.guest_scanout_bound = false;
-        self.last_guest_present = None;
         for scanout in self.scanouts.values_mut() {
             scanout.resource_id = None;
             // Drop the previous guest's surface: update_scanout_resource() only recreates a
