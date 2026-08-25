@@ -244,6 +244,22 @@ pub(crate) fn vnc_touch_input(input: Option<&str>) -> bool {
     }
 }
 
+/// Names for the display-window device set. They are constants and not derived from anything,
+/// which is the point: these four devices belong to the VM's display window, not to any one
+/// screen, so nothing about a screen may leak into them. Sharing a name with a `--input` device
+/// would hand the guest two devices claiming one identity -- and since a guest maps an absolute
+/// device to an output *by name*, the mapping the user set for one of them would silently start
+/// matching the other. Fixed strings also mean they come back identical across reboots, which is
+/// what makes them mappable at all.
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+const DISPLAY_WINDOW_TOUCH_NAME: &str = "DroidVM VNC Touch";
+#[cfg(feature = "vnc")]
+const DISPLAY_WINDOW_TABLET_NAME: &str = "DroidVM VNC Tablet";
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+const DISPLAY_WINDOW_MOUSE_NAME: &str = "DroidVM VNC Mouse";
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+const DISPLAY_WINDOW_KEYBOARD_NAME: &str = "DroidVM VNC Keyboard";
+
 /// Creates the display-window input devices and returns their event-device ends: a
 /// multi-touch touchscreen, a relative mouse, an absolute-mouse tablet (only when the VNC
 /// server opts in with `input=tablet`) and a keyboard. Shared by the virtio-gpu and
@@ -262,25 +278,21 @@ fn create_display_window_input_devices(
         let (event_device_socket, virtio_dev_socket) =
             StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
                 .context("failed to create socket")?;
+        // Dimensions only: the first `--input multi-touch`'s width/height stand in for the display
+        // size when one was given, because both devices are measuring the same window. Its *name*
+        // is deliberately not taken. A name identifies a device, and with one `--input multi-touch`
+        // per guest output the first one's name is one screen's identity, not a spare label -- copy
+        // it here and the guest sees two touchscreens called e.g. "DroidVM Touch (gpu-0)", one of
+        // which has nothing to do with gpu-0. This device gets its own fixed name below.
         let mut multi_touch_width = default_width;
         let mut multi_touch_height = default_height;
-        let mut multi_touch_name = None;
         for input in &cfg.virtio_input {
-            if let InputDeviceOption::MultiTouch {
-                width,
-                height,
-                name,
-                ..
-            } = input
-            {
+            if let InputDeviceOption::MultiTouch { width, height, .. } = input {
                 if let Some(width) = width {
                     multi_touch_width = *width;
                 }
                 if let Some(height) = height {
                     multi_touch_height = *height;
-                }
-                if let Some(name) = name {
-                    multi_touch_name = Some(name.as_str());
                 }
                 break;
             }
@@ -306,7 +318,7 @@ fn create_display_window_input_devices(
             virtio_dev_socket,
             multi_touch_width,
             multi_touch_height,
-            multi_touch_name,
+            Some(DISPLAY_WINDOW_TOUCH_NAME),
             virtio::base_features(cfg.protection_type),
         )
         .context("failed to set up multi-touch device")?;
@@ -327,6 +339,7 @@ fn create_display_window_input_devices(
             let dev = virtio::input::new_mouse(
                 u32::MAX,
                 virtio_dev_socket,
+                Some(DISPLAY_WINDOW_MOUSE_NAME),
                 virtio::base_features(cfg.protection_type),
             )
             .context("failed to set up relative mouse device")?;
@@ -355,6 +368,7 @@ fn create_display_window_input_devices(
                 virtio_dev_socket,
                 multi_touch_width,
                 multi_touch_height,
+                Some(DISPLAY_WINDOW_TABLET_NAME),
                 virtio::base_features(cfg.protection_type),
             )
             .context("failed to set up absolute mouse device")?;
@@ -374,6 +388,7 @@ fn create_display_window_input_devices(
         let dev = virtio::input::new_keyboard(
             u32::MAX,
             virtio_dev_socket,
+            Some(DISPLAY_WINDOW_KEYBOARD_NAME),
             virtio::base_features(cfg.protection_type),
         )
         .context("failed to set up keyboard device")?;
@@ -763,6 +778,7 @@ fn create_virtio_devices(
                 path,
                 width,
                 height,
+                name,
             } => {
                 let width = *width;
                 let height = *height;
@@ -777,6 +793,7 @@ fn create_virtio_devices(
                     path.as_path(),
                     width.unwrap_or(NORMALIZED_ABS_MAX),
                     height.unwrap_or(NORMALIZED_ABS_MAX),
+                    name.as_deref(),
                     absolute_mouse_idx,
                 )?;
                 absolute_mouse_idx += 1;

@@ -453,10 +453,19 @@ pub enum InputDeviceOption {
     // SingleTouch (a BTN_TOUCH touchscreen) it reports a position continuously, so the guest gets
     // pointer hover, right-click and scroll -- what the app's "tablet" input mode maps a host
     // mouse/stylus onto.
+    //
+    // `name` is here for the same reason the touch devices have one: an absolute coordinate only
+    // means something against one output's geometry, so a VM with several outputs wants one of
+    // these per output, and evdev has no field saying which output a device belongs to. The guest
+    // is told by hand -- kwin stores the mapping by device name, `xinput map-to-output` takes one,
+    // Windows' Tablet PC setup remembers the one it was pointed at -- so the name is the only
+    // handle a per-output mapping has. Without it the device is "Crosvm Virtio Absolute Mouse
+    // <idx>", an index that shifts when the set of devices changes.
     AbsoluteMouse {
         path: PathBuf,
         width: Option<u32>,
         height: Option<u32>,
+        name: Option<String>,
     },
     MultiTouch {
         path: PathBuf,
@@ -2674,6 +2683,80 @@ mod tests {
                 name: None
             }
         );
+    }
+
+    // An absolute pointer is per guest output, and a guest maps one to an output by name, so the
+    // name has to survive the command line. It also has to survive the *whole* name: spaces and
+    // parentheses are what a screen-derived name is made of ("DroidVM Tablet (gpu-0)"), and the
+    // key-value parser runs an unquoted value to the next ',' or ']', so those characters arrive
+    // intact and only a stray comma would need quoting.
+    #[test]
+    fn parse_absolute_mouse_name() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &[
+                    "--input",
+                    "absolute-mouse[path=/tmp/tablet.sock,name=DroidVM Tablet (gpu-0)]",
+                    "bzImage",
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.virtio_input.len(), 1);
+        assert_eq!(
+            cfg.virtio_input[0],
+            InputDeviceOption::AbsoluteMouse {
+                path: PathBuf::from("/tmp/tablet.sock"),
+                width: None,
+                height: None,
+                name: Some("DroidVM Tablet (gpu-0)".to_string()),
+            }
+        );
+    }
+
+    // Omitting it stays legal -- the normalized-range tablet with no per-output identity is still
+    // the shape every caller used before the field existed.
+    #[test]
+    fn parse_absolute_mouse_without_name() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &["--input", "absolute-mouse[path=/tmp/tablet.sock]", "bzImage"],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.virtio_input[0],
+            InputDeviceOption::AbsoluteMouse {
+                path: PathBuf::from("/tmp/tablet.sock"),
+                width: None,
+                height: None,
+                name: None,
+            }
+        );
+    }
+
+    // The keyboard and the relative mouse are the VM's, not a screen's -- neither carries an
+    // output binding, so neither takes a name. `deny_unknown_fields` makes that a parse failure
+    // rather than a silently ignored key, which is the behaviour the app's emitter relies on to
+    // learn that a field does not exist.
+    #[test]
+    fn keyboard_and_mouse_reject_name() {
+        for arg in [
+            "keyboard[path=/tmp/kbd.sock,name=DroidVM Keyboard]",
+            "mouse[path=/tmp/mouse.sock,name=DroidVM Mouse]",
+        ] {
+            assert!(
+                crate::crosvm::cmdline::RunCommand::from_args(&[], &["--input", arg, "bzImage"])
+                    .is_err(),
+                "expected name= to be rejected in {arg}"
+            );
+        }
     }
 
     #[test]

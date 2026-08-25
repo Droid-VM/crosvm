@@ -54,10 +54,13 @@ pub fn new_multitouch_trackpad_config(
 
 /// Instantiates a VirtioInputConfig object with the default configuration for a mouse.
 /// It supports left, right and middle buttons, as wel as X, Y and wheel relative axes.
-pub fn new_mouse_config(idx: u32) -> VirtioInputConfig {
+pub fn new_mouse_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Mouse {idx}"));
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
-        format!("Crosvm Virtio Mouse {idx}"),
+        name,
         format!("virtio-mouse-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_mouse_events(),
@@ -69,10 +72,23 @@ pub fn new_mouse_config(idx: u32) -> VirtioInputConfig {
 /// profile): ABS_X/ABS_Y positioning plus mouse buttons and a scroll wheel. Remote displays
 /// (VNC) need absolute coordinates so the client cursor maps 1:1 onto the guest with no drift,
 /// while the button/wheel set keeps full mouse semantics (hover, right-click, scroll).
-pub fn new_absolute_mouse_config(idx: u32, width: u32, height: u32) -> VirtioInputConfig {
+///
+/// `name` overrides the generated device name, exactly as it does for the touchscreen configs.
+/// An absolute pointer's coordinates only mean anything against one output's geometry, and evdev
+/// has no field saying which output that is -- every guest maps such a device to an output by its
+/// name, so a caller creating one per output has to be able to say which one this is.
+pub fn new_absolute_mouse_config(
+    idx: u32,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Absolute Mouse {idx}"));
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
-        format!("Crosvm Virtio Absolute Mouse {idx}"),
+        name,
         format!("virtio-abs-mouse-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_absolute_mouse_events(),
@@ -82,10 +98,13 @@ pub fn new_absolute_mouse_config(idx: u32, width: u32, height: u32) -> VirtioInp
 
 /// Instantiates a VirtioInputConfig object with the default configuration for a keyboard.
 /// It supports the same keys as a en-us keyboard and the CAPSLOCK, NUMLOCK and SCROLLLOCK leds.
-pub fn new_keyboard_config(idx: u32) -> VirtioInputConfig {
+pub fn new_keyboard_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Keyboard {idx}"));
     VirtioInputConfig::new(
         virtio_input_device_ids::new(0, 0, 0, 0),
-        format!("Crosvm Virtio Keyboard {idx}"),
+        name,
         format!("virtio-keyboard-{idx}"),
         virtio_input_bitmap::new([0u8; 128]),
         default_keyboard_events(),

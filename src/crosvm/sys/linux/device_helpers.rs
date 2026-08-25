@@ -702,6 +702,7 @@ pub fn create_absolute_mouse_device<T: IntoUnixStream>(
     absolute_mouse_socket: T,
     width: u32,
     height: u32,
+    name: Option<&str>,
     idx: u32,
 ) -> DeviceResult {
     let socket = absolute_mouse_socket
@@ -713,6 +714,7 @@ pub fn create_absolute_mouse_device<T: IntoUnixStream>(
         socket,
         width,
         height,
+        name,
         virtio::base_features(protection_type),
     )
     .context("failed to set up input device")?;
@@ -819,7 +821,10 @@ pub fn create_mouse_device<T: IntoUnixStream>(
         .into_unix_stream()
         .context("failed configuring virtio mouse")?;
 
-    let dev = virtio::input::new_mouse(idx, socket, virtio::base_features(protection_type))
+    // `--input mouse` takes no name=: a relative pointer carries no output binding (it walks from
+    // one output to the next and the compositor follows focus), so there is nothing for a
+    // per-device name to key a mapping to.
+    let dev = virtio::input::new_mouse(idx, socket, None, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -838,7 +843,8 @@ pub fn create_keyboard_device<T: IntoUnixStream>(
         .into_unix_stream()
         .context("failed configuring virtio keyboard")?;
 
-    let dev = virtio::input::new_keyboard(idx, socket, virtio::base_features(protection_type))
+    // `--input keyboard` takes no name= either, for the same reason as the mouse above.
+    let dev = virtio::input::new_keyboard(idx, socket, None, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {

@@ -1622,6 +1622,7 @@ pub struct RunCommand {
     /// virtio-input device
     /// TYPE is an input device type, and OPTIONS are key=value
     /// pairs specific to the device type:
+    ///     absolute-mouse[path=PATH,width=W,height=H,name=N]
     ///     evdev[path=PATH]
     ///     keyboard[path=PATH]
     ///     mouse[path=PATH]
