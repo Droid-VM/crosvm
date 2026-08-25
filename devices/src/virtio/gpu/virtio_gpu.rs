@@ -319,6 +319,11 @@ struct VirtioGpuScanout {
     parent_surface_id: Option<u32>,
 
     surface_id: Option<u32>,
+    // The scanout id half of the same fact `parent_surface_id` records: which scanout this cursor
+    // is currently overlayed onto. Snapshot/restore has always read it, but nothing ever wrote it
+    // -- it stayed None for the device's whole life, so a restored cursor came back parented to
+    // nothing. It is written where the parenting actually happens (`update_scanout_resource`), and
+    // it is what `move_cursor` compares the guest's scanout_id against to notice a crossing.
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
@@ -419,6 +424,10 @@ impl VirtioGpuScanout {
         assert_eq!(self.display_params, snapshot.display_params);
 
         self.resource_id = snapshot.resource_id;
+        // The parent the caller just resolved `parent_surface_id` from. Now that the field decides
+        // whether a MOVE_CURSOR is a crossing, a restored cursor that claims no parent would make
+        // the guest's next move look like one.
+        self.parent_scanout_id = snapshot.parent_scanout_id;
         if snapshot.has_surface {
             self.create_surface(display, parent_surface_id, None)?;
         } else {
@@ -1607,6 +1616,19 @@ impl VirtioGpu {
             }
         }
 
+        // Disabling a scanout takes down whatever was overlayed on it. Until now the cursor layer
+        // only ever came down when the guest volunteered UPDATE_CURSOR with resource_id 0, which is
+        // goodwill rather than a guarantee: a guest that shows a pointer and then simply stops
+        // driving virtio-gpu (an OS handover to a driver that scans out some other way) left the
+        // last cursor image floating over the frozen last frame, because releasing the surface only
+        // drops crosvm's handle -- neither sink tears down what the viewer sees. Say it at the
+        // device's own edge instead, while the surface still exists to carry the message, and in
+        // the same two steps update_cursor's resource_id==0 arm uses.
+        if resource_id == 0 && self.cursor_scanout.parent_scanout_id == Some(scanout_id) {
+            self.cursor_scanout.set_cursor_visible(&self.display, false)?;
+            self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, 0)?;
+        }
+
         let r = self.update_scanout_resource(
             SurfaceType::Scanout,
             Some(scanout_rect),
@@ -1718,10 +1740,47 @@ impl VirtioGpu {
         self.flush_resource(resource_id)
     }
 
-    /// Moves the cursor's position to the given coordinates.
-    pub fn move_cursor(&mut self, _scanout_id: u32, x: i32, y: i32) -> VirtioGpuResult {
+    /// Moves the cursor's position to the given coordinates, on the given scanout.
+    ///
+    /// MOVE_CURSOR is the whole message a guest sends while the pointer travels with an unchanged
+    /// image, crossing between scanouts included -- so the scanout_id it carries is the only notice
+    /// the device gets that the single cursor surface now belongs somewhere else. Dropping it left
+    /// the surface parented to the scanout of the last UPDATE_CURSOR while wearing coordinates
+    /// meant for a different one: the pointer draws on the wrong screen, or at an offset on the
+    /// right one, and nothing reports an error.
+    pub fn move_cursor(&mut self, scanout_id: u32, x: i32, y: i32) -> VirtioGpuResult {
         if gpu_diag_enabled() {
-            base::warn!("CURSOR-MOVE: pos=({},{})", x, y);
+            base::warn!("CURSOR-MOVE: scanout={} pos=({},{})", scanout_id, x, y);
+        }
+        // Re-parent through the exact call update_cursor makes, so the two paths cannot describe
+        // the move differently. A single-scanout guest never reaches it: scanout_id is 0 forever
+        // and the cursor is already parented to 0, leaving position + commit as the whole of this
+        // function, as before.
+        //
+        // Only for a cursor that is actually somewhere -- a surface on screen and a live resource
+        // behind it. Re-parenting means building a new surface for the image to be flushed into,
+        // so with either missing there is nothing to move and every call below would be a
+        // surface-gated no-op anyway; asking for the move with a resource the guest has already
+        // unref'd would turn one into an error response instead.
+        if self.cursor_scanout.surface_id.is_some()
+            && self.cursor_scanout.parent_scanout_id != Some(scanout_id)
+        {
+            let cursor_resource_id = self
+                .cursor_scanout
+                .resource_id
+                .map(|id| id.get())
+                .filter(|id| self.resources.contains_key(id));
+            if let Some(resource_id) = cursor_resource_id {
+                self.update_scanout_resource(
+                    SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
+                self.cursor_scanout.set_cursor_visible(&self.display, true)?;
+                // The new surface is empty until something writes the cursor image into it, and a
+                // move carries no image of its own. Push the resource the cursor already has, the
+                // same flush update_cursor ends on. (Its hotspot does not come along: MOVE_CURSOR
+                // has no hotspot field, and only VNC's RFB cursor uses one -- it keeps the last
+                // one it was given, server-wide, until the next UPDATE_CURSOR restates it.)
+                self.flush_resource(resource_id)?;
+            }
         }
         self.cursor_scanout.set_position(&self.display, x, y)?;
         self.cursor_scanout.commit(&self.display)?;
@@ -2440,6 +2499,12 @@ impl VirtioGpu {
             }
 
             scanout.resource_id = None;
+            // A cursor with no surface is overlayed onto nothing, and saying so keeps
+            // `parent_scanout_id` an answer to "where is the cursor now" rather than "where was it
+            // last" -- which is what both `move_cursor` and the scanout-disable edge ask it.
+            if matches!(scanout_type, SurfaceType::Cursor) {
+                scanout.parent_scanout_id = None;
+            }
             return Ok(OkNoData);
         }
 
@@ -2458,6 +2523,11 @@ impl VirtioGpu {
                         Some(scanout_parent_surface_id),
                         scanout_rect,
                     )?;
+                    // The parenting just happened (or was already in force -- create_surface is a
+                    // no-op when the parent is unchanged); record which scanout it was against.
+                    // Not recorded when the parent scanout has no surface of its own, because then
+                    // the cursor was not re-parented and still hangs off whatever it hung off.
+                    scanout.parent_scanout_id = Some(scanout_id);
                 }
             }
             SurfaceType::Scanout => {
@@ -2533,7 +2603,18 @@ impl VirtioGpu {
                 scanout.height = height;
             }
         }
+        // Hide before releasing, and not instead of it: `release_surface` drops crosvm's handle to
+        // the surface, which at neither sink is what removes the pointer from the screen. The
+        // Android surface is never destroy_android_surface'd (the app keeps the cursor Surface and
+        // the last buffer posted to it), and `VncCursorSurface` has no Drop, so the composited
+        // pointer and the RFB cursor both outlive it. Both sinks do act on the hide -- the Android
+        // one parks the layer at CURSOR_HIDDEN_POS, VNC clears fb.cursor.visible and sends
+        // rfbSetCursor(NULL) -- but only while the surface is still here to be told.
+        self.cursor_scanout
+            .set_cursor_visible(&self.display, false)
+            .map_err(|e| anyhow::anyhow!("gpu reset: failed to hide the cursor: {}", e))?;
         self.cursor_scanout.resource_id = None;
+        self.cursor_scanout.parent_scanout_id = None;
         self.cursor_scanout.release_surface(&self.display);
         {
             let mut display = self.display.borrow_mut();
