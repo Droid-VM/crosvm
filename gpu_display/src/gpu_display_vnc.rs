@@ -76,7 +76,7 @@ extern "C" {
     );
     fn vnc_server_set_cursor_pos(server: *mut std::ffi::c_void, x: c_int, y: c_int);
     #[allow(clippy::too_many_arguments)]
-    fn vnc_server_composite(
+    fn vnc_server_offer_frame(
         server: *mut std::ffi::c_void,
         clean: *const u8,
         clean_size: u32,
@@ -143,15 +143,18 @@ struct CursorState {
 }
 
 impl SharedFramebuffer {
-    /// Push to LibVNCServer. `full` recopies the whole frame (a new guest frame); otherwise only
-    /// the old and new cursor rectangles are touched, so a pointer can move over a static desktop
-    /// without costing a frame.
-    fn composite(&mut self, full: bool) {
+    /// Offer the frame to the bridge's consumers. `full` means the guest produced a new frame;
+    /// otherwise not one guest pixel changed and only the pointer moved, which is what lets a
+    /// cursor travel over a static desktop without costing a frame.
+    ///
+    /// What each consumer makes of the offer is the bridge's business (vnc_frame_consumer.h);
+    /// today there is one, the LibVNCServer path.
+    fn offer_frame(&mut self, full: bool) {
         let c = &self.cursor;
         let has_img = !c.pixels.is_empty() && c.width > 0 && c.height > 0;
         // SAFETY: both buffers outlive the call; the bridge only reads them.
         unsafe {
-            vnc_server_composite(
+            vnc_server_offer_frame(
                 self.server.ptr,
                 self.data.as_ptr(),
                 self.data.len() as u32,
@@ -234,7 +237,7 @@ impl GpuDisplaySurface for VncSurface {
             }
             fb.data[..copy_len].copy_from_slice(&self.local_buffer[..copy_len]);
             // fb.data stays cursor-free; the bridge blends the pointer on its way out.
-            fb.composite(true);
+            fb.offer_frame(true);
         }
     }
 }
@@ -249,7 +252,7 @@ impl GpuDisplaySurface for VncSurface {
 /// rendering of the same data -- differencing a frame grabbed with the encoding against one
 /// grabbed without it is how the hotspot bug in the composited path was caught.
 ///
-/// The cost of compositing is a framebuffer update per pointer move; `composite(false)` keeps
+/// The cost of compositing is a framebuffer update per pointer move; `offer_frame(false)` keeps
 /// that to the two rectangles the pointer left and entered rather than a whole frame.
 struct VncCursorSurface {
     width: u32,
@@ -280,7 +283,7 @@ impl GpuDisplaySurface for VncCursorSurface {
             fb.cursor.width = self.width;
             fb.cursor.height = self.height;
             fb.cursor.visible = true;
-            fb.composite(false);
+            fb.offer_frame(false);
         }
         // And as an RFB cursor, which is what a client with the Cursor pseudo-encoding draws
         // itself. Unlike the composited copy this one carries the hotspot, because LibVNCServer
@@ -315,7 +318,7 @@ impl GpuDisplaySurface for VncCursorSurface {
             fb.cursor.y = y;
             // Partial: only the rectangles the pointer left and entered. Without this the pointer
             // would only move when the guest happened to send a frame.
-            fb.composite(false);
+            fb.offer_frame(false);
         }
         // LibVNCServer wants the POINTER, not the image: it draws the cursor at
         // cursorX - hot_x. (x,y) is the image origin, so the hotspot goes back on here.
@@ -332,7 +335,7 @@ impl GpuDisplaySurface for VncCursorSurface {
     fn set_cursor_visible(&mut self, visible: bool) {
         if let Ok(mut fb) = self.shared_fb.lock() {
             fb.cursor.visible = visible;
-            fb.composite(false);
+            fb.offer_frame(false);
         }
         if !visible {
             // SAFETY: null pixels is the bridge's hide request.
