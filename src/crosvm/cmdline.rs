@@ -94,6 +94,8 @@ use crate::crosvm::config::parse_pflash_parameters;
 use crate::crosvm::config::parse_serial_options;
 use crate::crosvm::config::parse_touch_device_option;
 use crate::crosvm::config::parse_vhost_user_fs_option;
+#[cfg(feature = "android_display")]
+use crate::crosvm::config::AndroidDisplayServiceConfig;
 use crate::crosvm::config::BatteryConfig;
 use crate::crosvm::config::PreAllocConfig;
 use crate::crosvm::config::RuntimeShareConfig;
@@ -918,6 +920,13 @@ fn vnc_server_from_str(s: &str) -> Result<VncConfig, String> {
     from_key_values(s)
 }
 
+/// Parse an Android display service option. `name` is the first field of the struct, so a bare
+/// service name parses as `name=<that>` and the older form of this option keeps working unchanged.
+#[cfg(feature = "android_display")]
+fn android_display_service_from_str(s: &str) -> Result<AndroidDisplayServiceConfig, String> {
+    from_key_values(s)
+}
+
 /// User-specified configuration for the `crosvm run` command.
 ///
 /// All fields of this structure MUST be either an `Option` or a `Vec` of their type. Arguments of
@@ -987,10 +996,25 @@ pub struct RunCommand {
     pub acpi_table: Vec<PathBuf>,
 
     #[cfg(feature = "android_display")]
-    #[argh(option, arg_name = "NAME")]
-    #[merge(strategy = overwrite_option)]
-    /// name that the Android display backend will be registered to the service manager.
-    pub android_display_service: Option<String>,
+    #[argh(
+        option,
+        arg_name = "NAME[,screen=SCREEN]",
+        from_str_fn(android_display_service_from_str)
+    )]
+    #[serde(default)]
+    #[merge(strategy = append)]
+    /// name that the Android display backend will be registered to
+    /// the service manager, and the screen whose frames it shows.
+    /// May be given once per screen.
+    ///     name=NAME - service manager name (the `name=` may be
+    ///         omitted, so a bare NAME is still accepted).
+    ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
+    ///         "simplefb". Defaults to gpu-0 when a GPU device is
+    ///         configured, otherwise simplefb.
+    /// Examples:
+    ///   --android-display-service droidvm_disp_1
+    ///   --android-display-service name=win_fb,screen=simplefb
+    pub android_display_service: Vec<AndroidDisplayServiceConfig>,
 
     #[argh(option)]
     #[serde(skip)] // TODO(b/255223604)
@@ -2865,12 +2889,22 @@ pub struct RunCommand {
     #[cfg(feature = "vnc")]
     #[argh(option, arg_name = "CONFIG", from_str_fn(vnc_server_from_str))]
     #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// start a VNC server for remote display access.
+    #[merge(strategy = append)]
+    /// start a VNC server for remote display access. May be given
+    /// once per screen.
+    ///     host=HOST - address to listen on (default 0.0.0.0).
+    ///     port=PORT - port to listen on (default 5900).
+    ///     password=PASSWORD - require this password.
+    ///     input=MODE - "tablet" (alias "mouse") for an absolute
+    ///         pointer, "touch" (default) for multi-touch.
+    ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
+    ///         "simplefb". Defaults to gpu-0 when a GPU device is
+    ///         configured, otherwise simplefb.
     /// Examples:
     ///   --vnc-server port=5900
     ///   --vnc-server host=127.0.0.1,port=5900,password=secret
-    pub vnc_server: Option<VncConfig>,
+    ///   --vnc-server port=5901,screen=simplefb
+    pub vnc_server: Vec<VncConfig>,
 
     #[argh(option, arg_name = "cid=CID[,device=VHOST_DEVICE]")]
     #[serde(default)]
@@ -3589,32 +3623,6 @@ impl TryFrom<RunCommand> for super::config::Config {
                     .extend(cmd.gpu_display.into_iter().map(|p| p.0));
             }
 
-            #[cfg(feature = "android_display")]
-            {
-                // Accept the service for any display producer, not just virtio-gpu: simplefb has
-                // no --gpu at all, and dropping the value here silently left it presenting to VNC
-                // instead of the app's Surface.
-                let gpu_has_display = cfg
-                    .gpu_parameters
-                    .as_ref()
-                    .is_some_and(|p| !p.display_params.is_empty());
-                // Read simplefb off `cmd`: cfg.simplefb is only assigned further down this
-                // function, so checking it here would always see None.
-                if gpu_has_display || cmd.simplefb.is_some() {
-                    cfg.android_display_service = cmd.android_display_service;
-                }
-            }
-
-            #[cfg(feature = "vnc")]
-            {
-                cfg.vnc_server = cmd.vnc_server;
-                if cfg.vnc_server.is_some() {
-                    cfg.display_window_keyboard = true;
-                    cfg.display_window_mouse = true;
-                    log::info!("VNC: auto-enabled display_window_keyboard and display_window_mouse");
-                }
-            }
-
             #[cfg(windows)]
             if let Some(gpu_parameters) = &cfg.gpu_parameters {
                 let num_displays = gpu_parameters.display_params.len();
@@ -3630,6 +3638,27 @@ impl TryFrom<RunCommand> for super::config::Config {
             {
                 cfg.gpu_cgroup_path = cmd.gpu_cgroup_path;
                 cfg.gpu_server_cgroup_path = cmd.gpu_server_cgroup_path;
+            }
+        }
+
+        // Exporters bind to screens, and a screen can come from the GPU device or from simplefb,
+        // so these no longer live inside the `gpu` block that used to decide whether to keep them.
+        // Every entry is carried through as given; whether the screen it names exists is settled
+        // once, in `validate_config`, which is the only place that can see all the display devices
+        // at once. Dropping a value here instead is what left a configured display service
+        // unregistered with nothing said about it, and the app waiting on a binder forever.
+        #[cfg(feature = "android_display")]
+        {
+            cfg.android_display_service = cmd.android_display_service;
+        }
+
+        #[cfg(feature = "vnc")]
+        {
+            cfg.vnc_server = cmd.vnc_server;
+            if !cfg.vnc_server.is_empty() {
+                cfg.display_window_keyboard = true;
+                cfg.display_window_mouse = true;
+                log::info!("VNC: auto-enabled display_window_keyboard and display_window_mouse");
             }
         }
 

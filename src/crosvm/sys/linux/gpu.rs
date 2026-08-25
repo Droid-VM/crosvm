@@ -19,6 +19,12 @@ use serde_keyvalue::FromKeyValues;
 
 use super::*;
 use crate::crosvm::config::Config;
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+use crate::crosvm::config::DisplayScreen;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_HOST;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_PORT;
 
 pub struct GpuCacheInfo<'a> {
     directory: Option<&'a str>,
@@ -189,42 +195,41 @@ pub fn create_gpu_device(
         virtio::DisplayBackend::Stub,
     ];
 
+    // This device provides one screen, `gpu-0`, so it takes the one exporter bound to that screen
+    // and nothing else. An exporter bound to `simplefb` belongs to the simplefb device's screen
+    // and is none of this device's business, even though the simplefb bridge currently feeds its
+    // frames through here (ExternalScanout).
+    //
+    // `display_backends` remains an ordered try-in-turn list, but the two entries that used to
+    // race for the front of it can no longer both be here: config rejects two exporters on one
+    // screen, so at most one of the two inserts below runs. The list is a fallback chain again
+    // (Wayland/X/Stub), not a silent winner-takes-all -- which is what it was when
+    // `insert(0, Android)` followed by `insert(0, VncTcp)` put VNC in front and left
+    // `AServiceManager_addService` uncalled, so the app's native display waited on a binder that
+    // was never registered.
     #[cfg(feature = "android_display")]
-    if let Some(service_name) = &cfg.android_display_service {
-        // The GPU device owns this sink even when `--simplefb` is also configured: it registers
-        // the one ICrosvmAndroidDisplayService the app hands its Surface to, and the simplefb
-        // bridge feeds its frames through the same device (ExternalScanout) instead of opening a
-        // second display under the same name. Two registrations under one name is what made the
-        // app's Surface go to whichever producer won the race, with the loser drawing into
-        // nothing for the rest of the VM's life.
-        display_backends.insert(0, virtio::DisplayBackend::Android(service_name.to_string()));
+    if let Some(service) = cfg.android_display_service_for(DisplayScreen::Gpu0) {
+        display_backends.insert(0, virtio::DisplayBackend::Android(service.name.clone()));
     }
 
     #[cfg(feature = "vnc")]
-    if let Some(ref vnc_cfg) = cfg.vnc_server {
-        {
-            // Taken even with `--simplefb`, for the same reason as the Android sink above: there
-            // is one display and the GPU device owns it, with the bridge feeding its frames in
-            // through ExternalScanout. This used to stand down for simplefb, from when the bridge
-            // presented on its own -- leaving nobody to open the VNC server once the bridge
-            // started handing frames over instead.
-            let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
-            let port = vnc_cfg.port.unwrap_or(5900);
-            let addr = format!("{}:{}", host, port);
-            let (w, h) = cfg
-                .display_input_width
-                .zip(cfg.display_input_height)
-                .unwrap_or((1280, 720));
-            // Pointer input mode. Default (no `input=` given) keeps the original
-            // multi-touch behavior. `input=tablet` (alias `mouse`) opts into the added
-            // absolute-coordinate pointer with mouse button/wheel semantics (qemu
-            // usb-tablet equivalent).
-            let touch_input = super::vnc_touch_input(vnc_cfg.input.as_deref());
-            display_backends.insert(
-                0,
-                virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone(), touch_input),
-            );
-        }
+    if let Some(vnc_cfg) = cfg.vnc_server_for(DisplayScreen::Gpu0) {
+        let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+        let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+        let addr = format!("{}:{}", host, port);
+        let (w, h) = cfg
+            .display_input_width
+            .zip(cfg.display_input_height)
+            .unwrap_or((1280, 720));
+        // Pointer input mode. Default (no `input=` given) keeps the original
+        // multi-touch behavior. `input=tablet` (alias `mouse`) opts into the added
+        // absolute-coordinate pointer with mouse button/wheel semantics (qemu
+        // usb-tablet equivalent).
+        let touch_input = super::vnc_touch_input(vnc_cfg.input.as_deref());
+        display_backends.insert(
+            0,
+            virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone(), touch_input),
+        );
     }
 
     // Use the unnamed socket for GPU display screens.

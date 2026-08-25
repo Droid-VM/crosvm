@@ -196,6 +196,12 @@ use vm_memory::MemoryRegionOptions;
 use x86_64::X8664arch as Arch;
 
 use crate::crosvm::config::Config;
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+use crate::crosvm::config::DisplayScreen;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_HOST;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_PORT;
 use crate::crosvm::config::Executable;
 use crate::crosvm::config::HypervisorKind;
 use crate::crosvm::config::RuntimeShareExceedPolicy;
@@ -283,8 +289,12 @@ fn create_display_window_input_devices(
         // against the *current* framebuffer size (VNC_ABS_MAX in gpu_display_vnc.rs), keeping the
         // mapping 1:1 across guest auto-resize -- so its touch + tablet advertise that fixed range
         // instead of a pixel size. Non-VNC (X11) display windows keep pixel dimensions.
+        // Any VNC binding at all, not a particular screen's: this device set is VM-global (one
+        // keyboard, one relative pointer, one touchscreen -- the compositor routes them by focus),
+        // so the coordinate space has to be settled once for the whole VM. Making the absolute
+        // range per-screen means a virtio-input device per screen, which is step 9's job.
         #[cfg(feature = "vnc")]
-        let (multi_touch_width, multi_touch_height) = if cfg.vnc_server.is_some() {
+        let (multi_touch_width, multi_touch_height) = if !cfg.vnc_server.is_empty() {
             (0x7FFF_u32, 0x7FFF_u32)
         } else {
             (multi_touch_width, multi_touch_height)
@@ -331,8 +341,12 @@ fn create_display_window_input_devices(
         // only when the VNC server opts in with `input=tablet`, so the default device set
         // stays unchanged. The VNC backend then emits Tablet-kind events with ABS
         // coordinates, giving a 1:1 cursor mapping with hover/right-click/wheel.
+        // Same VM-global reasoning as the absolute range above: whether the tablet exists is a
+        // property of the device set, so the first VNC binding decides it for all of them. With
+        // one binding -- every configuration expressible before this option repeated -- this is
+        // the same question as before.
         #[cfg(feature = "vnc")]
-        if !vnc_touch_input(cfg.vnc_server.as_ref().and_then(|v| v.input.as_deref())) {
+        if !vnc_touch_input(cfg.vnc_server.first().and_then(|v| v.input.as_deref())) {
             let (event_device_socket, virtio_dev_socket) =
                 StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
                     .context("failed to create socket")?;
@@ -4100,18 +4114,42 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             poll_hz: sfb_cfg.poll_hz,
         };
 
-        // The app display path takes precedence when configured: it presents into the Surface the
-        // app owns, which is lower latency than encoding frames for a VNC client.
+        // This device provides the `simplefb` screen, so it takes the exporter bound to that
+        // screen. The app display path still takes precedence over VNC when both are somehow
+        // present, but config now rejects that pairing outright (one exporter per screen), so the
+        // ordering below is a leftover tie-break rather than a decision anyone can reach.
         #[cfg(feature = "android_display")]
-        let android_service = cfg.android_display_service.clone();
+        let android_service = cfg
+            .android_display_service_for(DisplayScreen::Simplefb)
+            .map(|s| s.name.clone());
         #[cfg(not(feature = "android_display"))]
         let android_service: Option<String> = None;
 
-        // With a GPU device present there is exactly one display and it belongs to that device;
-        // feed it instead of opening a second one (see ExternalScanout). Without a GPU the bridge
-        // presents on its own, as it always did.
+        // With a GPU device present there is still exactly one display and it belongs to that
+        // device; feed it instead of opening a second one (see ExternalScanout). Without a GPU the
+        // bridge presents on its own, as it always did -- and that is where the `simplefb` screen's
+        // exporter is honoured today.
         #[cfg(feature = "gpu")]
         if let Some(scanout) = external_scanout.clone() {
+            // step 6b: this is where an exporter bound to `simplefb` attaches once this screen has
+            // a display of its own instead of feeding the GPU device's. Until then a binding made
+            // here is real config -- resolved and validated -- with nowhere to go, so say so
+            // rather than let it look like it worked.
+            #[cfg(feature = "android_display")]
+            if let Some(service) = cfg.android_display_service_for(DisplayScreen::Simplefb) {
+                warn!(
+                    "simplefb: display service `{}` is bound to the simplefb screen, which has no \
+                     display of its own yet; its frames go to the gpu device instead",
+                    service.name
+                );
+            }
+            #[cfg(feature = "vnc")]
+            if cfg.vnc_server_for(DisplayScreen::Simplefb).is_some() {
+                warn!(
+                    "simplefb: a vnc server is bound to the simplefb screen, which has no display \
+                     of its own yet; its frames go to the gpu device instead"
+                );
+            }
             return match simplefb_display::start_simplefb_display_thread(
                 guest_mem,
                 params,
@@ -4134,9 +4172,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             None => {
                 #[cfg(feature = "vnc")]
                 {
-                    let vnc_cfg = cfg.vnc_server.as_ref()?;
-                    let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
-                    let port = vnc_cfg.port.unwrap_or(5900);
+                    let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
+                    let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+                    let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
                     simplefb_display::SimplefbDisplayTarget::Vnc {
                         addr: format!("{}:{}", host, port),
                         password: vnc_cfg.password.clone(),

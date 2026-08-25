@@ -145,8 +145,59 @@ pub struct CpuOptions {
     pub sve: Option<SveConfig>,
 }
 
-/// Device tree overlay configuration.
-#[derive(Clone, Debug, Default, Serialize, Deserialize, FromKeyValues)]
+/// The screen an exporter (a VNC server, an Android display service) binds to.
+///
+/// A screen is whoever is producing pictures, and the simplefb device and the virtio-gpu device
+/// are two parallel display devices each providing one -- not two sources contending for a single
+/// output. An exporter binds to exactly one screen, and a screen carries at most one exporter.
+/// There is deliberately no "both" and no "any": mirroring is a non-goal, and letting the VMM pick
+/// for the user is what produced the silent race this replaces, where a VNC server and an Android
+/// display service configured together left the app's Surface waiting forever on a binder that was
+/// never registered.
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayScreen {
+    /// virtio-gpu scanout 0.
+    ///
+    /// Spelled with its scanout index because multi-scanout is a path left open rather than one
+    /// taken: `gpu-1` and up do not exist until more than one scanout is enabled, and nothing
+    /// here should read as if scanout 0 were the only one there could be.
+    #[serde(rename = "gpu-0")]
+    Gpu0,
+    /// The simplefb device's single screen, whose geometry the device tree fixes.
+    #[serde(rename = "simplefb")]
+    Simplefb,
+}
+
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+impl DisplayScreen {
+    /// The name this screen is written as on the command line, for error messages that have to
+    /// quote back what the user typed (or what the compat default resolved to).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DisplayScreen::Gpu0 => "gpu-0",
+            DisplayScreen::Simplefb => "simplefb",
+        }
+    }
+
+    /// The option that has to be present for this screen to exist at all.
+    fn source_option(self) -> &'static str {
+        match self {
+            DisplayScreen::Gpu0 => "--gpu",
+            DisplayScreen::Simplefb => "--simplefb",
+        }
+    }
+}
+
+/// Address a VNC server listens on when the option does not say. Kept here rather than repeated at
+/// each consumer because validation has to compare the same effective port the server will bind.
+#[cfg(feature = "vnc")]
+pub const DEFAULT_VNC_HOST: &str = "0.0.0.0";
+#[cfg(feature = "vnc")]
+pub const DEFAULT_VNC_PORT: u32 = 5900;
+
+/// One VNC server: where it listens, and which screen's frames it serves.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 #[cfg(feature = "vnc")]
 pub struct VncConfig {
@@ -160,6 +211,30 @@ pub struct VncConfig {
     /// or "touch" (multi-touch touchscreen events, tap/drag only).
     #[serde(default)]
     pub input: Option<String>,
+    /// Which screen this server shows. `None` on the wire means "not said"; `validate_config`
+    /// resolves it and writes the answer back, so nothing downstream ever sees `None`.
+    #[serde(default)]
+    pub screen: Option<DisplayScreen>,
+}
+
+/// One Android display service: the name crosvm registers with the service manager, and which
+/// screen's frames go into the Surface the app hands back through it.
+///
+/// `name` comes first so the older bare form keeps parsing: `--android-display-service droidvm_x`
+/// means exactly `--android-display-service name=droidvm_x`, the same shape that lets `--pmem
+/// /path/to/disk.img` and `--block /path/to/disk.img,ro=true` share one option. (A service
+/// literally named `name` or `screen` would be read as a key instead; no name generator produces
+/// those, and the failure is a parse error rather than a wrong binding.)
+#[cfg(feature = "android_display")]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct AndroidDisplayServiceConfig {
+    /// Name to register the display service under. The app derives it and looks it up under the
+    /// same name, so it is the identity of the channel, not just a label.
+    pub name: String,
+    /// Which screen this service shows. `None` on the wire means "not said"; see `VncConfig`.
+    #[serde(default)]
+    pub screen: Option<DisplayScreen>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, FromKeyValues)]
@@ -802,8 +877,9 @@ pub struct Config {
     #[cfg(all(target_arch = "x86_64", unix))]
     pub ac_adapter: bool,
     pub acpi_tables: Vec<PathBuf>,
+    /// Android display services, one per screen they export. Empty is the normal case.
     #[cfg(feature = "android_display")]
-    pub android_display_service: Option<String>,
+    pub android_display_service: Vec<AndroidDisplayServiceConfig>,
     pub android_fstab: Option<PathBuf>,
     pub async_executor: Option<ExecutorKind>,
     #[cfg(feature = "balloon")]
@@ -1029,8 +1105,9 @@ pub struct Config {
     #[cfg(feature = "audio")]
     #[serde(skip)]
     pub virtio_snds: Vec<SndParameters>,
+    /// VNC servers, one per screen they export. Empty is the normal case.
     #[cfg(feature = "vnc")]
-    pub vnc_server: Option<VncConfig>,
+    pub vnc_server: Vec<VncConfig>,
     pub vsock: Option<VsockConfig>,
     #[cfg(feature = "vtpm")]
     pub vtpm_proxy: bool,
@@ -1047,7 +1124,7 @@ impl Default for Config {
             ac_adapter: false,
             acpi_tables: Vec::new(),
             #[cfg(feature = "android_display")]
-            android_display_service: None,
+            android_display_service: Vec::new(),
             android_fstab: None,
             async_executor: None,
             #[cfg(feature = "balloon")]
@@ -1254,7 +1331,7 @@ impl Default for Config {
             vhost_user_connect_timeout_ms: None,
             vhost_user_fs: Vec::new(),
             #[cfg(feature = "vnc")]
-            vnc_server: None,
+            vnc_server: Vec::new(),
             vsock: None,
             #[cfg(feature = "video-decoder")]
             video_dec: Vec::new(),
@@ -1280,6 +1357,169 @@ impl Default for Config {
             x_display: None,
         }
     }
+}
+
+impl Config {
+    /// The VNC server bound to `screen`, or `None` if that screen has no VNC exporter.
+    ///
+    /// Answers with the resolved binding, so it is only meaningful after `validate_config` has
+    /// run; before that every entry still reads as unspecified and matches no screen. Callers are
+    /// all downstream of validation.
+    #[cfg(feature = "vnc")]
+    pub fn vnc_server_for(&self, screen: DisplayScreen) -> Option<&VncConfig> {
+        self.vnc_server.iter().find(|v| v.screen == Some(screen))
+    }
+
+    /// The Android display service bound to `screen`, or `None` if that screen has no native
+    /// exporter. Same resolution caveat as `vnc_server_for`.
+    #[cfg(feature = "android_display")]
+    pub fn android_display_service_for(
+        &self,
+        screen: DisplayScreen,
+    ) -> Option<&AndroidDisplayServiceConfig> {
+        self.android_display_service
+            .iter()
+            .find(|s| s.screen == Some(screen))
+    }
+}
+
+/// Resolves each exporter's screen and enforces the one-exporter-per-screen rules.
+///
+/// This runs at validation rather than at parse time because "which screen did you mean" cannot be
+/// answered from the option alone: it depends on which display devices the rest of the command
+/// line configured, and that is only settled once everything has been folded into the `Config`.
+/// The answer is written back into the entry, so no consumer downstream ever has to decide again
+/// what an unspecified screen meant -- and none of them can decide it differently.
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
+    // Which screens exist. `validate_gpu_config` has already run and given a GPU with no
+    // `displays=` its one default display, so the presence of the device is the whole question.
+    #[cfg(feature = "gpu")]
+    let has_gpu_screen = cfg.gpu_parameters.is_some();
+    #[cfg(not(feature = "gpu"))]
+    let has_gpu_screen = false;
+    let has_simplefb_screen = cfg.simplefb.is_some();
+
+    let screen_exists = |screen: DisplayScreen| match screen {
+        DisplayScreen::Gpu0 => has_gpu_screen,
+        DisplayScreen::Simplefb => has_simplefb_screen,
+    };
+
+    // Compat default for an exporter that named no screen. Before screens were expressible there
+    // was one display and the GPU device owned it whenever there was a GPU device at all, with the
+    // simplefb bridge feeding that same display; only with no GPU did simplefb present on its own.
+    // Resolving the same way keeps every command line that parsed yesterday binding where it bound
+    // yesterday.
+    let default_screen = if has_gpu_screen {
+        DisplayScreen::Gpu0
+    } else {
+        DisplayScreen::Simplefb
+    };
+
+    // Resolve first, then judge, so every message below can name a concrete screen.
+    #[cfg(feature = "vnc")]
+    for vnc in cfg.vnc_server.iter_mut() {
+        let _ = vnc.screen.get_or_insert(default_screen);
+    }
+    #[cfg(feature = "android_display")]
+    for service in cfg.android_display_service.iter_mut() {
+        let _ = service.screen.get_or_insert(default_screen);
+    }
+
+    // A binding to a screen that does not exist. Rejecting is the point: the alternative is an
+    // exporter that is configured, reports no error, and never shows anything -- which is how a
+    // dropped display service turned into "the app's display is permanently blank" with nothing
+    // in the log to say so.
+    #[cfg(feature = "vnc")]
+    for vnc in cfg.vnc_server.iter() {
+        let screen = vnc.screen.expect("resolved above");
+        if !screen_exists(screen) {
+            return Err(format!(
+                "`vnc-server` is bound to screen `{}`, but no {} device is configured",
+                screen.as_str(),
+                screen.source_option(),
+            ));
+        }
+    }
+    #[cfg(feature = "android_display")]
+    for service in cfg.android_display_service.iter() {
+        let screen = service.screen.expect("resolved above");
+        if !screen_exists(screen) {
+            return Err(format!(
+                "`android-display-service` `{}` is bound to screen `{}`, but no {} device is \
+                 configured",
+                service.name,
+                screen.as_str(),
+                screen.source_option(),
+            ));
+        }
+    }
+
+    // Two servers cannot hold the same port, and two services cannot hold the same name -- the
+    // second one loses at bind/register time, far from the option that caused it. Checked before
+    // the per-screen rule so that a plain copy-pasted duplicate is reported as a duplicate rather
+    // than as a screen conflict.
+    #[cfg(feature = "vnc")]
+    {
+        let mut ports: Vec<u32> = Vec::with_capacity(cfg.vnc_server.len());
+        for vnc in cfg.vnc_server.iter() {
+            let port = vnc.port.unwrap_or(DEFAULT_VNC_PORT);
+            if ports.contains(&port) {
+                return Err(format!(
+                    "two `vnc-server` options use port {}; each needs its own",
+                    port
+                ));
+            }
+            ports.push(port);
+        }
+    }
+    #[cfg(feature = "android_display")]
+    {
+        let mut names: Vec<&str> = Vec::with_capacity(cfg.android_display_service.len());
+        for service in cfg.android_display_service.iter() {
+            if names.contains(&service.name.as_str()) {
+                return Err(format!(
+                    "two `android-display-service` options use the name `{}`; each needs its own",
+                    service.name
+                ));
+            }
+            names.push(service.name.as_str());
+        }
+    }
+
+    // One exporter per screen. Mirroring -- one screen feeding both a VNC server and the app's
+    // Surface -- is a deliberate non-goal, not a limitation waiting to be lifted: the choice was
+    // between making the existing "both configured" case mirror and making it an error, and this
+    // is the error. A screen with no exporter at all stays perfectly legal.
+    for screen in [DisplayScreen::Gpu0, DisplayScreen::Simplefb] {
+        let mut exporters: Vec<String> = Vec::new();
+        #[cfg(feature = "vnc")]
+        for vnc in cfg.vnc_server.iter().filter(|v| v.screen == Some(screen)) {
+            exporters.push(format!(
+                "`vnc-server` on port {}",
+                vnc.port.unwrap_or(DEFAULT_VNC_PORT)
+            ));
+        }
+        #[cfg(feature = "android_display")]
+        for service in cfg
+            .android_display_service
+            .iter()
+            .filter(|s| s.screen == Some(screen))
+        {
+            exporters.push(format!("`android-display-service` `{}`", service.name));
+        }
+        if exporters.len() > 1 {
+            return Err(format!(
+                "screen `{}` has {} exporters ({}); a screen drives at most one, and mirroring one \
+                 screen onto several exporters is not supported. Give each a `screen=` of its own.",
+                screen.as_str(),
+                exporters.len(),
+                exporters.join(", "),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
@@ -1493,6 +1733,11 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
         validate_simplefb(simplefb)?;
     }
 
+    // After the display devices are all known: which screens exist is exactly the input this
+    // needs, and it writes each exporter's resolved screen back into the config.
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    validate_display_exporters(cfg)?;
+
     // Validate platform specific things
     super::sys::config::validate_config(cfg)
 }
@@ -1567,6 +1812,17 @@ mod tests {
             .try_into()
             .unwrap()
     }
+
+    /// Same as `config_from_args` but keeps a validation failure instead of panicking on it, so a
+    /// test can say which rule rejected the command line and not merely that something did.
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    fn config_from_args_result(args: &[&str]) -> std::result::Result<Config, String> {
+        Config::try_from(crate::crosvm::cmdline::RunCommand::from_args(&[], args).unwrap())
+    }
+
+    /// A `--simplefb` that parses; the geometry is never used by these tests, only its presence.
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    const SIMPLEFB_ARG: &str = "width=1280,height=720";
 
     #[test]
     fn parse_cpu_opts() {
@@ -2765,5 +3021,267 @@ mod tests {
         assert!(validate_pmem(&pmem)
             .unwrap_err()
             .contains("swap-interval parameter can only be set for writable pmem device"));
+    }
+
+    // ---- exporter-to-screen bindings ----
+    //
+    // The two things these have to pin down are that nothing expressible before this option
+    // repeated changed meaning, and that the cases which used to resolve themselves silently now
+    // say what they resolved to (or refuse to).
+
+    /// The form every existing command line uses: a bare service name, no `screen=`.
+    #[test]
+    #[cfg(feature = "android_display")]
+    fn parse_android_display_service_bare_name() {
+        assert_eq!(
+            from_key_values::<AndroidDisplayServiceConfig>("droidvm_disp_1").unwrap(),
+            AndroidDisplayServiceConfig {
+                name: "droidvm_disp_1".to_string(),
+                screen: None,
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "android_display")]
+    fn parse_android_display_service_key_values() {
+        assert_eq!(
+            from_key_values::<AndroidDisplayServiceConfig>("name=win_fb,screen=simplefb").unwrap(),
+            AndroidDisplayServiceConfig {
+                name: "win_fb".to_string(),
+                screen: Some(DisplayScreen::Simplefb),
+            }
+        );
+        // The two forms mix: the name keeps its implicit first position with a `screen=` after it.
+        assert_eq!(
+            from_key_values::<AndroidDisplayServiceConfig>("droidvm_disp_1,screen=gpu-0").unwrap(),
+            AndroidDisplayServiceConfig {
+                name: "droidvm_disp_1".to_string(),
+                screen: Some(DisplayScreen::Gpu0),
+            }
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn parse_vnc_server_screen() {
+        let vnc = from_key_values::<VncConfig>("host=127.0.0.1,port=5900,password=s").unwrap();
+        assert_eq!(vnc.port, Some(5900));
+        assert_eq!(vnc.screen, None);
+
+        let vnc = from_key_values::<VncConfig>("port=5901,screen=simplefb").unwrap();
+        assert_eq!(vnc.screen, Some(DisplayScreen::Simplefb));
+
+        let vnc = from_key_values::<VncConfig>("port=5901,screen=gpu-0").unwrap();
+        assert_eq!(vnc.screen, Some(DisplayScreen::Gpu0));
+    }
+
+    /// A single `--vnc-server` with no `screen=` and a GPU present: the shape of every VNC command
+    /// line written so far, and it has to keep meaning the GPU's screen.
+    #[test]
+    #[cfg(all(feature = "vnc", feature = "gpu"))]
+    fn display_exporter_defaults_to_gpu_screen() {
+        let cfg = config_from_args(&["--gpu", "", "--vnc-server", "port=5900", "/dev/null"]);
+        assert_eq!(cfg.vnc_server.len(), 1);
+        assert_eq!(cfg.vnc_server[0].screen, Some(DisplayScreen::Gpu0));
+        assert!(cfg.vnc_server_for(DisplayScreen::Gpu0).is_some());
+        assert!(cfg.vnc_server_for(DisplayScreen::Simplefb).is_none());
+    }
+
+    /// The other half of the compat default: with no GPU the only screen is simplefb's, which is
+    /// where the bridge presented on its own before any of this was expressible.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn display_exporter_defaults_to_simplefb_without_gpu() {
+        let cfg = config_from_args(&[
+            "--simplefb",
+            SIMPLEFB_ARG,
+            "--vnc-server",
+            "port=5900",
+            "/dev/null",
+        ]);
+        assert_eq!(cfg.vnc_server[0].screen, Some(DisplayScreen::Simplefb));
+        assert!(cfg.vnc_server_for(DisplayScreen::Simplefb).is_some());
+    }
+
+    #[test]
+    #[cfg(all(feature = "android_display", feature = "gpu"))]
+    fn display_exporter_legacy_android_service_resolves() {
+        let cfg = config_from_args(&[
+            "--gpu",
+            "",
+            "--android-display-service",
+            "droidvm_disp_1",
+            "/dev/null",
+        ]);
+        assert_eq!(cfg.android_display_service.len(), 1);
+        assert_eq!(
+            cfg.android_display_service_for(DisplayScreen::Gpu0)
+                .map(|s| s.name.as_str()),
+            Some("droidvm_disp_1")
+        );
+    }
+
+    /// Two screens, one exporter each: the arrangement the whole change exists to make sayable.
+    #[test]
+    #[cfg(all(feature = "vnc", feature = "android_display", feature = "gpu"))]
+    fn display_exporter_one_per_screen() {
+        let cfg = config_from_args(&[
+            "--gpu",
+            "",
+            "--simplefb",
+            SIMPLEFB_ARG,
+            "--vnc-server",
+            "port=5900,screen=gpu-0",
+            "--android-display-service",
+            "name=win_fb,screen=simplefb",
+            "/dev/null",
+        ]);
+        assert!(cfg.vnc_server_for(DisplayScreen::Gpu0).is_some());
+        assert!(cfg.vnc_server_for(DisplayScreen::Simplefb).is_none());
+        assert!(cfg
+            .android_display_service_for(DisplayScreen::Gpu0)
+            .is_none());
+        assert_eq!(
+            cfg.android_display_service_for(DisplayScreen::Simplefb)
+                .map(|s| s.name.as_str()),
+            Some("win_fb")
+        );
+    }
+
+    /// A screen with no exporter is legal -- nobody is watching it, which is a state, not a fault.
+    #[test]
+    #[cfg(all(feature = "vnc", feature = "gpu"))]
+    fn display_exporter_screen_without_exporter_is_legal() {
+        let cfg = config_from_args(&[
+            "--gpu",
+            "",
+            "--simplefb",
+            SIMPLEFB_ARG,
+            "--vnc-server",
+            "port=5900,screen=gpu-0",
+            "/dev/null",
+        ]);
+        assert!(cfg.vnc_server_for(DisplayScreen::Simplefb).is_none());
+    }
+
+    /// Both exporters, neither naming a screen, with a GPU: this used to start, with VNC taking
+    /// the display and the service never registering. It is now the one thing that changed.
+    #[test]
+    #[cfg(all(feature = "vnc", feature = "android_display", feature = "gpu"))]
+    fn display_exporter_rejects_two_on_one_screen() {
+        let err = config_from_args_result(&[
+            "--gpu",
+            "",
+            "--vnc-server",
+            "port=5900",
+            "--android-display-service",
+            "droidvm_disp_1",
+            "/dev/null",
+        ])
+        .err()
+        .expect("expected the command line to be rejected");
+        assert!(err.contains("screen `gpu-0` has 2 exporters"), "{}", err);
+        assert!(err.contains("at most one"), "{}", err);
+    }
+
+    #[test]
+    #[cfg(all(feature = "vnc", feature = "gpu"))]
+    fn display_exporter_rejects_duplicate_vnc_port() {
+        let err = config_from_args_result(&[
+            "--gpu",
+            "",
+            "--simplefb",
+            SIMPLEFB_ARG,
+            "--vnc-server",
+            "port=5900,screen=gpu-0",
+            "--vnc-server",
+            "port=5900,screen=simplefb",
+            "/dev/null",
+        ])
+        .err()
+        .expect("expected the command line to be rejected");
+        assert!(err.contains("port 5900"), "{}", err);
+    }
+
+    /// The default port counts as a port: one entry saying `port=5900` and one saying nothing are
+    /// the same port, and the collision has to be caught on the value the server would bind.
+    #[test]
+    #[cfg(all(feature = "vnc", feature = "gpu"))]
+    fn display_exporter_rejects_duplicate_default_vnc_port() {
+        let err = config_from_args_result(&[
+            "--gpu",
+            "",
+            "--simplefb",
+            SIMPLEFB_ARG,
+            "--vnc-server",
+            "screen=gpu-0",
+            "--vnc-server",
+            "port=5900,screen=simplefb",
+            "/dev/null",
+        ])
+        .err()
+        .expect("expected the command line to be rejected");
+        assert!(err.contains("port 5900"), "{}", err);
+    }
+
+    #[test]
+    #[cfg(all(feature = "android_display", feature = "gpu"))]
+    fn display_exporter_rejects_duplicate_service_name() {
+        let err = config_from_args_result(&[
+            "--gpu",
+            "",
+            "--simplefb",
+            SIMPLEFB_ARG,
+            "--android-display-service",
+            "name=dup,screen=gpu-0",
+            "--android-display-service",
+            "name=dup,screen=simplefb",
+            "/dev/null",
+        ])
+        .err()
+        .expect("expected the command line to be rejected");
+        assert!(err.contains("name `dup`"), "{}", err);
+    }
+
+    /// Naming a screen whose device is absent. Loud on purpose: the alternative is an exporter
+    /// that is configured, reports nothing, and shows nothing for the life of the VM.
+    #[test]
+    #[cfg(all(feature = "vnc", feature = "gpu"))]
+    fn display_exporter_rejects_unconfigured_screen() {
+        let err = config_from_args_result(&[
+            "--gpu",
+            "",
+            "--vnc-server",
+            "port=5900,screen=simplefb",
+            "/dev/null",
+        ])
+        .err()
+        .expect("expected the command line to be rejected");
+        assert!(err.contains("screen `simplefb`"), "{}", err);
+        assert!(err.contains("--simplefb"), "{}", err);
+
+        let err = config_from_args_result(&[
+            "--simplefb",
+            SIMPLEFB_ARG,
+            "--vnc-server",
+            "port=5900,screen=gpu-0",
+            "/dev/null",
+        ])
+        .err()
+        .expect("expected the command line to be rejected");
+        assert!(err.contains("screen `gpu-0`"), "{}", err);
+        assert!(err.contains("--gpu"), "{}", err);
+    }
+
+    /// An exporter with no display device at all. Before, the value was quietly dropped (the
+    /// service) or quietly kept and never opened (the VNC server); either way nothing said so.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn display_exporter_rejects_no_display_device() {
+        let err = config_from_args_result(&["--vnc-server", "port=5900", "/dev/null"])
+            .err()
+            .expect("expected the command line to be rejected");
+        assert!(err.contains("no --simplefb device is configured"), "{}", err);
     }
 }
