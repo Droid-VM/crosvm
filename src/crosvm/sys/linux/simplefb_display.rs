@@ -270,25 +270,31 @@ fn build_gpu_transport(
     // udmabuf windows are made of whole pages, and it rejects anything else with `NotPageAligned`
     // -- checking here is only so the refusal names which end was wrong.
     let pagesize = base::pagesize();
-    if params.addr % pagesize as u64 != 0 {
+    if params.addr % pagesize as u64 != 0 || params.size % pagesize as u64 != 0 {
         return Err(format!(
-            "framebuffer at {:#x} is not page aligned",
-            params.addr
+            "framebuffer region {:#x}+{:#x} is not page aligned",
+            params.addr, params.size
         ));
     }
     let fb_bytes = (params.stride as usize)
         .checked_mul(params.height as usize)
         .ok_or_else(|| "framebuffer geometry overflows a usize".to_string())?;
-    // Round the window up to a whole page. Safe only because the rounded window is then checked
-    // against the region the device tree reserved: the extra bytes are guest memory nobody
-    // displays, not the next region's.
-    let window = fb_bytes.next_multiple_of(pagesize);
-    if window as u64 > params.size {
+    if fb_bytes as u64 > params.size {
         return Err(format!(
-            "{window}-byte page-rounded framebuffer does not fit the {}-byte region",
+            "{fb_bytes}-byte framebuffer does not fit the {}-byte region",
             params.size
         ));
     }
+    // The window is the WHOLE reserved region, not just the bytes the picture occupies, and the
+    // reason is not the obvious one. An importer's own layout for the same geometry can need more
+    // memory than `stride x height`: turnip asks for two rows beyond the last one, and refuses an
+    // fd smaller than its `VkMemoryRequirements` ("requirements exceed DMA-BUF allocation",
+    // measured on 5567). Nothing here can predict that number -- it belongs to whichever driver
+    // the sink loaded -- so give the importer everything the region has instead of computing a
+    // bound that is only right for the sinks we happened to test. It costs nothing: this region
+    // exists for this framebuffer and holds nothing else, the extra pages are never read (the
+    // image is described at its real geometry), and the guest cannot see the difference.
+    let window = params.size as usize;
 
     let driver = UdmabufDriver::new().map_err(|e| format!("udmabuf unavailable: {e}"))?;
     // The region is a slice of the guest's own memfd (see the comment where these params are
