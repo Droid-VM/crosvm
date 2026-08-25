@@ -17,6 +17,7 @@ use base::SafeDescriptor;
 use base::VolatileSlice;
 use base::WaitContext;
 use gpu_display::Damage;
+use gpu_display::DisplayExternalResourceImport;
 use gpu_display::EventDevice;
 use gpu_display::GpuDisplay;
 use gpu_display::GpuDisplayExt;
@@ -25,6 +26,8 @@ use gpu_display::ScanoutFrame;
 use gpu_display::SurfaceType;
 use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
+use vm_memory::udmabuf::UdmabufDriver;
+use vm_memory::udmabuf::UdmabufDriverTrait;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
@@ -137,6 +140,183 @@ pub fn start_simplefb_display_thread(
             }
         })
         .context("failed to spawn simplefb display thread")
+}
+
+/// The only modifier a udmabuf window over guest pages can honestly claim: the bytes are exactly
+/// as the guest laid them out, row after row.
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+/// How long the bridge waits for the sink to finish reading the framebuffer before flipping onto
+/// it again.
+///
+/// This is NOT the virtio-gpu flush path's fence, despite riding the same API. There the fence
+/// gates the *guest*'s reuse of a buffer it rendered into, and skipping the wait corrupts a frame.
+/// Here the source is guest memory the guest writes continuously with no synchronisation of any
+/// kind, so there is nothing to hold back and nothing to corrupt that was not already racy: the
+/// only thing this wait buys is that our timer loop does not queue a second blit while the first
+/// is still reading. The guest never waits on it -- it is a pacing device for the producer, and
+/// the timeout exists so that a sink which stops signalling slows the bridge down instead of
+/// stopping it. Three 120Hz vsyncs, the same figure the flush path settled on.
+const FLIP_FENCE_TIMEOUT: Duration = Duration::from_millis(25);
+
+/// What the bridge does with a frame once it has decided one exists.
+///
+/// The two arms differ in who reads the framebuffer, not in what is on screen. On `Cpu` the bridge
+/// copies `read_buf` into a buffer the sink hands out. On `Gpu` the sink reads the guest pages
+/// itself, through a dmabuf window created once at startup, and the copy the CPU path pays per
+/// frame becomes a Vulkan blit the sink was going to do anyway.
+///
+/// The watcher is untouched by this choice: it still reads the changed bands out of guest memory
+/// into `read_buf` on both. That read is redundant on the GPU path -- nothing presents `read_buf`
+/// there -- and it is kept deliberately, because it is also what makes the fallback below a
+/// single assignment: the moment a blit fails, the frame the sink was going to be shown is already
+/// sitting in host memory in the layout the CPU path wants. Removing it means the watcher has to
+/// learn which transport is live, which is the coupling §4.2 is trying to avoid; the measurement
+/// that would justify paying that price has not been taken.
+enum Transport {
+    Gpu(GpuTransport),
+    /// Always reachable. Every failure on the GPU path -- at startup or mid-run -- ends here and
+    /// stays here for the life of the bridge, because a udmabuf that could not be created or an
+    /// import a sink refused will not start working on the next tick, and retrying every 33ms
+    /// would be a log line and an ioctl per frame forever.
+    Cpu,
+}
+
+/// A dmabuf window over the framebuffer and the sink's import of it.
+struct GpuTransport {
+    /// The import the sink blits from. Created once and reused for the life of the bridge: unlike
+    /// virtio-gpu, whose compositor cycles through swapchain buffers, this framebuffer is one
+    /// fixed region at one fixed address, so there is nothing to re-import per frame.
+    import_id: u32,
+    /// The dmabuf the import was made from. Held for as long as the import is alive: the sink
+    /// takes what it needs from the fd at import time, but nothing here should depend on that
+    /// having been a full transfer of ownership.
+    _dmabuf: SafeDescriptor,
+    /// The completion fence of the previous `flip_to`, when the backend produced one. Waited on
+    /// (bounded) before the next flip; see `FLIP_FENCE_TIMEOUT`.
+    pending_fence: Option<SafeDescriptor>,
+    /// Whether a fence timeout has already been reported. A sink that stops signalling stops on
+    /// every frame, and a line per frame is not observability.
+    fence_timeout_logged: bool,
+}
+
+impl GpuTransport {
+    /// Waits, with a bound, for the previous flip's completion fence.
+    fn await_previous_flip(&mut self) {
+        let Some(fence) = self.pending_fence.take() else {
+            return;
+        };
+        let mut pfd = libc::pollfd {
+            fd: fence.as_raw_descriptor(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `pfd` points at one valid pollfd for the duration of the call, and the fd is
+        // owned by `fence`, which outlives it.
+        let ret = unsafe {
+            libc::poll(
+                &mut pfd,
+                1,
+                FLIP_FENCE_TIMEOUT.as_millis() as libc::c_int,
+            )
+        };
+        if ret == 0 && !self.fence_timeout_logged {
+            self.fence_timeout_logged = true;
+            warn!(
+                "simplefb: display flip fence still unsignaled after {:?}; flipping anyway \
+                 (further timeouts silent)",
+                FLIP_FENCE_TIMEOUT
+            );
+        }
+    }
+}
+
+/// Builds the GPU transport for this framebuffer, or says why there is none.
+///
+/// Everything here runs once, immediately after the surface is created and therefore BEFORE the
+/// first tick -- which means before any consumer can exist. That ordering is the point: whether
+/// this framebuffer can be handed to a sink as a dmabuf is a property of the region and the sink,
+/// not of whether somebody happens to be watching, so the answer is reached, and logged, on every
+/// run rather than only on runs where an app attached.
+fn build_gpu_transport(
+    guest_mem: &GuestMemory,
+    params: &SimplefbDisplayParams,
+    display: &mut GpuDisplay,
+    surface_id: u32,
+) -> std::result::Result<GpuTransport, String> {
+    if !display.is_dmabuf_import_supported() {
+        return Err("the bound sink imports no dmabufs".to_string());
+    }
+
+    // udmabuf windows are made of whole pages, and it rejects anything else with `NotPageAligned`
+    // -- checking here is only so the refusal names which end was wrong.
+    let pagesize = base::pagesize();
+    if params.addr % pagesize as u64 != 0 {
+        return Err(format!(
+            "framebuffer at {:#x} is not page aligned",
+            params.addr
+        ));
+    }
+    let fb_bytes = (params.stride as usize)
+        .checked_mul(params.height as usize)
+        .ok_or_else(|| "framebuffer geometry overflows a usize".to_string())?;
+    // Round the window up to a whole page. Safe only because the rounded window is then checked
+    // against the region the device tree reserved: the extra bytes are guest memory nobody
+    // displays, not the next region's.
+    let window = fb_bytes.next_multiple_of(pagesize);
+    if window as u64 > params.size {
+        return Err(format!(
+            "{window}-byte page-rounded framebuffer does not fit the {}-byte region",
+            params.size
+        ));
+    }
+
+    let driver = UdmabufDriver::new().map_err(|e| format!("udmabuf unavailable: {e}"))?;
+    // The region is a slice of the guest's own memfd (see the comment where these params are
+    // built), so this is a window over exactly the pages the guest writes -- no copy, no second
+    // allocation. The driver fd is not kept: the ioctl is what needed it, and the dma_buf it
+    // returns holds its own reference to the memfd pages.
+    let dmabuf = driver
+        .create_udmabuf(guest_mem, &[(GuestAddress(params.addr), window)])
+        .map_err(|e| format!("udmabuf create failed: {e}"))?;
+
+    // THE CROSSING (plan §4.4). Until now this framebuffer travelled the CPU path, where colour is
+    // kept right by an unwritten invariant: the producer is assumed to emit BGRX and the sink
+    // swaps red and blue unconditionally. From here the sink stops assuming and reads the fourcc
+    // instead, picking a VkFormat from it (`vkFormatFromDrmFourcc`). The device tree's default
+    // `a8r8g8b8` is AR24, which in memory IS the pipeline's canonical BGRX, so declaring it lands
+    // on B8G8R8A8_UNORM and the picture is identical to the CPU path's. Declare it wrong and every
+    // pixel comes out with red and blue exchanged, on both paths' behalf, with no error anywhere
+    // and nothing in the logs -- the failure looks like a picture. `params.fourcc` is the DT
+    // string resolved once at config time (`simplefb_format_fourcc`) precisely so that this is one
+    // declaration rather than an assumption made twice.
+    //
+    // `linear_layout_verified` means what the pool-scanout path means by it: this single-plane
+    // buffer really is a linear image with the stride given. Here it holds by construction rather
+    // than by inspection -- the window starts at byte zero of the framebuffer, rows are `stride`
+    // apart because that is how simplefb is defined, and no tiling exists anywhere on this route.
+    let import_id = display
+        .import_resource(
+            surface_id,
+            DisplayExternalResourceImport::Dmabuf {
+                descriptor: &dmabuf,
+                offset: 0,
+                stride: params.stride,
+                modifiers: DRM_FORMAT_MOD_LINEAR,
+                linear_layout_verified: true,
+                width: params.width,
+                height: params.height,
+                fourcc: params.fourcc,
+            },
+        )
+        .map_err(|e| format!("the sink refused the import: {e:#}"))?;
+
+    Ok(GpuTransport {
+        import_id,
+        _dmabuf: dmabuf,
+        pending_fence: None,
+        fence_timeout_logged: false,
+    })
 }
 
 /// Rows hashed as one unit.
@@ -439,6 +619,27 @@ fn simplefb_display_loop(
         .create_surface(None, None, &display_params, SurfaceType::Scanout)
         .context("failed to create display surface")?;
 
+    info!(
+        "simplefb display bridge: {}x{} stride={} bpp={} addr={:#x} @ {}fps",
+        params.width, params.height, params.stride, params.bpp, params.addr, params.poll_hz,
+    );
+
+    // Decided here, before the loop and before any consumer can exist, so that the outcome is on
+    // record for every run. A failure is permanent by design: see `Transport::Cpu`.
+    let mut transport = match build_gpu_transport(&guest_mem, params, display, surface_id) {
+        Ok(gpu) => {
+            info!(
+                "simplefb: transport=gpu-blit {}x{} stride={} fourcc={:#x} import={}",
+                params.width, params.height, params.stride, params.fourcc, gpu.import_id,
+            );
+            Transport::Gpu(gpu)
+        }
+        Err(reason) => {
+            info!("simplefb: transport=cpu ({reason})");
+            Transport::Cpu
+        }
+    };
+
     let frame_duration = tick_duration(params.poll_hz);
     let guest_addr = GuestAddress(params.addr);
     let fb_size = (params.stride as usize) * (params.height as usize);
@@ -448,11 +649,6 @@ fn simplefb_display_loop(
     let mut scratch = [0u8; HASH_CHUNK_BYTES];
     let mut watcher = FramebufferWatcher::new(params);
     let mut no_framebuffer: u64 = 0;
-
-    info!(
-        "simplefb display bridge: {}x{} stride={} bpp={} addr={:#x} @ {}fps",
-        params.width, params.height, params.stride, params.bpp, params.addr, params.poll_hz,
-    );
 
     loop {
         let frame_start = Instant::now();
@@ -536,47 +732,91 @@ fn simplefb_display_loop(
             continue;
         }
 
-        // The whole buffer, with full damage, however few bands were copied into it. The narrower
-        // present that suggests itself here -- copy only the changed rows into the sink -- is a
-        // trap: the destination rotates between buffers and nothing tracks their age, so the rows
-        // this frame does not write are whatever some earlier frame left in that particular
-        // buffer, not what is currently on screen. `read_buf` is what makes the skip safe, and the
-        // skip is where the saving is; narrowing the copy as well would give back a memcpy of host
-        // memory in exchange for a class of stale-region bug that reports nothing when it happens.
-        let frame = ScanoutFrame {
-            bytes: &read_buf,
-            stride: params.stride,
-            width: params.width,
-            height: params.height,
-            fourcc: params.fourcc,
-            damage: Damage::Full,
-        };
-        match display.present_frame(surface_id, &frame) {
-            PresentOutcome::Flipped => {
-                watcher.pending_present = false;
-                no_framebuffer = 0;
-            }
-            PresentOutcome::NoFramebuffer => {
-                // No framebuffer to write into: the sink never gave us one (an Android display
-                // whose service lost the name race hands out a surface with no window behind it)
-                // or it is transiently locked. Silence here cost a whole debugging session -- the
-                // bridge looked perfectly healthy while presenting nothing -- so say it, backing
-                // off so a permanent condition does not fill the log.
-                //
-                // `pending_present` stays set. It has to: the content is in read_buf and its hash
-                // is recorded, so nothing later would call this frame new, and a dropped frame
-                // that never comes back is the failure this producer is supposed to be immune to.
-                no_framebuffer += 1;
-                if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
-                    warn!(
-                        "simplefb: no framebuffer from the display sink ({} frame(s) dropped)",
-                        no_framebuffer
-                    );
+        // Which transport carries it is settled; what counts as a frame is not affected by it. Both
+        // arms clear `pending_present` only on a present that landed, so the attach edge's forced
+        // full pass and the `NoFramebuffer` re-offer behave identically either way.
+        let mut blit_failed: Option<u32> = None;
+        match &mut transport {
+            Transport::Gpu(gpu) => {
+                // Pace against the previous blit before handing the sink the same pages again.
+                gpu.await_previous_flip();
+                match display.flip_to(surface_id, gpu.import_id, None, None, None) {
+                    Ok(_waitable) => {
+                        watcher.pending_present = false;
+                        no_framebuffer = 0;
+                        // A backend whose blit is asynchronous hands back a sync_file here; one
+                        // whose flip is synchronous hands back nothing and the wait above is a
+                        // no-op. Collect it either way -- an uncollected fence is closed on the
+                        // sink's next flip, which is a leak of exactly one fd per frame.
+                        gpu.pending_fence = display.take_flip_completion_fence(surface_id);
+                    }
+                    Err(e) => {
+                        // The blit is the sink's, and a sink that cannot do it now will not be able
+                        // to on the next tick either (a lost Vulkan device, a torn-down surface).
+                        // Say so once and spend the rest of this VM on the CPU path, which needs no
+                        // cooperation from anything: `read_buf` already holds this exact frame, and
+                        // `pending_present` is still set, so the very next tick presents it.
+                        warn!(
+                            "simplefb: gpu blit failed, falling back to cpu copy for the rest of \
+                             this VM: {e:#}"
+                        );
+                        blit_failed = Some(gpu.import_id);
+                    }
                 }
-                // The flip on this path is not presenting anything -- it is what releases a sink
-                // that handed back nothing, and it has been here since before the copy moved out.
-                display.flip(surface_id);
             }
+            Transport::Cpu => {
+                // The whole buffer, with full damage, however few bands were copied into it. The
+                // narrower present that suggests itself here -- copy only the changed rows into the
+                // sink -- is a trap: the destination rotates between buffers and nothing tracks
+                // their age, so the rows this frame does not write are whatever some earlier frame
+                // left in that particular buffer, not what is currently on screen. `read_buf` is
+                // what makes the skip safe, and the skip is where the saving is; narrowing the copy
+                // as well would give back a memcpy of host memory in exchange for a class of
+                // stale-region bug that reports nothing when it happens.
+                let frame = ScanoutFrame {
+                    bytes: &read_buf,
+                    stride: params.stride,
+                    width: params.width,
+                    height: params.height,
+                    fourcc: params.fourcc,
+                    damage: Damage::Full,
+                };
+                match display.present_frame(surface_id, &frame) {
+                    PresentOutcome::Flipped => {
+                        watcher.pending_present = false;
+                        no_framebuffer = 0;
+                    }
+                    PresentOutcome::NoFramebuffer => {
+                        // No framebuffer to write into: the sink never gave us one (an Android
+                        // display whose service lost the name race hands out a surface with no
+                        // window behind it) or it is transiently locked. Silence here cost a whole
+                        // debugging session -- the bridge looked perfectly healthy while presenting
+                        // nothing -- so say it, backing off so a permanent condition does not fill
+                        // the log.
+                        //
+                        // `pending_present` stays set. It has to: the content is in read_buf and
+                        // its hash is recorded, so nothing later would call this frame new, and a
+                        // dropped frame that never comes back is the failure this producer is
+                        // supposed to be immune to.
+                        no_framebuffer += 1;
+                        if no_framebuffer == 1 || no_framebuffer % 300 == 0 {
+                            warn!(
+                                "simplefb: no framebuffer from the display sink ({} frame(s) \
+                                 dropped)",
+                                no_framebuffer
+                            );
+                        }
+                        // The flip on this path is not presenting anything -- it is what releases a
+                        // sink that handed back nothing, and it has been here since before the copy
+                        // moved out.
+                        display.flip(surface_id);
+                    }
+                }
+            }
+        }
+        if let Some(import_id) = blit_failed {
+            display.release_import(import_id, surface_id);
+            transport = Transport::Cpu;
         }
 
         let elapsed = frame_start.elapsed();
@@ -585,6 +825,9 @@ fn simplefb_display_loop(
         }
     }
 
+    if let Transport::Gpu(gpu) = &transport {
+        display.release_import(gpu.import_id, surface_id);
+    }
     display.release_surface(surface_id);
     Ok(())
 }
