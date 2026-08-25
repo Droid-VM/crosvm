@@ -305,7 +305,14 @@ fn build(
     #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
     snapshot_scratch_directory: Option<PathBuf>,
 ) -> Option<VirtioGpu> {
+    // `display_backends` is a try-in-turn chain, so a backend declining is how it is meant to
+    // work, not a fault: `--gpu` on an Android host carries an X entry that no Android host has
+    // ever been able to open. Reporting each refusal at error level as it happened made the
+    // ordinary case read as a failure -- "failed to open display: unsupported by the
+    // implementation" on every single boot -- while saying nothing about what did open. Collect
+    // them instead and report once, below, where the outcome is known.
     let mut display_opt = None;
+    let mut declined: Vec<String> = Vec::new();
     for display_backend in display_backends {
         match display_backend.build(
             #[cfg(windows)]
@@ -316,20 +323,40 @@ fn build(
                 .expect("failed to clone wait context ctrl channel"),
         ) {
             Ok(c) => {
-                display_opt = Some(c);
+                display_opt = Some((display_backend, c));
                 break;
             }
-            Err(e) => error!("failed to open display: {}", e),
+            Err(e) => declined.push(format!("{}: {}", display_backend.name(), e)),
         };
     }
 
-    let display = match display_opt {
+    let (chosen, display) = match display_opt {
         Some(d) => d,
         None => {
-            error!("failed to open any displays");
+            error!("failed to open any display backend ({})", declined.join("; "));
             return None;
         }
     };
+
+    // One line, and it names the outcome rather than the attempts. Landing on the stub is the
+    // case worth spelling out: it is what a GPU device does when no exporter is bound to its
+    // screen, which is a legitimate configuration -- the picture is somebody else's, the simplefb
+    // screen's or nobody's -- and it used to be indistinguishable from a broken display. Whatever
+    // was declined on the way is carried in the same line so a bound exporter that failed to open
+    // still reports its reason here.
+    let declined = if declined.is_empty() {
+        String::new()
+    } else {
+        format!(" (after {})", declined.join("; "))
+    };
+    match chosen {
+        DisplayBackend::Stub => info!(
+            "gpu: no exporter opened this device's screen; rendering to the stub display, where \
+             frames are discarded{}",
+            declined
+        ),
+        _ => info!("gpu: display backend {} opened{}", chosen.name(), declined),
+    }
 
     VirtioGpu::new(
         display,
@@ -912,10 +939,32 @@ impl Frontend {
                             GpuResponse::ErrRutabaga(RutabagaError::InvalidContextId)
                         )
                     );
+                    // A display with nowhere to put pixels refuses the cursor plane, and a guest
+                    // moving its pointer asks again for every motion sample. The stub backend --
+                    // where a GPU device lands when no exporter is bound to its screen -- returns
+                    // `Unsupported` from `create_surface` for any parented surface, so a VM whose
+                    // picture is somebody else's (the simplefb screen's, or nobody's) printed one
+                    // ERROR per pointer sample for as long as it ran. The response the guest gets
+                    // is unchanged, and the guest does not read it: cursor commands ride the
+                    // cursor queue, which the driver posts to without inspecting the reply. What
+                    // changes is that the log stops describing a working configuration as broken;
+                    // the one INFO line at display-open already said there is no screen here.
+                    let cursor_on_a_screenless_display = matches!(
+                        (&gpu_cmd, &gpu_response),
+                        (
+                            GpuCommand::UpdateCursor(_) | GpuCommand::MoveCursor(_),
+                            GpuResponse::ErrDisplay(GpuDisplayError::Unsupported)
+                        )
+                    );
                     if expected_during_teardown {
                         debug!(
                             "gpu command {:?} arrived after its context went away: {:?}",
                             gpu_cmd, gpu_response
+                        );
+                    } else if cursor_on_a_screenless_display {
+                        debug!(
+                            "gpu command {:?}: this display has no plane to put a cursor on",
+                            gpu_cmd
                         );
                     } else {
                         error!(
@@ -1649,6 +1698,27 @@ pub enum DisplayBackend {
 }
 
 impl DisplayBackend {
+    /// What this entry is called when the chain reports which of them opened and which declined.
+    ///
+    /// Deliberately not the `Debug` derive: the Android and VNC variants carry a service name and
+    /// a listen address, and a log line about which backend opened is not the place to repeat
+    /// either. What a reader needs is which kind it was.
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            DisplayBackend::Wayland(_) => "wayland",
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            DisplayBackend::X(_) => "x",
+            DisplayBackend::Stub => "stub",
+            #[cfg(windows)]
+            DisplayBackend::WinApi => "winapi",
+            #[cfg(feature = "android_display")]
+            DisplayBackend::Android(_) => "android",
+            #[cfg(feature = "vnc")]
+            DisplayBackend::VncTcp(..) => "vnc",
+        }
+    }
+
     fn build(
         &self,
         #[cfg(windows)] wndproc_thread: &mut Option<WindowProcedureThread>,
