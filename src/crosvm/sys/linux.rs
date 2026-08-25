@@ -4095,6 +4095,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             bpp,
             size: fb_size,
             fourcc,
+            // A host-side property: it says how often we look, not anything about the device the
+            // guest was handed, which is why it goes here and not into the device tree.
+            poll_hz: sfb_cfg.poll_hz,
         };
 
         // The app display path takes precedence when configured: it presents into the Surface the

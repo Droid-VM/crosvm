@@ -2416,7 +2416,7 @@ pub struct RunCommand {
     /// for testing purposes.
     pub simple_media_device: Option<bool>,
 
-    #[argh(option, arg_name = "width=WIDTH,height=HEIGHT[,format=FORMAT]")]
+    #[argh(option, arg_name = "width=WIDTH,height=HEIGHT[,format=FORMAT][,poll-hz=N]")]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
     /// configure a simple framebuffer device exposed via device tree.
@@ -2425,6 +2425,9 @@ pub struct RunCommand {
     ///     width=WIDTH - framebuffer width in pixels
     ///     height=HEIGHT - framebuffer height in pixels
     ///     format=FORMAT - pixel format (default: a8r8g8b8)
+    ///     poll-hz=N - times a second the host looks for a new
+    ///     picture; this framebuffer signals nothing, so this is
+    ///     the whole of what decides a frame rate (default: 30)
     pub simplefb: Option<SimplefbConfig>,
 
     #[argh(

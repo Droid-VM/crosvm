@@ -638,10 +638,29 @@ pub struct SimplefbConfig {
     pub height: u32,
     #[serde(default = "default_simplefb_format")]
     pub format: String,
+    /// How many times a second the host looks at the framebuffer.
+    ///
+    /// This framebuffer has no way to announce a new frame -- the guest maps it write-combining and
+    /// nothing traps -- so the only thing that decides when a picture exists is this rate. It is a
+    /// property of the host's watcher, not of the device the guest sees: the device tree says
+    /// nothing about it and the guest cannot tell what it is set to.
+    #[serde(default = "default_simplefb_poll_hz")]
+    pub poll_hz: u32,
 }
 
 fn default_simplefb_format() -> String {
     "a8r8g8b8".to_string()
+}
+
+/// The rate the simplefb bridge polled at for as long as the rate was not settable.
+pub const DEFAULT_SIMPLEFB_POLL_HZ: u32 = 30;
+
+/// Above this the watcher is asking for more work than a display can show. It is a sanity bound on
+/// a knob whose cost is linear in it, not a claim about what the hardware can do.
+const MAX_SIMPLEFB_POLL_HZ: u32 = 240;
+
+fn default_simplefb_poll_hz() -> u32 {
+    DEFAULT_SIMPLEFB_POLL_HZ
 }
 
 pub fn parse_cpu_btreemap_u32(s: &str) -> Result<BTreeMap<usize, u32>, String> {
@@ -1470,6 +1489,10 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
         validate_pmem(pmem)?;
     }
 
+    if let Some(simplefb) = cfg.simplefb.as_ref() {
+        validate_simplefb(simplefb)?;
+    }
+
     // Validate platform specific things
     super::sys::config::validate_config(cfg)
 }
@@ -1487,6 +1510,23 @@ fn validate_file_backed_mapping(mapping: &mut FileBackedMappingParameters) -> Re
         return Err(
             "--file-backed-mapping addr and size parameters must be page size aligned".to_string(),
         );
+    }
+
+    Ok(())
+}
+
+fn validate_simplefb(simplefb: &SimplefbConfig) -> Result<(), String> {
+    // Zero is the value worth rejecting by name: it reads like "do not poll" but the bridge divides
+    // by it to get a frame duration, so what it would actually mean is decided by arithmetic rather
+    // than by anyone. There is no "off" here -- not configuring `--simplefb` is the off switch.
+    if simplefb.poll_hz == 0 {
+        return Err("`simplefb` poll-hz must be at least 1".to_string());
+    }
+    if simplefb.poll_hz > MAX_SIMPLEFB_POLL_HZ {
+        return Err(format!(
+            "`simplefb` poll-hz must be at most {}",
+            MAX_SIMPLEFB_POLL_HZ
+        ));
     }
 
     Ok(())
