@@ -2,93 +2,52 @@
 // Copyright DroidVM contributors
 // Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
 
-//! The VNC sink's hardware-encode rung: a second consumer on the frame bus, and the socket its
-//! output leaves by.
+//! The VNC sink's hardware-encode rung: a second consumer on the frame bus, and the codec behind
+//! it.
 //!
-//! Plan §6 step 13. The frame the sink is already holding -- the same offer, at the same instant,
-//! that the LibVNCServer consumer is turning into RFB rectangles -- is also handed to a MediaCodec
-//! H.264 encoder, and the compressed result is served on a TCP port of its own. Nothing about RFB
-//! changes: a legacy client connected to the same server keeps being served the same way it always
-//! was, from the same offer, which is the entire reason step 12 split ingest from consumers.
+//! Plan §6 step 13, and then plans/H264_SINGLE_PORT.md. The frame the sink is already holding --
+//! the same offer, at the same instant, that the LibVNCServer consumer is turning into RFB
+//! rectangles -- is also handed to a MediaCodec H.264 encoder. Nothing about RFB changes: a legacy
+//! client connected to the same server keeps being served the same way it always was, from the
+//! same offer, which is the entire reason step 12 split ingest from consumers.
 //!
-//! **Two audiences, one encoder.** The compressed stream leaves by two doors. This file owns the
-//! side channel: a TCP port of its own, the DVH2 framing below, one client at a time, and it is
-//! what the DroidVM app uses -- pixels from here, input over RFB, neither half having to know
-//! about the other. The second door is `vnc_h264_rfb.c`, which serves the same stream inside
-//! ordinary FramebufferUpdate messages on the RFB port itself, to third-party clients that ask for
-//! the Open H.264 encoding (50). Both are fed from the drain thread below, out of one codec.
+//! **One door, on the RFB port.** The compressed stream leaves by exactly one route:
+//! `vnc_h264_rfb.c`, which serves it inside ordinary FramebufferUpdate messages to clients that
+//! asked for the Open H.264 encoding (50) -- TigerVNC, noVNC, and the DroidVM app, which asks for
+//! 50 and for the private pseudo-encoding 0x44564831 as well.
 //!
-//! The side channel came first and is not made redundant by the RFB one. It states the geometry in
-//! a header instead of a rectangle, it is length-prefixed rather than request-driven, and it is
-//! independent of whatever an RFB client is doing to the pixel path -- so it stays the thing the
-//! app depends on, and the failure mode of the newer door is "a viewer sees no picture", not "the
-//! app lost its stream".
+//! It used to leave by two. The DVH2 side channel -- its own TCP listener on `RFB port + 100`, its
+//! own framing, one client at a time -- is gone, and this file is what is left of it: the codec,
+//! the drain thread, and the two facts the side channel's framing used to carry, which have moved
+//! onto the RFB wire as 0x44564831 rects. What the deletion buys is one port per screen, which is
+//! one thing to open, one thing to forward, and one thing that can be wrong.
 //!
-//! **Double encoding is real and bounded.** While a LEGACY RFB client and a side-channel client
-//! are both connected the frame is encoded twice, once by LibVNCServer and once by the codec. That
-//! is the honest cost of serving two client kinds at once and it is what the bus is for; it is not
-//! paid when only one kind is connected, because this consumer feeds nothing with nothing waiting
-//! for it and LibVNCServer marks nothing with no RFB client. An RFB client being served encoding
-//! 50 does not pay it either: its pixel path is suppressed for as long as it is on the stream (see
+//! Two of its mechanisms survive by name in the C file, because they were never about sockets:
+//!
+//! * The **heartbeat**, and its three-second unit. A still screen and a dead stream are
+//!   indistinguishable to a receiver that is only ever written to. DVH2 answered that with a
+//!   zero-length frame every three seconds; the broker answers it with a heartbeat rect on the
+//!   same cadence, to clients that speak the pseudo-encoding.
+//! * The **refusal**, which was a token on the wire and is now a caps value: 1 where DVH2 said
+//!   `no-encoder`, which is the one answer that licenses a client to stop asking.
+//!
+//! **Double encoding is real and bounded.** While a LEGACY RFB client and an h264 one are both
+//! connected the frame is encoded twice, once by LibVNCServer and once by the codec. That is the
+//! honest cost of serving two client kinds at once and it is what the bus is for; it is not paid
+//! when only one kind is connected, because this consumer feeds nothing with nothing waiting for
+//! it and LibVNCServer marks nothing with no RFB client. An RFB client being served encoding 50
+//! does not pay it either: its pixel path is suppressed for as long as it is on the stream (see
 //! vnc_h264_rfb.c), so it costs the codec nothing extra and LibVNCServer nothing at all.
 //!
-//! **The wire format**, in full, because a receiver has to be written against it:
-//!
-//! ```text
-//! on connect:    "DVH2"          4 bytes, magic
-//!                width           u16 little-endian
-//!                height          u16 little-endian
-//! then, forever: length          u32 little-endian
-//!                payload         `length` bytes of Annex-B NAL units (start codes included)
-//!                                -- or nothing at all, when `length` is zero: a heartbeat
-//! ```
-//!
-//! A refused connection gets the magic `"DVHX"` followed by a NUL-terminated reason and is closed.
-//! A client that does not read `"DVH2"` must give up rather than guess. The geometry in the header
-//! describes every payload that follows it: if the screen changes size the connection is ended, so
-//! that the new size is stated by a new header rather than inferred from the stream.
-//!
-//! **Liveness, in both directions, out of one mechanism.** The stream carries no traffic at all
-//! while the screen is still, and a TCP connection with no traffic on it tells neither end anything
-//! about the other. So a live connection that has had nothing to say for three seconds is sent a
-//! frame of length zero and no payload. It is not a picture and it is not counted as one; it exists
-//! so that both ends have something to time out against.
-//!
-//! * For the client, it means silence longer than the heartbeat interval is a fact about the host,
-//!   not about the screen: a receiver sets its own read timeout and falls back when the beats stop.
-//! * For the host, it means there is always a write to fail. A peer that is gone -- process dead,
-//!   connection reset, cable pulled -- is discovered by the next beat, within three seconds,
-//!   whatever the screen is doing. Before the heartbeat there was nothing to fail on: a client that
-//!   left during a static EDK2 screen held the stream for seventeen measured seconds, because the
-//!   write that would have failed only happened when a keystroke finally changed the picture.
-//!
-//! A peer that is still *there* and has merely stopped reading is a slower thing to see, and the
-//! honest bound is worth stating: the write only blocks once the bytes it is not draining have
-//! filled its receive buffer and then this end's send buffer (capped, see `CLIENT_SEND_BUFFER`),
-//! and only then does the ten-second write timeout start. How long that takes is the buffering
-//! divided by the bitrate -- seconds on a moving screen, longer on an idle one, where the only
-//! thing not being read is a four-byte beat every three seconds and nothing is being missed.
-//!
-//! Heartbeats begin after the header and only on a promoted connection; a client that is still
-//! waiting for the first encoder gets nothing until it is admitted or refused.
-//!
-//! **SPS/PPS: sent on connect, not attached to every IDR.** The encoder emits its codec-specific
-//! data exactly once, in its first output buffer, which serves the client that was already
-//! connected and nobody after it. So the parameter sets are cached when they appear and written as
-//! the first payload frame of every later connection, immediately before the sync frame that
-//! connection asks for. The alternative -- prepend them to every IDR -- costs bytes every couple
-//! of seconds forever to solve a problem that only exists at connect time. Because payloads are
-//! concatenated by the receiver, the bytes that arrive are `SPS PPS IDR ...` either way, which is
-//! what an Annex-B decoder wants to see.
+//! **SPS/PPS: cached, not attached to every IDR.** The encoder emits its codec-specific data
+//! exactly once, in its first output buffer, which serves whoever was already connected and nobody
+//! after that. So the parameter sets are cached by the broker when they appear and put in front of
+//! the IDR each later client joins on. The alternative -- prepend them to every IDR -- costs bytes
+//! every couple of seconds forever to solve a problem that only exists at join time.
 
 use std::ffi::c_char;
 use std::ffi::c_int;
 use std::ffi::c_void;
-use std::io::Write;
-use std::net::SocketAddr;
-use std::net::TcpListener;
-use std::net::TcpStream;
-use std::os::fd::AsRawFd;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -97,15 +56,6 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
-
-/// The side channel's port, relative to the RFB port this sink already listens on.
-///
-/// A fixed offset rather than "the next free port": a client has to be able to work out where the
-/// stream is without being told, and it already knows the VNC port. 100 rather than 1 so the
-/// pairing survives the common habit of running several VMs on consecutive VNC ports -- 5900/5901
-/// would collide with the neighbour's RFB port, 6000/6001 do not collide with anything.
-/// `h264-port=` overrides it for the case where something else already holds the address.
-pub const H264_PORT_OFFSET: u16 = 100;
 
 /// Frames per second declared to the encoder, and the rate the bitrate is scaled against.
 ///
@@ -140,59 +90,34 @@ const OUTPUT_BUFFER_INITIAL: usize = 512 * 1024;
 /// a wedged encoder is a worse failure than a large allocation.
 const OUTPUT_BUFFER_LOUD: usize = 16 * 1024 * 1024;
 
-/// Longest a drain iteration parks in the codec waiting for output. Also the shutdown latency.
+/// Longest a drain iteration parks in the codec waiting for output. Also the shutdown latency, and
+/// the resolution of the broker's heartbeat clock: `vnc_h264_rfb_tick` is called once per
+/// iteration, so a beat lands within a tenth of a second of when it is due.
 const OUTPUT_POLL_TIMEOUT_US: i64 = 100_000;
 
-/// How long a socket write is given before the client is considered gone.
-///
-/// It is a bound on how long a stalled reader can occupy the stream, and nothing else has to be
-/// traded against it: the write happens on the drain thread with no lock held, so a peer that has
-/// stopped reading costs this module a drain thread and the codec a few buffers, never the
-/// producer -- the guest's flush path takes the slot lock only to say the screen resized, and it
-/// finds it free.
-///
-/// Ten seconds is generous for a LAN and deliberately so: the thing being caught here is a client
-/// that is gone or wedged, not one that is briefly slow, and the heartbeat below is what turns
-/// "gone" into a write that can time out at all.
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// What this host can currently do about H.264, as the caps rect's `value` byte says it.
+/// plans/H264_SINGLE_PORT.md §1; the numbers are the wire and are mirrored in vnc_h264_rfb.h.
+const CAPS_AVAILABLE: c_int = 0;
+const CAPS_UNAVAILABLE: c_int = 1;
+const CAPS_WARMING: c_int = 2;
 
-/// How large a backlog the kernel may hold for a client before a write has to wait for it.
+/// The caps value for a host in this state, derived rather than remembered.
 ///
-/// Measured, because the write timeout above turns out not to mean what it looks like: `write`
-/// blocks only when the socket's send buffer is full, and Linux grows that buffer on its own --
-/// 6.4 MB on the test device. A client that stopped reading a 40 KB/s stream absorbed four
-/// megabytes over two minutes without a single write ever blocking, so the ten-second timeout had
-/// nothing to count against and the slot stayed held. Capping the buffer converts the timeout from
-/// "ten seconds after the kernel gives up growing" into "ten seconds after a quarter of a megabyte
-/// is outstanding", which is a wall-clock bound as soon as the stream has a bitrate at all.
+/// `encoder_failed` is the permanent answer and outranks everything: it is a fact about the device
+/// -- no codec could be created -- and the one value that licenses a client to stop waiting. An
+/// encoder that exists is `available`; one that has not been asked for yet, or is between builds,
+/// is `warming`, which is what a broker starts at.
 ///
-/// 256 KiB is about two thirds of a second of a 720p stream, and at any round trip this is used
-/// over -- loopback, USB, a LAN -- it still allows tens of megabytes a second, which is more than
-/// an order of magnitude above what the stream asks for.
-///
-/// It bounds this end only, and that is worth being honest about: the peer's receive buffer is not
-/// ours to size, and a receiver that stops reading keeps acknowledging into its own buffer until
-/// that is full too. The host cannot see a stalled reader any sooner than the reader's own buffer
-/// allows -- which is the one thing a write-only protocol cannot fix from this side.
-const CLIENT_SEND_BUFFER: c_int = 256 * 1024;
-
-/// How long a promoted client may hear nothing before the host sends it a zero-length frame.
-///
-/// Three seconds is the whole liveness contract's unit: the receiver's read timeout is set against
-/// it (comfortably longer, so a late beat is not a death), and the worst case for noticing a peer
-/// that stopped reading is one of these plus one `CLIENT_WRITE_TIMEOUT`.
-///
-/// It is a floor on silence, not a schedule. A frame that goes out resets it, so a moving screen
-/// sends no heartbeats at all -- there is nothing to prove when frames are arriving.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
-
-/// How long a connecting client waits for the first encoder to exist before being turned away.
-///
-/// It has to wait for one, because the header states the stream's geometry and there is no honest
-/// answer until a frame has arrived to be encoded. Ten seconds is long enough for a guest that is
-/// merely between frames and short enough that a client attached to a VM producing nothing at all
-/// finds out.
-const ADMIT_ENCODER_WAIT: Duration = Duration::from_secs(10);
+/// A free function so that the mapping can be asserted without a device, a server or a codec.
+fn caps_for(encoder_failed: bool, have_encoder: bool) -> c_int {
+    if encoder_failed {
+        CAPS_UNAVAILABLE
+    } else if have_encoder {
+        CAPS_AVAILABLE
+    } else {
+        CAPS_WARMING
+    }
+}
 
 // -------------------------------------------------------------------------------------------
 // The encoder, on the other side of the FFI.
@@ -483,330 +408,19 @@ struct CursorOverlay {
 }
 
 // -------------------------------------------------------------------------------------------
-// The socket.
-// -------------------------------------------------------------------------------------------
-
-const MAGIC_STREAM: &[u8; 4] = b"DVH2";
-const MAGIC_REFUSED: &[u8; 4] = b"DVHX";
-
-// -------------------------------------------------------------------------------------------
-// Why a connection was refused, as the wire says it.
-//
-// **The first token is machine-readable and stable.** A reason is `token: sentence`: everything
-// before the first colon is a fixed word a receiver may dispatch on and this file may never
-// reword, and everything after it is for a human reading a log and may be reworded at will. A
-// receiver that matches on the sentence is matching on the wrong half.
-//
-// The tokens, and what each one licenses the client to do:
-//
-// * `no-encoder` -- this device cannot build an H.264 encoder at all. **Permanent**: the answer
-//   comes from a codec that could not be created, which is a fact about the device and not about
-//   this moment, so a client should stop asking and tell its user the stream is unavailable.
-// * `busy` -- another client holds the stream. **Transient**: one at a time is a limitation of this
-//   implementation, and the slot frees the moment that client leaves, so back off and retry.
-// * `no-frame` -- nothing has been encoded yet; the screen may simply be idle. **Transient**, and
-//   the token a client that only knows the two above should treat like any other unknown one: back
-//   off and retry. New tokens may be added; the two named above will not change meaning.
-//
-// The set only grows, and no token ever changes what it means. A client that sees a token it does
-// not know should retry rather than give up, because giving up is the one answer that only
-// `no-encoder` justifies.
-// -------------------------------------------------------------------------------------------
-
-const REFUSE_NO_ENCODER: &str = "no-encoder: this device has no H.264 encoder we can use";
-const REFUSE_BUSY: &str = "busy: another client already has the stream";
-const REFUSE_NO_FRAME: &str = "no-frame: no encoded frame is available; the screen may be idle";
-
-/// Caps how much the kernel will queue for this client. See `CLIENT_SEND_BUFFER`.
-///
-/// A failure is worth a line and nothing more: the stream still works, it is only the promptness of
-/// noticing a stalled reader that is lost.
-fn cap_send_buffer(stream: &TcpStream) {
-    let size = CLIENT_SEND_BUFFER;
-    // SAFETY: the fd belongs to `stream` and outlives the call; `size` is a live `c_int` and the
-    // length passed is its own.
-    let ret = unsafe {
-        libc::setsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &size as *const c_int as *const c_void,
-            std::mem::size_of::<c_int>() as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        base::info!(
-            "VNC h264: could not cap the client's send buffer: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-}
-
-/// Turns a connection away with `"DVHX"` and a NUL-terminated reason, and drops it.
-///
-/// Errors are ignored on purpose: this is the last thing said to a socket nobody will read again,
-/// and a client that has already left is not a problem worth a log line.
-fn refuse(stream: &mut TcpStream, reason: &str) {
-    let _ = stream.write_all(MAGIC_REFUSED);
-    let _ = stream.write_all(reason.as_bytes());
-    let _ = stream.write_all(&[0u8]);
-}
-
-/// Where the one client is in its life.
-///
-/// `Pending` exists because of an ordering that cannot be avoided: the header states the stream's
-/// geometry, the geometry is a property of the first frame, and the first frame is only encoded
-/// because somebody is waiting for it. So a connection is accepted, parked, and promoted by the
-/// thread that accepted it once the producer has built an encoder.
-#[derive(Default)]
-struct ClientSlot {
-    /// Connected, header sent, receiving payloads.
-    ///
-    /// Shared rather than owned because writing to it must not hold this lock: the drain thread
-    /// takes a reference out, releases the lock, and writes for as long as the write timeout
-    /// allows, while everything else -- a resize, a reconnect, the EOF peek -- goes on taking the
-    /// lock and finding it free. The socket outlives its removal from the slot by exactly one
-    /// in-flight write, which is what `shutdown` is for.
-    live: Option<Arc<TcpStream>>,
-    /// Accepted, waiting for the first encoder.
-    pending: Option<TcpStream>,
-}
-
-/// The one client, and the flags everything else reads instead of locking to ask.
-struct Channel {
-    slot: Mutex<ClientSlot>,
-    /// `slot.live.is_some()`. Read by the drain thread before every write.
-    connected: AtomicBool,
-    /// `slot.live.is_some() || slot.pending.is_some()`. Read once per offered frame on the
-    /// producer's thread, so it is an atomic rather than a lock: the producer must never be able
-    /// to wait on a socket write.
-    wanted: AtomicBool,
-    /// Payload frames written. Heartbeats are not payload and are counted separately, so that
-    /// "how much did this client actually get" keeps meaning what it says on an idle screen.
-    written: AtomicU64,
-    heartbeats: AtomicU64,
-    /// Milliseconds since `epoch` at the last byte successfully written to the live client, of
-    /// either kind.
-    ///
-    /// One timestamp rather than two because the heartbeat rule reduces to one question -- has
-    /// anything at all gone down this socket in the last interval -- and a heartbeat is an answer
-    /// to it as much as a frame is. Reset when a client is promoted, so the first beat is due one
-    /// interval after the header rather than immediately.
-    last_write_ms: AtomicU64,
-    epoch: Instant,
-}
-
-impl Channel {
-    fn new() -> Channel {
-        Channel {
-            slot: Mutex::new(ClientSlot::default()),
-            connected: AtomicBool::new(false),
-            wanted: AtomicBool::new(false),
-            written: AtomicU64::new(0),
-            heartbeats: AtomicU64::new(0),
-            last_write_ms: AtomicU64::new(0),
-            epoch: Instant::now(),
-        }
-    }
-
-    fn now_ms(&self) -> u64 {
-        self.epoch.elapsed().as_millis() as u64
-    }
-
-    fn has_client(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
-    }
-
-    /// Whether anything is waiting for frames, connected or not. This is what makes the producer
-    /// feed the encoder, and it goes true one connection earlier than `has_client`.
-    fn is_wanted(&self) -> bool {
-        self.wanted.load(Ordering::Relaxed)
-    }
-
-    fn refresh_flags(&self, slot: &ClientSlot) {
-        self.connected.store(slot.live.is_some(), Ordering::Relaxed);
-        self.wanted
-            .store(slot.live.is_some() || slot.pending.is_some(), Ordering::Relaxed);
-    }
-
-    /// Writes one length-prefixed unit to the live client, if there is one.
-    ///
-    /// The single place bytes reach a promoted connection, so that the framing exists once and
-    /// heartbeats cannot be interleaved into the middle of a frame: both callers are the drain
-    /// thread, and the header is written by the accepting thread before the connection is live.
-    ///
-    /// The lock is taken to find the socket and released before the write, so a peer that has
-    /// stopped reading blocks this thread for the write timeout and blocks nobody else at all. A
-    /// failed write drops the client rather than retrying: the stream is a sequence of NAL units,
-    /// so a partial one is not a frame lost, it is the stream desynchronised for good.
-    fn write_unit(&self, payload: &[u8], what: &str) -> bool {
-        let stream = {
-            let Ok(slot) = self.slot.lock() else {
-                return false;
-            };
-            match slot.live.as_ref() {
-                Some(stream) => stream.clone(),
-                None => return false,
-            }
-        };
-        let header = (payload.len() as u32).to_le_bytes();
-        // `&TcpStream` writes, because the socket is shared: `write_all` needs `&mut Write`, and
-        // that is the reference this gets without owning the stream.
-        let result = (&*stream).write_all(&header).and_then(|_| {
-            if payload.is_empty() {
-                Ok(())
-            } else {
-                (&*stream).write_all(payload)
-            }
-        });
-        match result {
-            Ok(()) => {
-                self.last_write_ms.store(self.now_ms(), Ordering::Relaxed);
-                true
-            }
-            Err(e) => {
-                // One line, whichever way it died, because the two are the same event to whoever
-                // reads the log: the client is not taking bytes any more.
-                let stalled = matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                );
-                let why = if stalled {
-                    let seconds = CLIENT_WRITE_TIMEOUT.as_secs();
-                    format!("stopped reading; the {what} write timed out after {seconds}s")
-                } else {
-                    format!("left mid-{what}: {e}")
-                };
-                self.drop_live(&stream, &why);
-                false
-            }
-        }
-    }
-
-    /// Writes one length-prefixed payload.
-    fn send_frame(&self, payload: &[u8]) {
-        if self.write_unit(payload, "frame") {
-            self.written.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Sends the zero-length frame if the connection has been silent for an interval.
-    ///
-    /// `now_ms` is passed in rather than read here so the rule can be tested without waiting three
-    /// seconds for it. Called from the drain thread ten times a second, which is what makes the
-    /// beat land within a tenth of a second of when it is due.
-    fn heartbeat_if_due(&self, now_ms: u64) {
-        if !self.has_client() {
-            // Never before the header, and never to a connection still waiting for its first
-            // encoder: `connected` is set at promotion and at no other time.
-            return;
-        }
-        let idle_ms = now_ms.saturating_sub(self.last_write_ms.load(Ordering::Relaxed));
-        if idle_ms < HEARTBEAT_INTERVAL.as_millis() as u64 {
-            return;
-        }
-        if self.write_unit(&[], "heartbeat") {
-            self.heartbeats.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// Takes the live client away, if it is still the one this write was for.
-    ///
-    /// The identity check is what makes an out-of-lock write safe: by the time a stalled write
-    /// gives up, the slot may hold a different client entirely -- the screen resized, the old
-    /// socket was shut down, somebody else was admitted -- and the answer to "my write failed" is
-    /// then "of course it did", not "drop whoever is there now".
-    fn drop_live(&self, stream: &Arc<TcpStream>, why: &str) {
-        let Ok(mut slot) = self.slot.lock() else {
-            return;
-        };
-        let same = matches!(slot.live.as_ref(), Some(live) if Arc::ptr_eq(live, stream));
-        if !same {
-            return;
-        }
-        let _ = stream.shutdown(std::net::Shutdown::Both);
-        slot.live = None;
-        self.refresh_flags(&slot);
-        base::info!("VNC h264: dropped the side-channel client: {}", why);
-    }
-
-    /// Notices a client that has gone away without us having written to it.
-    ///
-    /// Needed because this socket only ever carries traffic in one direction, so the ordinary way
-    /// a dead peer is discovered -- a failed write -- only happens when there is a frame to send.
-    /// On a screen that has stopped moving there is no next frame, so a client that closed stays
-    /// "connected" indefinitely: the port refuses the reconnect, and the producer goes on encoding
-    /// for nobody. Measured, not feared -- a client that left during a static EDK2 screen held the
-    /// slot for seventeen seconds, until a keystroke produced the frame whose write failed.
-    ///
-    /// A peek of zero bytes is EOF and nothing else: the protocol is write-only, so a well-behaved
-    /// client never sends anything, and an `EAGAIN` is the healthy answer.
-    ///
-    /// The peek asks for non-blocking by flag rather than by putting the socket into non-blocking
-    /// mode, because the mode is a property of the socket and the drain thread may be inside a
-    /// write on it: flipping it under a write in flight would turn one large frame into a short
-    /// one and cost a healthy client its connection. `MSG_DONTWAIT` is per-call and cannot.
-    fn reap_if_closed(&self) {
-        let Ok(mut slot) = self.slot.lock() else {
-            return;
-        };
-        let Some(stream) = slot.live.as_ref() else {
-            return;
-        };
-        let mut probe = 0u8;
-        // SAFETY: the fd is owned by the `TcpStream` this borrows and outlives the call; `recv`
-        // writes at most the one byte offered and reports how many.
-        let peeked = unsafe {
-            libc::recv(
-                stream.as_raw_fd(),
-                &mut probe as *mut u8 as *mut c_void,
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if peeked == 0 {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-            slot.live = None;
-            self.refresh_flags(&slot);
-            base::info!("VNC h264: the side-channel client closed the connection");
-        }
-    }
-
-    /// Ends whatever connection there is. Used when the geometry changes underneath a client whose
-    /// header said something else, and at shutdown.
-    ///
-    /// The shutdown is not a formality: a write may be in flight on the live socket, and dropping
-    /// the slot's reference would leave it to finish or time out on its own. Shutting the socket
-    /// down ends both at once -- the client sees the stream close now, and the in-flight write
-    /// fails now instead of ten seconds from now.
-    fn disconnect(&self, why: &str) {
-        let Ok(mut slot) = self.slot.lock() else {
-            return;
-        };
-        let had = slot.live.is_some() || slot.pending.is_some();
-        if let Some(stream) = slot.live.take() {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
-        slot.pending = None;
-        self.refresh_flags(&slot);
-        if had {
-            base::info!("VNC h264: dropped the side-channel client: {}", why);
-        }
-    }
-}
-
-// -------------------------------------------------------------------------------------------
 // The consumer.
 // -------------------------------------------------------------------------------------------
 
-/// Everything the frame callback, the listener and the drain thread share.
+/// Everything the frame callback and the drain thread share.
 ///
-/// One object rather than three because the three are one mechanism: a client arriving is what
-/// makes the consumer feed the codec, and what the codec produces is what the client is sent.
+/// One object rather than two because the two are one mechanism: a client arriving is what makes
+/// the consumer feed the codec, and what the codec produces is what the client is sent.
 pub(crate) struct H264Consumer {
-    channel: Channel,
-    /// The RFB-50 broadcaster, or `None` on a build or a device where it could not be created. The
-    /// side channel does not depend on it: the two are audiences for one encoder, not layers.
+    /// The RFB-50 broadcaster, or `None` on a build or a device where it could not be created.
+    ///
+    /// It is the only audience there is. `None` therefore means this consumer will never serve
+    /// anybody -- it stays registered on the bus, answers "nothing wants frames" to every offer,
+    /// and costs a pointer.
     rfb: Option<RfbBroker>,
     /// The broadcaster's join generation as of the last sync frame asked for on its behalf. A join
     /// is served nothing until an IDR arrives, so somebody has to ask for one, and the drain thread
@@ -833,11 +447,6 @@ pub(crate) struct H264Consumer {
     was_feeding: AtomicBool,
     paused_offers: AtomicU64,
     encode_errors: AtomicU64,
-    /// Bumped every time a client is accepted. It is the sink's answer to "did the consumer set
-    /// change" (`DisplayT::consumer_generation`), and it has to be a counter rather than a flag
-    /// because the interesting case is a side-channel client arriving while an RFB one is already
-    /// connected -- the moment when every boolean in sight is already true.
-    connect_generation: AtomicU64,
     /// Time base for presentation timestamps. Wall time, not frame counting: the producer's rate
     /// is whatever the guest is doing, so numbering frames would tell the decoder the wrong story
     /// about how long each one was on screen.
@@ -883,6 +492,8 @@ extern "C" {
     fn vnc_h264_rfb_client_count(broker: *mut c_void) -> c_int;
     fn vnc_h264_rfb_join_generation(broker: *mut c_void) -> u64;
     fn vnc_h264_rfb_reset(broker: *mut c_void, width: c_int, height: c_int);
+    fn vnc_h264_rfb_set_caps(broker: *mut c_void, value: c_int);
+    fn vnc_h264_rfb_tick(broker: *mut c_void);
     #[allow(clippy::too_many_arguments)]
     fn vnc_h264_rfb_submit(
         broker: *mut c_void,
@@ -925,7 +536,7 @@ unsafe impl Sync for RfbBroker {}
 
 impl RfbBroker {
     /// Builds the broadcaster and arms LibVNCServer's protocol extension. `None` if it cannot be
-    /// built, which costs the side channel nothing.
+    /// built, which leaves every client on the pixel path exactly as before.
     fn create(server: *mut c_void) -> Option<RfbBroker> {
         // SAFETY: `server` is the live server handle, and the call only stores a pointer in it.
         let ptr = unsafe { vnc_h264_rfb_create(server) };
@@ -948,6 +559,20 @@ impl RfbBroker {
     fn reset(&self, width: u32, height: u32) {
         // SAFETY: as above.
         unsafe { vnc_h264_rfb_reset(self.ptr, width as c_int, height as c_int) }
+    }
+
+    /// Declares what this host can do about H.264, so the broker can tell the clients that speak
+    /// the pseudo-encoding (plans/H264_SINGLE_PORT.md §1). A value equal to the current one does
+    /// nothing, so this is cheap to call from a path that only sometimes changes the answer.
+    fn set_caps(&self, value: c_int) {
+        // SAFETY: as above.
+        unsafe { vnc_h264_rfb_set_caps(self.ptr, value) }
+    }
+
+    /// One turn of the broker's heartbeat clock. See `drain_loop`.
+    fn tick(&self) {
+        // SAFETY: as above.
+        unsafe { vnc_h264_rfb_tick(self.ptr) }
     }
 
     /// Hands over one compressed unit. The geometry is the encoder's, not the screen's, so that a
@@ -979,43 +604,32 @@ impl Drop for RfbBroker {
 }
 
 /// The name the bus knows this consumer by. NUL-terminated here because the bus keeps the pointer.
-const CONSUMER_NAME: &[u8] = b"h264-side-channel\0";
+const CONSUMER_NAME: &[u8] = b"h264-rfb\0";
 
 impl H264Consumer {
-    /// Brings up the side channel: binds the listener, starts the two service threads, and
+    /// Brings up the hardware-encode rung: builds the RFB broadcaster, starts the drain thread, and
     /// registers on the frame bus.
     ///
-    /// Returns `None` if the port cannot be bound or the bus has no room, and says why. It does
-    /// NOT bring the encoder up -- that waits until something is waiting for frames, so a VM
-    /// nobody watches never loads the media stack, and the encoder is built against the geometry
-    /// of a real frame rather than the one the command line guessed.
-    pub fn start(server: *mut c_void, port: u16) -> Option<Arc<H264Consumer>> {
-        let listener = match TcpListener::bind(("0.0.0.0", port)) {
-            Ok(l) => l,
-            Err(e) => {
-                base::error!("VNC h264: cannot listen on port {}: {}", port, e);
-                return None;
-            }
-        };
-        // Polled rather than blocked in, so `stop` is noticed without having to connect to
-        // ourselves to wake the accept up.
-        if let Err(e) = listener.set_nonblocking(true) {
-            base::error!("VNC h264: cannot poll the listener on port {}: {}", port, e);
-            return None;
-        }
-
-        // Before the threads, because the drain thread reads this field, and before the frame bus
-        // registration for the same reason the threads are: a failure after it would leave the
+    /// Returns `None` if the bus has no room, and says why. It does NOT bring the encoder up --
+    /// that waits until something is waiting for frames, so a VM nobody watches never loads the
+    /// media stack, and the encoder is built against the geometry of a real frame rather than the
+    /// one the command line guessed.
+    ///
+    /// Nothing here binds anything. The stream's only door is the RFB port the server has already
+    /// been given, so there is no listener to fail, no port to collide, and no address for a
+    /// caller to have to be told.
+    pub fn start(server: *mut c_void) -> Option<Arc<H264Consumer>> {
+        // Before the thread, because the drain thread reads this field, and before the frame bus
+        // registration for the same reason the thread is: a failure after it would leave the
         // server pointing at a broker this function dropped on its way out. Dropping it is safe
         // even so -- `vnc_h264_rfb_destroy` takes the pointer back out of the server -- but the
         // server has not been started yet either, so no client can have reached it.
         let rfb = RfbBroker::create(server);
         if rfb.is_none() {
-            base::error!("VNC h264: no RFB h264 broadcaster; only the side channel will be served");
+            base::error!("VNC h264: no RFB h264 broadcaster; this screen will serve pixels only");
         }
 
         let consumer = Arc::new(H264Consumer {
-            channel: Channel::new(),
             rfb,
             rfb_joins_answered: AtomicU64::new(0),
             encoder: Mutex::new(None),
@@ -1024,25 +638,15 @@ impl H264Consumer {
             was_feeding: AtomicBool::new(false),
             paused_offers: AtomicU64::new(0),
             encode_errors: AtomicU64::new(0),
-            connect_generation: AtomicU64::new(0),
             epoch: Instant::now(),
             stop: AtomicBool::new(false),
         });
 
-        // Threads first, registration last, and the order is load-bearing: the bus keeps the `ctx`
+        // Thread first, registration last, and the order is load-bearing: the bus keeps the `ctx`
         // pointer forever, so registering and THEN failing would leave it pointing at an `Arc`
         // this function dropped on its way out -- a dangling callback that fires on the next
         // frame. Nothing offers frames until the server is started, so there is no window in
-        // which the threads exist and the registration does not.
-        let accept_side = consumer.clone();
-        if let Err(e) = thread::Builder::new()
-            .name("vnc_h264_accept".into())
-            .spawn(move || accept_side.accept_loop(listener))
-        {
-            base::error!("VNC h264: cannot start the listener thread: {}", e);
-            consumer.stop.store(true, Ordering::Relaxed);
-            return None;
-        }
+        // which the thread exists and the registration does not.
         let drain_side = consumer.clone();
         if let Err(e) = thread::Builder::new()
             .name("vnc_h264_drain".into())
@@ -1069,177 +673,48 @@ impl H264Consumer {
             return None;
         }
 
-        base::info!(
-            "VNC h264: side channel listening on port {} (length-prefixed Annex-B)",
-            port
-        );
+        base::info!("VNC h264: serving the stream on the RFB port as encoding 50");
         Some(consumer)
     }
 
-    /// Accepts one client at a time and turns the rest away with a reason.
-    ///
-    /// One is a limitation, not a design: a second stream would need a second encoder, or a shared
-    /// one with per-client sync frames, and neither is worth building before anything asks. Being
-    /// turned away with `"DVHX"` and a sentence is at least something a client can report.
-    fn accept_loop(self: Arc<Self>, listener: TcpListener) {
-        while !self.stop.load(Ordering::Relaxed) {
-            match listener.accept() {
-                Ok((stream, peer)) => self.admit(stream, peer),
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(200));
-                }
-                Err(e) => {
-                    base::error!("VNC h264: accept failed: {}", e);
-                    thread::sleep(Duration::from_millis(500));
-                }
-            }
-        }
-    }
-
-    /// Takes a connection, parks it until there is an encoder, then sends the header and promotes
-    /// it. All of it on this thread, so that no part of a socket write is ever on the producer's.
-    fn admit(&self, mut stream: TcpStream, peer: SocketAddr) {
-        // Nagle would hold a small NAL back waiting for company, which on a stream whose whole
-        // point is latency is the wrong trade.
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT));
-        cap_send_buffer(&stream);
-
-        // Before deciding the slot is taken: the client holding it may have closed while the
-        // screen was still, in which case nothing has tried to write to it since.
-        self.channel.reap_if_closed();
-
-        {
-            let Ok(mut slot) = self.channel.slot.lock() else {
-                return;
-            };
-            if slot.live.is_some() || slot.pending.is_some() {
-                base::info!("VNC h264: refused {} -- {}", peer, REFUSE_BUSY);
-                refuse(&mut stream, REFUSE_BUSY);
-                return;
-            }
-            // Parked here rather than held as a local, so a second connection arriving while this
-            // one waits is refused rather than allowed to race it -- and so the producer starts
-            // feeding, which is the only thing that will ever produce the encoder waited for below.
-            slot.pending = Some(stream);
-            self.channel.refresh_flags(&slot);
-            // Bumped under the same lock that made the connection visible, so a producer that
-            // reads the generation after seeing `wants_frames` cannot see the old value.
-            self.connect_generation.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let deadline = Instant::now() + ADMIT_ENCODER_WAIT;
-        let encoder = loop {
-            if self.stop.load(Ordering::Relaxed) {
-                self.channel.disconnect("the display is going away");
-                return;
-            }
-            if let Some(encoder) = self.current_encoder() {
-                break encoder;
-            }
-            if self.encoder_failed.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                // The two are told apart on the wire because they mean opposite things to a
-                // client: one says never ask again, the other says ask again later.
-                let reason = if self.encoder_failed.load(Ordering::Relaxed) {
-                    REFUSE_NO_ENCODER
-                } else {
-                    REFUSE_NO_FRAME
-                };
-                base::info!("VNC h264: refused {} -- {}", peer, reason);
-                let Ok(mut slot) = self.channel.slot.lock() else {
-                    return;
-                };
-                if let Some(mut waiting) = slot.pending.take() {
-                    refuse(&mut waiting, reason);
-                }
-                self.channel.refresh_flags(&slot);
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        };
-
-        let mut header = Vec::with_capacity(8);
-        header.extend_from_slice(MAGIC_STREAM);
-        header.extend_from_slice(&(encoder.width as u16).to_le_bytes());
-        header.extend_from_slice(&(encoder.height as u16).to_le_bytes());
-        // The parameter sets go out before the sync frame is even asked for: a decoder handed an
-        // IDR with no SPS in front of it has nothing to decode it against. If the encoder has not
-        // emitted them yet -- which is the case for the very first client, whose arrival is what
-        // started the encoder -- then it has not emitted a coded picture either, and its own first
-        // output buffer will carry them down this same socket.
-        let config = encoder.codec_config();
-
-        let Ok(mut slot) = self.channel.slot.lock() else {
-            return;
-        };
-        let Some(mut waiting) = slot.pending.take() else {
-            // Dropped while waiting: a resize, or shutdown.
-            self.channel.refresh_flags(&slot);
-            return;
-        };
-        let sent = waiting.write_all(&header).and_then(|_| match &config {
-            Some(config) => waiting
-                .write_all(&(config.len() as u32).to_le_bytes())
-                .and_then(|_| waiting.write_all(config)),
-            None => Ok(()),
-        });
-        if let Err(e) = sent {
-            base::info!("VNC h264: {} left before the header: {}", peer, e);
-            self.channel.refresh_flags(&slot);
-            return;
-        }
-        slot.live = Some(Arc::new(waiting));
-        // Promotion is the first thing this connection has heard, so the heartbeat clock starts
-        // here: no beat until it has been silent for an interval, and none at all before now --
-        // the drain thread writes only to `live`, which is what this line makes it.
-        self.channel
-            .last_write_ms
-            .store(self.channel.now_ms(), Ordering::Relaxed);
-        self.channel.refresh_flags(&slot);
-        drop(slot);
-
-        encoder.request_sync_frame();
-        base::info!(
-            "VNC h264: {} attached to the {}x{} stream; {} bytes of parameter sets, sync frame \
-             requested",
-            peer,
-            encoder.width,
-            encoder.height,
-            config.map(|c| c.len()).unwrap_or(0)
-        );
-    }
-
-    /// Moves compressed frames from the codec to the socket, and nowhere else.
+    /// Moves compressed frames from the codec into the broker, and nowhere else.
     ///
     /// It keeps draining with no client connected, which is deliberate: the consumer stops FEEDING
     /// when the last client leaves, so what is left inside the codec is a handful of frames that
     /// have to come out before it can be reused. Draining them into nothing is how it gets back to
     /// idle.
     ///
-    /// **This is also where the heartbeat's three-second clock lives**, and it belongs here rather
-    /// than on either of the other two threads. The producer is out of the question: it must never
-    /// touch a socket, which is the property the whole `wanted` flag exists to protect. The
-    /// listener could hold a timer -- it wakes every 200ms between accepts -- but it is not the
-    /// thread that writes frames, so it would need a shared "did anything go out recently" answer
-    /// AND it can be parked inside `admit` for as long as ten seconds waiting for a first encoder,
-    /// which is three missed beats. The drain thread is the one that writes payloads, it wakes ten
-    /// times a second whether or not there is an encoder, and "nothing has gone out for three
-    /// seconds" is a fact it already has in its hands.
+    /// **This is also the thread that turns the broker's heartbeat clock**, and it belongs here
+    /// rather than on either of the other two. The producer's thread is out of the question: it is
+    /// the guest's flush path, and must not be given a job that has to happen on time. A client's
+    /// own output thread cannot do it either -- it is asleep in `clientOutput` waiting for exactly
+    /// the event that is not coming, which is what a heartbeat exists to say. This thread wakes ten
+    /// times a second whether or not there is an encoder, because that is how long it parks in
+    /// `poll_output`, so the tick is free and lands within a tenth of a second of when it is due.
+    ///
+    /// The tick and the caps push are both BEFORE the encoder is looked for, so a client is kept
+    /// alive across a codec that is being rebuilt as much as across a screen that is not moving.
     fn drain_loop(self: Arc<Self>) {
         let mut buf: Vec<u8> = Vec::with_capacity(OUTPUT_BUFFER_INITIAL);
         let mut announced = 0u32;
         while !self.stop.load(Ordering::Relaxed) {
-            // Before the encoder is looked for, so that a client is kept alive across a codec
-            // that is being rebuilt as much as across a screen that is not moving.
-            self.channel.heartbeat_if_due(self.channel.now_ms());
-            let Some(encoder) = self.current_encoder() else {
-                self.channel.reap_if_closed();
+            let held = self.current_encoder();
+            if let Some(rfb) = self.rfb.as_ref() {
+                // Derived here, not remembered. `encoder_for` pushes each transition at the instant
+                // it decides it, which is what makes the news prompt; this is the same answer read
+                // off the state itself, so a transition that somehow went unreported cannot leave a
+                // client waiting for ever on a stale value. `set_caps` does nothing when the two
+                // agree, which is every tick but the one after a change.
+                rfb.set_caps(caps_for(
+                    self.encoder_failed.load(Ordering::Relaxed),
+                    held.is_some(),
+                ));
+                rfb.tick();
+            }
+            let Some(encoder) = held else {
                 thread::sleep(Duration::from_millis(100));
                 continue;
             };
-            // Ten times a second, which is what makes "the last client left" a fact the producer
-            // learns from the pause rather than from the next failed write.
-            self.channel.reap_if_closed();
             self.sync_frame_for_rfb_joins(&encoder);
             buf.clear();
             match encoder.poll_output(&mut buf, OUTPUT_POLL_TIMEOUT_US) {
@@ -1256,13 +731,9 @@ impl H264Consumer {
                             flags
                         );
                     }
-                    if self.channel.has_client() {
-                        self.channel.send_frame(&buf);
-                    }
-                    // The same bytes, to the other audience. It queues and returns: the RFB
-                    // clients' own output threads do the writing, so this call cannot be delayed
-                    // by one of them that has stopped reading -- which is the whole reason the
-                    // broadcaster is built the way it is.
+                    // It queues and returns: the RFB clients' own output threads do the writing,
+                    // so this call cannot be delayed by one of them that has stopped reading --
+                    // which is the whole reason the broadcaster is built the way it is.
                     if let Some(rfb) = self.rfb.as_ref() {
                         rfb.submit(&buf, flags, encoder.width, encoder.height);
                     }
@@ -1282,8 +753,12 @@ impl H264Consumer {
                     buf.reserve(needed);
                 }
                 PollOutput::Failed => {
-                    base::error!("VNC h264: the encoder failed while draining; stream ends");
-                    self.channel.disconnect("the encoder failed");
+                    // The codec is kept: a drain failure is not the same statement as "this device
+                    // has no encoder", and the next poll may well succeed. The clients keep their
+                    // connection and their heartbeats and see a still picture, which is what they
+                    // would see anyway -- the one thing they must not be told is the permanent
+                    // answer, which only a codec that could not be CREATED justifies.
+                    base::error!("VNC h264: the encoder failed while draining");
                     thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -1297,12 +772,11 @@ impl H264Consumer {
     /// Answers a client that has joined -- or been thrown out of -- the RFB stream with a sync
     /// frame, once per generation.
     ///
-    /// The same mechanism as the side channel's, and deliberately not a second one: a joining
-    /// receiver is served nothing at all until an IDR arrives, because the alternative is showing
-    /// it the middle of a stream. It runs on the drain thread rather than where the sink polls the
-    /// generation, because the sink's poll happens on the producer's thread and the producer must
-    /// never make a codec call -- and because this thread already wakes ten times a second holding
-    /// the encoder, which is everything the request needs.
+    /// A joining receiver is served nothing at all until an IDR arrives, because the alternative
+    /// is showing it the middle of a stream. It runs on the drain thread rather than where the
+    /// sink polls the generation, because the sink's poll happens on the producer's thread and the
+    /// producer must never make a codec call -- and because this thread already wakes ten times a
+    /// second holding the encoder, which is everything the request needs.
     fn sync_frame_for_rfb_joins(&self, encoder: &Encoder) {
         let Some(rfb) = self.rfb.as_ref() else {
             return;
@@ -1320,10 +794,19 @@ impl H264Consumer {
 
     /// The encoder for a frame of this size, building or rebuilding it if that is what it takes.
     ///
-    /// A geometry change ends the current connection. The header a client was given states the
-    /// size of everything that follows it, so sending a different size down the same connection
-    /// would be a lie the receiver has no way to detect; making it reconnect restates the
-    /// contract instead.
+    /// **The two caps transitions §1 names are decided here**, because this is the only place that
+    /// learns either of them: a codec that came up, and a codec that could not be created. They are
+    /// pushed straight into the broker rather than left for the drain thread to notice, so that
+    /// "there will never be a stream on this host" reaches a client in the same instant the host
+    /// found it out, and not one poll later. `set_caps` does nothing when the value has not moved,
+    /// which is what makes it safe to call from a path that runs once per encoder.
+    ///
+    /// This runs on the producer's thread, and that is the one thing worth checking rather than
+    /// assuming: `set_caps` takes the broker lock and, under it, `cl->updateMutex` -- the same pair
+    /// in the same order as `submit`, and LibVNCServer holds that mutex for region arithmetic only
+    /// (rfbserver.c:3280-3374, released before the encode and before the first byte goes out). A
+    /// client that has stopped reading cannot hold it, so it cannot hold the guest's flush path
+    /// either.
     fn encoder_for(&self, width: u32, height: u32) -> Option<Arc<Encoder>> {
         {
             let guard = self.encoder.lock().ok()?;
@@ -1344,29 +827,28 @@ impl H264Consumer {
             // recorded here is only that it was asked and answered.
             self.encoder_failed.store(true, Ordering::Relaxed);
             base::error!(
-                "VNC h264: no encoder for a {}x{} screen; the side channel will serve nobody",
+                "VNC h264: no encoder for a {}x{} screen; this host serves pixels only",
                 width,
                 height
             );
+            // The permanent answer, and the only one that licenses a client to stop waiting.
+            if let Some(rfb) = self.rfb.as_ref() {
+                rfb.set_caps(CAPS_UNAVAILABLE);
+            }
             return None;
         }
-        let replaced = {
+        {
             let mut guard = self.encoder.lock().ok()?;
-            let replaced = guard.is_some();
             *guard = built.clone();
-            replaced
-        };
-        // The RFB clients are not disconnected the way the side-channel one is: their protocol has
-        // a way to say "the desktop is this size now" and this one does not, so they are put back
-        // to joining instead and restarted on the next sync frame at the new geometry. Declaring
-        // it here rather than from the sink's resize path is what keeps it in step with the codec
-        // that will actually produce those frames.
+        }
+        // The RFB clients are not disconnected: their protocol has a way to say "the desktop is
+        // this size now" and DVH2's did not, so they are put back to joining instead and restarted
+        // on the next sync frame at the new geometry. Declaring it here rather than from the sink's
+        // resize path is what keeps it in step with the codec that will actually produce those
+        // frames.
         if let Some(rfb) = self.rfb.as_ref() {
             rfb.reset(width, height);
-        }
-        if replaced {
-            self.channel
-                .disconnect("the screen changed size; reconnect for the new geometry");
+            rfb.set_caps(CAPS_AVAILABLE);
         }
         built
     }
@@ -1390,7 +872,7 @@ impl H264Consumer {
             return;
         }
         if !self.was_feeding.swap(true, Ordering::Relaxed) {
-            base::info!("VNC h264: a side-channel client is waiting; feeding the encoder");
+            base::info!("VNC h264: an RFB client is on the stream; feeding the encoder");
         }
 
         if offer.pixels.is_null() || offer.width <= 0 || offer.height <= 0 {
@@ -1484,48 +966,41 @@ impl H264Consumer {
         }
     }
 
-    /// Whether the side channel needs frames to keep arriving.
+    /// Whether the stream needs frames to keep arriving: the broker's client count, and nothing
+    /// else, now that the broker is the only audience.
     ///
-    /// This is the sink's `has_consumer` answer as far as this consumer is concerned, and it has
-    /// to be part of it: the simplefb producer does not build a frame at all when the sink reports
-    /// no consumer, so a VM watched over the side channel and nothing else would be a stream of
-    /// nothing -- the encoder waiting for offers that the producer is not making because the
-    /// encoder is the only thing that wants them.
+    /// This is the sink's `has_consumer` answer as far as this consumer is concerned, and it has to
+    /// be part of it, because otherwise it is a deadlock and not a refinement: the simplefb
+    /// producer does not build a frame at all when the sink reports no consumer, the encoder is
+    /// only built out of an offered frame, and a screen watched over RFB h264 alone would wait for
+    /// a stream that is waiting for it.
     ///
-    /// True from the moment a connection is accepted, not from the moment it is promoted, because
-    /// the promotion needs an encoder and the encoder needs a frame.
-    ///
-    /// An RFB client that asked for encoding 50 counts for exactly the same reason a side-channel
-    /// one does, and it is the same deadlock if it does not: the encoder is only built out of an
-    /// offered frame, and the simplefb producer only builds a frame when something says it wants
-    /// one. A screen watched over RFB h264 alone would otherwise wait for a stream that is waiting
-    /// for it.
+    /// A client that advertised only the DroidVM pseudo-encoding is deliberately NOT counted: it
+    /// asked what this host can do, not for a picture, and building a codec for it would be a
+    /// mediaserver round trip nobody is watching. See `vnc_h264_rfb_client_count`.
     pub fn wants_frames(&self) -> bool {
-        self.channel.is_wanted() || self.rfb.as_ref().map(|r| r.client_count()).unwrap_or(0) > 0
+        self.rfb.as_ref().map(|r| r.client_count()).unwrap_or(0) > 0
     }
 
-    /// How many clients have joined either audience. See `DisplayT::consumer_generation`.
+    /// How many clients have joined the stream. See `DisplayT::consumer_generation`.
     ///
-    /// Both halves are counters and they are packed rather than added, so that a side-channel
-    /// client arriving in the same instant an RFB one leaves cannot come out as no change at all.
-    /// Only the fact that the number moved is ever read.
+    /// A counter and not a flag, because the case that matters is a second client arriving while
+    /// the first is still there -- the moment when every boolean in sight is already true, and the
+    /// producer would otherwise re-supply nothing and leave the new stream showing a screen that
+    /// had stopped moving before it joined. Only the fact that the number moved is ever read.
     pub fn connect_generation(&self) -> u64 {
-        let joins = self.rfb.as_ref().map(|r| r.join_generation()).unwrap_or(0);
-        (self.connect_generation.load(Ordering::Relaxed) << 32) | (joins & 0xffff_ffff)
+        self.rfb.as_ref().map(|r| r.join_generation()).unwrap_or(0)
     }
 
-    /// Stops the service threads and says what the run did.
+    /// Stops the drain thread and says what the run did.
     pub fn shutdown(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        self.channel.disconnect("the display is going away");
         match self.current_encoder().map(|e| e.frame_counts()) {
             Some((queued, dropped)) => base::info!(
-                "VNC h264: {} frames queued, {} dropped for want of an input buffer, {} written to \
-                 the socket, {} heartbeats, {} offers skipped with nothing listening",
+                "VNC h264: {} frames queued, {} dropped for want of an input buffer, {} offers \
+                 skipped with nothing listening",
                 queued,
                 dropped,
-                self.channel.written.load(Ordering::Relaxed),
-                self.channel.heartbeats.load(Ordering::Relaxed),
                 self.paused_offers.load(Ordering::Relaxed)
             ),
             None => base::info!(
@@ -1550,222 +1025,30 @@ extern "C" fn h264_on_frame(_server: *mut c_void, ctx: *mut c_void, offer: *cons
     consumer.on_frame(offer);
 }
 
-/// What a receiver is entitled to assume, asserted here so that changing it breaks a test rather
+/// What the wire is entitled to assume, asserted here so that changing it breaks a test rather
 /// than a client.
 ///
-/// The encoder is not reachable from a host test -- it is a device's MediaCodec -- but the wire is:
-/// framing, the heartbeat rule and the refusal tokens are all decided on this side of the FFI and
-/// all of them are what another codebase is written against. Each test drives a `Channel` over a
-/// real loopback socket, so what is asserted is the bytes that arrive, not the intent.
+/// Almost nothing of the seam is reachable from a host test any more, and that is the point of the
+/// single-port change rather than a gap in it: the bytes are written by vnc_h264_rfb.c and the
+/// encoder is a device's MediaCodec. What is still decided on this side of the FFI is which of §1's
+/// three caps values a given host state is, and a client that stops waiting for ever does so
+/// because of it.
 #[cfg(test)]
 mod tests {
-    use std::io::ErrorKind;
-    use std::io::Read;
-
     use super::*;
 
-    /// A connected pair: the end the `Channel` writes to, and the end a client reads from.
-    fn connected_pair() -> (TcpStream, TcpStream) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind loopback");
-        let addr = listener.local_addr().expect("local addr");
-        let client = TcpStream::connect(addr).expect("connect");
-        let (server, _) = listener.accept().expect("accept");
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-        (server, client)
-    }
-
-    /// A channel with a promoted client, as `admit` would leave it.
-    fn live_channel() -> (Channel, TcpStream) {
-        let (server, client) = connected_pair();
-        let channel = Channel::new();
-        {
-            let mut slot = channel.slot.lock().expect("slot");
-            slot.live = Some(Arc::new(server));
-            channel.refresh_flags(&slot);
-        }
-        (channel, client)
-    }
-
-    fn read_frame(client: &mut TcpStream) -> Vec<u8> {
-        let mut length = [0u8; 4];
-        client.read_exact(&mut length).expect("length prefix");
-        let mut payload = vec![0u8; u32::from_le_bytes(length) as usize];
-        if !payload.is_empty() {
-            client.read_exact(&mut payload).expect("payload");
-        }
-        payload
-    }
-
-    /// Whether anything at all is waiting to be read, without waiting long for it.
-    fn quiet(client: &mut TcpStream) -> bool {
-        client
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .expect("read timeout");
-        let mut byte = [0u8; 1];
-        let answer = matches!(
-            client.read(&mut byte),
-            Err(ref e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut
-        );
-        client
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .expect("read timeout");
-        answer
-    }
-
     #[test]
-    fn a_heartbeat_is_a_length_of_zero_and_nothing_else() {
-        let (channel, mut client) = live_channel();
-        let interval = HEARTBEAT_INTERVAL.as_millis() as u64;
+    fn caps_says_permanent_only_when_a_codec_could_not_be_built() {
+        // Nothing has asked for an encoder yet: warming, not available. Sending 0 here would
+        // promise a stream before anything had tried to make one, and would leave §1's second caps
+        // rect with no transition to report.
+        assert_eq!(caps_for(false, false), CAPS_WARMING);
+        assert_eq!(caps_for(false, true), CAPS_AVAILABLE);
 
-        // Silence shorter than the interval is not yet worth a beat.
-        channel.heartbeat_if_due(0);
-        channel.heartbeat_if_due(interval - 1);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 0);
-        assert!(quiet(&mut client));
-
-        channel.heartbeat_if_due(interval);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 1);
-        assert!(read_frame(&mut client).is_empty());
-        // The four bytes of length were the whole of it: no payload followed.
-        assert!(quiet(&mut client));
-
-        // A beat resets the clock exactly as a frame does, so the next one is an interval away.
-        let sent_at = channel.last_write_ms.load(Ordering::Relaxed);
-        channel.heartbeat_if_due(sent_at + interval - 1);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 1);
-        channel.heartbeat_if_due(sent_at + interval);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 2);
-    }
-
-    #[test]
-    fn a_heartbeat_is_not_a_frame_in_any_of_the_accounting() {
-        let (channel, mut client) = live_channel();
-        channel.heartbeat_if_due(HEARTBEAT_INTERVAL.as_millis() as u64);
-        assert!(read_frame(&mut client).is_empty());
-
-        // Payload counters do not move for a beat, and neither does demand: the producer must not
-        // start feeding an encoder because the host said "still here".
-        assert_eq!(channel.written.load(Ordering::Relaxed), 0);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 1);
-        assert!(channel.has_client());
-        assert!(channel.is_wanted());
-    }
-
-    #[test]
-    fn a_payload_frame_is_length_prefixed_and_defers_the_next_beat() {
-        let (channel, mut client) = live_channel();
-        let interval = HEARTBEAT_INTERVAL.as_millis() as u64;
-        let unit = b"\x00\x00\x00\x01\x65 a coded picture".to_vec();
-
-        channel.send_frame(&unit);
-        assert_eq!(read_frame(&mut client), unit);
-        assert_eq!(channel.written.load(Ordering::Relaxed), 1);
-
-        let sent_at = channel.last_write_ms.load(Ordering::Relaxed);
-        channel.heartbeat_if_due(sent_at + interval - 1);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 0);
-        assert!(quiet(&mut client));
-
-        channel.heartbeat_if_due(sent_at + interval);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 1);
-        assert!(read_frame(&mut client).is_empty());
-    }
-
-    #[test]
-    fn a_connection_waiting_for_its_first_encoder_is_never_written_to() {
-        let (server, mut client) = connected_pair();
-        let channel = Channel::new();
-        {
-            let mut slot = channel.slot.lock().expect("slot");
-            slot.pending = Some(server);
-            channel.refresh_flags(&slot);
-        }
-
-        // Wanted -- that is what makes the producer feed the encoder that will promote it -- but
-        // not connected, and the heartbeat follows the second flag, not the first.
-        assert!(channel.is_wanted());
-        assert!(!channel.has_client());
-        channel.heartbeat_if_due(u64::MAX);
-        assert_eq!(channel.heartbeats.load(Ordering::Relaxed), 0);
-        assert!(quiet(&mut client));
-    }
-
-    #[test]
-    fn a_closed_client_is_reaped_without_a_frame_having_to_flow() {
-        let (channel, client) = live_channel();
-        drop(client);
-
-        // The FIN has to arrive first; on loopback that is immediate, but "immediate" is not a
-        // guarantee, so this waits for it rather than assuming it.
-        for _ in 0..40 {
-            channel.reap_if_closed();
-            if !channel.has_client() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(!channel.has_client());
-        assert!(!channel.is_wanted());
-    }
-
-    #[test]
-    fn a_failed_write_takes_the_client_away() {
-        let (channel, client) = live_channel();
-        drop(client);
-
-        // The first write after the peer is gone often succeeds -- it lands in a buffer whose
-        // reset is still in flight -- so what is asserted is that writing keeps not being a
-        // no-op, not that the very first one fails.
-        for _ in 0..40 {
-            channel.send_frame(b"\x00\x00\x00\x01\x65 nobody is listening");
-            if !channel.has_client() {
-                break;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(!channel.has_client());
-        assert!(!channel.is_wanted());
-    }
-
-    #[test]
-    fn every_refusal_is_a_stable_token_and_a_human_tail() {
-        for (token, reason) in [
-            ("no-encoder", REFUSE_NO_ENCODER),
-            ("busy", REFUSE_BUSY),
-            ("no-frame", REFUSE_NO_FRAME),
-        ] {
-            // The token is what a receiver dispatches on, and the two ways a receiver is likely to
-            // cut it out -- up to the colon, or the first word with the colon trimmed -- have to
-            // agree, because the wire cannot say which one the other codebase chose.
-            assert!(reason.starts_with(&format!("{token}: ")), "{}", reason);
-            assert_eq!(reason.split(':').next(), Some(token));
-            assert_eq!(
-                reason
-                    .split_whitespace()
-                    .next()
-                    .map(|word| word.trim_end_matches(':')),
-                Some(token)
-            );
-            assert!(!token.contains(char::is_whitespace));
-            assert!(!reason.contains('\0'));
-            // A human tail, and a real one.
-            assert!(reason[token.len() + 2..].len() > 8, "{}", reason);
-        }
-    }
-
-    #[test]
-    fn a_refusal_is_the_magic_the_reason_and_a_nul() {
-        let (mut server, mut client) = connected_pair();
-        refuse(&mut server, REFUSE_BUSY);
-        drop(server);
-
-        let mut said = Vec::new();
-        client.read_to_end(&mut said).expect("read the refusal");
-        let mut expected = MAGIC_REFUSED.to_vec();
-        expected.extend_from_slice(REFUSE_BUSY.as_bytes());
-        expected.push(0);
-        assert_eq!(said, expected);
+        // Permanent outranks everything, including an encoder still held from before the failure:
+        // it is the only value that licenses a client to stop asking, so it must not be reachable
+        // by accident -- and must not be masked by one that is.
+        assert_eq!(caps_for(true, false), CAPS_UNAVAILABLE);
+        assert_eq!(caps_for(true, true), CAPS_UNAVAILABLE);
     }
 }

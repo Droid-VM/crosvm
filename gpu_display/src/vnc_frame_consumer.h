@@ -31,7 +31,7 @@ extern "C" {
  * The LibVNCServer consumer is registered internally when the server is created and is not
  * configurable. The H.264 one is registered by the Rust sink between `vnc_server_create` and
  * `vnc_server_start`, because whether it exists at all is a property of the binding (its transport
- * ceiling and its `h264-port=`) that this file has no way to learn.
+ * ceiling) that this file has no way to learn.
  */
 
 /* A run of consecutive full-width rows that differ from the previously offered frame. */
