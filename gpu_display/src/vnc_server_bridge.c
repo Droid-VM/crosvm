@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "vnc_frame_consumer.h"
+#include "vnc_h264_rfb.h"
 
 #define INPUT_RING_SIZE 256
 #define INPUT_RING_MASK (INPUT_RING_SIZE - 1)
@@ -68,6 +69,9 @@ struct vnc_server {
     struct vnc_ingest ingest;
     struct vnc_frame_consumer consumers[VNC_MAX_FRAME_CONSUMERS];
     int consumer_count;
+    /* The Open H.264 broadcaster serving this screen's clients, or NULL when this binding has no
+     * hardware stream. Borrowed, not owned -- see vnc_server_set_h264_rfb in the header. */
+    struct vnc_h264_rfb* h264_rfb;
 };
 
 static void attach_frame_consumers(vnc_server_t* server);
@@ -262,6 +266,32 @@ static void vnc_display_hook(rfbClientPtr cl) {
         cl->enableCursorShapeUpdates = TRUE;
         cl->cursorWasChanged = FALSE;
     }
+
+    /* AFTER the flag above, never before: the H.264 broadcaster suppresses cursor rectangles for
+     * the clients it serves, and doing that first would destroy the one reliable answer to "did
+     * this client ask for cursor updates?" that the block above depends on. */
+    {
+        struct vnc_server* s = (struct vnc_server*)cl->screen->screenData;
+        if (s && s->h264_rfb)
+            (void)vnc_h264_rfb_display_hook(s->h264_rfb, cl);
+    }
+}
+
+void vnc_server_set_h264_rfb(vnc_server_t* server, struct vnc_h264_rfb* broker) {
+    if (!server)
+        return;
+    server->h264_rfb = broker;
+}
+
+struct vnc_h264_rfb* vnc_server_h264_rfb_for_client(struct _rfbClientRec* client) {
+    rfbClientPtr cl = (rfbClientPtr)client;
+    struct vnc_server* server;
+    if (!cl || !cl->screen)
+        return NULL;
+    /* Every screen in this process is one of ours, so screenData is a vnc_server_t: the bridge is
+     * the only thing here that calls rfbGetScreen. */
+    server = (struct vnc_server*)cl->screen->screenData;
+    return server ? server->h264_rfb : NULL;
 }
 
 vnc_server_t* vnc_server_create(int width, int height, int port, const char* password) {
@@ -806,6 +836,16 @@ void vnc_server_destroy(vnc_server_t* server) {
     server->ingest.bands_cap = 0;
     if (server->screen) {
         rfbShutdownServer(server->screen, TRUE);
+        /* After the shutdown and not before: rfbShutdownServer joins every client thread
+         * (main.c:1245-1260), so by here no client can be inside the broker and every enrolled
+         * client has already removed itself through clientGoneHook. Detaching rather than
+         * destroying, because the broker belongs to the H.264 consumer whose drain thread may
+         * still be holding a frame -- what this ends is its ability to reach a screen that is
+         * about to be freed. */
+        if (server->h264_rfb) {
+            vnc_h264_rfb_detach(server->h264_rfb);
+            server->h264_rfb = NULL;
+        }
         free(server->screen->frameBuffer);
         server->screen->frameBuffer = NULL;
         rfbScreenCleanup(server->screen);

@@ -11,18 +11,26 @@
 //! changes: a legacy client connected to the same server keeps being served the same way it always
 //! was, from the same offer, which is the entire reason step 12 split ingest from consumers.
 //!
-//! **Why a side channel and not an RFB encoding.** RFB has no H.264 pseudo-encoding that every
-//! client understands, and inventing one would make this sink stop being a VNC server for anybody
-//! who does not know about it. A separate port keeps the two audiences apart: an ordinary viewer
-//! connects to 5900 and sees a picture, the DroidVM app connects to both -- pixels from the side
-//! channel, input over RFB -- and neither has to know the other exists. It also means the failure
-//! mode of the new thing is "nobody connects to the new port", not "VNC broke".
+//! **Two audiences, one encoder.** The compressed stream leaves by two doors. This file owns the
+//! side channel: a TCP port of its own, the DVH2 framing below, one client at a time, and it is
+//! what the DroidVM app uses -- pixels from here, input over RFB, neither half having to know
+//! about the other. The second door is `vnc_h264_rfb.c`, which serves the same stream inside
+//! ordinary FramebufferUpdate messages on the RFB port itself, to third-party clients that ask for
+//! the Open H.264 encoding (50). Both are fed from the drain thread below, out of one codec.
 //!
-//! **Double encoding is real and bounded.** While an RFB client and a side-channel client are both
-//! connected the frame is encoded twice, once by LibVNCServer and once by the codec. That is the
-//! honest cost of serving two client kinds at once and it is what the bus is for; it is not paid
-//! when only one kind is connected, because this consumer feeds nothing with no side-channel
-//! client and LibVNCServer marks nothing with no RFB client.
+//! The side channel came first and is not made redundant by the RFB one. It states the geometry in
+//! a header instead of a rectangle, it is length-prefixed rather than request-driven, and it is
+//! independent of whatever an RFB client is doing to the pixel path -- so it stays the thing the
+//! app depends on, and the failure mode of the newer door is "a viewer sees no picture", not "the
+//! app lost its stream".
+//!
+//! **Double encoding is real and bounded.** While a LEGACY RFB client and a side-channel client
+//! are both connected the frame is encoded twice, once by LibVNCServer and once by the codec. That
+//! is the honest cost of serving two client kinds at once and it is what the bus is for; it is not
+//! paid when only one kind is connected, because this consumer feeds nothing with nothing waiting
+//! for it and LibVNCServer marks nothing with no RFB client. An RFB client being served encoding
+//! 50 does not pay it either: its pixel path is suppressed for as long as it is on the stream (see
+//! vnc_h264_rfb.c), so it costs the codec nothing extra and LibVNCServer nothing at all.
 //!
 //! **The wire format**, in full, because a receiver has to be written against it:
 //!
@@ -797,6 +805,13 @@ impl Channel {
 /// makes the consumer feed the codec, and what the codec produces is what the client is sent.
 pub(crate) struct H264Consumer {
     channel: Channel,
+    /// The RFB-50 broadcaster, or `None` on a build or a device where it could not be created. The
+    /// side channel does not depend on it: the two are audiences for one encoder, not layers.
+    rfb: Option<RfbBroker>,
+    /// The broadcaster's join generation as of the last sync frame asked for on its behalf. A join
+    /// is served nothing until an IDR arrives, so somebody has to ask for one, and the drain thread
+    /// is the thread that already wakes ten times a second with the encoder in its hand.
+    rfb_joins_answered: AtomicU64,
     /// The live encoder. `None` until the first frame is offered with something waiting for it,
     /// and replaced wholesale when the screen changes size.
     ///
@@ -862,6 +877,105 @@ struct VncFrameConsumer {
 
 extern "C" {
     fn vnc_server_attach_consumer(server: *mut c_void, consumer: *const VncFrameConsumer) -> c_int;
+
+    fn vnc_h264_rfb_create(server: *mut c_void) -> *mut c_void;
+    fn vnc_h264_rfb_destroy(broker: *mut c_void);
+    fn vnc_h264_rfb_client_count(broker: *mut c_void) -> c_int;
+    fn vnc_h264_rfb_join_generation(broker: *mut c_void) -> u64;
+    fn vnc_h264_rfb_reset(broker: *mut c_void, width: c_int, height: c_int);
+    #[allow(clippy::too_many_arguments)]
+    fn vnc_h264_rfb_submit(
+        broker: *mut c_void,
+        data: *const u8,
+        len: u32,
+        is_config: c_int,
+        is_idr: c_int,
+        width: c_int,
+        height: c_int,
+    );
+}
+
+/// The codec's output-buffer flags, as `poll_output` hands them over verbatim from
+/// `AMediaCodecBufferInfo::flags` (crosvm_android_display_client.cpp: `*outFlags = info.flags`).
+///
+/// `CODEC_CONFIG` is `AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG` from the NDK's NdkMediaCodec.h, which
+/// is where the C++ side reads it. `SYNC_FRAME` is `MediaCodec.BUFFER_FLAG_KEY_FRAME`, spelled out
+/// here rather than taken from that header because the NDK only named it at API 34 and this tree
+/// builds against 33 -- the value is the same one the Java constant has always had.
+const BUFFER_FLAG_SYNC_FRAME: u32 = 1;
+const BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
+
+/// The RFB-50 broadcaster (vnc_h264_rfb.c), which serves this same stream to ordinary VNC clients
+/// on the RFB port.
+///
+/// Owned here rather than by the C server, and the direction is deliberate: the drain thread holds
+/// an `Arc<H264Consumer>` and therefore outlives the display that destroys the server, so a broker
+/// belonging to the server could be freed while a frame was on its way into it. Belonging to the
+/// consumer, it cannot be: `vnc_server_destroy` detaches it instead, after LibVNCServer has joined
+/// every client thread, and a submit that arrives afterwards finds a broker with no clients.
+struct RfbBroker {
+    ptr: *mut c_void,
+}
+
+// SAFETY: every entry point behind this pointer takes the broker's own mutex before touching
+// anything shared, and the pointer itself is fixed for the object's life. Sharing it across the
+// drain thread and the producer's is the whole point of it.
+unsafe impl Send for RfbBroker {}
+unsafe impl Sync for RfbBroker {}
+
+impl RfbBroker {
+    /// Builds the broadcaster and arms LibVNCServer's protocol extension. `None` if it cannot be
+    /// built, which costs the side channel nothing.
+    fn create(server: *mut c_void) -> Option<RfbBroker> {
+        // SAFETY: `server` is the live server handle, and the call only stores a pointer in it.
+        let ptr = unsafe { vnc_h264_rfb_create(server) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(RfbBroker { ptr })
+    }
+
+    fn client_count(&self) -> i32 {
+        // SAFETY: `ptr` came from `vnc_h264_rfb_create` and is live for `self`.
+        unsafe { vnc_h264_rfb_client_count(self.ptr) }
+    }
+
+    fn join_generation(&self) -> u64 {
+        // SAFETY: as above.
+        unsafe { vnc_h264_rfb_join_generation(self.ptr) }
+    }
+
+    fn reset(&self, width: u32, height: u32) {
+        // SAFETY: as above.
+        unsafe { vnc_h264_rfb_reset(self.ptr, width as c_int, height as c_int) }
+    }
+
+    /// Hands over one compressed unit. The geometry is the encoder's, not the screen's, so that a
+    /// frame still draining out of a codec that has been replaced can be told apart from one the
+    /// clients have been prepared for.
+    fn submit(&self, payload: &[u8], flags: u32, width: u32, height: u32) {
+        // SAFETY: the payload is borrowed for the duration of the call and copied by the callee
+        // into whatever per-client queues it decides to; nothing of it is retained.
+        unsafe {
+            vnc_h264_rfb_submit(
+                self.ptr,
+                payload.as_ptr(),
+                payload.len() as u32,
+                ((flags & BUFFER_FLAG_CODEC_CONFIG) != 0) as c_int,
+                ((flags & BUFFER_FLAG_SYNC_FRAME) != 0) as c_int,
+                width as c_int,
+                height as c_int,
+            )
+        }
+    }
+}
+
+impl Drop for RfbBroker {
+    fn drop(&mut self) {
+        // SAFETY: the pointer came from `vnc_h264_rfb_create` and is destroyed once. Reached only
+        // after every thread that could submit has dropped its `Arc<H264Consumer>`.
+        unsafe { vnc_h264_rfb_destroy(self.ptr) }
+    }
 }
 
 /// The name the bus knows this consumer by. NUL-terminated here because the bus keeps the pointer.
@@ -890,8 +1004,20 @@ impl H264Consumer {
             return None;
         }
 
+        // Before the threads, because the drain thread reads this field, and before the frame bus
+        // registration for the same reason the threads are: a failure after it would leave the
+        // server pointing at a broker this function dropped on its way out. Dropping it is safe
+        // even so -- `vnc_h264_rfb_destroy` takes the pointer back out of the server -- but the
+        // server has not been started yet either, so no client can have reached it.
+        let rfb = RfbBroker::create(server);
+        if rfb.is_none() {
+            base::error!("VNC h264: no RFB h264 broadcaster; only the side channel will be served");
+        }
+
         let consumer = Arc::new(H264Consumer {
             channel: Channel::new(),
+            rfb,
+            rfb_joins_answered: AtomicU64::new(0),
             encoder: Mutex::new(None),
             gpu_route_failed: AtomicBool::new(false),
             encoder_failed: AtomicBool::new(false),
@@ -1114,6 +1240,7 @@ impl H264Consumer {
             // Ten times a second, which is what makes "the last client left" a fact the producer
             // learns from the pause rather than from the next failed write.
             self.channel.reap_if_closed();
+            self.sync_frame_for_rfb_joins(&encoder);
             buf.clear();
             match encoder.poll_output(&mut buf, OUTPUT_POLL_TIMEOUT_US) {
                 PollOutput::Frame { flags } => {
@@ -1131,6 +1258,13 @@ impl H264Consumer {
                     }
                     if self.channel.has_client() {
                         self.channel.send_frame(&buf);
+                    }
+                    // The same bytes, to the other audience. It queues and returns: the RFB
+                    // clients' own output threads do the writing, so this call cannot be delayed
+                    // by one of them that has stopped reading -- which is the whole reason the
+                    // broadcaster is built the way it is.
+                    if let Some(rfb) = self.rfb.as_ref() {
+                        rfb.submit(&buf, flags, encoder.width, encoder.height);
                     }
                 }
                 PollOutput::Idle => {}
@@ -1158,6 +1292,30 @@ impl H264Consumer {
 
     fn current_encoder(&self) -> Option<Arc<Encoder>> {
         self.encoder.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Answers a client that has joined -- or been thrown out of -- the RFB stream with a sync
+    /// frame, once per generation.
+    ///
+    /// The same mechanism as the side channel's, and deliberately not a second one: a joining
+    /// receiver is served nothing at all until an IDR arrives, because the alternative is showing
+    /// it the middle of a stream. It runs on the drain thread rather than where the sink polls the
+    /// generation, because the sink's poll happens on the producer's thread and the producer must
+    /// never make a codec call -- and because this thread already wakes ten times a second holding
+    /// the encoder, which is everything the request needs.
+    fn sync_frame_for_rfb_joins(&self, encoder: &Encoder) {
+        let Some(rfb) = self.rfb.as_ref() else {
+            return;
+        };
+        let joins = rfb.join_generation();
+        if self.rfb_joins_answered.swap(joins, Ordering::Relaxed) == joins {
+            return;
+        }
+        encoder.request_sync_frame();
+        base::info!(
+            "VNC h264: an RFB client is waiting to start the stream (join {}); sync frame requested",
+            joins
+        );
     }
 
     /// The encoder for a frame of this size, building or rebuilding it if that is what it takes.
@@ -1198,6 +1356,14 @@ impl H264Consumer {
             *guard = built.clone();
             replaced
         };
+        // The RFB clients are not disconnected the way the side-channel one is: their protocol has
+        // a way to say "the desktop is this size now" and this one does not, so they are put back
+        // to joining instead and restarted on the next sync frame at the new geometry. Declaring
+        // it here rather than from the sink's resize path is what keeps it in step with the codec
+        // that will actually produce those frames.
+        if let Some(rfb) = self.rfb.as_ref() {
+            rfb.reset(width, height);
+        }
         if replaced {
             self.channel
                 .disconnect("the screen changed size; reconnect for the new geometry");
@@ -1210,7 +1376,7 @@ impl H264Consumer {
         if self.stop.load(Ordering::Relaxed) {
             return;
         }
-        if !self.channel.is_wanted() {
+        if !self.wants_frames() {
             // Paused. The classic consumer is still being served out of this very offer, so
             // pausing here costs an RFB client nothing -- which is the property the bus exists to
             // give.
@@ -1328,13 +1494,24 @@ impl H264Consumer {
     ///
     /// True from the moment a connection is accepted, not from the moment it is promoted, because
     /// the promotion needs an encoder and the encoder needs a frame.
+    ///
+    /// An RFB client that asked for encoding 50 counts for exactly the same reason a side-channel
+    /// one does, and it is the same deadlock if it does not: the encoder is only built out of an
+    /// offered frame, and the simplefb producer only builds a frame when something says it wants
+    /// one. A screen watched over RFB h264 alone would otherwise wait for a stream that is waiting
+    /// for it.
     pub fn wants_frames(&self) -> bool {
-        self.channel.is_wanted()
+        self.channel.is_wanted() || self.rfb.as_ref().map(|r| r.client_count()).unwrap_or(0) > 0
     }
 
-    /// How many clients this channel has accepted. See `DisplayT::consumer_generation`.
+    /// How many clients have joined either audience. See `DisplayT::consumer_generation`.
+    ///
+    /// Both halves are counters and they are packed rather than added, so that a side-channel
+    /// client arriving in the same instant an RFB one leaves cannot come out as no change at all.
+    /// Only the fact that the number moved is ever read.
     pub fn connect_generation(&self) -> u64 {
-        self.connect_generation.load(Ordering::Relaxed)
+        let joins = self.rfb.as_ref().map(|r| r.join_generation()).unwrap_or(0);
+        (self.connect_generation.load(Ordering::Relaxed) << 32) | (joins & 0xffff_ffff)
     }
 
     /// Stops the service threads and says what the run did.

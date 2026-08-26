@@ -14,6 +14,12 @@ extern "C" {
 
 typedef struct vnc_server vnc_server_t;
 
+/* LibVNCServer's client record and this bridge's H.264 broadcaster, named rather than included:
+ * this header is also the one the Rust side's declarations are written against, and neither type
+ * is ever dereferenced by a caller. */
+struct _rfbClientRec;
+struct vnc_h264_rfb;
+
 #define VNC_INPUT_NONE      0
 #define VNC_INPUT_KEY       1
 #define VNC_INPUT_POINTER   2
@@ -86,6 +92,21 @@ void vnc_server_offer_frame(vnc_server_t* server, const uint8_t* clean, uint32_t
                             void* gpu_blit_ctx, int64_t gpu_import_id);
 void vnc_server_set_input_event_fd(vnc_server_t* server, int fd);
 int vnc_server_poll_input_event(vnc_server_t* server, struct vnc_input_event* out);
+
+/* The H.264 broadcaster (vnc_h264_rfb.h), which this server carries but does not own.
+ *
+ * Two directions, because the two are asked by different people. The setter is called once while
+ * the server is being built, by the same Rust side that decides whether a hardware stream exists
+ * at all. The lookup is called by the broadcaster itself: its LibVNCServer protocol extension is
+ * process-global while brokers are per-screen, so every per-client callback has to get from a
+ * client back to the right one -- and `screenData` is the bridge's own field, whose meaning is not
+ * something another file should have to know.
+ *
+ * The broker outlives the server on purpose: it is owned by the Rust consumer whose drain thread
+ * feeds it. `vnc_server_destroy` therefore detaches it rather than freeing it, once every client
+ * thread has been joined and nothing can reach it through a screen any more. */
+void vnc_server_set_h264_rfb(vnc_server_t* server, struct vnc_h264_rfb* broker);
+struct vnc_h264_rfb* vnc_server_h264_rfb_for_client(struct _rfbClientRec* cl);
 
 #ifdef __cplusplus
 }
