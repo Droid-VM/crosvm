@@ -189,3 +189,22 @@ impl fmt::Debug for EventDevice {
         write!(f, "Event device ({:?})", self.kind)
     }
 }
+
+/// The input devices belonging to one display binding, on their way to that binding's sink.
+///
+/// A VNC binding gets an absolute pointer and a keyboard of its own, created with the guest device
+/// and handed to the sink that injects into them. Both `None` is a view-only binding: no devices
+/// were made and the sink drops RFB input.
+///
+/// They travel as a pair because they are created together, taken together, and named after the
+/// same screen -- and because "which of these two `Option<EventDevice>`s went where" is exactly the
+/// question a named pair answers for free. It lives here, next to `EventDevice` rather than beside
+/// either consumer, because the two consumers (the virtio-gpu display chain and the simplefb
+/// bridge) are in different crates and neither is upstream of the other.
+#[derive(Default)]
+pub struct VncBindingInput {
+    /// Absolute pointer, named for the screen this binding serves.
+    pub tablet: Option<EventDevice>,
+    /// Keyboard, named for the same screen.
+    pub keyboard: Option<EventDevice>,
+}

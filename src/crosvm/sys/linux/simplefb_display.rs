@@ -18,12 +18,12 @@ use base::VolatileSlice;
 use base::WaitContext;
 use gpu_display::Damage;
 use gpu_display::DisplayExternalResourceImport;
-use gpu_display::EventDevice;
 use gpu_display::GpuDisplay;
 use gpu_display::GpuDisplayExt;
 use gpu_display::PresentOutcome;
 use gpu_display::ScanoutFrame;
 use gpu_display::SurfaceType;
+use gpu_display::VncBindingInput;
 use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
 use vm_memory::udmabuf::UdmabufDriver;
@@ -80,14 +80,18 @@ pub enum SimplefbDisplayTarget {
     Vnc {
         addr: String,
         password: Option<String>,
-        /// Same `--vnc-server input=` interpretation as the virtio-gpu display path (see
-        /// vnc_touch_input): true = legacy multi-touch, false = absolute-mouse tablet.
-        touch_input: bool,
-        /// Where the H.264 side channel listens, or `None` when this binding's transport ceiling
-        /// does not allow one. Carried here for the same reason `transport_cap` is: the ceiling
-        /// belongs to the binding, and this screen's binding is a different one from the GPU
-        /// screen's.
-        h264_port: Option<u16>,
+        /// Whether this binding may run the hardware H.264 encoder. Carried here for the same
+        /// reason `transport_cap` is: the ceiling belongs to the binding, and this screen's binding
+        /// is a different one from the GPU screen's. There is no port with it -- the stream rides
+        /// `addr`, the RFB port this server already listens on.
+        hw_encode: bool,
+        /// This screen's own absolute pointer and keyboard, for the sink to inject RFB events into.
+        /// Empty on a `view-only=true` binding, which is how RFB input comes to be dropped: there
+        /// is nowhere for it to go.
+        ///
+        /// Carried on the target rather than passed beside it because it is a property of THIS
+        /// binding, and the other target has no input of its own at all.
+        input: VncBindingInput,
     },
     /// The Android Surface the app hands over through the display service binder. Input does
     /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
@@ -107,27 +111,29 @@ pub fn start_simplefb_display_thread(
     params: SimplefbDisplayParams,
     target: SimplefbDisplayTarget,
     transport_cap: TransportCap,
-    event_devices: Vec<EventDevice>,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("simplefb_display".into())
         .spawn(move || {
-            let display_result = match &target {
+            // `target` is consumed rather than borrowed: the VNC arm's input devices are moved into
+            // the sink, and a device cannot be handed over through a `&`.
+            let display_result = match target {
                 SimplefbDisplayTarget::Vnc {
                     addr,
                     password,
-                    touch_input,
-                    h264_port,
+                    hw_encode,
+                    input,
                 } => GpuDisplay::open_vnc_tcp(
-                    addr,
+                    &addr,
                     params.width,
                     params.height,
-                    password.clone(),
-                    *touch_input,
-                    *h264_port,
+                    password,
+                    hw_encode,
+                    input.tablet,
+                    input.keyboard,
                 ),
                 SimplefbDisplayTarget::Android { service_name } => {
-                    GpuDisplay::open_android(service_name)
+                    GpuDisplay::open_android(&service_name)
                 }
             };
             let mut display = match display_result {
@@ -146,13 +152,11 @@ pub fn start_simplefb_display_thread(
                 display.cap_transport_to_cpu();
             }
 
-            // Routes VNC input to the guest. The Android backend has no input of its own (the
-            // app drives the `--input` evdev sockets instead), so this is a no-op there.
-            for ed in event_devices {
-                if let Err(e) = display.import_event_device(ed) {
-                    error!("simplefb: failed to import event device: {:?}", e);
-                }
-            }
+            // No `import_event_device` here any more. The VNC sink was handed its devices above and
+            // delivers to them itself; importing them would have put them in this display's
+            // owner-scoped map, which is precisely the map that was empty on this path whenever a
+            // GPU device existed -- the device present, the road absent. The Android backend never
+            // had input of its own (the app drives the `--input` evdev sockets instead).
 
             if let Err(e) = simplefb_display_loop(guest_mem, &params, &mut display, transport_cap) {
                 error!("simplefb display thread exited with error: {:?}", e);

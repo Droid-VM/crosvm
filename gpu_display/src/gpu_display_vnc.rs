@@ -22,7 +22,7 @@ use crate::vnc_blit::BlitMapping;
 use crate::vnc_blit::VncBlitContext;
 use crate::vnc_h264::H264Consumer;
 use crate::DisplayT;
-use crate::EventDeviceKind;
+use crate::EventDevice;
 use crate::GpuDisplayError;
 use crate::GpuDisplayEvents;
 use crate::GpuDisplayFramebuffer;
@@ -243,7 +243,7 @@ struct VncImport {
     handle: i64,
     /// The same dmabuf, imported a second time in the byte order a video encoder reads.
     ///
-    /// 0 when there is no H.264 side channel on this display, which is the usual case. It is a
+    /// 0 when there is no H.264 encoder on this display, which is the usual case. It is a
     /// separate import rather than a flag on the blit because the channel exchange is performed by
     /// the SOURCE image's declared format (`blitSourceFourcc`, C++ side), and that is fixed when
     /// the image is created -- so a frame that has to reach two consumers in two byte orders needs
@@ -588,10 +588,30 @@ pub struct DisplayVnc {
     server: Arc<VncServerHandle>,
     shared_fb: Option<Arc<Mutex<SharedFramebuffer>>>,
     input_queue: VecDeque<VncInputEvent>,
-    next_tracking_id: i32,
     prev_button_mask: u8,
-    /// Inject pointer events as multi-touch (legacy) instead of the absolute mouse.
-    touch_input: bool,
+    /// The absolute pointer THIS server's clients drive, and no other server's.
+    ///
+    /// Held here rather than reached through `GpuDisplay`'s event-device map because that map is
+    /// scoped to one display OWNER and fans out by device KIND, and neither is the scope these
+    /// devices have. Two VNC servers on one owner both matched the one Tablet in it, each
+    /// normalizing against its own framebuffer, so the guest received two screens' coordinates on
+    /// one device with nothing to tell them apart; and the simplefb bridge is its own owner whose
+    /// map is empty whenever a GPU device exists, so there every event of every kind was iterated
+    /// over an empty list and dropped. A device that belongs to a binding lives in that binding.
+    ///
+    /// Owned outright, not shared: everything that writes to it is this sink's own event drain,
+    /// which runs on one thread, so report interleaving is not a hazard that has to be excluded --
+    /// it cannot arise. `None` on a `view-only=true` binding.
+    tablet: Option<EventDevice>,
+    /// The keyboard THIS server's clients type into. Same scope, same ownership and the same
+    /// `None`-when-view-only as `tablet`.
+    ///
+    /// The guest ends up with one of these per non-view-only VNC screen, alongside the VM-global
+    /// keyboard the `--input keyboard` socket still backs. That is not an accident of the wiring;
+    /// it is the resource model. A keyboard could be routed by guest focus instead of by screen,
+    /// but making it per-screen is what removes the last thing this sink has to share with anything
+    /// -- no writer crosses a thread, so no lock, no interleaving, no shared failure.
+    keyboard: Option<EventDevice>,
     /// The GPU half, once something has asked for it. `None` before the probe and after a probe
     /// that came back empty -- `blit_probed` tells those two apart, because "there is no blit
     /// driver on this machine" must be answered once and not re-attempted per resource.
@@ -600,7 +620,7 @@ pub struct DisplayVnc {
     /// Imports made against `blit`, keyed by the id `GpuDisplay` handed out. Shared with the
     /// surfaces, which are where flips happen.
     imports: Rc<RefCell<BTreeMap<u32, VncImport>>>,
-    /// The hardware-encode rung: a second consumer on the frame bus with a socket of its own.
+    /// The hardware-encode rung: a second consumer on the frame bus, feeding the RFB broadcaster.
     ///
     /// Declared last so it is dropped last. Field order is drop order, and this one has to outlive
     /// `server`: destroying the server is what stops offers arriving, and an offer arriving after
@@ -608,12 +628,14 @@ pub struct DisplayVnc {
     h264: Option<Arc<H264Consumer>>,
 }
 
-/// The VNC pointer/touch devices advertise this fixed absolute-axis maximum. Every injected
-/// coordinate is scaled to it against the *current* framebuffer size, so the guest cursor stays
-/// 1:1 with the pointer at any resolution -- including after the guest auto-resizes the display --
-/// without pinning the axis range to a static config value. MUST match the ABS_X/ABS_Y max the
-/// VNC tablet/touchscreen advertise in `create_display_window_input_devices()`
-/// (src/crosvm/sys/linux.rs).
+/// The VNC tablet advertises this fixed absolute-axis maximum. Every injected coordinate is scaled
+/// to it against the *current* framebuffer size, so the guest cursor stays 1:1 with the pointer at
+/// any resolution -- including after the guest auto-resizes the display -- without pinning the axis
+/// range to a static config value. MUST equal the ABS_X/ABS_Y max the tablet was created with:
+/// that device omits width/height and so advertises `NORMALIZED_ABS_MAX` (src/crosvm/config.rs),
+/// which is this same number. Two constants that are required to be equal, in two crates, is not
+/// tidy -- it is what the `--input absolute-mouse` feeder already relies on, and this sink is now
+/// one more feeder of the same shape of device.
 const VNC_ABS_MAX: i32 = 0x7FFF;
 
 /// Scale a VNC framebuffer coordinate in `0..extent` (where `extent` is the live framebuffer
@@ -624,18 +646,27 @@ fn vnc_norm_abs(v: i32, extent: u32) -> i32 {
 }
 
 impl DisplayVnc {
-    /// `h264_port` is the side channel's TCP port, or `None` when this binding may not have one --
-    /// which is what a transport ceiling below `gpu-hw` means, and also what a build with no
-    /// encoder behind it ends up doing anyway. It is resolved by the caller rather than derived
-    /// here so that the default (`vnc port + 100`) and an explicit `h264-port=` arrive the same
-    /// way, and so a sink that is not allowed one never binds the port at all.
+    /// `hw_encode` says whether this binding may run the hardware H.264 encoder and serve the
+    /// stream to RFB clients that ask for encoding 50. It is the transport ceiling's answer
+    /// (`transport-cap=gpu-hw` or `auto`), resolved by the caller rather than read here, because
+    /// the ceiling belongs to the binding and one sink serves several of them.
+    ///
+    /// There is no port to go with it. The stream leaves by the RFB port this server is already
+    /// listening on, which is the whole of plans/H264_SINGLE_PORT.md: nothing extra is bound, so
+    /// nothing extra can collide, be firewalled, or be told to a client.
+    ///
+    /// `tablet` and `keyboard` are this binding's own input devices, handed in rather than made
+    /// here because the guest-facing halves of them have to be registered as virtio devices by the
+    /// code that owns the VM's device list. Both `None` means `view-only=true`: no devices were
+    /// built and RFB input is dropped on arrival.
     pub fn new_tcp(
         addr: &str,
         width: u32,
         height: u32,
         password: Option<String>,
-        touch_input: bool,
-        h264_port: Option<u16>,
+        hw_encode: bool,
+        tablet: Option<EventDevice>,
+        keyboard: Option<EventDevice>,
     ) -> GpuDisplayResult<DisplayVnc> {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
 
@@ -670,12 +701,27 @@ impl DisplayVnc {
         // Between create and start, because that is the window the bus's registration contract
         // names: the consumer list is read without a lock from the producer's thread, so it has to
         // be finished before any frame can be offered.
-        let h264 = h264_port.and_then(|port| H264Consumer::start(server_ptr, port));
+        let h264 = if hw_encode {
+            H264Consumer::start(server_ptr)
+        } else {
+            None
+        };
 
         unsafe { vnc_server_start(server_ptr) };
         base::info!("VNC server started on TCP port {}", port);
 
         let server = Arc::new(VncServerHandle { ptr: server_ptr });
+
+        base::info!(
+            "VNC port {}: input -> {}",
+            port,
+            match (tablet.is_some(), keyboard.is_some()) {
+                (true, true) => "this binding's own tablet + keyboard",
+                (true, false) => "this binding's own tablet (no keyboard)",
+                (false, true) => "this binding's own keyboard (no tablet)",
+                (false, false) => "dropped (view-only)",
+            },
+        );
 
         Ok(DisplayVnc {
             event,
@@ -684,9 +730,9 @@ impl DisplayVnc {
             server,
             shared_fb: None,
             input_queue: VecDeque::new(),
-            next_tracking_id: 0,
             prev_button_mask: 0,
-            touch_input,
+            tablet,
+            keyboard,
             blit: None,
             blit_probed: false,
             imports: Rc::new(RefCell::new(BTreeMap::new())),
@@ -729,20 +775,10 @@ impl DisplayVnc {
         let _ = self.event.wait_timeout(std::time::Duration::ZERO);
     }
 
-    fn next_touch_tracking_id(&mut self) -> i32 {
-        let id = self.next_tracking_id;
-        self.next_tracking_id = self.next_tracking_id.wrapping_add(1);
-        id
-    }
-
-    fn current_tracking_id(&self) -> i32 {
-        self.next_tracking_id.wrapping_sub(1)
-    }
-
     /// Mouse mode (qemu usb-tablet equivalent): absolute position on every event (hover
     /// works), button transitions from the RFB mask, wheel as REL_WHEEL.
     /// RFB button mask: bit0=left, bit1=middle, bit2=right, bit3/4=wheel up/down.
-    fn pointer_to_mouse_events(&mut self, ev: &VncInputEvent) -> Option<GpuDisplayEvents> {
+    fn pointer_to_mouse_events(&mut self, ev: &VncInputEvent) -> Vec<virtio_input_event> {
         let cur_mask = ev.button_mask;
         let prev_mask = self.prev_button_mask;
         self.prev_button_mask = cur_mask;
@@ -767,86 +803,54 @@ impl DisplayVnc {
         if changed & 0x10 != 0 && cur_mask & 0x10 != 0 {
             events.push(virtio_input_event::wheel(-1));
         }
-        Some(GpuDisplayEvents {
-            events,
-            // Absolute pointer -> the Tablet device, not the relative Mouse device, so both
-            // can coexist as separate guest input devices.
-            device_type: EventDeviceKind::Tablet,
-        })
+        events
     }
 
-    fn convert_next_event(&mut self) -> Option<GpuDisplayEvents> {
-        let ev = self.input_queue.pop_front()?;
+    /// Takes one RFB event off the queue and writes it into this binding's own device.
+    ///
+    /// Direct, not through `GpuDisplayEvents` and the owner's fan-out. That route delivers to the
+    /// event devices of the `GpuDisplay` this backend happens to be inside, matched by device kind
+    /// -- which is wrong here in both directions at once. The simplefb bridge is its own
+    /// `GpuDisplay` and its event-device list is empty whenever a GPU device exists, so every event
+    /// of every kind, keys included, was iterated over an empty list and dropped: the device was
+    /// there, the road was not. And where the list was not empty, matching by kind is matching by
+    /// kind and nothing else, so two VNC servers' pointers landed on whichever tablet the owner
+    /// held. Both are the same mistake -- delivery scoped to a display owner when it needed to be
+    /// scoped to a binding -- so the devices written to here are the binding's own.
+    ///
+    /// A view-only binding still comes through here and still pops. Dropping the event is the
+    /// point; leaving it queued would grow the queue for as long as somebody kept clicking.
+    fn inject_next_event(&mut self) {
+        let Some(ev) = self.input_queue.pop_front() else {
+            return;
+        };
 
         match ev.event_type {
             VNC_INPUT_KEY => {
-                let pressed = ev.down != 0;
-                let events = vec![virtio_input_event::key(
-                    ev.linux_keycode,
-                    pressed,
-                    false,
-                )];
-                Some(GpuDisplayEvents {
-                    events,
-                    device_type: EventDeviceKind::Keyboard,
-                })
+                let Some(keyboard) = &mut self.keyboard else {
+                    return;
+                };
+                let events = [virtio_input_event::key(ev.linux_keycode, ev.down != 0, false)];
+                // One `send_report` call per RFB event, so the SYN_REPORT it appends closes exactly
+                // the events that arrived together -- which is what a guest reads as one keystroke.
+                if let Err(e) = keyboard.send_report(events.into_iter()) {
+                    base::error!("VNC: keyboard event dropped: {}", e);
+                }
             }
             VNC_INPUT_POINTER => {
-                // Absolute-mouse (qemu usb-tablet) mode, selected via --vnc-server
-                // input=mouse (the default). input=touch keeps the multi-touch
-                // handling below.
-                if !self.touch_input {
-                    return self.pointer_to_mouse_events(&ev);
-                }
-
-                let cur_mask = ev.button_mask;
-                let prev_mask = self.prev_button_mask;
-                self.prev_button_mask = cur_mask;
-
-                let btn1_now = cur_mask & 1;
-                let btn1_prev = prev_mask & 1;
-
-                if btn1_now != 0 && btn1_prev == 0 {
-                    let tid = self.next_touch_tracking_id();
-                    let events = vec![
-                        virtio_input_event::multitouch_slot(0),
-                        virtio_input_event::multitouch_tracking_id(tid),
-                        virtio_input_event::multitouch_absolute_x(vnc_norm_abs(ev.x, self.width)),
-                        virtio_input_event::multitouch_absolute_y(vnc_norm_abs(ev.y, self.height)),
-                        virtio_input_event::touch(true),
-                    ];
-                    Some(GpuDisplayEvents {
-                        events,
-                        device_type: EventDeviceKind::Touchscreen,
-                    })
-                } else if btn1_now != 0 && btn1_prev != 0 {
-                    let tid = self.current_tracking_id();
-                    let events = vec![
-                        virtio_input_event::multitouch_slot(0),
-                        virtio_input_event::multitouch_tracking_id(tid),
-                        virtio_input_event::multitouch_absolute_x(vnc_norm_abs(ev.x, self.width)),
-                        virtio_input_event::multitouch_absolute_y(vnc_norm_abs(ev.y, self.height)),
-                        virtio_input_event::touch(true),
-                    ];
-                    Some(GpuDisplayEvents {
-                        events,
-                        device_type: EventDeviceKind::Touchscreen,
-                    })
-                } else if btn1_now == 0 && btn1_prev != 0 {
-                    let events = vec![
-                        virtio_input_event::multitouch_slot(0),
-                        virtio_input_event::multitouch_tracking_id(-1),
-                        virtio_input_event::touch(false),
-                    ];
-                    Some(GpuDisplayEvents {
-                        events,
-                        device_type: EventDeviceKind::Touchscreen,
-                    })
-                } else {
-                    None
+                let events = self.pointer_to_mouse_events(&ev);
+                // After the conversion, not before: `pointer_to_mouse_events` is what advances
+                // `prev_button_mask`, and a view-only binding still has to track the mask it would
+                // have reported. Otherwise a button held across the moment input came back would
+                // produce a release for a press the guest never saw.
+                let Some(tablet) = &mut self.tablet else {
+                    return;
+                };
+                if let Err(e) = tablet.send_report(events.into_iter()) {
+                    base::error!("VNC: pointer event dropped: {}", e);
                 }
             }
-            _ => None,
+            _ => {}
         }
     }
 }
@@ -863,18 +867,18 @@ impl DisplayT for DisplayVnc {
         self.blit_context().is_some()
     }
 
-    /// Whether anything is waiting for frames -- an RFB client, or a side-channel one.
+    /// Whether anything is waiting for frames -- any RFB client, or one on the H.264 stream.
     ///
     /// No RFB client used to be the whole answer: LibVNCServer's mark-as-modified walks an empty
     /// client list, so a frame pushed then is encoded for nobody and sent to nobody. Producers ask
     /// this before building a frame; the surface's own flip and the C bridge both check again, so
     /// a producer that ignores the answer is still correct, only wasteful.
     ///
-    /// The H.264 consumer has to be part of the answer now, and it is not a refinement -- it is
-    /// the difference between working and not. The simplefb producer builds no frame at all when
-    /// this is false, so a VM watched over the side channel alone would deadlock on itself: no
-    /// offers because nothing is watching, and nothing counted as watching because the only client
-    /// is on the other socket.
+    /// The H.264 consumer is part of the answer for a reason that has survived the side channel it
+    /// was written for: an h264 client's pixel path is suppressed, so LibVNCServer marks nothing
+    /// for it, and a screen watched over the stream alone would deadlock on itself -- no offers
+    /// because nothing is watching, and nothing counted as watching because the encoder is what is
+    /// watching.
     fn has_consumer(&self) -> bool {
         self.server.has_clients()
             || self
@@ -886,10 +890,10 @@ impl DisplayT for DisplayVnc {
 
     /// Both kinds of client folded into one number, so a producer can see either of them arrive.
     ///
-    /// The RFB half is the bool it always was. The side-channel half is a counter, because a client
-    /// arriving there is exactly the case the bool cannot report: it goes true while the RFB flag
-    /// is already true, and the producer would then re-supply nothing and leave the new stream
-    /// showing a screen that had stopped moving before it connected.
+    /// The pixel half is the bool it always was. The stream half is a counter, because a client
+    /// joining there is exactly the case the bool cannot report: it goes true while the RFB flag is
+    /// already true, and the producer would then re-supply nothing and leave the new stream showing
+    /// a screen that had stopped moving before it joined.
     fn consumer_generation(&self) -> u64 {
         let rfb = self.server.has_clients() as u64;
         let h264 = self
@@ -910,15 +914,23 @@ impl DisplayT for DisplayVnc {
         Ok(0)
     }
 
+    /// Always `None`: this backend has already delivered the event by the time it returns.
+    ///
+    /// The two hooks stay because they are what the owner's drain loop calls per queued event --
+    /// `pending_events` says there is one, this consumes it -- and the loop must keep draining. It
+    /// is only the DELIVERY that moved (see `inject_next_event`), so handing back `None` here is
+    /// what stops the owner-scoped fan-out from also running, rather than an event going missing.
     fn handle_next_event(
         &mut self,
         _surface: &mut Box<dyn GpuDisplaySurface>,
     ) -> Option<GpuDisplayEvents> {
-        self.convert_next_event()
+        self.inject_next_event();
+        None
     }
 
     fn handle_next_event_without_surface(&mut self) -> Option<GpuDisplayEvents> {
-        self.convert_next_event()
+        self.inject_next_event();
+        None
     }
 
     fn create_surface(
@@ -1050,7 +1062,7 @@ impl DisplayT for DisplayVnc {
         // The second view of the same pages, in the byte order the encoder reads. Only when there
         // is an encoder to read it: an import is a VkImage and an imported allocation, so making
         // one nothing will ever blit from is a cost with no reader. A failure here is not fatal --
-        // the side channel falls to uploading the pixels the first import produces -- so it is
+        // the encoder falls to uploading the pixels the first import produces -- so it is
         // reported and the frame path carries on.
         let encoder_handle = if wants_encoder_source {
             match ctx.import_dmabuf(
@@ -1103,9 +1115,9 @@ impl DisplayT for DisplayVnc {
 
 impl Drop for DisplayVnc {
     fn drop(&mut self) {
-        // Before the imports are released, and before the server is destroyed: it tells the two
-        // side-channel threads to stop and closes the client, so nothing is left that could ask
-        // for a blit from an import that is about to go.
+        // Before the imports are released, and before the server is destroyed: it tells the drain
+        // thread to stop, so nothing is left that could ask for a blit from an import that is
+        // about to go.
         if let Some(h264) = &self.h264 {
             h264.shutdown();
         }

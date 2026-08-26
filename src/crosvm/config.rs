@@ -217,8 +217,8 @@ pub enum TransportCap {
     /// anything above it, and it means what it always meant -- the difference is that there is now
     /// a rung above it for it to be below.
     Gpu,
-    /// Allow the GPU blit and the hardware encoder above it: the VNC sink's H.264 side channel may
-    /// come up on this binding. Distinct from `auto` only in intent -- `auto` also permits it --
+    /// Allow the GPU blit and the hardware encoder above it: the VNC sink's H.264 stream may come
+    /// up on this binding. Distinct from `auto` only in intent -- `auto` also permits it --
     /// so that a caller can pin the ceiling here and have the meaning survive a future rung being
     /// added on top.
     GpuHw,
@@ -239,8 +239,8 @@ impl TransportCap {
     ///
     /// `gpu` caps below it, which is the whole reason the value had to be spellable: the app
     /// already sends `transport-cap=gpu` for bindings that should blit but not encode, and if that
-    /// were read as "anything the negotiation can reach" the side channel would come up on every
-    /// one of them.
+    /// were read as "anything the negotiation can reach" the encoder would come up on every one of
+    /// them.
     pub fn allows_hw_encode(self) -> bool {
         matches!(self, TransportCap::Auto | TransportCap::GpuHw)
     }
@@ -264,10 +264,26 @@ pub struct VncConfig {
     pub port: Option<u32>,
     #[serde(default)]
     pub password: Option<String>,
-    /// Pointer input mode: "mouse" (default; absolute mouse with hover/right-click/wheel)
-    /// or "touch" (multi-touch touchscreen events, tap/drag only).
+    /// Whether this binding's clients only watch.
+    ///
+    /// `false` (the default) is a working VNC session: crosvm builds this binding an absolute
+    /// pointer and a keyboard of its own and injects the server's RFB events into them. `true`
+    /// builds neither and drops RFB pointer and key events on arrival -- what a screen whose input
+    /// devices the user switched off asks for.
+    ///
+    /// A property of the BINDING, not of the VM. Two screens can differ, which is the whole reason
+    /// this could not stay where it was: the retired `input=` key selected between shapes of a
+    /// VM-global pointer set, and a set shared by two servers cannot express "this screen watches,
+    /// that one is driven" -- nor could the guest tell which screen a coordinate came from, since
+    /// both servers normalized against their own framebuffer into the same device.
+    ///
+    /// There is deliberately NO `input=` here, and `deny_unknown_fields` above is what makes that a
+    /// refusal rather than a shrug -- the same reasoning as the retired `h264-port` below. A
+    /// command line that still names it was written against a crosvm whose input wiring this one
+    /// does not have, and starting anyway would hand its author a pointer landing on the wrong
+    /// screen or on nothing at all.
     #[serde(default)]
-    pub input: Option<String>,
+    pub view_only: bool,
     /// Which screen this server shows. `None` on the wire means "not said"; `validate_config`
     /// resolves it and writes the answer back, so nothing downstream ever sees `None`.
     #[serde(default)]
@@ -277,21 +293,16 @@ pub struct VncConfig {
     /// Accepted here for the same reason both exporters take `screen=`: the two options describe
     /// the same kind of thing and a caller should not have to remember which half of the surface
     /// exists on which one. Both of its upper rungs mean something on this sink now -- `gpu` is
-    /// the Vulkan blit that step 11 gave it, `gpu-hw` the H.264 side channel above that.
+    /// the Vulkan blit that step 11 gave it, `gpu-hw` the hardware H.264 encoder above that.
     #[serde(default)]
     pub transport_cap: TransportCap,
-    /// TCP port for the hardware-encoded H.264 side channel, when the ceiling allows one.
-    ///
-    /// `None` means the default, which is this server's RFB port plus
-    /// [`gpu_display::H264_PORT_OFFSET`]. A default rather than a required key because a client
-    /// has to be able to find the stream from the one address it was given, and an offset it can
-    /// compute is the cheapest way to say where it is. The key exists for the case the offset
-    /// lands on something already taken.
-    ///
-    /// Saying it does not turn the side channel on: `transport-cap` decides that, and a port on a
-    /// binding capped below `gpu-hw` is simply never bound.
-    #[serde(default)]
-    pub h264_port: Option<u32>,
+    // There is deliberately NO `h264-port` here, and `deny_unknown_fields` above is what makes
+    // that a refusal rather than a shrug. The H.264 stream used to have a side channel of its own
+    // on `port + 100`; it now rides the RFB port as encoding 50
+    // (plans/H264_SINGLE_PORT.md). A command line that still names the retired key was written
+    // against a crosvm that answered on a socket this one does not open, so starting anyway would
+    // hand its author a VM whose stream is silently missing. Mixed deploys are already forbidden
+    // in this project, and a silently dropped key is how a stale config passes a gate.
 }
 
 #[cfg(feature = "vnc")]
@@ -301,20 +312,26 @@ impl VncConfig {
         self.port.unwrap_or(DEFAULT_VNC_PORT)
     }
 
-    /// Where the H.264 side channel should listen, or `None` if this binding may not have one.
+    /// Whether this binding may run the hardware H.264 encoder and serve its stream to RFB clients
+    /// that ask for encoding 50.
     ///
-    /// The one place the ceiling and the offset meet, so that "is hardware encoding allowed here"
-    /// and "what port would it use" cannot answer differently anywhere downstream. A `None` from
-    /// here means the port is never bound at all -- not bound and then refused -- which is what
-    /// keeps a capped binding from showing an open port that answers nothing.
-    pub fn h264_listen_port(&self) -> Option<u16> {
-        if !self.transport_cap.allows_hw_encode() {
-            return None;
-        }
-        let port = self
-            .h264_port
-            .unwrap_or(self.effective_port() + gpu_display::H264_PORT_OFFSET as u32);
-        u16::try_from(port).ok()
+    /// The one place the ceiling is read for this question, so that "is hardware encoding allowed
+    /// here" cannot answer differently in the two sinks that ask it. `false` means no broker is
+    /// built at all, so a client that asks for 50 there is served pixels and told nothing -- which
+    /// is exactly what an older server looks like on the wire, and what a client has to handle
+    /// anyway.
+    pub fn h264_enabled(&self) -> bool {
+        self.transport_cap.allows_hw_encode()
+    }
+
+    /// Whether this binding gets input devices of its own (a tablet and a keyboard).
+    ///
+    /// Asked as a question rather than as `!view_only` at each call site, for the same reason
+    /// `TransportCap` does it: the two places that must agree are the device creation and the
+    /// sink's injection, and disagreement is silent in both directions -- a device nothing writes
+    /// to, or events written to nothing.
+    pub fn wants_input_devices(&self) -> bool {
+        !self.view_only
     }
 }
 
@@ -548,9 +565,25 @@ pub enum InputDeviceOption {
     Evdev {
         path: PathBuf,
     },
+    // `name` is here for a different reason than the touch devices' below, and the difference is
+    // worth stating because it looks like the same field. A keyboard reports no coordinates, so it
+    // is not mapped to an output and nothing silently breaks if it is renamed. It is named because
+    // there is now more than one of them: a keyboard belongs to a scanout, so the guest sees one
+    // per screen with input enabled, and several devices all called "Crosvm Virtio Keyboard <idx>"
+    // is a list nobody can read -- the idx counts emission order, so it is not even stable per
+    // screen. Omitted keeps that generated name, which is still right for a single unnamed keyboard.
+    //
+    // CROSS-REPO SEAM: the DroidVM daemon passes `DroidVM Keyboard (<screenId>)` here for a
+    // natively exported screen, the same string crosvm generates itself for a VNC-exported one (see
+    // `vnc_keyboard_device_name`, sys/linux.rs). One format, two producers, so a screen keeps its
+    // keyboard's name when it changes exporter.
     Keyboard {
         path: PathBuf,
+        name: Option<String>,
     },
+    // No `name` here, deliberately. The relative mouse is the VM's and not a scanout's -- it is
+    // what the app's MOUSE console mode drives, a pointer that walks from one output to the next --
+    // so there is exactly one and it has no per-screen identity to carry.
     Mouse {
         path: PathBuf,
     },
@@ -1575,36 +1608,20 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     // than as a screen conflict.
     #[cfg(feature = "vnc")]
     {
-        // The RFB port and the side channel's are in one list, not two, because they are two
-        // listeners in one process and a collision between them is exactly as fatal as a collision
-        // between two RFB ports -- and rather more surprising, since the second one is usually
-        // derived rather than typed. The default offset makes it hard to reach by accident and the
-        // arithmetic makes it trivial to reach on purpose (`--vnc-server port=5900` beside
-        // `--vnc-server port=6000`), which is why it is checked rather than reasoned about.
-        let mut ports: Vec<(u32, &'static str)> = Vec::with_capacity(cfg.vnc_server.len() * 2);
+        // One listener per server, since the H.264 stream was folded onto the RFB port: there is
+        // no derived second port left to collide with anything. What is still worth catching here
+        // is the plain copy-paste, because the loser of a duplicate finds out at bind time, far
+        // from the option that caused it.
+        let mut ports: Vec<u32> = Vec::with_capacity(cfg.vnc_server.len());
         for vnc in cfg.vnc_server.iter() {
-            if let Some(port) = vnc.h264_port {
-                if port == 0 || u16::try_from(port).is_err() {
-                    return Err(format!(
-                        "`vnc-server` `h264-port={}` is not a TCP port number",
-                        port
-                    ));
-                }
+            let port = vnc.effective_port();
+            if ports.contains(&port) {
+                return Err(format!(
+                    "port {} is claimed by two `vnc-server` options; each needs its own",
+                    port
+                ));
             }
-            let mut claim = |port: u32, what: &'static str| -> Result<(), String> {
-                if let Some((_, held_by)) = ports.iter().find(|(p, _)| *p == port) {
-                    return Err(format!(
-                        "port {} is claimed by two listeners ({} and {}); each needs its own",
-                        port, held_by, what
-                    ));
-                }
-                ports.push((port, what));
-                Ok(())
-            };
-            claim(vnc.effective_port(), "a `vnc-server` RFB port")?;
-            if let Some(h264) = vnc.h264_listen_port() {
-                claim(h264 as u32, "a `vnc-server` H.264 side channel")?;
-            }
+            ports.push(port);
         }
     }
     #[cfg(feature = "android_display")]
@@ -2866,22 +2883,103 @@ mod tests {
         );
     }
 
-    // The keyboard and the relative mouse are the VM's, not a screen's -- neither carries an
-    // output binding, so neither takes a name. `deny_unknown_fields` makes that a parse failure
-    // rather than a silently ignored key, which is the behaviour the app's emitter relies on to
-    // learn that a field does not exist.
+    // A keyboard belongs to a scanout now, so there is one per screen with input enabled and each
+    // carries a name to tell them apart in the guest's device list. The name is not an output
+    // mapping key the way a tablet's is -- a keyboard reports no coordinates -- so nothing breaks
+    // silently if it changes; what it buys is a readable list.
     #[test]
-    fn keyboard_and_mouse_reject_name() {
-        for arg in [
-            "keyboard[path=/tmp/kbd.sock,name=DroidVM Keyboard]",
-            "mouse[path=/tmp/mouse.sock,name=DroidVM Mouse]",
-        ] {
-            assert!(
-                crate::crosvm::cmdline::RunCommand::from_args(&[], &["--input", arg, "bzImage"])
-                    .is_err(),
-                "expected name= to be rejected in {arg}"
-            );
-        }
+    fn parse_keyboard_with_name() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &[
+                    "--input",
+                    "keyboard[path=/tmp/kbd.sock,name=DroidVM Keyboard (gpu-0)]",
+                    "bzImage",
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.virtio_input[0],
+            InputDeviceOption::Keyboard {
+                path: PathBuf::from("/tmp/kbd.sock"),
+                name: Some("DroidVM Keyboard (gpu-0)".to_string()),
+            }
+        );
+    }
+
+    // Omitting it stays legal: a single unnamed keyboard is every command line written before the
+    // field existed, and the generated name is still right for it.
+    #[test]
+    fn parse_keyboard_without_name() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &["--input", "keyboard[path=/tmp/kbd.sock]", "bzImage"],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            cfg.virtio_input[0],
+            InputDeviceOption::Keyboard {
+                path: PathBuf::from("/tmp/kbd.sock"),
+                name: None,
+            }
+        );
+    }
+
+    // Several keyboards is the ordinary case now (one per screen), and they must come out as
+    // several INDEPENDENT devices -- distinct options, distinct names, and distinct generated
+    // indices downstream, which is what keeps their unique-id strings apart.
+    #[test]
+    fn parse_several_named_keyboards() {
+        let cfg = TryInto::<Config>::try_into(
+            crate::crosvm::cmdline::RunCommand::from_args(
+                &[],
+                &[
+                    "--input",
+                    "keyboard[path=/tmp/kbd-gpu0.sock,name=DroidVM Keyboard (gpu-0)]",
+                    "--input",
+                    "keyboard[path=/tmp/kbd-fb.sock,name=DroidVM Keyboard (simplefb)]",
+                    "bzImage",
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.virtio_input.len(), 2);
+        assert_eq!(
+            cfg.virtio_input[0],
+            InputDeviceOption::Keyboard {
+                path: PathBuf::from("/tmp/kbd-gpu0.sock"),
+                name: Some("DroidVM Keyboard (gpu-0)".to_string()),
+            }
+        );
+        assert_eq!(
+            cfg.virtio_input[1],
+            InputDeviceOption::Keyboard {
+                path: PathBuf::from("/tmp/kbd-fb.sock"),
+                name: Some("DroidVM Keyboard (simplefb)".to_string()),
+            }
+        );
+    }
+
+    // The relative mouse is the VM's, not a screen's -- it carries no output binding, so it takes
+    // no name. `deny_unknown_fields` makes that a parse failure rather than a silently ignored key,
+    // which is the behaviour the app's emitter relies on to learn that a field does not exist.
+    #[test]
+    fn mouse_rejects_name() {
+        assert!(crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &["--input", "mouse[path=/tmp/mouse.sock,name=DroidVM Mouse]", "bzImage"],
+        )
+        .is_err());
     }
 
     #[test]
@@ -3371,41 +3469,73 @@ mod tests {
         assert!(TransportCap::Auto.allows_hw_encode());
     }
 
-    /// Where the side channel listens, and when it does not.
+    /// Whether this binding may run the hardware encoder, and the one key that used to say where
+    /// its stream came out.
+    ///
+    /// The stream rides the RFB port now (plans/H264_SINGLE_PORT.md), so `h264-port=` names a
+    /// listener this crosvm does not open. A command line that still carries it was written against
+    /// a different server, and the whole point of `deny_unknown_fields` here is that it FAILS
+    /// rather than starting a VM whose stream is silently missing -- a mixed deploy is already
+    /// forbidden, and a quietly dropped key is how a stale config passes a gate.
     #[test]
     #[cfg(feature = "vnc")]
-    fn parse_vnc_server_h264_port() {
-        // Unsaid means the offset from the RFB port, so a client that knows one knows the other.
+    fn parse_vnc_server_rejects_the_retired_h264_port() {
+        assert!(from_key_values::<VncConfig>("port=5900,h264-port=7100").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hw,h264-port=7100")
+            .is_err());
+        // The underscore spelling too: neither form has a field to land in.
+        assert!(from_key_values::<VncConfig>("port=5900,h264_port=7100").is_err());
+
+        // What is left is the ceiling, and it still decides.
         let vnc = from_key_values::<VncConfig>("port=5900").unwrap();
-        assert_eq!(vnc.h264_port, None);
-        assert_eq!(vnc.h264_listen_port(), Some(6000));
-
-        // The offset follows the port it is an offset from, including the default one.
-        let vnc = from_key_values::<VncConfig>("host=0.0.0.0").unwrap();
-        assert_eq!(vnc.h264_listen_port(), Some(6000));
-        let vnc = from_key_values::<VncConfig>("port=5931").unwrap();
-        assert_eq!(vnc.h264_listen_port(), Some(6031));
-
-        // Said means said.
-        let vnc = from_key_values::<VncConfig>("port=5900,h264-port=7100").unwrap();
-        assert_eq!(vnc.h264_port, Some(7100));
-        assert_eq!(vnc.h264_listen_port(), Some(7100));
-
-        // A ceiling below the rung means no port at all -- not a port that answers nothing.
+        assert!(vnc.h264_enabled());
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hw").unwrap();
+        assert!(vnc.h264_enabled());
         let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu").unwrap();
-        assert_eq!(vnc.h264_listen_port(), None);
-        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=cpu,h264-port=7100")
-            .unwrap();
-        assert_eq!(vnc.h264_port, Some(7100));
-        assert_eq!(vnc.h264_listen_port(), None);
+        assert!(!vnc.h264_enabled());
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=cpu").unwrap();
+        assert!(!vnc.h264_enabled());
 
         // And it combines with the keys that were already there.
-        let vnc = from_key_values::<VncConfig>(
-            "port=5901,screen=simplefb,transport-cap=gpu-hw,h264-port=6001",
-        )
-        .unwrap();
+        let vnc =
+            from_key_values::<VncConfig>("port=5901,screen=simplefb,transport-cap=gpu-hw").unwrap();
         assert_eq!(vnc.screen, Some(DisplayScreen::Simplefb));
-        assert_eq!(vnc.h264_listen_port(), Some(6001));
+        assert!(vnc.h264_enabled());
+    }
+
+    /// Whether this binding's clients drive anything, and the key that used to answer a different
+    /// question in the same place.
+    ///
+    /// `input=` selected between shapes of a VM-global pointer set that no longer exists, so a
+    /// command line still carrying it was written against a crosvm whose input wiring this one does
+    /// not have. It fails for the same reason `h264-port=` does, and is pinned here for the same
+    /// reason: a quietly dropped key is how a stale config passes a gate -- here it would produce a
+    /// VM whose pointer lands on the wrong screen, or nowhere.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn parse_vnc_server_view_only_and_the_retired_input_key() {
+        // Unsaid means driven, which is what makes a bare `--vnc-server` usable.
+        let vnc = from_key_values::<VncConfig>("port=5900").unwrap();
+        assert!(!vnc.view_only);
+        assert!(vnc.wants_input_devices());
+
+        let vnc = from_key_values::<VncConfig>("port=5900,view-only=true").unwrap();
+        assert!(vnc.view_only);
+        assert!(!vnc.wants_input_devices());
+
+        let vnc = from_key_values::<VncConfig>("port=5900,view-only=false").unwrap();
+        assert!(vnc.wants_input_devices());
+
+        // It is per binding, not per VM: two servers, two answers.
+        let vnc = from_key_values::<VncConfig>("port=5901,screen=simplefb,view-only=true").unwrap();
+        assert_eq!(vnc.screen, Some(DisplayScreen::Simplefb));
+        assert!(!vnc.wants_input_devices());
+
+        // Every spelling of the retired key, including the ones that used to be valid values.
+        assert!(from_key_values::<VncConfig>("port=5900,input=tablet").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,input=mouse").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,input=touch").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,input=none").is_err());
     }
 
     /// A single `--vnc-server` with no `screen=` and a GPU present: the shape of every VNC command

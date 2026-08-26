@@ -843,14 +843,17 @@ pub fn create_keyboard_device<T: IntoUnixStream>(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,
     keyboard_socket: T,
+    name: Option<&str>,
     idx: u32,
 ) -> DeviceResult {
     let socket = keyboard_socket
         .into_unix_stream()
         .context("failed configuring virtio keyboard")?;
 
-    // `--input keyboard` takes no name= either, for the same reason as the mouse above.
-    let dev = virtio::input::new_keyboard(idx, socket, None, virtio::base_features(protection_type))
+    // Named, unlike the relative mouse above: a keyboard belongs to a scanout, so a VM has one per
+    // screen and the guest's device list needs them told apart. `None` keeps the generated
+    // "Crosvm Virtio Keyboard <idx>", which still fits a lone unnamed keyboard.
+    let dev = virtio::input::new_keyboard(idx, socket, name, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {

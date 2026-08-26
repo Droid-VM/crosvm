@@ -92,7 +92,9 @@ use devices::vfio::VfioContainerManager;
 use devices::virtio;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoDeviceType;
-#[cfg(feature = "gpu")]
+// `vnc` implies `devices/gpu`, so this type is reachable on a VNC-only build too -- and needed
+// there, since that is the build where the simplefb bridge is the only display.
+#[cfg(any(feature = "gpu", feature = "vnc"))]
 use devices::virtio::gpu::EventDevice;
 #[cfg(target_arch = "x86_64")]
 use devices::virtio::memory_mapper::MemoryMapper;
@@ -151,6 +153,8 @@ use devices::VirtioPciDevice;
 use devices::XhciController;
 #[cfg(feature = "gpu")]
 use gpu::*;
+#[cfg(feature = "vnc")]
+use gpu_display::VncBindingInput;
 #[cfg(target_arch = "riscv64")]
 use hypervisor::CpuConfigRiscv64;
 #[cfg(target_arch = "x86_64")]
@@ -228,44 +232,168 @@ const GENIEZONE_PATH: &str = "/dev/gzvm";
 #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
 static GUNYAH_PATH: &str = "/dev/gunyah";
 
-/// Pointer input mode for a VNC session: true injects RFB pointer events as the legacy
-/// multi-touch touchscreen, false as the absolute-mouse tablet (`input=tablet`, alias
-/// `mouse`). Shared by the virtio-gpu and simplefb display paths so both interpret the
-/// `--vnc-server input=` option identically.
+/// The evdev names this screen's built-in VNC input devices carry.
+///
+/// CROSS-REPO SEAM. The tablet string is the one
+/// `NativeDisplay.tabletDeviceName(screenId)` produces in the DroidVM app repo
+/// (app/src/main/java/cn/classfun/droidvm/lib/store/vm/NativeDisplay.java), and the keyboard is that
+/// file's keyboard variant of the same format. On a NATIVELY exported screen those devices are
+/// `--input absolute-mouse[...,name=]` fed over a daemon socket; here they are built in-process and
+/// fed by this screen's VNC server. The guest must not be able to tell the two apart: a user maps an
+/// absolute pointer to an output BY NAME (kwin stores it by name, `xinput map-to-output` takes one,
+/// Windows' Tablet PC setup remembers the one it was pointed at), so moving a screen from one
+/// exporter to the other has to leave the name its mapping is keyed on untouched. Change the format
+/// on one side only and a mapping silently stops matching, with nothing anywhere to notice.
 #[cfg(feature = "vnc")]
-pub(crate) fn vnc_touch_input(input: Option<&str>) -> bool {
-    match input {
-        Some("tablet") | Some("mouse") => false,
-        None | Some("touch") => true,
-        Some(other) => {
-            warn!("invalid vnc-server input mode {other:?}; keeping \"touch\"");
-            true
-        }
+fn vnc_tablet_device_name(screen: DisplayScreen) -> String {
+    format!("DroidVM Tablet ({})", screen.as_str())
+}
+
+/// See `vnc_tablet_device_name` -- same seam, same file on the other side, same format with the
+/// kind swapped. `NativeDisplay.tabletDeviceName`'s javadoc names this string explicitly as the
+/// keyboard sibling, and the DroidVM daemon emits the identical format itself for a NATIVELY
+/// exported screen (`--input keyboard[path=…,name=DroidVM Keyboard (<screenId>)]`). One format, two
+/// producers: a screen keeps its keyboard's name when it moves between exporters.
+///
+/// A keyboard is not an output-mapped device the way a pointer is -- it reports no coordinates, so
+/// no guest-side mapping is keyed on this and nothing breaks silently if it changes. It is
+/// per-screen because the DEVICE is: a keyboard belongs to a scanout, so the guest sees one per
+/// screen with input enabled, and a name is the difference between a device list that explains
+/// itself and several identical rows.
+#[cfg(feature = "vnc")]
+fn vnc_keyboard_device_name(screen: DisplayScreen) -> String {
+    format!("DroidVM Keyboard ({})", screen.as_str())
+}
+
+/// The `idx` a built-in device is created with.
+///
+/// Fixed per screen, and a function of the screen and nothing else. It reaches the guest only as
+/// the device's unique-id string (`virtio-absolute-mouse-<idx>`, `virtio-keyboard-<idx>`) -- the
+/// names are set explicitly above -- but a number that moved when some other screen's input was
+/// switched off would still be a per-screen identity that is not derived from the screen.
+///
+/// Counted DOWN from just under `u32::MAX`, which keeps it clear of both neighbours at once: the
+/// `--input` devices count UP from 0 in emission order, and the display-window set uses `u32::MAX`
+/// itself. That last one matters even though nothing in this project passes
+/// `--display-window-keyboard`: its keyboard and a VNC binding's keyboard are the same device type,
+/// so sharing an index would give two live devices one unique-id string.
+#[cfg(feature = "vnc")]
+fn vnc_device_idx(screen: DisplayScreen) -> u32 {
+    match screen {
+        DisplayScreen::Gpu0 => u32::MAX - 1,
+        DisplayScreen::Simplefb => u32::MAX - 2,
     }
 }
 
+/// Builds the tablet and keyboard belonging to one VNC binding.
+///
+/// Returns an empty pair for a screen with no VNC exporter and for one whose binding says
+/// `view-only=true` -- the same answer for two different reasons, and the sink treats them the same
+/// way because there is nothing to tell apart: no device, so nowhere to inject, so RFB input is
+/// dropped.
+///
+/// The tablet's width and height are `NORMALIZED_ABS_MAX` rather than a pixel size, which is exactly
+/// what `--input absolute-mouse` declares when it omits them: the sink scales every coordinate to
+/// that fixed range against the framebuffer size it has at the time (`VNC_ABS_MAX` in
+/// gpu_display_vnc.rs, required to be the same number), so the mapping stays 1:1 across a guest
+/// auto-resize without anything having to be told the new size.
+///
+/// Both devices are created here, in device creation, because the guest-facing half of each has to
+/// land in the same device list as everything else the VM gets, and this is the only code path
+/// holding that list. The sink-facing halves travel to whichever display path serves this screen.
+#[cfg(feature = "vnc")]
+fn create_vnc_binding_input(
+    cfg: &Config,
+    screen: DisplayScreen,
+    devs: &mut Vec<VirtioDeviceStub>,
+) -> DeviceResult<VncBindingInput> {
+    let Some(vnc_cfg) = cfg.vnc_server_for(screen) else {
+        return Ok(VncBindingInput::default());
+    };
+    if !vnc_cfg.wants_input_devices() {
+        info!(
+            "vnc: screen {} is view-only; no tablet or keyboard, RFB input dropped",
+            screen.as_str()
+        );
+        return Ok(VncBindingInput::default());
+    }
+    let idx = vnc_device_idx(screen);
+
+    let (tablet_sink, tablet_dev_socket) =
+        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+            .context("failed to create socket")?;
+    let tablet_name = vnc_tablet_device_name(screen);
+    let tablet = virtio::input::new_absolute_mouse(
+        idx,
+        tablet_dev_socket,
+        NORMALIZED_ABS_MAX,
+        NORMALIZED_ABS_MAX,
+        Some(&tablet_name),
+        virtio::base_features(cfg.protection_type),
+    )
+    .context("failed to set up the VNC binding's absolute mouse device")?;
+    devs.push(VirtioDeviceStub {
+        dev: Box::new(tablet),
+        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+    });
+
+    let (keyboard_sink, keyboard_dev_socket) =
+        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+            .context("failed to create socket")?;
+    let keyboard_name = vnc_keyboard_device_name(screen);
+    let keyboard = virtio::input::new_keyboard(
+        idx,
+        keyboard_dev_socket,
+        Some(&keyboard_name),
+        virtio::base_features(cfg.protection_type),
+    )
+    .context("failed to set up the VNC binding's keyboard device")?;
+    devs.push(VirtioDeviceStub {
+        dev: Box::new(keyboard),
+        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+    });
+
+    info!(
+        "vnc: screen {} gets \"{}\" + \"{}\"",
+        screen.as_str(),
+        tablet_name,
+        keyboard_name
+    );
+    Ok(VncBindingInput {
+        tablet: Some(EventDevice::tablet(tablet_sink)),
+        keyboard: Some(EventDevice::keyboard(keyboard_sink)),
+    })
+}
+
 /// Names for the display-window device set. They are constants and not derived from anything,
-/// which is the point: these four devices belong to the VM's display window, not to any one
-/// screen, so nothing about a screen may leak into them. Sharing a name with a `--input` device
-/// would hand the guest two devices claiming one identity -- and since a guest maps an absolute
-/// device to an output *by name*, the mapping the user set for one of them would silently start
-/// matching the other. Fixed strings also mean they come back identical across reboots, which is
-/// what makes them mappable at all.
+/// which is the point: these devices belong to the VM's display window, not to any one screen, so
+/// nothing about a screen may leak into them. Sharing a name with a `--input` device would hand the
+/// guest two devices claiming one identity -- and since a guest maps an absolute device to an output
+/// *by name*, the mapping the user set for one of them would silently start matching the other.
+/// Fixed strings also mean they come back identical across reboots, which is what makes them
+/// mappable at all.
+///
+/// They still say "VNC" and no VNC configuration can reach them any more -- the name is history, not
+/// a claim. This set is the X11 display window's, built only when `--display-window-mouse` /
+/// `--display-window-keyboard` are passed explicitly; VNC stopped turning those on and stopped
+/// injecting into these (see `create_vnc_binding_input`). Renaming them would move a device
+/// identity that somebody's guest-side mapping is keyed on, in exchange for tidier strings.
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 const DISPLAY_WINDOW_TOUCH_NAME: &str = "DroidVM VNC Touch";
-#[cfg(feature = "vnc")]
-const DISPLAY_WINDOW_TABLET_NAME: &str = "DroidVM VNC Tablet";
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 const DISPLAY_WINDOW_MOUSE_NAME: &str = "DroidVM VNC Mouse";
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 const DISPLAY_WINDOW_KEYBOARD_NAME: &str = "DroidVM VNC Keyboard";
 
-/// Creates the display-window input devices and returns their event-device ends: a
-/// multi-touch touchscreen, a relative mouse, an absolute-mouse tablet (only when the VNC
-/// server opts in with `input=tablet`) and a keyboard. Shared by the virtio-gpu and
-/// simplefb+VNC display paths so a VNC session exposes the same guest input devices
-/// regardless of the display backend. The absolute devices span `default_width` x
-/// `default_height` unless a `--input multi-touch` option overrides the dimensions.
+/// Creates the display-window input devices and returns their event-device ends: a multi-touch
+/// touchscreen, a relative mouse and a keyboard, spanning `default_width` x `default_height` unless
+/// a `--input multi-touch` option overrides the dimensions.
+///
+/// The X11 display window's, and only its: a VNC session's devices belong to the BINDING that serves
+/// one screen, not to the VM (`create_vnc_binding_input`). What used to be here was the same set
+/// with a VNC-shaped absolute range bolted on and an extra tablet, handed to whichever display
+/// happened to ask -- which is how two VNC screens ended up injecting into one tablet, and how a
+/// simplefb screen alongside a GPU device ended up injecting into nothing at all.
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 fn create_display_window_input_devices(
     cfg: &Config,
@@ -297,20 +425,10 @@ fn create_display_window_input_devices(
                 break;
             }
         }
-        // The VNC backend normalizes injected pointer/touch coords to a fixed absolute range
-        // against the *current* framebuffer size (VNC_ABS_MAX in gpu_display_vnc.rs), keeping the
-        // mapping 1:1 across guest auto-resize -- so its touch + tablet advertise that fixed range
-        // instead of a pixel size. Non-VNC (X11) display windows keep pixel dimensions.
-        // Any VNC binding at all, not a particular screen's: this device set is VM-global (one
-        // keyboard, one relative pointer, one touchscreen -- the compositor routes them by focus),
-        // so the coordinate space has to be settled once for the whole VM. Making the absolute
-        // range per-screen means a virtio-input device per screen, which is step 9's job.
-        #[cfg(feature = "vnc")]
-        let (multi_touch_width, multi_touch_height) = if !cfg.vnc_server.is_empty() {
-            (0x7FFF_u32, 0x7FFF_u32)
-        } else {
-            (multi_touch_width, multi_touch_height)
-        };
+        // Pixel dimensions, unconditionally. This used to be overridden to the VNC sink's
+        // normalized range whenever ANY vnc binding existed -- a VM-global device measured against
+        // whichever screen a client happened to be looking at, which is the coordinate half of the
+        // same mistake the per-binding devices fix. Nothing normalized reaches this device now.
         let dev = virtio::input::new_multi_touch(
             // u32::MAX is the least likely to collide with the indices generated above for
             // the multi_touch options, which begin at 0.
@@ -328,10 +446,9 @@ fn create_display_window_input_devices(
         });
         event_devices.push(EventDevice::touchscreen(event_device_socket));
 
-        // Relative-motion mouse (EventDeviceKind::Mouse), a distinct device from the
-        // absolute Tablet created below, so the guest exposes both a relative and an
-        // absolute pointer at once. VNC (RFB is absolute) only drives the Tablet; this
-        // relative mouse is left for the Android app / games that want relative motion.
+        // Relative-motion mouse (EventDeviceKind::Mouse) for the display window. There used to be
+        // an absolute Tablet beside it, created when the VNC server asked for one; it is gone with
+        // the rest of VNC's claim on this set.
         {
             let (event_device_socket, virtio_dev_socket) =
                 StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
@@ -348,37 +465,6 @@ fn create_display_window_input_devices(
                 jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
             });
             event_devices.push(EventDevice::mouse(event_device_socket));
-        }
-
-        // Tablet mode: an absolute-coordinate pointer (qemu usb-tablet equivalent) created
-        // only when the VNC server opts in with `input=tablet`, so the default device set
-        // stays unchanged. The VNC backend then emits Tablet-kind events with ABS
-        // coordinates, giving a 1:1 cursor mapping with hover/right-click/wheel.
-        // Same VM-global reasoning as the absolute range above: whether the tablet exists is a
-        // property of the device set, so the first VNC binding decides it for all of them. With
-        // one binding -- every configuration expressible before this option repeated -- this is
-        // the same question as before.
-        #[cfg(feature = "vnc")]
-        if !vnc_touch_input(cfg.vnc_server.first().and_then(|v| v.input.as_deref())) {
-            let (event_device_socket, virtio_dev_socket) =
-                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                    .context("failed to create socket")?;
-            let dev = virtio::input::new_absolute_mouse(
-                u32::MAX,
-                virtio_dev_socket,
-                multi_touch_width,
-                multi_touch_height,
-                Some(DISPLAY_WINDOW_TABLET_NAME),
-                virtio::base_features(cfg.protection_type),
-            )
-            .context("failed to set up absolute mouse device")?;
-            devs.push(VirtioDeviceStub {
-                dev: Box::new(dev),
-                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-            });
-            // Route the absolute pointer to the dedicated Tablet kind (not Mouse), so it
-            // is independent of the relative mouse created above.
-            event_devices.push(EventDevice::tablet(event_device_socket));
         }
     }
     if cfg.display_window_keyboard {
@@ -412,7 +498,7 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
-    #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "vnc")] simplefb_vnc_input_out: &mut VncBindingInput,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -488,16 +574,20 @@ fn create_virtio_devices(
             let event_devices =
                 create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
 
-            // This device set belongs to this device's display: one keyboard, one relative
-            // pointer, one absolute device, routed by guest focus. The simplefb bridge keeps its
-            // own event devices where it makes them, and it makes them only when there is no GPU
-            // device at all -- a simplefb screen exported alongside a GPU one therefore has no
-            // input of its own, which is a per-screen device set and so step 9's to give it.
+            // `event_devices` above is the X11 display window's, if any were asked for, and nothing
+            // else. A VNC exporter bound to this screen gets its own pair instead, built here and
+            // carried to whichever backend in the chain opens.
+            //
+            // Bound to a local rather than written inline in the call below: both it and the
+            // `devs.push` around the call want `&mut devs`, and the argument is evaluated inside
+            // the push's borrow.
+            #[cfg(feature = "vnc")]
+            let vnc_input = create_vnc_binding_input(cfg, DisplayScreen::Gpu0, &mut devs)?;
 
             let (gpu_control_host_tube, gpu_control_device_tube) =
                 Tube::pair().context("failed to create gpu tube")?;
             add_control_tube(DeviceControlTube::Gpu(gpu_control_host_tube).into());
-            devs.push(create_gpu_device(
+            let gpu_dev = create_gpu_device(
                 cfg,
                 vm_evt_wrtube,
                 gpu_control_device_tube,
@@ -505,24 +595,21 @@ fn create_virtio_devices(
                 render_server_fd,
                 has_vfio_gfx_device,
                 event_devices,
-            )?);
+                #[cfg(feature = "vnc")]
+                vnc_input,
+            )?;
+            devs.push(gpu_dev);
         }
     }
 
+    // The simplefb screen's, on the same terms as the GPU screen's above -- and unconditionally,
+    // which is the fix. This used to be gated on `cfg.gpu_parameters.is_none()`, so a simplefb
+    // screen exported over VNC alongside a GPU device got no input devices at all: the bridge was
+    // handed an empty list, and every RFB event it received was dispatched to nobody. Whether some
+    // other device exists says nothing about whether THIS screen's exporter needs a pointer.
     #[cfg(feature = "vnc")]
-    if cfg.gpu_parameters.is_none() && cfg.simplefb.is_some() {  // bridge owns its own sink
-        // Same device set as the virtio-gpu display path above, so a VNC session gets
-        // identical guest input devices (including the `input=tablet` absolute mouse)
-        // regardless of which display backend serves it.
-        let simplefb_cfg = cfg.simplefb.as_ref().unwrap();
-        let event_devices = create_display_window_input_devices(
-            cfg,
-            simplefb_cfg.width,
-            simplefb_cfg.height,
-            &mut devs,
-        )?;
-        log::info!("simplefb: total event_devices={}", event_devices.len());
-        *simplefb_event_devices_out = event_devices;
+    if cfg.simplefb.is_some() {
+        *simplefb_vnc_input_out = create_vnc_binding_input(cfg, DisplayScreen::Simplefb, &mut devs)?;
     }
 
     for (_, param) in cfg
@@ -754,11 +841,18 @@ fn create_virtio_devices(
                 cfg.jail_config.as_ref(),
                 path.as_path(),
             )?,
-            InputDeviceOption::Keyboard { path } => {
+            InputDeviceOption::Keyboard { path, name } => {
+                // One of these per screen with input enabled, not one per VM: `keyboard_idx`
+                // counts them the same way the touch devices' index counts theirs, which is what
+                // keeps their unique-id strings (`virtio-keyboard-<idx>`) distinct. The NAME is
+                // what a reader tells them apart by, and it comes from the caller precisely
+                // because an emission-order index does not survive another screen's input being
+                // switched off.
                 let dev = create_keyboard_device(
                     cfg.protection_type,
                     cfg.jail_config.as_ref(),
                     path.as_path(),
+                    name.as_deref(),
                     keyboard_idx,
                 )?;
                 keyboard_idx += 1;
@@ -1207,7 +1301,7 @@ fn create_devices(
     vfio_container_manager: &mut VfioContainerManager,
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
-    #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "vnc")] simplefb_vnc_input_out: &mut VncBindingInput,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -1346,7 +1440,7 @@ fn create_devices(
         #[cfg(feature = "registered_events")]
         registered_evt_q,
         #[cfg(feature = "vnc")]
-        simplefb_event_devices_out,
+        simplefb_vnc_input_out,
     )?;
 
     for stub in stubs {
@@ -2483,7 +2577,7 @@ where
     let mut worker_process_pids = BTreeSet::new();
 
     #[cfg(feature = "vnc")]
-    let mut simplefb_event_devices: Vec<EventDevice> = Vec::new();
+    let mut simplefb_vnc_input = VncBindingInput::default();
 
     let mut devices = create_devices(
         &cfg,
@@ -2502,7 +2596,7 @@ where
         &mut vfio_container_manager,
         &mut worker_process_pids,
         #[cfg(feature = "vnc")]
-        &mut simplefb_event_devices,
+        &mut simplefb_vnc_input,
     )?;
 
     #[cfg(feature = "pci-hotplug")]
@@ -2787,7 +2881,7 @@ where
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         vcpu_domain_paths,
         #[cfg(feature = "vnc")]
-        simplefb_event_devices,
+        simplefb_vnc_input,
     )
 }
 
@@ -3900,7 +3994,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         usize,
         PathBuf,
     >,
-    #[cfg(feature = "vnc")] simplefb_event_devices: Vec<EventDevice>,
+    #[cfg(feature = "vnc")] simplefb_vnc_input: VncBindingInput,
 ) -> Result<ExitState> {
     // Split up `all_control_tubes`.
     #[cfg(feature = "balloon")]
@@ -4137,8 +4231,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         simplefb_display::SimplefbDisplayTarget::Vnc {
                             addr: format!("{}:{}", host, port),
                             password: vnc_cfg.password.clone(),
-                            touch_input: vnc_touch_input(vnc_cfg.input.as_deref()),
-                            h264_port: vnc_cfg.h264_listen_port(),
+                            hw_encode: vnc_cfg.h264_enabled(),
+                            // This screen's own tablet and keyboard, built during device creation
+                            // beside the guest halves they are paired with. Empty on a
+                            // `view-only=true` binding.
+                            input: simplefb_vnc_input,
                         },
                         vnc_cfg.transport_cap,
                     )
@@ -4153,7 +4250,6 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             params,
             target,
             transport_cap,
-            simplefb_event_devices,
         ) {
             Ok(handle) => {
                 info!("simplefb display bridge started");

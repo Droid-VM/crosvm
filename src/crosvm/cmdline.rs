@@ -1014,8 +1014,8 @@ pub struct RunCommand {
     ///     transport-cap=CAP - ceiling on how the frame gets here,
     ///         never a request: "auto" (default), "cpu", "gpu" or
     ///         "gpu-hw". Only the first three change anything on
-    ///         this exporter -- the hardware encoder is the VNC
-    ///         sink's side channel and this one presents instead.
+    ///         this exporter -- the hardware encoder belongs to the
+    ///         VNC sink and this one presents instead.
     /// Examples:
     ///   --android-display-service droidvm_disp_1
     ///   --android-display-service name=win_fb,screen=simplefb
@@ -1629,7 +1629,7 @@ pub struct RunCommand {
     /// pairs specific to the device type:
     ///     absolute-mouse[path=PATH,width=W,height=H,name=N]
     ///     evdev[path=PATH]
-    ///     keyboard[path=PATH]
+    ///     keyboard[path=PATH,name=N]
     ///     mouse[path=PATH]
     ///     multi-touch[path=PATH,width=W,height=H,name=N]
     ///     rotary[path=PATH]
@@ -2901,8 +2901,13 @@ pub struct RunCommand {
     ///     host=HOST - address to listen on (default 0.0.0.0).
     ///     port=PORT - port to listen on (default 5900).
     ///     password=PASSWORD - require this password.
-    ///     input=MODE - "tablet" (alias "mouse") for an absolute
-    ///         pointer, "touch" (default) for multi-touch.
+    ///     view-only=BOOL - false (default) gives this binding an
+    ///         absolute pointer and a keyboard of its own, named
+    ///         for the screen it serves, and injects this server's
+    ///         RFB events into them; true builds neither and drops
+    ///         RFB pointer/key events. The retired `input=` key is
+    ///         refused, not ignored: it named a VM-global pointer
+    ///         set that no longer exists.
     ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
     ///         "simplefb". Defaults to gpu-0 when a GPU device is
     ///         configured, otherwise simplefb.
@@ -2910,16 +2915,14 @@ pub struct RunCommand {
     ///         never a request: "auto" (default, whatever the two
     ///         ends negotiate), "cpu" (refuse dmabuf import),
     ///         "gpu" (Vulkan blit, no hardware encoder) or
-    ///         "gpu-hw" (also allow the H.264 side channel).
-    ///     h264-port=PORT - where the hardware-encoded H.264 side
-    ///         channel listens. Defaults to the RFB port plus 100,
-    ///         so a client that knows one knows the other. Only
-    ///         bound when transport-cap allows it.
+    ///         "gpu-hw" (also allow the hardware H.264 encoder,
+    ///         served on this same port to clients that ask for
+    ///         RFB encoding 50).
     /// Examples:
     ///   --vnc-server port=5900
     ///   --vnc-server host=127.0.0.1,port=5900,password=secret
     ///   --vnc-server port=5901,screen=simplefb
-    ///   --vnc-server port=5900,transport-cap=gpu-hw,h264-port=7100
+    ///   --vnc-server port=5900,transport-cap=gpu-hw
     pub vnc_server: Vec<VncConfig>,
 
     #[argh(option, arg_name = "cid=CID[,device=VHOST_DEVICE]")]
@@ -3533,7 +3536,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.virtio_input.extend(
                 cmd.keyboard
                     .into_iter()
-                    .map(|path| InputDeviceOption::Keyboard { path }),
+                    .map(|path| InputDeviceOption::Keyboard { path, name: None }),
             )
         }
 
@@ -3670,12 +3673,16 @@ impl TryFrom<RunCommand> for super::config::Config {
 
         #[cfg(feature = "vnc")]
         {
+            // No `display_window_*` here any more, deliberately. Those flags build the VM-GLOBAL
+            // display-window device set, and turning them on for VNC is what gave a two-screen VM
+            // one touchscreen and one tablet that both servers injected into -- each normalizing
+            // against its own framebuffer, so the guest saw two screens' coordinates arrive on one
+            // device with nothing to tell them apart. A VNC binding's pointer is now its own
+            // per-screen device (`--vnc-server input=tablet`), and the keyboard is one device every
+            // source writes into, so there is nothing left here for a display window to provide.
+            // The flags themselves still work for whoever passes them: they are the X11 display
+            // window's, and that path is untouched.
             cfg.vnc_server = cmd.vnc_server;
-            if !cfg.vnc_server.is_empty() {
-                cfg.display_window_keyboard = true;
-                cfg.display_window_mouse = true;
-                log::info!("VNC: auto-enabled display_window_keyboard and display_window_mouse");
-            }
         }
 
         #[cfg(all(unix, feature = "net"))]

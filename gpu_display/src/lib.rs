@@ -51,13 +51,12 @@ mod sys;
 mod vnc_blit;
 #[cfg(feature = "vnc")]
 mod vnc_h264;
-#[cfg(feature = "vnc")]
-pub use vnc_h264::H264_PORT_OFFSET;
 #[cfg(feature = "vulkan_display")]
 pub mod vulkan;
 
 pub use event_device::EventDevice;
 pub use event_device::EventDeviceKind;
+pub use event_device::VncBindingInput;
 #[cfg(windows)]
 pub use gpu_display_win::WindowProcedureThread;
 #[cfg(windows)]
@@ -454,8 +453,8 @@ trait DisplayT: AsRawDescriptor {
     ///
     /// `has_consumer` is a bool, and a bool cannot say "a DIFFERENT consumer arrived while another
     /// one was already there". That distinction did not exist while every sink fed one kind of
-    /// client; the VNC sink now feeds two, an RFB client and an H.264 side-channel client, and
-    /// they arrive independently.
+    /// client; the VNC sink now feeds two, a client on the pixel path and one on the H.264 stream,
+    /// and they arrive independently.
     ///
     /// It matters because of what a producer does with a consumer arriving: it re-supplies a frame
     /// that content-wise did not change, because content that sat still while nobody watched
@@ -653,22 +652,28 @@ impl GpuDisplay {
         })
     }
 
+    /// `tablet`/`keyboard` are this binding's own input devices; see `DisplayVnc::new_tcp`. They are
+    /// deliberately NOT imported as this display's event devices: the VNC backend delivers to them
+    /// itself, because the event-device map is scoped to a display owner and these belong to a
+    /// binding. Both `None` is a view-only binding.
     #[cfg(feature = "vnc")]
     pub fn open_vnc_tcp(
         addr: &str,
         width: u32,
         height: u32,
         password: Option<String>,
-        touch_input: bool,
-        h264_port: Option<u16>,
+        hw_encode: bool,
+        tablet: Option<EventDevice>,
+        keyboard: Option<EventDevice>,
     ) -> GpuDisplayResult<GpuDisplay> {
         let display = gpu_display_vnc::DisplayVnc::new_tcp(
             addr,
             width,
             height,
             password,
-            touch_input,
-            h264_port,
+            hw_encode,
+            tablet,
+            keyboard,
         )?;
 
         let wait_ctx = WaitContext::new()?;

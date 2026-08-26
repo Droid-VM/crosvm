@@ -88,6 +88,10 @@ pub fn get_gpu_cache_info<'a>(
     }
 }
 
+/// `vnc_input` carries what a VNC exporter bound to `gpu-0` injects into: this screen's own
+/// absolute pointer and keyboard. Built by the caller, because the virtio-input devices behind them
+/// go into the same device list as this one and only the caller holds it. Empty on every other
+/// configuration -- no VNC binding on this screen, a `view-only=true` one, or a native exporter.
 pub fn create_gpu_device(
     cfg: &Config,
     exit_evt_wrtube: &SendTube,
@@ -96,6 +100,7 @@ pub fn create_gpu_device(
     render_server_fd: Option<SafeDescriptor>,
     has_vfio_gfx_device: bool,
     event_devices: Vec<EventDevice>,
+    #[cfg(feature = "vnc")] vnc_input: gpu_display::VncBindingInput,
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
@@ -225,11 +230,6 @@ pub fn create_gpu_device(
             .display_input_width
             .zip(cfg.display_input_height)
             .unwrap_or((1280, 720));
-        // Pointer input mode. Default (no `input=` given) keeps the original
-        // multi-touch behavior. `input=tablet` (alias `mouse`) opts into the added
-        // absolute-coordinate pointer with mouse button/wheel semantics (qemu
-        // usb-tablet equivalent).
-        let touch_input = super::vnc_touch_input(vnc_cfg.input.as_deref());
         display_backends.insert(
             0,
             virtio::DisplayBackend::VncTcp {
@@ -237,12 +237,14 @@ pub fn create_gpu_device(
                 width: w,
                 height: h,
                 password: vnc_cfg.password.clone(),
-                touch_input,
-                // Resolved from the ceiling here rather than inside the sink, so that a binding
-                // capped below `gpu-hw` never binds the port -- the difference between "there is
-                // no side channel" and "there is one and it refuses you" is the difference between
-                // a client falling back and a client waiting.
-                h264_port: vnc_cfg.h264_listen_port(),
+                // Resolved from the ceiling here rather than inside the sink, because the ceiling
+                // belongs to the binding and one sink serves several of them. A binding capped
+                // below `gpu-hw` builds no broker at all, so a client that asks for encoding 50
+                // there is served pixels and told nothing -- which is what an old server looks
+                // like, and what the app is written to fall back from.
+                hw_encode: vnc_cfg.h264_enabled(),
+                // This screen's own devices, parked for whichever `build` call opens the sink.
+                vnc_input: std::sync::Arc::new(sync::Mutex::new(vnc_input)),
             },
         );
         transport_cap = vnc_cfg.transport_cap;

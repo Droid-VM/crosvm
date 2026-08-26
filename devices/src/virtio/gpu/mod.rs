@@ -1704,20 +1704,30 @@ pub enum DisplayBackend {
     #[cfg(feature = "vnc")]
     /// Start a VNC server for remote display access on a TCP address.
     ///
-    /// Named fields rather than a tuple: the list grew a sixth member and "which of these bools is
-    /// which" at the call site is exactly the kind of question a struct answers for free.
+    /// Named fields rather than a tuple: the list is long enough that "which of these is which" at
+    /// the call site is exactly the kind of question a struct answers for free.
     VncTcp {
         addr: String,
         width: u32,
         height: u32,
         password: Option<String>,
-        /// `false` (the default) injects pointer events as an absolute mouse; `true` keeps the
-        /// older multi-touch touchscreen behaviour.
-        touch_input: bool,
-        /// Where the hardware-encoded H.264 side channel listens, or `None` when this binding's
-        /// transport ceiling does not allow one. Resolved by the caller from `transport-cap` and
-        /// `h264-port=` (see `VncConfig::h264_listen_port`).
-        h264_port: Option<u16>,
+        /// Whether this binding may run the hardware H.264 encoder and serve the stream to RFB
+        /// clients that ask for encoding 50. Resolved by the caller from the transport ceiling
+        /// (see `VncConfig::h264_enabled`); there is no port, the stream rides `addr`.
+        hw_encode: bool,
+        /// This binding's own absolute pointer and keyboard, parked until the sink is built.
+        ///
+        /// Behind an `Arc<Mutex<..>>` because of what this enum is: a CLONEABLE entry in a
+        /// try-in-turn chain whose `build` takes `&self`. An `EventDevice` owns a socket and can be
+        /// neither cloned nor moved out of a `&self`, so the devices are parked here and taken by
+        /// whichever `build` call succeeds. The chain stops at the first success, so they are taken
+        /// at most once; if this entry declines, the next backend leaves them alone and they are
+        /// dropped with the config.
+        ///
+        /// Empty inside means `view-only=true` -- a binding that was given no input devices -- which
+        /// is a different thing from devices already taken, but neither can reach a second `build`.
+        /// The lock is an artifact of `&self`, not of sharing: after `build`, one thread owns them.
+        vnc_input: Arc<Mutex<VncBindingInput>>,
     },
 }
 
@@ -1775,16 +1785,20 @@ impl DisplayBackend {
                 width,
                 height,
                 password,
-                touch_input,
-                h264_port,
-            } => GpuDisplay::open_vnc_tcp(
-                addr,
-                *width,
-                *height,
-                password.clone(),
-                *touch_input,
-                *h264_port,
-            ),
+                hw_encode,
+                vnc_input,
+            } => {
+                let input = std::mem::take(&mut *vnc_input.lock());
+                GpuDisplay::open_vnc_tcp(
+                    addr,
+                    *width,
+                    *height,
+                    password.clone(),
+                    *hw_encode,
+                    input.tablet,
+                    input.keyboard,
+                )
+            }
         }
     }
 }
