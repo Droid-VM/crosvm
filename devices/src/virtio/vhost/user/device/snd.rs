@@ -92,7 +92,9 @@ impl SndBackend {
         #[cfg(windows)] audio_client_guid: Option<String>,
         card_index: usize,
     ) -> anyhow::Result<Self> {
-        let cfg = droidvm_snd_config(&params);
+        // Descriptors first: the config declares how many of them there are.
+        let snd_data = hardcoded_snd_data(&params);
+        let cfg = droidvm_snd_config(&params, &snd_data);
         // Unprotected unconditionally, because this process does not know what kind of VM it is
         // serving and cannot ask. The one protection-dependent bit is passed in instead: without
         // it the guest skips the DMA API for this device, puts its vrings at guest-physical
@@ -103,7 +105,6 @@ impl SndBackend {
             avail_features |= 1 << VIRTIO_F_ACCESS_PLATFORM;
         }
 
-        let snd_data = hardcoded_snd_data(&params);
         let mut keep_rds = Vec::new();
         let builders = create_stream_info_builders(&params, &snd_data, &mut keep_rds, card_index)?;
 

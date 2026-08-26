@@ -242,8 +242,9 @@ impl VirtioSnd {
         control_tube: Tube,
     ) -> Result<VirtioSnd, Error> {
         let params = resize_parameters_pcm_device_config(params);
-        let cfg = droidvm_snd_config(&params);
+        // Descriptors first: the config declares how many of them there are.
         let snd_data = hardcoded_snd_data(&params);
+        let cfg = droidvm_snd_config(&params, &snd_data);
         let avail_features = base_features;
         let mut keep_rds: Vec<RawDescriptor> = Vec::new();
         keep_rds.push(control_tube.as_raw_descriptor());
@@ -420,13 +421,15 @@ impl Default for DroidVmSndConfig {
     }
 }
 
-pub fn droidvm_snd_config(params: &Parameters) -> DroidVmSndConfig {
+/// Takes the built descriptors, not just the parameters: the spec half of the config declares how
+/// many of them the guest should ask for, and that has to be their actual number.
+pub fn droidvm_snd_config(params: &Parameters, snd_data: &SndData) -> DroidVmSndConfig {
     let (preferred_output, preferred_output_count) =
         collect_preferred(&params.output_device_config, &params.device_table, false);
     let (preferred_input, preferred_input_count) =
         collect_preferred(&params.input_device_config, &params.device_table, true);
     DroidVmSndConfig {
-        spec: hardcoded_virtio_snd_config(params),
+        spec: hardcoded_virtio_snd_config(params, snd_data),
         controls: 0.into(),
         spec_reserved: [0u8; DROIDVM_SND_CFG_OFFSET - 16],
         magic: DROIDVM_SND_CFG_MAGIC.into(),
@@ -551,11 +554,21 @@ fn collect_preferred(
     (out, count as u32)
 }
 
-pub fn hardcoded_virtio_snd_config(params: &Parameters) -> virtio_snd_config {
+/// The counts the guest reads before it asks for anything, which is what makes them binding:
+/// Linux requests exactly `chmaps` descriptors in a single query and fails the whole probe with
+/// -EINVAL when the backend returns fewer, so declaring too many is not a harmless over-estimate
+/// but a guest with no sound card.
+///
+/// `chmaps` is therefore the length of the list that was actually built, taken from the built
+/// [`SndData`] rather than recomputed here. `hardcoded_snd_data` gives each device only the
+/// layouts that fit under its `channels_max`, deliberately (see there), so any second expression
+/// of "how many that comes to" is a separate thing to keep in agreement -- and the one that used
+/// to be here, three per output device, disagreed on every stereo endpoint.
+pub fn hardcoded_virtio_snd_config(params: &Parameters, snd_data: &SndData) -> virtio_snd_config {
     virtio_snd_config {
         jacks: 0.into(),
         streams: params.get_total_streams().into(),
-        chmaps: (params.num_output_devices * 3 + params.num_input_devices).into(),
+        chmaps: (snd_data.chmap_info.len() as u32).into(),
     }
 }
 
@@ -1364,7 +1377,17 @@ mod tests {
         assert_eq!(res.avail_features, 123); // avail_features must be equal to the input
         assert_eq!(res.cfg.spec.jacks.to_native(), 0);
         assert_eq!(res.cfg.spec.streams.to_native(), 13); // (Output = 3*3) + (Input = 2*2)
-        assert_eq!(res.cfg.spec.chmaps.to_native(), 11); // (Output = 3*3) + (Input = 2*1)
+        // No device_table here, so every device keeps its fallback width: outputs 6 channels,
+        // which fits all three layouts, inputs 2, which fits only the stereo one. That the old
+        // hardcoded formula (three per output, one per input) also landed on 11 is what let it
+        // survive -- it only agrees when the outputs are six-channel.
+        assert_eq!(res.cfg.spec.chmaps.to_native(), 3 * 3 + 2 * 1);
+        // The count the guest is told is the count it will ask for, so it has to be the count
+        // the backend can answer with.
+        assert_eq!(
+            res.cfg.spec.chmaps.to_native() as usize,
+            res.snd_data.chmap_info.len()
+        );
 
         // Check snd_data.pcm_info
         assert_eq!(res.snd_data.pcm_info.len(), 13);
