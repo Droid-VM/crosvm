@@ -614,9 +614,15 @@ pub fn create_virtio_snd_device(
 /// See `snd_helper` for why the backend cannot simply stay here.
 fn create_unprivileged_virtio_snd_device(
     protection_type: ProtectionType,
-    snd_params: SndParameters,
+    mut snd_params: SndParameters,
     worker_process_pids: &mut BTreeSet<Pid>,
 ) -> DeviceResult {
+    // The backend process builds its own feature set out of nothing but these parameters, and the
+    // frontend below can only mask against what the backend offers -- so the one thing the backend
+    // cannot work out for itself, that this VM's memory is not the host's to address, has to be
+    // carried across. Same rule `base_features` applies to every in-process device.
+    snd_params.access_platform = protection_type != ProtectionType::Unprotected;
+
     let (vmm_end, pid) = crate::crosvm::sys::linux::snd_helper::launch(snd_params)
         .context("failed to launch the unprivileged snd backend")?;
     // So that the child exiting is not reported as a device crashing.

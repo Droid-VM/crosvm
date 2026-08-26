@@ -23,6 +23,7 @@ use serde::Serialize;
 use snapshot::AnySnapshot;
 pub use sys::run_snd_device;
 pub use sys::Options;
+use virtio_sys::virtio_config::VIRTIO_F_ACCESS_PLATFORM;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::VhostUserProtocolFeatures;
 use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
@@ -92,8 +93,15 @@ impl SndBackend {
         card_index: usize,
     ) -> anyhow::Result<Self> {
         let cfg = droidvm_snd_config(&params);
-        let avail_features = virtio::base_features(ProtectionType::Unprotected)
+        // Unprotected unconditionally, because this process does not know what kind of VM it is
+        // serving and cannot ask. The one protection-dependent bit is passed in instead: without
+        // it the guest skips the DMA API for this device, puts its vrings at guest-physical
+        // addresses, and the frontend fails to translate them at activate -- before any audio.
+        let mut avail_features = virtio::base_features(ProtectionType::Unprotected)
             | 1 << VHOST_USER_F_PROTOCOL_FEATURES;
+        if params.access_platform {
+            avail_features |= 1 << VIRTIO_F_ACCESS_PLATFORM;
+        }
 
         let snd_data = hardcoded_snd_data(&params);
         let mut keep_rds = Vec::new();

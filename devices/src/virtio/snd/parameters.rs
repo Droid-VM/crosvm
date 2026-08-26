@@ -215,6 +215,16 @@ pub struct Parameters {
     /// out, and guessing would defeat the point of dropping them.
     #[serde(default)]
     pub supp_gids: Vec<u32>,
+    /// Advertise `VIRTIO_F_ACCESS_PLATFORM`, which is what tells the guest's virtio core to put
+    /// this device's vrings and buffers through the DMA API -- a bounce pool, in a protected VM --
+    /// instead of at guest-physical addresses the host cannot reach.
+    ///
+    /// Only the out-of-process backend reads this. It has no `ProtectionType` of its own to derive
+    /// the bit from the way `virtio::base_features` does for every in-process device, and the
+    /// frontend can only mask against what the backend offers. So the VMM sets this from the VM's
+    /// real protection type just before launching the backend, and a value given on the command
+    /// line is overwritten there.
+    pub access_platform: bool,
 }
 
 impl Default for Parameters {
@@ -242,6 +252,7 @@ impl Default for Parameters {
             uid: None,
             gid: None,
             supp_gids: Vec::new(),
+            access_platform: false,
         }
     }
 }
