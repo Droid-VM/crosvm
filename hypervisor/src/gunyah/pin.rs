@@ -20,7 +20,7 @@
 //! crosvm, and a `qcom_scm: Assign memory protection call failed -22` that reset the phone.
 //!
 //! The cheap question is not "pin it" but "would pinning have to migrate anything?", and that
-//! is a property of the pages: `/dev/gh_pinprobe` (gh_unmovable.ko) samples one page per 2MB and
+//! is a property of the pages: `/dev/gh_pinprobe` (gh_hugepage_reserve.ko) samples one page per 2MB and
 //! reports how many sit in a CMA / isolate / ZONE_MOVABLE pageblock. It takes no long-term
 //! reference and migrates nothing, so asking costs microseconds and cannot itself push a tight
 //! system over. A pool-served region answers zero and goes straight to the ioctl.
@@ -153,7 +153,8 @@ struct IoUringParams {
     cq_off: IoCqringOffsets,
 }
 
-/// `struct gh_pinprobe_range` from gh_unmovable.ko. Layout must match byte for byte.
+/// `struct gh_pinprobe_range` from gh_hugepage_reserve.ko (was gh_unmovable.ko). Layout must match
+/// byte for byte; the ABI is unchanged by the move, so this struct did not.
 #[repr(C)]
 #[derive(Default, Debug)]
 struct GhPinprobeRange {
@@ -183,8 +184,16 @@ struct ProbeVerdict {
     first_bad_offset: u64,
 }
 
-/// Asks `/dev/gh_pinprobe`. `Ok(None)` means the node is not there (older module): the caller
-/// falls back to proving pinnability the expensive way.
+/// Whether the CMA-detect probe node is present at all. When it is not, the caller "just
+/// continues" -- no probe, and (on the pin path) no fallback pin either: the behaviour from before
+/// the probe existed. The node is served by `gh_hugepage_reserve.ko` now (the probe moved there
+/// from `gh_unmovable.ko`, which owned no CMA state); either module registering it satisfies this.
+fn pinprobe_present() -> bool {
+    std::path::Path::new("/dev/gh_pinprobe").exists()
+}
+
+/// Asks `/dev/gh_pinprobe`. `Ok(None)` means the probe could not answer -- the node is absent
+/// (see [`pinprobe_present`]) or the ioctl failed; each caller decides what to do with that.
 fn probe_range(host_addr: u64, size: u64) -> Option<ProbeVerdict> {
     let dev = File::open("/dev/gh_pinprobe").ok()?;
     let mut req = GhPinprobeRange {
@@ -226,7 +235,8 @@ pub(crate) enum Settled {
     /// At least one sample is absent, or sits where a pin would have to migrate it. The prose is
     /// the counters, for the line that explains the refusal.
     No(String),
-    /// `/dev/gh_pinprobe` is not there (older gh_unmovable.ko), so nothing can be said either way.
+    /// `/dev/gh_pinprobe` is not there (no gh_hugepage_reserve.ko, nor a legacy gh_unmovable.ko),
+    /// so nothing can be said either way.
     Unknown,
 }
 
@@ -361,8 +371,9 @@ impl LongtermPin {
     /// Asks `/dev/gh_pinprobe` first, which touches nothing. A clean answer means there is
     /// nothing to do and nothing is held (`Ok(None)`). Unpinnable pages mean the region did not
     /// come from the reserve pool: refuse, unless `GUNYAH_PIN_POLICY=fix` asks us to migrate them
-    /// by pinning. If the probe node is missing we cannot tell, so we pin -- the safe, slower
-    /// answer.
+    /// by pinning. If the probe node is absent we do not probe at all and just continue (`Ok(None)`)
+    /// -- the pre-probe behaviour; a node that exists but whose ioctl fails still falls back to the
+    /// safe, slower pin.
     pub fn ensure_pinnable(
         host_addr: u64,
         size: u64,
@@ -380,6 +391,13 @@ impl LongtermPin {
                 host_addr
             );
             return Err(Error::new(libc::ENOMEM));
+        }
+
+        // Only probe if the detect node exists. When it does not -- no gh_hugepage_reserve.ko (nor
+        // a legacy gh_unmovable.ko) providing it -- there is nothing to read and nothing to decide:
+        // just continue, unprobed and unpinned, the way this path worked before the probe existed.
+        if !pinprobe_present() {
+            return Ok(None);
         }
 
         // A pre-boot region that is not pool-served is usually a VM starting into the couple of

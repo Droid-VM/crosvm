@@ -162,8 +162,8 @@ fn prepare_shared_framebuffer(
                     pin::Settled::Unknown => (
                         coverage,
                         FramebufferPrep::NotPoolBacked(
-                            "/dev/gh_pinprobe is absent (older gh_unmovable.ko), so where the \
-                             folios came from cannot be established"
+                            "/dev/gh_pinprobe is absent (no gh_hugepage_reserve.ko providing it), \
+                             so where the folios came from cannot be established"
                                 .to_string(),
                         ),
                     ),
