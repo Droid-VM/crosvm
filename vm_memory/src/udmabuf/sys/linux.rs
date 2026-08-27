@@ -48,13 +48,13 @@ type UdmabufCreateList = FlexibleArrayWrapper<udmabuf_create_list, udmabuf_creat
 /// this, the only bound on a single call is whatever the host's udmabuf driver happens to enforce,
 /// and a VMM should not be relying on the kernel to sanity-check a number a guest chose.
 ///
-/// 16384 matches the guest driver's own `guest_pool_max_nents` and our udmabuf module's
+/// 65536 matches the guest driver's own `guest_pool_max_nents` and our udmabuf module's
 /// `list_limit`, so this rejects nothing that is expected to work; it exists to make the refusal
 /// happen here, with a legible error, rather than as an ENOMEM out of an ioctl.
 ///
 /// This is a PER-CALL bound and deliberately not presented as more than that. It does not limit
 /// the total across concurrent dma-bufs, which is a separate gap.
-const MAX_UDMABUF_ENTRIES: usize = 16384;
+const MAX_UDMABUF_ENTRIES: usize = 65536;
 
 // Returns absolute offset within the memory corresponding to a particular guest address.
 // This offset is not relative to a particular mapping.
