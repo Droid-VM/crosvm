@@ -1149,7 +1149,7 @@ impl GunyahVm {
                         Error::new(EINVAL)
                     })?;
                 // exec: the payload runs from here.
-                let handle = self.share_blob(at, Box::new(mapping), false, true)?;
+                let handle = self.share_blob(at, Box::new(mapping), None, 0, false, true)?;
                 let parcel = abi::ShimParcel {
                     handle,
                     reserved: 0,
@@ -1347,7 +1347,7 @@ impl GunyahVm {
             let pattern: Vec<u8> = gpa.to_le_bytes().repeat(512);
             let _ = region.write_slice(&pattern, 0);
 
-            match self.share_blob(GuestAddress(gpa), Box::new(region), false, false) {
+            match self.share_blob(GuestAddress(gpa), Box::new(region), None, 0, false, false) {
                 Ok(handle) => base::error!(
                     "GH-SHARE-PROBE: gpa={:#x} size={:#x} => SHARED handle={:#x} \
                      (accept it in the guest with gunyah_guest_mem_accept)",
@@ -1374,6 +1374,8 @@ impl GunyahVm {
         &self,
         guest_addr: GuestAddress,
         mem_region: Box<dyn MappedRegion>,
+        source_descriptor: Option<RawDescriptor>,
+        source_offset: u64,
         read_only: bool,
         exec: bool,
     ) -> Result<u32> {
@@ -1421,6 +1423,53 @@ impl GunyahVm {
         // gunyah VM fd is passed as a request field rather than as the ioctl target.
         let share_dev = File::open("/dev/gunyah_share")
             .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+
+        // Driver-exported DMA-BUFs may mmap as VM_PFNMAP/VM_MIXEDMAP. GUP is required to reject
+        // those VMAs, so let gunyah_share hold a DMA-BUF attachment and build the memparcel from
+        // the exporter's sg-table. ENOTTY means either an older module or an ordinary descriptor
+        // such as a pool memfd; those retain the existing VA/GUP behavior below.
+        if let Some(dmabuf_fd) = source_descriptor {
+            let mut dmabuf = ghsm_share_dmabuf {
+                vm_fd: self.vm.as_raw_descriptor(),
+                dmabuf_fd,
+                label,
+                flags,
+                mem_handle: 0,
+                reserved: 0,
+                guest_phys_addr: guest_addr.offset(),
+                memory_size: size,
+                dmabuf_offset: source_offset,
+            };
+            // SAFETY: the ioctl synchronously imports descriptors owned by this process and
+            // writes mem_handle into `dmabuf`. Both fds remain valid for the whole call.
+            let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_DMABUF, &mut dmabuf) };
+            if ret == 0 {
+                self.blob_regions.lock().insert(label, mem_region);
+                debug!(
+                    "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} label={} handle={:#x}",
+                    guest_addr.offset(),
+                    size,
+                    source_offset,
+                    label,
+                    dmabuf.mem_handle,
+                );
+                return Ok(dmabuf.mem_handle);
+            }
+            let err = Error::last();
+            if err.errno() != libc::ENOTTY {
+                error!(
+                    "GUNYAH-SHARE-DMABUF: gpa={:#x} size={:#x} offset={:#x} FAILED: {}",
+                    guest_addr.offset(),
+                    size,
+                    source_offset,
+                    err,
+                );
+                return Err(err);
+            }
+            debug!(
+                "GUNYAH-SHARE-DMABUF: descriptor is not a DMA-BUF (or module is old); falling back to VA/GUP"
+            );
+        }
 
         let mut blob = ghsm_share_blob {
             vm_fd: self.vm.as_raw_descriptor(),
@@ -1604,6 +1653,8 @@ impl Vm for GunyahVm {
         &mut self,
         guest_addr: GuestAddress,
         mem_region: Box<dyn MappedRegion>,
+        source_descriptor: Option<RawDescriptor>,
+        source_offset: u64,
         read_only: bool,
         _cache: MemCacheType,
         _accept: crate::VmAccept,
@@ -1614,7 +1665,14 @@ impl Vm for GunyahVm {
         // the guest accept (Off -> caller/virtio-gpu; Sync/Async -> in-VM module via transport);
         // that routing happens above this layer, so nothing to branch on here.
         // Host-visible blobs are data: rings, buffers, framebuffers. Nothing executes from them.
-        let handle = self.share_blob(guest_addr, mem_region, read_only, false)?;
+        let handle = self.share_blob(
+            guest_addr,
+            mem_region,
+            source_descriptor,
+            source_offset,
+            read_only,
+            false,
+        )?;
         Ok((0, Some(handle)))
     }
 
@@ -1636,37 +1694,6 @@ impl Vm for GunyahVm {
         // (driven per vm_accept, symmetric with the attach) before this runs.
         let label = (guest_addr.offset() >> 12) as u32;
         self.unshare_blob(label)
-    }
-
-    // Host-visible blob backing: fold each blob's shmem into a 2MB order-9 folio *before* it is
-    // pinned (formerly gfxstream's HostVisibleFolio; moved here so the GPU backend is
-    // backend-agnostic and gzvm/etc. reuse it). A 2MB-clean blob's later SHARE (share_blob) never
-    // splits a hyp stage-2 block shared with LENT guest RAM -> no EXEC strip. `threshold` /
-    // `exceed-policy` are VMM policy (here); the host-visible VRAM quota is metered on the GPU side.
-    fn prepare_runtime_blob_backing(
-        &mut self,
-        fd: &dyn base::AsRawDescriptor,
-        size: u64,
-    ) -> Result<u64> {
-        // Folio policy is VMM-owned (--runtime-share hugepage-threshold-kb=,exceed-policy=),
-        // read from hv_cfg -- no per-blob arg from the GPU side.
-        if size < self.hv_cfg.folio_threshold_bytes {
-            return Ok(0); // below threshold -> 4K direct-supply path
-        }
-        let rounded = mthp::round_up_2mb(size);
-
-        // SAFETY: fd is a live growable shmem descriptor for this blob (owned by the GPU backend
-        // for the blob's lifetime); folio_back_fd only grows + collapses it.
-        if let Err(e) = unsafe { mthp::folio_back_fd(fd.as_raw_descriptor(), rounded) } {
-            // Reserve/CMA exhausted (or collapse failed): honour the exceed-policy.
-            warn!("GH-FOLIO: folio_back_fd failed ({}); size=0x{:x}", e, size);
-            if self.hv_cfg.folio_oom_on_exceed {
-                return Err(Error::new(e.raw_os_error().unwrap_or(EINVAL)));
-            }
-            return Ok(0); // fallback: leave it on the 4K path
-        }
-        debug!("GH-FOLIO: blob size=0x{:x} -> 2MB folios rounded=0x{:x}", size, rounded);
-        Ok(rounded)
     }
 
     fn prepare_blob_range(

@@ -68,6 +68,13 @@ pub const GHSM_IOCTL_TYPE: u8 = 0x47;
 ioctl_iowr_nr!(GHSM_SHARE_BLOB, GHSM_IOCTL_TYPE, 0x14, ghsm_share_blob);
 // GHSM_UNSHARE_BLOB on /dev/gunyah_share: reclaim a shared blob by label. nr 0x15.
 ioctl_iow_nr!(GHSM_UNSHARE_BLOB, GHSM_IOCTL_TYPE, 0x15, ghsm_unshare_blob);
+// Share an existing DMA-BUF by fd, bypassing GUP of its userspace VMA. nr 0x16.
+ioctl_iowr_nr!(
+    GHSM_SHARE_DMABUF,
+    GHSM_IOCTL_TYPE,
+    0x16,
+    ghsm_share_dmabuf
+);
 ioctl_iow_nr!(
     GH_VM_RECLAIM_REGION,
     GH_ANDROID_IOCTL_TYPE,

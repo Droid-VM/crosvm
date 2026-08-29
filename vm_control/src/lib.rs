@@ -647,6 +647,10 @@ fn drive_guest_accept(
         match tube.recv::<GunyahAcceptResponse>() {
             Ok(resp) if resp.seq == seq => {
                 return if resp.ret == 0 {
+                    info!(
+                        "gunyah-accept {:?} completed: seq={} handle={:#x} gpa={:#x} size={:#x}",
+                        op, seq, handle, gpa, size
+                    );
                     Ok(())
                 } else {
                     error!(
@@ -707,19 +711,9 @@ pub enum VmMemoryRequest {
     UnregisterMemory(VmMemoryRegionId),
     /// Register an eventfd with raw guest memory address.
     IoEventRaw(IoEventUpdateRequest),
-    /// Prepare a host-visible virtio-gpu blob's backing per the backend's folio policy, BEFORE the
-    /// GPU backend pins/exports it (the gfxstream prepare-blob-backing callback). `descriptor` is
-    /// the blob's growable shmem fd; Gunyah protected folds it into 2MB order-9 folios per its
-    /// VMM-owned folio policy (`--runtime-share hugepage-threshold-kb=,exceed-policy=`).
-    /// Answered with `VmMemoryResponse::PreparedBlobBacking { charged }`.
-    PrepareBlobBacking {
-        descriptor: SafeDescriptor,
-        size: u64,
-    },
     /// Fold `[offset, offset+size)` of `descriptor` into 2 MiB folios, leaving the rest of the
-    /// file alone. Distinct from `PrepareBlobBacking`, which sizes and collapses the WHOLE file:
-    /// a growable pool's file is its whole declared window, so doing that would populate every
-    /// byte the guest has not asked for. Answered with `VmMemoryResponse::Ok`.
+    /// file alone. A growable pool's file is its whole declared window, so only a granted range
+    /// may be populated. Answered with `VmMemoryResponse::Ok`.
     PrepareBlobRange {
         descriptor: SafeDescriptor,
         offset: u64,
@@ -907,6 +901,10 @@ impl VmMemoryRequest {
                 // bare map_blob error (VK_ERROR_OUT_OF_DEVICE_MEMORY), so without these logs the
                 // failing stage (host mmap vs BAR allocation vs hypervisor share) is
                 // indistinguishable. Error path only.
+                let source_offset = match &source {
+                    VmMemorySource::Descriptor { offset, .. } => *offset,
+                    _ => 0,
+                };
                 let (mapped_region, size, descriptor) = match source.map(gralloc, prot) {
                     Ok((region, size, descriptor)) => (region, size, descriptor),
                     Err(e) => {
@@ -932,6 +930,8 @@ impl VmMemoryRequest {
                 let (slot, accept_handle) = match vm.runtime_share(
                     guest_addr,
                     mapped_region,
+                    descriptor.as_ref().map(AsRawDescriptor::as_raw_descriptor),
+                    source_offset,
                     prot == Protection::read(),
                     cache,
                     vm_accept,
@@ -1355,12 +1355,6 @@ impl VmMemoryRequest {
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
-            PrepareBlobBacking { descriptor, size } => {
-                match vm.prepare_runtime_blob_backing(&descriptor, size) {
-                    Ok(charged) => VmMemoryResponse::PreparedBlobBacking { charged },
-                    Err(e) => VmMemoryResponse::Err(e),
-                }
-            }
             PrepareBlobRange {
                 descriptor,
                 offset,
@@ -1397,11 +1391,6 @@ pub enum VmMemoryResponse {
         /// and the RM memparcel handle is handed back to the caller (`vm_accept = Off`); `None`
         /// when the region was registered as a plain memslot (KVM / geniezone / Gunyah unprotected).
         accept_handle: Option<u32>,
-    },
-    /// Bytes actually folio-backed by `PrepareBlobBacking` (2MB-rounded, or 0 if the blob stayed on
-    /// the 4K path). The GPU device meters this against its host-visible VRAM quota.
-    PreparedBlobBacking {
-        charged: u64,
     },
     Ok,
     Err(SysError),

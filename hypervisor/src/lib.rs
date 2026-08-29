@@ -219,11 +219,15 @@ pub trait Vm: Send {
         &mut self,
         guest_addr: GuestAddress,
         mem_region: Box<dyn MappedRegion>,
+        // Original mapping fd and byte offset when the region came from a descriptor.
+        // The fd remains valid for this synchronous call.
+        source_descriptor: Option<RawDescriptor>,
+        source_offset: u64,
         read_only: bool,
         cache: MemCacheType,
         accept: VmAccept,
     ) -> Result<(MemSlot, Option<u32>)> {
-        let _ = accept;
+        let _ = (source_descriptor, source_offset, accept);
         let slot = self.add_memory_region(guest_addr, mem_region, read_only, false, cache)?;
         Ok((slot, None))
     }
@@ -252,27 +256,9 @@ pub trait Vm: Send {
         let _ = guest_addr;
     }
 
-    /// Prepare a host-visible blob's *backing* per the backend's own folio policy, before the GPU
-    /// backend pins/exports it (the callback fires inside gfxstream's `VkAllocateMemory`, before the
-    /// udmabuf pin that would otherwise block collapse). Gunyah protected rounds the `fd`-backed
-    /// shmem up to a 2MB order-9 folio (when the VMM-owned `folio_threshold_bytes` in [`Config`]
-    /// allows) so the later [`Vm::runtime_share`] is stage-2/exec clean; other hypervisors are a
-    /// no-op. Returns the number of bytes actually folio-backed (the 2MB-rounded size, or 0 if it
-    /// stayed 4K -- below threshold, or the reserve was exhausted under the fallback exceed-policy).
-    /// The GPU side meters this against its own host-visible VRAM quota. The threshold /
-    /// exceed-policy are VMM policy (set via `--runtime-share hugepage-threshold-kb=,
-    /// exceed-policy=`), so the backend reads them from its own config -- no per-blob arg.
-    fn prepare_runtime_blob_backing(&mut self, fd: &dyn AsRawDescriptor, size: u64) -> Result<u64> {
-        let _ = (fd, size);
-        Ok(0)
-    }
-
     /// Fold a sub-range of `fd` into 2 MiB folios. Default no-op; only Gunyah protected acts.
-    ///
-    /// Separate from [`Vm::prepare_runtime_blob_backing`] because that one owns the whole file --
-    /// it sizes it and collapses all of it -- which is right for a per-blob fd and wrong for a
-    /// growable pool, whose file is the entire declared window and must stay sparse where the
-    /// guest has not asked for memory.
+    /// The file is a growable VMM-owned pool, so only the granted range is populated and the rest
+    /// remains sparse.
     fn prepare_blob_range(
         &mut self,
         fd: &dyn AsRawDescriptor,
@@ -800,16 +786,6 @@ pub struct Config {
     /// mlock) on lend regions before VM start. The mode selects single-parcel
     /// vs chunked LEND of the prepared region. `None` disables mTHP preparation.
     pub prepare_lend_mthp: Option<LendMthpMode>,
-    /// VMM-owned host-visible virtio-gpu blob folio policy (set from
-    /// `--runtime-share hugepage-threshold-kb=,exceed-policy=`; see
-    /// [`Vm::prepare_runtime_blob_backing`]). Only Gunyah protected acts on it. Allocations
-    /// `>= folio_threshold_bytes` fold into a 2MB order-9 folio so their later runtime SHARE is
-    /// stage-2/exec clean; smaller ones stay 4K (0 => every allocation is folio-backed). When the
-    /// folio backing (reserve/CMA) is exhausted: `folio_oom_on_exceed` true => fail with ENOMEM,
-    /// false => drop to the 4K path. The host-visible VRAM *quota* is metered separately on the GPU
-    /// side; these two fields are purely the folio mechanism's policy.
-    pub folio_threshold_bytes: u64,
-    pub folio_oom_on_exceed: bool,
 }
 
 impl Default for Config {
@@ -819,8 +795,6 @@ impl Default for Config {
             mte: false,
             protection_type: ProtectionType::Unprotected,
             prepare_lend_mthp: None,
-            folio_threshold_bytes: 0,
-            folio_oom_on_exceed: false,
         }
     }
 }

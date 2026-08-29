@@ -208,7 +208,6 @@ use crate::crosvm::config::DEFAULT_VNC_HOST;
 use crate::crosvm::config::DEFAULT_VNC_PORT;
 use crate::crosvm::config::Executable;
 use crate::crosvm::config::HypervisorKind;
-use crate::crosvm::config::RuntimeShareExceedPolicy;
 use crate::crosvm::config::InputDeviceOption;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_HEIGHT;
@@ -1859,17 +1858,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         }
     }
 
-    // VMM-owned runtime dynamic-memory (SHARE) backing policy from `--runtime-share`. General VMM
-    // feature; only Gunyah protected acts on it (prepare_runtime_blob_backing), other backends leave
-    // it at (0, fallback).
-    let (folio_threshold_bytes, folio_oom_on_exceed) = match &cfg.runtime_share {
-        Some(rs) => (
-            rs.hugepage_threshold_kb.unwrap_or(0) << 10,
-            matches!(rs.exceed_policy, Some(RuntimeShareExceedPolicy::Oom)),
-        ),
-        None => (0, false),
-    };
-
     Ok(VmComponents {
         #[cfg(target_arch = "x86_64")]
         ac_adapter: cfg.ac_adapter,
@@ -1903,8 +1891,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             mte: cfg.mte,
             protection_type: cfg.protection_type,
             prepare_lend_mthp: cfg.prepare_lend_mthp,
-            folio_threshold_bytes,
-            folio_oom_on_exceed,
         },
         vm_image,
         android_fstab: cfg

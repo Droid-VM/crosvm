@@ -71,18 +71,6 @@ pub trait SharedMemoryMapper: Send {
         Ok(None)
     }
 
-    /// Prepare a host-visible virtio-gpu blob's backing per the backend's folio policy, before the
-    /// GPU backend pins/exports it. `fd` is the blob's growable shmem descriptor. On a folio
-    /// backend (Gunyah protected) this folds it into 2MB order-9 folios (per the VMM-owned
-    /// `--runtime-share hugepage-threshold-kb=,exceed-policy=` policy) so the later SHARE is
-    /// stage-2/exec clean; elsewhere it is a no-op. Returns the bytes actually folio-backed
-    /// (2MB-rounded, or 0 if it stayed 4K); the GPU device meters this against its own host-visible
-    /// VRAM quota. Default: no-op (0).
-    fn prepare_blob_backing(&mut self, fd: SafeDescriptor, size: u64) -> Result<u64> {
-        let _ = (fd, size);
-        Ok(0)
-    }
-
     /// Removes the mapping beginning at |offset|.
     fn remove_mapping(&mut self, offset: u64) -> Result<()>;
 

@@ -52,13 +52,6 @@ const STREAM_RENDERER_PARAM_WIN0_WIDTH: u64 = 4;
 const STREAM_RENDERER_PARAM_WIN0_HEIGHT: u64 = 5;
 const STREAM_RENDERER_PARAM_DEBUG_CALLBACK: u64 = 6;
 const STREAM_RENDERER_PARAM_RENDERER_FEATURES: u64 = 11;
-// DroidVM host-visible blob backing (folio) callbacks. gfxstream calls prepare inside
-// VkAllocateMemory (before the udmabuf pin) and release at VkFreeMemory; the crosvm GPU backend
-// accounts the VRAM quota and folds the blob's shmem into 2MB folios per the VMM-owned folio
-// policy (--runtime-share hugepage-threshold-kb=,exceed-policy=). Custom key range, kept in
-// sync with gfxstream's virtio-gpu-gfxstream-renderer.h.
-const STREAM_RENDERER_PARAM_PREPARE_BLOB_BACKING_CALLBACK: u64 = 2048;
-const STREAM_RENDERER_PARAM_RELEASE_BLOB_BACKING_CALLBACK: u64 = 2049;
 
 #[cfg(gfxstream_unstable)]
 const STREAM_RENDERER_IMPORT_FLAG_VULKAN_INFO: u32 = RUTABAGA_IMPORT_FLAG_VULKAN_INFO;
@@ -396,40 +389,6 @@ impl Drop for GfxstreamContext {
     }
 }
 
-/// Host-visible blob-backing handlers, registered once by the crosvm GPU device (which owns the
-/// SharedMemoryMapper Tube to the VM backend + the folio config). gfxstream's prepare/release
-/// callbacks are process-global function pointers, so this global bridges them to the mapper
-/// without threading closures through the whole RutabagaBuilder chain. There is one GPU device.
-type PrepareBlobBackingFn = Box<dyn Fn(i32, u64) -> i64 + Send + Sync>;
-type ReleaseBlobBackingFn = Box<dyn Fn(u64) + Send + Sync>;
-static BLOB_BACKING: std::sync::OnceLock<(PrepareBlobBackingFn, ReleaseBlobBackingFn)> =
-    std::sync::OnceLock::new();
-
-/// Register the host-visible blob-backing handlers. First call wins (single GPU device).
-pub fn register_blob_backing_handlers(prepare: PrepareBlobBackingFn, release: ReleaseBlobBackingFn) {
-    let _ = BLOB_BACKING.set((prepare, release));
-}
-
-/// gfxstream calls this in VkAllocateMemory (before the udmabuf pin) with the blob's shmem fd and
-/// size; returns the bytes charged against the folio quota (0 if not folio-backed).
-extern "C" fn gfxstream_prepare_blob_backing(_cookie: *mut c_void, memfd: i32, size: u64) -> i64 {
-    catch_unwind(|| match BLOB_BACKING.get() {
-        Some((prepare, _)) => prepare(memfd, size),
-        None => 0,
-    })
-    .unwrap_or(0)
-}
-
-/// gfxstream calls this at VkFreeMemory with the value that prepare returned, to refund the quota.
-extern "C" fn gfxstream_release_blob_backing(_cookie: *mut c_void, charged: u64) {
-    catch_unwind(|| {
-        if let Some((_, release)) = BLOB_BACKING.get() {
-            release(charged);
-        }
-    })
-    .unwrap_or(())
-}
-
 extern "C" fn write_context_fence(cookie: *mut c_void, fence: *const RutabagaFence) {
     catch_unwind(|| {
         assert!(!cookie.is_null());
@@ -507,17 +466,6 @@ impl Gfxstream {
                 value: gfxstream_debug_callback as usize as u64,
             });
         }
-
-        // DroidVM: host-visible blob backing (folio) callbacks. Safe to always advertise; if no
-        // handler is registered the extern fns no-op (return 0).
-        stream_renderer_params.push(stream_renderer_param {
-            key: STREAM_RENDERER_PARAM_PREPARE_BLOB_BACKING_CALLBACK,
-            value: gfxstream_prepare_blob_backing as usize as u64,
-        });
-        stream_renderer_params.push(stream_renderer_param {
-            key: STREAM_RENDERER_PARAM_RELEASE_BLOB_BACKING_CALLBACK,
-            value: gfxstream_release_blob_backing as usize as u64,
-        });
 
         let features_cstr = gfxstream_features.map(|f| CString::new(f).unwrap());
         if let Some(features_cstr) = &features_cstr {

@@ -46,6 +46,16 @@ pub enum AudioDeviceMode {
     OneGlobal,
 }
 
+/// What gfxstream does when its host-visible folio budget is exhausted or a collapse fails.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VramExceedPolicy {
+    /// Keep the allocation on ordinary 4 KiB pages.
+    Fallback,
+    /// Fail the Vulkan allocation.
+    Oom,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct GpuParameters {
@@ -93,13 +103,17 @@ pub struct GpuParameters {
     // When running with device sandboxing, the path of a directory available for
     // scratch space.
     pub snapshot_scratch_path: Option<PathBuf>,
-    // DroidVM host-visible VRAM *quota* (GPU-side cap so the GPU can't monopolise host-visible
-    // memory and starve peer devices). Metering ONLY -- the folio *policy* is VMM-owned
-    // (`--runtime-share hugepage-threshold-kb=,exceed-policy=`) and applied regardless.
+    // DroidVM gfxstream host-visible VRAM quota and folio policy. These are renderer allocation
+    // knobs, plumbed to gfxstream as GFXSTREAM_VRAM_* env before the GPU process forks.
     //   vram-limit=<MB>: N>0 = cap; 0 = unmetered; -1 = explicitly unlimited (still counts as
     //   "defined", which enables fusion routing together with a --pre-alloc gfx pool).
-    // Ignored (forced 0) when udmabuf=true: in guest-alloc mode the pool itself is the cap.
+    // Not exported when udmabuf=true: in guest-alloc mode the pool itself is the cap.
     pub vram_limit: Option<i64>,
+    // Allocations at least this large are rounded and collapsed into 2 MiB folios before gfxstream
+    // creates the udmabuf imported by the host Vulkan driver. 0 means every allocation.
+    pub vram_folio_threshold_kb: Option<u64>,
+    // On folio quota/collapse failure, either keep ordinary pages or fail the allocation.
+    pub vram_exceed_policy: Option<VramExceedPolicy>,
     // CMDLINE_V2 v3 fusion size gate: host-visible allocations <= this (KB) try the pre-alloc
     // pool first; larger ones go straight to the runtime-SHARE path. Only effective when fusion
     // routing is enabled (udmabuf=false AND vram-limit defined AND a --pre-alloc gfx pool exists);
@@ -154,6 +168,8 @@ impl Default for GpuParameters {
             renderer_features: None,
             snapshot_scratch_path: None,
             vram_limit: None,
+            vram_folio_threshold_kb: None,
+            vram_exceed_policy: None,
             pool_blob_max_kb: None,
             gfx_host_pre_alloc_mb: None,
             gunyah_pvm: None,

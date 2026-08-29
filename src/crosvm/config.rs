@@ -738,33 +738,6 @@ pub struct BatteryConfig {
     pub type_: BatteryType,
 }
 
-/// Behaviour when the reserved-hugepage (`gh_hugepage_reserve`) supply is exhausted while backing a
-/// runtime-shared region. `--runtime-share exceed-policy=...`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RuntimeShareExceedPolicy {
-    /// Silently drop the allocation to the plain 4K path.
-    Fallback,
-    /// Fail the allocation with ENOMEM.
-    Oom,
-}
-
-/// VMM-side runtime dynamic-memory backing policy (the `add_memory_region` / runtime-SHARE path).
-/// This is a general VMM-layer feature, not tied to any one backend: only backends whose runtime
-/// attach needs 2MB-clean stage-2 folios (Gunyah protected) act on it; the rest treat it as a
-/// no-op. Kept separate from the boot-time LEND knob (`--prepare-lend-mthp-mode`).
-/// `--runtime-share "hugepage-threshold-kb=512,exceed-policy=fallback"`.
-#[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-pub struct RuntimeShareConfig {
-    /// Allocations `>= hugepage-threshold-kb` (KB) fold into a 2MB order-9 folio so their runtime
-    /// SHARE is stage-2/exec clean; smaller ones stay 4K. Absent => 0 (every allocation
-    /// folio-backed).
-    pub hugepage_threshold_kb: Option<u64>,
-    /// Behaviour when the folio (reserved-hugepage) supply is exhausted. Absent => fallback.
-    pub exceed_policy: Option<RuntimeShareExceedPolicy>,
-}
-
 /// Pre-allocated GPU pool sizes (MB). Every one of these is a boot-blessed region -- SHARE'd once,
 /// folio-backed -- that something sub-allocates from, so no blob needs a runtime per-blob SHARE.
 ///
@@ -1184,9 +1157,6 @@ pub struct Config {
     pub restore_path: Option<PathBuf>,
     pub rng: bool,
     pub rt_cpus: CpuSet,
-    /// VMM-side runtime dynamic-memory (SHARE) backing policy (`--runtime-share`). General VMM
-    /// feature; only Gunyah protected acts on it.
-    pub runtime_share: Option<RuntimeShareConfig>,
     pub scsis: Vec<ScsiOption>,
     #[serde(with = "serde_serial_params")]
     pub serial_parameters: BTreeMap<(SerialHardware, u8), SerialParameters>,
@@ -1430,7 +1400,6 @@ impl Default for Config {
             restore_path: None,
             rng: true,
             rt_cpus: Default::default(),
-            runtime_share: None,
             serial_parameters: BTreeMap::new(),
             scsis: Vec::new(),
             #[cfg(windows)]

@@ -98,7 +98,6 @@ use crate::crosvm::config::parse_vhost_user_fs_option;
 use crate::crosvm::config::AndroidDisplayServiceConfig;
 use crate::crosvm::config::BatteryConfig;
 use crate::crosvm::config::PreAllocConfig;
-use crate::crosvm::config::RuntimeShareConfig;
 use crate::crosvm::config::CpuOptions;
 use crate::crosvm::config::DtboOption;
 use crate::crosvm::config::Executable;
@@ -2194,18 +2193,6 @@ pub struct RunCommand {
     /// comma-separated list of CPUs or CPU ranges to run VCPUs on. (e.g. 0,1-3,5) (default: none)
     pub rt_cpus: Option<CpuSet>,
 
-    #[argh(option, arg_name = "hugepage-threshold-kb=KB,exceed-policy=fallback|oom")]
-    #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// VMM-side runtime dynamic-memory (SHARE) backing policy. General VMM feature; only Gunyah
-    /// protected acts on it (others no-op). Kept separate from `--prepare-lend-mthp-mode` (the
-    /// boot-time LEND knob). Possible keys:
-    ///     hugepage-threshold-kb=<KB> - allocations >= this fold into a 2MB order-9 folio so their
-    ///       runtime SHARE is stage-2/exec clean; smaller stay 4K (default 0 = all folio-backed)
-    ///     exceed-policy=fallback|oom - when the reserved-hugepage supply is exhausted: drop to 4K
-    ///       (fallback, default) or fail with ENOMEM (oom)
-    pub runtime_share: Option<RuntimeShareConfig>,
-
     #[argh(option, arg_name = "PATH")]
     #[serde(skip)] // TODO(b/255223604)
     #[merge(strategy = append)]
@@ -3877,7 +3864,6 @@ impl TryFrom<RunCommand> for super::config::Config {
         }
 
         cfg.battery_config = cmd.battery;
-        cfg.runtime_share = cmd.runtime_share;
         cfg.simplefb = cmd.simplefb;
         #[cfg(all(target_arch = "x86_64", unix))]
         {

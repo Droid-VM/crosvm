@@ -126,19 +126,6 @@ impl VmMemoryClient {
         }
     }
 
-    /// Prepare a host-visible virtio-gpu blob's backing per the backend's folio policy before it
-    /// is pinned (the gfxstream prepare-blob-backing callback). `descriptor` is the blob's growable
-    /// shmem fd. Returns the bytes actually folio-backed (2MB-rounded, or 0 if it stayed 4K), which
-    /// the GPU side meters against its host-visible VRAM quota.
-    pub fn prepare_blob_backing(&self, descriptor: SafeDescriptor, size: u64) -> Result<u64> {
-        let request = VmMemoryRequest::PrepareBlobBacking { descriptor, size };
-        match self.request(&request)? {
-            VmMemoryResponse::PreparedBlobBacking { charged } => Ok(charged),
-            VmMemoryResponse::Err(e) => Err(ApiClientError::RequestFailed(e)),
-            _ => Err(ApiClientError::UnexpectedResponse),
-        }
-    }
-
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub fn mmap_and_register_memory(
         &self,

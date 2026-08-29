@@ -294,10 +294,8 @@ impl PoolWorker {
     /// the host share module once memory is fragmented -- a failure that looks like "grow stopped
     /// working after a few hours of uptime" rather than like a missing preparation step.
     ///
-    /// Deliberately NOT the existing PrepareBlobBacking: `folio_back_fd` ftruncates and collapses
-    /// the WHOLE file, and a pool's file is the whole declared window, so using it here would
-    /// populate everything the guest has not asked for -- exactly the memory this design exists
-    /// to leave unallocated.
+    /// A pool's file is its whole declared window, so only this granted range is prepared; touching
+    /// the whole file would populate the memory this design exists to leave unallocated.
     fn prepare_folios(&mut self, gpa: u64, len: u64) -> anyhow::Result<()> {
         let (shm, shm_offset) = self
             .mem

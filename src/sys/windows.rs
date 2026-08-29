@@ -2085,9 +2085,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         hv_cfg: hypervisor::Config {
             protection_type: cfg.protection_type,
             prepare_lend_mthp: cfg.prepare_lend_mthp,
-            // Gunyah-only folio policy; not applicable on Windows hypervisors.
-            folio_threshold_bytes: 0,
-            folio_oom_on_exceed: false,
         },
         vm_image,
         android_fstab: cfg
