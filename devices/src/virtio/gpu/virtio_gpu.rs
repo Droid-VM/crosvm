@@ -117,6 +117,23 @@ fn is_single_plane_8888_rgb(format: u32) -> bool {
     )
 }
 
+/// CPU display consumers take BGRX bytes. R-first scanouts therefore need one R/B exchange before
+/// they enter that pipeline; the Android sink performs the inverse exchange when it posts its
+/// fixed RGBA_8888 window buffer. A legacy SET_SCANOUT has no fourcc and keeps the historical
+/// desktop assumption that an exchange is required.
+fn cpu_scanout_needs_red_blue_swap(format: Option<u32>) -> bool {
+    match format {
+        Some(fourcc) => fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_XBGR8888,
+        None => true,
+    }
+}
+
+fn swap_red_blue_in_place(bytes: &mut [u8]) {
+    for pixel in bytes.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+}
+
 /// Falling back to the CPU copy path costs a full-frame copy on every present, and every way
 /// into it used to be silent. Say why, once, so a display backend that quietly refuses the
 /// import is visible instead of just slow.
@@ -754,14 +771,10 @@ impl VirtioGpuScanout {
             // keyed on the fourcc here too: a guest whose declared fourcc disagrees with the byte
             // order it actually wrote is a bug to fix where the two diverge, not to special-case
             // here. Kill-switch: GPU_POOL_SCANOUT_NO_SWIZZLE=1.
-            let needs_swizzle = match resource.scanout_data.map(|d| d.drm_format.0) {
-                Some(fourcc) => fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_XBGR8888,
-                None => true,
-            };
+            let needs_swizzle =
+                cpu_scanout_needs_red_blue_swap(resource.scanout_data.map(|d| d.drm_format.0));
             if pool_scanout_swizzle() && needs_swizzle {
-                for px in self.flush_staging[..total].chunks_exact_mut(4) {
-                    px.swap(0, 2);
-                }
+                swap_red_blue_in_place(&mut self.flush_staging[..total]);
             }
             // The swizzle above stays where it is: keeping the CPU pipeline in BGRX is the
             // producer's job, and the frame is built out of bytes that already satisfy it. The
@@ -863,6 +876,18 @@ impl VirtioGpuScanout {
                 let src_stride = data.strides[0] as usize;
                 let src_offset = data.offsets[0] as usize;
                 let packed_stride = self.width as usize * 4;
+                // Unlike transfer_read, this mapping exposes the colorbuffer's declared byte
+                // order directly. AB24/XB24 are R-first, while the CPU display pipeline is BGRX:
+                // apply the same fourcc-aware normalization as the guest-alloc pool path before
+                // Android's fixed RGBA sink performs its final R/B exchange.
+                let needs_swizzle =
+                    cpu_scanout_needs_red_blue_swap(Some(data.drm_format.0));
+                if needs_swizzle {
+                    note_flush_route("blob: normalizing R-first scanout to CPU BGRX");
+                    if self.flush_staging.len() < packed_stride {
+                        self.flush_staging.resize(packed_stride, 0);
+                    }
+                }
                 let mut display = display.borrow_mut();
                 if display.next_buffer_in_use(surface_id) {
                     return Ok(OkNoData);
@@ -891,6 +916,12 @@ impl VirtioGpuScanout {
                         break;
                     }
                     match fb_slice.sub_slice(row * fb_stride, packed_stride) {
+                        Ok(dst) if needs_swizzle => {
+                            let staging = &mut self.flush_staging[..packed_stride];
+                            staging.copy_from_slice(&src[s..s + packed_stride]);
+                            swap_red_blue_in_place(staging);
+                            dst.copy_from(staging);
+                        }
                         Ok(dst) => dst.copy_from(&src[s..s + packed_stride]),
                         Err(_) => {
                             copy_result = Err(ErrUnspec);
