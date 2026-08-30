@@ -34,6 +34,23 @@ license {
     ],
 }
 
+// crate_root source + build alias for the standalone crosvm_device_only build
+// (see crosvm_device_only/Android.bp). Kept before the first rust_ module so
+// cargo_embargo preserves them on regeneration.
+filegroup {
+    name: "crosvm_main_rs",
+    srcs: ["src/main.rs"],
+    visibility: ["//external/crosvm:__subpackages__"],
+}
+
+// Make-visible build target. crosvm_device_only_bin is installable:false and
+// gets no phony of its own, so `m crosvm_device_only_bin` fails with
+// "unknown target". This phony gives `m crosvm_device_only` a real target.
+phony {
+    name: "crosvm_device_only",
+    required: ["crosvm_device_only_bin"],
+}
+
 rust_binary {
     name: "crosvm",
     defaults: ["crosvm_defaults"],
