@@ -95,6 +95,7 @@ use crate::crosvm::config::parse_serial_options;
 use crate::crosvm::config::parse_touch_device_option;
 use crate::crosvm::config::parse_vhost_user_fs_option;
 use crate::crosvm::config::BatteryConfig;
+use crate::crosvm::config::PreAllocConfig;
 use crate::crosvm::config::CpuOptions;
 use crate::crosvm::config::DtboOption;
 use crate::crosvm::config::Executable;
@@ -2017,6 +2018,14 @@ pub struct RunCommand {
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// host-owned pre-allocated GPU pool sizes (MB). Boot-blessed regions the in-process renderer
+    /// sub-allocates host-visible blobs from (no runtime per-blob SHARE). crosvm exports these to
+    /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
+    ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
+    pub pre_alloc: Option<PreAllocConfig>,
+
     #[argh(switch)]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
@@ -3168,6 +3177,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.scsis = cmd.scsi_block;
 
         cfg.pmems = cmd.pmem;
+        cfg.pre_alloc = cmd.pre_alloc;
 
         if !cmd.pmem_device.is_empty() || !cmd.rw_pmem_device.is_empty() {
             log::warn!(

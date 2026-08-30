@@ -221,8 +221,46 @@ fn probe_range(host_addr: u64, size: u64) -> Option<ProbeVerdict> {
     })
 }
 
+/// What the read-only probe can say about a range that is about to be handed to something which
+/// will hold ordinary page references on it (today: the framebuffer's udmabuf).
+///
+/// This is the same question `ensure_pinnable` asks, minus the decision. `ensure_pinnable` is
+/// allowed to answer an untidy range by migrating it; a caller who is not going to pin, and whose
+/// consumer will instead make the pages *unmigratable* by referencing them, has no such move
+/// available. All it can do is find out, and either proceed or stay off that path.
+pub(crate) enum Settled {
+    /// Every sample is present and outside CMA / isolate / ZONE_MOVABLE. Nothing has to move for
+    /// a later `FOLL_LONGTERM` pin to succeed, so a reference taken now cannot block one.
+    Yes,
+    /// At least one sample is absent, or sits where a pin would have to migrate it. The prose is
+    /// the counters, for the line that explains the refusal.
+    No(String),
     /// `/dev/gh_pinprobe` is not there (no gh_hugepage_reserve.ko, nor a legacy gh_unmovable.ko),
     /// so nothing can be said either way.
+    Unknown,
+}
+
+/// Ask the probe whether `size` bytes at `host_addr` are settled where the host can leave them.
+///
+/// Reads one page per 2 MB through the module's own walk: it takes no reference and migrates
+/// nothing, so asking is free and cannot itself disturb what it is measuring.
+pub(crate) fn probe_settled(host_addr: u64, size: u64) -> Settled {
+    let Some(v) = probe_range(host_addr, size) else {
+        return Settled::Unknown;
+    };
+    if v.samples == 0 {
+        return Settled::No("the probe sampled nothing".to_string());
+    }
+    if v.bad == 0 && v.absent == 0 {
+        return Settled::Yes;
+    }
+    Settled::No(format!(
+        "{}/{} 2MB samples would have to move (cma={} isolate={} movable={}) and {} had no page \
+         present, first at +{:#x}; CmaFree {} kB",
+        v.bad, v.samples, v.cma, v.isolate, v.movable, v.absent, v.first_bad_offset, cma_free_kb(),
+    ))
+}
+
 /// Share of sampled 2 MB folios that may be off-pool before migration stops being the cheap
 /// answer. A handful is the ordinary case -- populate can fall back to 4 KB faults under
 /// fragmentation and those pages can land in CMA, which the collapse pass then mostly repairs;

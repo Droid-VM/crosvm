@@ -114,6 +114,34 @@ impl AsRef<dyn AsRawDescriptor + Sync + Send> for BackingObject {
     }
 }
 
+/// What the hypervisor backend was able to promise about the pages behind the `SharedFramebuffer`
+/// region, recorded at VM creation and read much later by whoever wants to hand those pages to
+/// someone who will hold a reference on them.
+///
+/// The one consumer is the simplefb bridge's GPU transport. A udmabuf over this region takes a
+/// plain page reference on every page (`shmem_read_mapping_page` on GKI 6.6 -- a reference, not a
+/// pin), and a referenced page cannot be migrated. If the page is sitting in a CMA pageblock when
+/// the guest first touches it, gunyah's fault-time `FOLL_LONGTERM` pin has to migrate it out and
+/// cannot, and the guest takes `page fault at <gpa>, attempt: -12` -- a vcpu OOM seconds after the
+/// bridge announces `transport=gpu-blit`. So the question the GPU path has to ask first is not
+/// "can I make a dmabuf" but "is this memory somewhere the host can leave it", and only the
+/// backend that laid the region out knows the answer.
+///
+/// `Unclaimed` is not "probably fine": it is "nobody has said", and the GPU path treats it exactly
+/// like a refusal. A backend that wants the fast path has to earn it by recording `PoolBacked`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FramebufferPrep {
+    /// No hypervisor backend has spoken for this region.
+    #[default]
+    Unclaimed,
+    /// Every 2 MiB of the region is a present, non-movable folio, and will still be one when the
+    /// guest faults on it.
+    PoolBacked,
+    /// It is not, and this is why. Carried as prose because the only thing done with it is to put
+    /// it in the line that explains why the bridge is on the CPU path.
+    NotPoolBacked(String),
+}
+
 /// For MemoryRegion::regions
 pub struct MemoryRegionInformation<'a> {
     pub index: usize,
@@ -130,6 +158,20 @@ pub struct MemoryRegionInformation<'a> {
 pub enum MemoryRegionPurpose {
     /// BIOS/firmware ROM
     Bios,
+
+    /// two can be sized independently, and so it gets its own `drm2kgsl_host` DT node.
+    /// DroidVM: GPU pre-alloc pool (gfxstream HOST-visible pool). Appended after
+    /// guest RAM, SHARE'd (not lent) at boot on protected Gunyah so the host renderer and the guest
+    /// reach the same pages, hugepage-prepared, and announced as a no-map reserved-memory node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    GpuPool,
+
+    /// DroidVM: gfxstream GUEST-alloc pool. A second SHARE-blessed region (treated exactly like
+    /// GpuPool for access/bless/hugepage) that the guest virtio-gpu driver owns and sub-allocates
+    /// BLOB_MEM_GUEST from in guest-alloc mode. Distinct so it gets its own `gpu_guest`
+    /// DT node and is NOT handed to the host gfxstream HostVisiblePool (which sees only GpuPool).
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    GpuPoolGuest,
 
     /// General purpose guest memory
     #[default]
@@ -317,6 +359,10 @@ pub struct GuestMemory {
     /// When true, host access to lent (non-shared) memory regions is forbidden.
     /// Set after memory is donated to a protected VM (e.g. Gunyah).
     protected: Arc<AtomicBool>,
+    /// What the hypervisor backend promised about the `SharedFramebuffer` region's pages. Written
+    /// once while the VM is being built, read by the simplefb bridge long afterwards; it lives
+    /// here rather than in a process global because it is a fact about one VM's memory.
+    fb_prep: Arc<Mutex<FramebufferPrep>>,
 }
 
 impl AsRawDescriptors for GuestMemory {
@@ -446,6 +492,7 @@ impl GuestMemory {
             regions: Arc::from(regions),
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
+            fb_prep: Arc::new(Mutex::new(FramebufferPrep::Unclaimed)),
         })
     }
 
@@ -488,6 +535,7 @@ impl GuestMemory {
             regions: Arc::from(regions),
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
+            fb_prep: Arc::new(Mutex::new(FramebufferPrep::Unclaimed)),
         })
     }
 
@@ -504,6 +552,21 @@ impl GuestMemory {
         self.protected.store(true, Ordering::Release);
     }
 
+    /// Record what the hypervisor backend managed to promise about the `SharedFramebuffer`
+    /// region's pages. Called once, while the VM is being built.
+    pub fn set_framebuffer_prep(&self, prep: FramebufferPrep) {
+        *self.fb_prep.lock().expect("framebuffer prep record poisoned") = prep;
+    }
+
+    /// What was recorded. `Unclaimed` when no backend said anything, which is the answer the
+    /// framebuffer's GPU transport must refuse on -- see [`FramebufferPrep`].
+    pub fn framebuffer_prep(&self) -> FramebufferPrep {
+        self.fb_prep
+            .lock()
+            .expect("framebuffer prep record poisoned")
+            .clone()
+    }
+
     /// Check whether `guest_addr` falls in a host-accessible region.
     /// Returns `Ok(())` when the access is safe, or an error describing why
     /// the host must not touch that address.
@@ -517,6 +580,12 @@ impl GuestMemory {
             .find(|r| r.contains(guest_addr))
             .ok_or(Error::InvalidGuestAddress(guest_addr))?;
         match region.options.purpose {
+            // The GPU pool is SHARE'd (never lent), so the host keeps access — same as the
+            // framebuffer/swiotlb regions (crosvm reads scanout data straight from the pool).
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            // Guest-alloc pool: SHARE'd like GpuPool; the host resolves guest-blob mem-entries
+            // that point into it via get_slice_at_addr (the whole point of guest-alloc).
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             // The window of a pseudo-unprotected VM, and the page the shim is told about it
             // through. Both are SHARE'd rather than lent -- that is the whole of the mode -- so
             // the host keeps its access, and needs it: the window IS the guest's RAM, and every

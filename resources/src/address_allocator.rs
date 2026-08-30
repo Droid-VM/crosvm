@@ -307,6 +307,16 @@ impl AddressAllocator {
         self.allocs.get(alloc)
     }
 
+    /// Find the first allocated `Alloc::PciBar` whose bar index matches `bar_index`.
+    /// Used to locate the virtio shmem BAR (gfxstream host-visible window) after all PCI BARs
+    /// have been allocated, so its GPA is known before VM start (for QTEE blessing on Gunyah).
+    pub fn find_pci_bar(&self, bar_index: u8) -> Option<(Alloc, AddressRange)> {
+        self.allocs.iter().find_map(|(a, (r, _))| match a {
+            Alloc::PciBar { bar, .. } if *bar == bar_index => Some((*a, *r)),
+            _ => None,
+        })
+    }
+
     /// Insert range of addresses into the pool, coalescing neighboring regions.
     fn insert_at(&mut self, mut slot: AddressRange) -> Result<()> {
         if slot.is_empty() {
@@ -465,6 +475,11 @@ impl<'a> AddressAllocatorSet<'a> {
             }
         }
         None
+    }
+
+    /// Find the first allocated `Alloc::PciBar` with the given bar index across all allocators.
+    pub fn find_pci_bar(&self, bar_index: u8) -> Option<(Alloc, AddressRange)> {
+        self.allocators.iter().find_map(|a| a.find_pci_bar(bar_index))
     }
 
     pub fn address_from_pci_offset(&self, alloc: Alloc, offset: u64, size: u64) -> Result<u64> {

@@ -113,7 +113,7 @@ impl Default for GpuParameters {
             cache_path: None,
             cache_size: None,
             pci_address: None,
-            pci_bar_size: (1 << 33),
+            pci_bar_size: (1 << 28),
             udmabuf: false,
             capset_mask: 0,
             external_blob: false,

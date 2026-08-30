@@ -1536,10 +1536,11 @@ impl Gpu {
         let (gpu_display_wait_descriptor_ctrl_wr, gpu_display_wait_descriptor_ctrl_rd) =
             Tube::directional_pair().expect("failed to create wait descriptor control pair.");
 
+        let mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>> = Arc::new(Mutex::new(None));
         Gpu {
             exit_evt_wrtube,
             gpu_control_tube: Some(gpu_control_tube),
-            mapper: Arc::new(Mutex::new(None)),
+            mapper,
             resource_bridges: Some(ResourceBridges::new(resource_bridges)),
             event_devices: Some(event_devices),
             worker_request_sender: None,

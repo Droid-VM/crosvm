@@ -515,6 +515,17 @@ pub struct BatteryConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct PreAllocConfig {
+    /// gfxstream HOST-visible pool size (MB): the host-alloc pool the gfxstream HostVisiblePool
+    /// sub-allocates from (ASG rings + host-visible blobs). Absent => 0 (host pre-alloc off ->
+    /// runtime-share). Its own SHARE-blessed GpuPool region + `gfx_host` DT node.
+    pub gfx_host_mb: Option<u64>,
+    /// `gpu_guest` DT node.
+    /// the round trip this route exists to avoid. Its own Drm2KgslPool region + `drm2kgsl_host` DT
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SimplefbConfig {
     pub width: u32,
     pub height: u32,
@@ -801,6 +812,9 @@ pub struct Config {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub pmem_ext2: Vec<crate::crosvm::sys::config::PmemExt2Option>,
     pub pmems: Vec<PmemOption>,
+    /// Host-owned pre-allocated GPU pool sizes (`--pre-alloc`; gfx host / guest). Exported to the
+    /// renderer as NCTX_GFX_POOL_MB env at startup.
+    pub pre_alloc: Option<PreAllocConfig>,
     pub prepare_lend_mthp: Option<LendMthpMode>,
     #[cfg(feature = "process-invariants")]
     pub process_invariants_data_handle: Option<u64>,
@@ -1048,6 +1062,7 @@ impl Default for Config {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             pmem_ext2: Vec::new(),
             pmems: Vec::new(),
+            pre_alloc: None,
             #[cfg(feature = "process-invariants")]
             process_invariants_data_handle: None,
             #[cfg(feature = "process-invariants")]

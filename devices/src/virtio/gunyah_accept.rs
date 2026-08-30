@@ -52,6 +52,11 @@ const REQ_WIRE_LEN: usize = 32;
 // struct virtio_gunyah_accept_comp, little-endian.
 const COMP_WIRE_LEN: usize = 8;
 
+// Debug-only, for the growable-pool test driver: take and drop the same host-side reference that
+// a dma-buf import takes, so the "cannot release a grant something is using" path can be
+// exercised without making a production pool growable. No production caller sends these.
+const VGP_OP_TEST_REF: u32 = 100;
+const VGP_OP_TEST_UNREF: u32 = 101;
 struct Worker {
     req_queue: Queue,
     comp_queue: Queue,
@@ -192,6 +197,29 @@ impl Worker {
         Ok(())
     }
 }
+
+            VGP_OP_TEST_REF | VGP_OP_TEST_UNREF => (self.test_ref(op, pool_id, offset, len), 0),
+    /// Debug: take or drop a reference on a range, as a dma-buf import would.
+    ///
+    /// The real reference is taken in resource_create_blob, which only fires for a pool the GPU
+    /// uses -- and those are all fully pre-shared, so nothing on device would otherwise reach the
+    /// busy path at all. This makes the test driver able to, without changing which pool the GPU
+    /// is given.
+    fn test_ref(&mut self, op: u32, pool_id: u32, offset: u64, len: u64) -> i32 {
+        let Some(base) = self.mem.pool_base(pool_id) else {
+            return -libc::ENODEV;
+        };
+        let iov = [(GuestAddress(base.offset() + offset), len as usize)];
+        if op == VGP_OP_TEST_REF {
+            match self.mem.pool_ref_iovecs(&iov) {
+                Ok(()) => 0,
+                Err(e) => -e.as_errno(),
+            }
+        } else {
+            self.mem.pool_unref_iovecs(&iov);
+            0
+        }
+    }
 
 /// The virtio-gunyah-accept device.
 pub struct GunyahAccept {

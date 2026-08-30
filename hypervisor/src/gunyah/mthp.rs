@@ -38,6 +38,7 @@ pub const LEND_CHUNK_SIZE: u64 = 256 * 1024 * 1024; // 256 MB
 const MADV_POPULATE_WRITE: i32 = 23;
 #[allow(dead_code)]
 const MADV_COLLAPSE: i32 = 25;
+const MADV_POPULATE_READ: i32 = 22;
 
 // ── mTHP sizes to enable ────────────────────────────────────────────────────
 
@@ -87,6 +88,20 @@ pub struct LendPrepResult {
     pub need_small: Vec<bool>,
     /// Total bytes that were successfully collapsed to ≥ 64 KB folios.
     pub large_page_bytes: u64,
+    /// Hard verification that every page in the region is genuinely resolvable
+    /// (`MADV_POPULATE_READ` over the whole range succeeded). Phase 2's
+    /// MADV_POPULATE_WRITE / manual-touch fallback can both report success while a
+    /// custom reserve-pool fault hook silently hands back an unbacked mapping (e.g.
+    /// CMA reservoir exhausted); this is the only phase that treats that as fatal so
+    /// the caller can fail VM creation instead of the guest SIGBUS-ing minutes later
+    /// deep inside its GPU stack (host-alloc must fail loudly, not silently).
+    pub populated: bool,
+    /// Whether Phase 4's `mlock` succeeded. An unpinned page inside a SHARE'd pool can still be
+    /// migrated or reclaimed by the host kernel while the RM's stage-2 mapping keeps pointing at
+    /// the page it was blessed with, and neither side notices -- the guest simply reads and
+    /// writes memory the GPU no longer shares. Reported rather than acted on here so the caller
+    /// can be fatal for the pool purposes and lenient elsewhere.
+    pub mlocked: bool,
 }
 
 /// Prepare a lend region for Gunyah by maximising large-page backing.
@@ -283,10 +298,15 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     // ── Phase 4: mlock ──────────────────────────────────────────────
 
     let ret = libc::mlock(host_addr as *const libc::c_void, size as usize);
-    if ret == 0 {
+    let mlocked = ret == 0;
+    if mlocked {
         info!("GH: mlock: OK");
     } else {
-        warn!("GH: mlock FAILED: errno={}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+        warn!(
+            "GH: mlock FAILED: errno={} -- pages in this region can still be migrated or \
+             reclaimed while the RM's stage-2 keeps the old ones (check RLIMIT_MEMLOCK)",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        );
     }
 
     // ── Build need_small bitmap from order_map ──────────────────────
@@ -301,9 +321,151 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
         need_small[ci] = !is_thp;
     }
 
+    // ── Hard verification: every page must genuinely be resolvable ──
+    //
+    // MADV_POPULATE_READ forces the kernel to resolve (not just request) every page
+    // in the range; a custom fault hook (e.g. the reserve-pool supply hook) that
+    // cannot serve a page returns an error here instead of silently leaving a hole
+    // that only surfaces as a SIGBUS on first guest/host touch. Safe (no crash risk)
+    // unlike a manual read/write touch of memory that might not be backed.
+    let verify_ret =
+        libc::madvise(host_addr as *mut libc::c_void, size as usize, MADV_POPULATE_READ);
+    let populated = verify_ret == 0;
+    if populated {
+        info!("GH: verify (MADV_POPULATE_READ): OK, region fully backed");
+    } else {
+        warn!(
+            "GH: verify (MADV_POPULATE_READ) FAILED: errno={} -- region is NOT fully backed \
+             (reserve pool likely exhausted); caller must treat this as fatal",
+            std::io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        );
+    }
+
+    // ── Phase 5: clean the region out of the caches ─────────────────
+    //
+    // Phases 2-3 wrote every page through the normal cacheable mapping, so those lines are
+    // sitting dirty in this CPU's caches. The GPU then reaches the same physical pages either
+    // non-coherently or through a write-combining guest mapping, so a line that has not reached
+    // the point of coherency can still be written back later, on top of what the guest wrote --
+    // hard glmark2 DEVICE LOST to exactly this (the CP executing stale zero lines that alias
+    // WC guest writes, giving a type-0 write to register 0 and an AHB error).
+    clean_dcache_to_poc(host_addr, size as usize);
+
     LendPrepResult {
         need_small,
         large_page_bytes,
+        populated,
+        mlocked,
+    }
+}
+
+/// Clean+invalidate `size` bytes from `host_addr` to the point of coherency.
+#[cfg(target_arch = "aarch64")]
+fn clean_dcache_to_poc(host_addr: *mut u8, size: usize) {
+    if size == 0 {
+        return;
+    }
+    let ctr: u64;
+    // SAFETY: reading CTR_EL0 and cleaning cache lines by VA are permitted at EL0 while Linux
+    // sets SCTLR_EL1.UCI, which it always does on arm64. `host_addr..host_addr+size` is a live
+    // writable mapping, and `dc civac` neither reads nor writes through the pointer.
+    unsafe {
+        std::arch::asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr);
+        // CTR_EL0.DminLine is log2 of the line size in words.
+        let line_size = 4usize << ((ctr >> 16) & 0xf);
+        let mut addr = (host_addr as usize) & !(line_size - 1);
+        let end = host_addr as usize + size;
+        while addr < end {
+            std::arch::asm!("dc civac, {addr}", addr = in(reg) addr, options(nostack));
+            addr += line_size;
+        }
+        std::arch::asm!("dsb sy", options(nostack));
+    }
+    info!("GH: dcache clean to PoC: {} MB", size >> 20);
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn clean_dcache_to_poc(_host_addr: *mut u8, _size: usize) {}
+
+/// but is expensive. How much of the range really came back as 2 MiB folios is in the returned
+/// [`FolioCoverage`], which a caller who cannot live with a degraded range checks and a caller who
+/// only wanted the cheap shape ignores.
+pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Result<FolioCoverage> {
+    let coverage = fold_mapped_range(mapped as *mut u8, len);
+    libc::munmap(mapped, l);
+    coverage
+}
+
+/// Fold an already-mapped shmem range into 2 MiB folios, one window at a time.
+///
+/// This is the actual work [`folio_back_range`] does; it is separate because the mapping does not
+/// always have to be made. A caller that already holds a mapping whose virtual address is congruent
+/// with its file offset mod 2 MiB -- guest RAM's own region mapping, and the framebuffer's -- can
+/// fold it in place, and gets something the fd-window version cannot give: the range is left
+/// POPULATED IN THAT MAPPING. Through a temporary mapping the folios end up in the page cache and
+/// the caller's own page tables stay empty, so anything that reads the caller's address space
+/// afterwards -- the pin probe, most of all -- sees an absent page and says so.
+///
+/// `MADV_HUGEPAGE` first, because `shmem_enabled` is `advise` on these phones: without it the fault
+/// below allocates 4 KiB pages and there is nothing for the reserve's order-9 hook to intercept.
+///
+/// # Safety
+/// `base` must point at a live shared shmem mapping of at least `len` bytes, 2 MiB-aligned and
+/// congruent with its file offset mod 2 MiB.
+pub unsafe fn fold_mapped_range(base: *mut u8, len: u64) -> std::io::Result<FolioCoverage> {
+    let err = || std::io::Error::last_os_error();
+    let _ = libc::madvise(base as *mut libc::c_void, len as usize, libc::MADV_HUGEPAGE);
+    let windows = len / THP_SIZE;
+    let mut collapsed = 0u64;
+    for w in 0..windows {
+        let ptr = base.add((w * THP_SIZE) as usize) as *mut libc::c_void;
+                _ => return Err(e),
+        if libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE) == 0 {
+            collapsed += 1;
+    Ok(FolioCoverage { windows, collapsed })
+}
+
+/// How much of a range [`folio_back_range`] was asked about came back as 2 MiB folios.
+///
+/// `collapsed` counts the windows whose `MADV_COLLAPSE` returned success, which includes the ones
+/// the populate above had already faulted in as a huge folio -- collapsing an already-huge range
+/// succeeds trivially, and on a healthy reserve that is what every window does.
+///
+/// This says nothing about WHERE those folios came from. `MADV_COLLAPSE` asks for an order-9
+/// allocation; the gh_hugepage reserve hook intercepts order-9 and serves it from the pool, but
+/// when the pool is empty the buddy allocator answers instead and the folio can be movable or in
+/// CMA. So complete coverage is necessary and not sufficient for "the host can leave these pages
+/// alone", and a caller who needs that has to ask the pin probe as well.
+pub struct FolioCoverage {
+    /// 2 MiB windows in the range.
+    pub windows: u64,
+    /// How many of them are 2 MiB folios.
+    pub collapsed: u64,
+}
+
+impl FolioCoverage {
+    /// Whether every 2 MiB of the range is a 2 MiB folio. An empty range is not complete: there is
+    /// nothing there to have succeeded.
+    pub fn is_complete(&self) -> bool {
+        self.windows > 0 && self.collapsed == self.windows
+    }
+
+    /// Bytes that came back as 2 MiB folios.
+    pub fn covered_bytes(&self) -> u64 {
+        self.collapsed * THP_SIZE
+    }
+
+    /// Bytes asked about.
+    pub fn total_bytes(&self) -> u64 {
+        self.windows * THP_SIZE
+    }
+
+    /// Coverage as the percentage the mTHP phases print.
+    pub fn pct(&self) -> f64 {
+        if self.windows == 0 {
+            return 0.0;
+        }
+        self.collapsed as f64 * 100.0 / self.windows as f64
     }
 }
 

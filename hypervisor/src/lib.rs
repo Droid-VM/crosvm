@@ -214,13 +214,17 @@ pub trait Vm: Send {
     ) -> Result<(MemSlot, Option<u32>)> {
         let slot = self.add_memory_region(guest_addr, mem_region, read_only, false, cache)?;
         Ok((slot, None))
+    }
+
     /// Runtime detach of a region attached with [`Vm::runtime_share`]. Default: remove the memslot.
     /// Gunyah protected overrides to reclaim the SHARE by label (`gpa >> 12`). The guest-side release
     /// must already have happened, driven per `accept` symmetrically with the attach.
     fn runtime_unshare(
+        &mut self,
         guest_addr: GuestAddress,
         slot: MemSlot,
         accept: VmAccept,
+    ) -> Result<()> {
         let _ = (guest_addr, accept);
         self.remove_memory_region(slot).map(|_| ())
     }
