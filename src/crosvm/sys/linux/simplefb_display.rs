@@ -146,6 +146,7 @@ pub fn start_simplefb_display_thread(
             // asks it a question. Doing it here rather than at the import attempt is what makes the
             // cap a property of the display for its whole life: nothing downstream has to remember
             // to consult it, and the probe never even reaches the backend.
+            if !transport_cap.allows_gpu_copy() {
                 display.cap_transport_to_cpu();
             }
 
@@ -269,6 +270,7 @@ fn build_gpu_transport(
     // separately only so the startup line names the ceiling instead of blaming the sink: "the sink
     // imports no dmabufs" would be a false statement about a perfectly capable sink, and the whole
     // value of that line is that somebody reading it can tell why they are on the slow path.
+    if !transport_cap.allows_gpu_copy() {
         return Err("capped by transport-cap=cpu".to_string());
     }
     if !display.is_dmabuf_import_supported() {
@@ -454,6 +456,11 @@ struct FramebufferWatcher {
     pending_present: bool,
     /// Whether a consumer was attached on the previous tick, so that false -> true can be seen.
     had_consumer: bool,
+    /// The sink's consumer generation on the previous tick. Separate from `had_consumer` because
+    /// it answers a question the bool cannot: a second KIND of client arriving while the first is
+    /// still attached leaves the flag true throughout, and that client needs the same forced full
+    /// pass as one that arrives to an empty sink. See `DisplayT::consumer_generation`.
+    consumer_generation: u64,
     /// When the content last hashed differently. Nothing reads it yet; it becomes the screen
     /// definition's liveness field, which is how a user is meant to tell a frozen screen from a
     /// live one without staring at it.
@@ -477,6 +484,7 @@ impl FramebufferWatcher {
             hashes_valid: false,
             pending_present: false,
             had_consumer: false,
+            consumer_generation: 0,
             last_changed_at: now,
             last_change_log_at: now,
             last_liveness_at: now,
@@ -740,6 +748,9 @@ fn simplefb_display_loop(
         // dispatch_events above is what notices a VNC client arriving, so both directions of this
         // are picked up within one tick.
         let has_consumer = display.has_consumer();
+        let consumer_generation = display.consumer_generation();
+        if (has_consumer && !watcher.had_consumer)
+            || (has_consumer && consumer_generation != watcher.consumer_generation)
         {
             // A consumer arriving is not a change in content, and that is exactly why it needs
             // saying. Content that sat still while nobody watched hashes as unchanged, so without
@@ -750,6 +761,7 @@ fn simplefb_display_loop(
             watcher.invalidate();
         }
         watcher.had_consumer = has_consumer;
+        watcher.consumer_generation = consumer_generation;
 
         // The host mapping of the region, not a copy of it. What replaced the unconditional
         // `read_exact_at_addr` is this plus the band pass: a tick where nothing moved reads each

@@ -212,10 +212,38 @@ pub enum TransportCap {
     /// Refuse dmabuf import on this binding, so the negotiation can only land on a CPU copy. The
     /// per-binding equivalent of the process-wide `GPU_SCANOUT_FORCE_TRANSFER=1`.
     Cpu,
+    /// Allow the GPU blit and stop there: no hardware video encoder on this binding, whatever the
+    /// device could do. This is the rung the app has been able to say since before there was
+    /// anything above it, and it means what it always meant -- the difference is that there is now
+    /// a rung above it for it to be below.
+    Gpu,
     /// Allow the GPU blit and the hardware encoder above it: the VNC sink's H.264 stream may come
     /// up on this binding. Distinct from `auto` only in intent -- `auto` also permits it --
+    /// so that a caller can pin the ceiling here and have the meaning survive a future rung being
+    /// added on top.
+    GpuHw,
+}
+
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+impl TransportCap {
+    /// Whether this ceiling leaves the dmabuf import available at all.
+    ///
+    /// Every value except `cpu` does. Written as a question rather than as `!= Cpu` at each call
+    /// site so that adding a rung does not mean auditing the comparisons for the ones that meant
+    /// "anything above the floor".
+    pub fn allows_gpu_copy(self) -> bool {
+        !matches!(self, TransportCap::Cpu)
+    }
+
+    /// Whether this ceiling leaves the hardware encoder available.
+    ///
+    /// `gpu` caps below it, which is the whole reason the value had to be spellable: the app
+    /// already sends `transport-cap=gpu` for bindings that should blit but not encode, and if that
     /// were read as "anything the negotiation can reach" the encoder would come up on every one of
     /// them.
+    pub fn allows_hw_encode(self) -> bool {
+        matches!(self, TransportCap::Auto | TransportCap::GpuHw)
+    }
 }
 
 /// Address a VNC server listens on when the option does not say. Kept here rather than repeated at
@@ -264,6 +292,7 @@ pub struct VncConfig {
     ///
     /// Accepted here for the same reason both exporters take `screen=`: the two options describe
     /// the same kind of thing and a caller should not have to remember which half of the surface
+    /// exists on which one. Both of its upper rungs mean something on this sink now -- `gpu` is
     /// the Vulkan blit that step 11 gave it, `gpu-hw` the hardware H.264 encoder above that.
     #[serde(default)]
     pub transport_cap: TransportCap,
@@ -274,8 +303,18 @@ pub struct VncConfig {
     // against a crosvm that answered on a socket this one does not open, so starting anyway would
     // hand its author a VM whose stream is silently missing. Mixed deploys are already forbidden
     // in this project, and a silently dropped key is how a stale config passes a gate.
+}
+
+#[cfg(feature = "vnc")]
+impl VncConfig {
+    /// This server's effective RFB port.
+    pub fn effective_port(&self) -> u32 {
+        self.port.unwrap_or(DEFAULT_VNC_PORT)
+    }
+
     /// Whether this binding may run the hardware H.264 encoder and serve its stream to RFB clients
     /// that ask for encoding 50.
+    ///
     /// The one place the ceiling is read for this question, so that "is hardware encoding allowed
     /// here" cannot answer differently in the two sinks that ask it. `false` means no broker is
     /// built at all, so a client that asks for 50 there is served pixels and told nothing -- which
@@ -283,6 +322,7 @@ pub struct VncConfig {
     /// anyway.
     pub fn h264_enabled(&self) -> bool {
         self.transport_cap.allows_hw_encode()
+    }
 
     /// Whether this binding gets input devices of its own (a tablet and a keyboard).
     ///
@@ -292,6 +332,7 @@ pub struct VncConfig {
     /// to, or events written to nothing.
     pub fn wants_input_devices(&self) -> bool {
         !self.view_only
+    }
 }
 
 /// One Android display service: the name crosvm registers with the service manager, and which
@@ -3308,11 +3349,43 @@ mod tests {
         assert_eq!(svc.transport_cap, TransportCap::Cpu);
     }
 
+    /// A ceiling nobody defined is a refusal, not a fallback to auto. Accepting an unknown value
+    /// silently would be the caller believing they had asked for something.
+    ///
+    /// `gpu` used to be in this list, as the plausible-but-unimplemented rung above `cpu`. It is
+    /// not any more, and that is the whole change: the rungs below are what exist, so `zero-copy`
+    /// -- the one that is still only a design (plan §4.7) -- takes its place here.
     #[test]
     #[cfg(feature = "vnc")]
     fn parse_transport_cap_rejects_unknown_value() {
         assert!(from_key_values::<VncConfig>("port=5900,transport-cap=zero-copy").is_err());
+        assert!(from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hardware").is_err());
         assert!(from_key_values::<VncConfig>("port=5900,transport_cap=cpu").is_err());
+    }
+
+    /// The two rungs step 13 adds, and the meaning that separates them.
+    ///
+    /// `gpu` is the one that has to be got right: the app has been sending it, and reading it as
+    /// "whatever the negotiation can reach" would turn the hardware encoder on for every binding
+    /// that only ever asked to blit.
+    #[test]
+    #[cfg(feature = "vnc")]
+    fn parse_transport_cap_gpu_rungs() {
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu").unwrap();
+        assert_eq!(vnc.transport_cap, TransportCap::Gpu);
+        assert!(vnc.transport_cap.allows_gpu_copy());
+        assert!(!vnc.transport_cap.allows_hw_encode());
+
+        let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hw").unwrap();
+        assert_eq!(vnc.transport_cap, TransportCap::GpuHw);
+        assert!(vnc.transport_cap.allows_gpu_copy());
+        assert!(vnc.transport_cap.allows_hw_encode());
+
+        // The two ends of the ladder keep the meanings they had before it grew.
+        assert!(!TransportCap::Cpu.allows_gpu_copy());
+        assert!(!TransportCap::Cpu.allows_hw_encode());
+        assert!(TransportCap::Auto.allows_gpu_copy());
+        assert!(TransportCap::Auto.allows_hw_encode());
     }
 
     /// Whether this binding may run the hardware encoder, and the one key that used to say where
@@ -3323,6 +3396,8 @@ mod tests {
     /// a different server, and the whole point of `deny_unknown_fields` here is that it FAILS
     /// rather than starting a VM whose stream is silently missing -- a mixed deploy is already
     /// forbidden, and a quietly dropped key is how a stale config passes a gate.
+    #[test]
+    #[cfg(feature = "vnc")]
     fn parse_vnc_server_rejects_the_retired_h264_port() {
         assert!(from_key_values::<VncConfig>("port=5900,h264-port=7100").is_err());
         assert!(from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hw,h264-port=7100")
@@ -3331,6 +3406,7 @@ mod tests {
         assert!(from_key_values::<VncConfig>("port=5900,h264_port=7100").is_err());
 
         // What is left is the ceiling, and it still decides.
+        let vnc = from_key_values::<VncConfig>("port=5900").unwrap();
         assert!(vnc.h264_enabled());
         let vnc = from_key_values::<VncConfig>("port=5900,transport-cap=gpu-hw").unwrap();
         assert!(vnc.h264_enabled());
@@ -3345,6 +3421,7 @@ mod tests {
         assert_eq!(vnc.screen, Some(DisplayScreen::Simplefb));
         assert!(vnc.h264_enabled());
     }
+
     /// Whether this binding's clients drive anything, and the key that used to answer a different
     /// question in the same place.
     ///
@@ -3360,13 +3437,17 @@ mod tests {
         let vnc = from_key_values::<VncConfig>("port=5900").unwrap();
         assert!(!vnc.view_only);
         assert!(vnc.wants_input_devices());
+
         let vnc = from_key_values::<VncConfig>("port=5900,view-only=true").unwrap();
         assert!(vnc.view_only);
         assert!(!vnc.wants_input_devices());
+
         let vnc = from_key_values::<VncConfig>("port=5900,view-only=false").unwrap();
         assert!(vnc.wants_input_devices());
+
         // It is per binding, not per VM: two servers, two answers.
         let vnc = from_key_values::<VncConfig>("port=5901,screen=simplefb,view-only=true").unwrap();
+        assert_eq!(vnc.screen, Some(DisplayScreen::Simplefb));
         assert!(!vnc.wants_input_devices());
 
         // Every spelling of the retired key, including the ones that used to be valid values.
@@ -3374,6 +3455,8 @@ mod tests {
         assert!(from_key_values::<VncConfig>("port=5900,input=mouse").is_err());
         assert!(from_key_values::<VncConfig>("port=5900,input=touch").is_err());
         assert!(from_key_values::<VncConfig>("port=5900,input=none").is_err());
+    }
+
     /// A single `--vnc-server` with no `screen=` and a GPU present: the shape of every VNC command
     /// line written so far, and it has to keep meaning the GPU's screen.
     #[test]

@@ -28,6 +28,10 @@ extern "C" {
  * both: the whole frame, AND what part of it is new. Neither consumer has to know the other
  * exists, and neither of them repeats the comparison.
  *
+ * The LibVNCServer consumer is registered internally when the server is created and is not
+ * configurable. The H.264 one is registered by the Rust sink between `vnc_server_create` and
+ * `vnc_server_start`, because whether it exists at all is a property of the binding (its transport
+ * ceiling) that this file has no way to learn.
  */
 
 /* A run of consecutive full-width rows that differ from the previously offered frame. */
@@ -66,6 +70,22 @@ struct vnc_frame_offer {
      * on top of the picture has nothing to restore. Only reachable when the comparison buffer
      * cannot be allocated. */
     int frame_replaced;
+
+    /* The same picture as `pixels`, still where the GPU can reach it: the guest's own dmabuf, as
+     * the producer imported it, ready to be blitted somewhere a consumer chooses. Both zero when
+     * the frame came up the CPU transport, and both zero on a cursor-only update -- there the
+     * previous frame's import may already have been released, and `pixels` is the honest answer
+     * anyway because it is what the last blit left behind.
+     *
+     * The handle is only good for the duration of the call, like `pixels`. A consumer that wants
+     * the frame later has to have copied it, which for the H.264 consumer means handing it to a
+     * codec before returning.
+     *
+     * `gpu_import_id` is the source declared in the byte order a video encoder reads (R,G,B,A),
+     * not the one LibVNCServer is served in -- the two orders are two imports of one dmabuf, and
+     * this is the consumer that wants the other one. See blitSourceFourcc, C++ side. */
+    void*   gpu_blit_ctx;
+    int64_t gpu_import_id;
 
     /* The guest's hardware cursor as last reported, in the same BGRX order as `pixels` with a
      * meaningful alpha byte. `visible` is the whole answer: it already folds in "the guest hid

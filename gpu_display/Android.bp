@@ -74,7 +74,10 @@ cc_library_static {
     name: "libvnc_server_bridge",
     host_supported: true,
     c_std: "c11",
-    srcs: ["src/vnc_server_bridge.c"],
+    srcs: [
+        "src/vnc_server_bridge.c",
+        "src/vnc_h264_rfb.c",
+    ],
     local_include_dirs: ["src"],
     shared_libs: ["libvncserver"],
     apex_available: ["com.android.virt"],

@@ -14,6 +14,12 @@ extern "C" {
 
 typedef struct vnc_server vnc_server_t;
 
+/* LibVNCServer's client record and this bridge's H.264 broadcaster, named rather than included:
+ * this header is also the one the Rust side's declarations are written against, and neither type
+ * is ever dereferenced by a caller. */
+struct _rfbClientRec;
+struct vnc_h264_rfb;
+
 #define VNC_INPUT_NONE      0
 #define VNC_INPUT_KEY       1
 #define VNC_INPUT_POINTER   2
@@ -64,6 +70,13 @@ void vnc_server_set_cursor_pos(vnc_server_t* server, int x, int y);
  *
  * This is the sink's ingest point. It works out what changed since the last offer and then hands
  * the frame to each registered consumer; compositing the cursor into an outgoing framebuffer is
+ * one consumer's job, not this function's. See vnc_frame_consumer.h.
+ *
+ * `gpu_blit_ctx`/`gpu_import_id` describe the same picture as `clean` while it is still a GPU
+ * object -- the guest dmabuf the producer imported -- for a consumer that would rather blit it
+ * than read it. NULL/0 says there is no such thing for this frame, which is the answer on the CPU
+ * transport and on every cursor-only update. They are arguments rather than state on the server
+ * because the handle is only valid for the length of this call.
  *
  * `clean` is the guest scanout with NO cursor in it, and stays that way -- keeping a pristine
  * copy is what removes the need for LibVNCServer's save-under-cursor bookkeeping entirely: the
@@ -75,8 +88,25 @@ void vnc_server_set_cursor_pos(vnc_server_t* server, int x, int y);
  * moving over a completely static desktop without pushing a whole frame. */
 void vnc_server_offer_frame(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
                             const uint8_t* cursor_argb, int cw, int ch,
+                            int cx, int cy, int visible, int full,
+                            void* gpu_blit_ctx, int64_t gpu_import_id);
 void vnc_server_set_input_event_fd(vnc_server_t* server, int fd);
 int vnc_server_poll_input_event(vnc_server_t* server, struct vnc_input_event* out);
+
+/* The H.264 broadcaster (vnc_h264_rfb.h), which this server carries but does not own.
+ *
+ * Two directions, because the two are asked by different people. The setter is called once while
+ * the server is being built, by the same Rust side that decides whether a hardware stream exists
+ * at all. The lookup is called by the broadcaster itself: its LibVNCServer protocol extension is
+ * process-global while brokers are per-screen, so every per-client callback has to get from a
+ * client back to the right one -- and `screenData` is the bridge's own field, whose meaning is not
+ * something another file should have to know.
+ *
+ * The broker outlives the server on purpose: it is owned by the Rust consumer whose drain thread
+ * feeds it. `vnc_server_destroy` therefore detaches it rather than freeing it, once every client
+ * thread has been joined and nothing can reach it through a screen any more. */
+void vnc_server_set_h264_rfb(vnc_server_t* server, struct vnc_h264_rfb* broker);
+struct vnc_h264_rfb* vnc_server_h264_rfb_for_client(struct _rfbClientRec* cl);
 
 #ifdef __cplusplus
 }

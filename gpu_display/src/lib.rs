@@ -49,6 +49,8 @@ mod keycode_converter;
 mod sys;
 #[cfg(feature = "vnc")]
 mod vnc_blit;
+#[cfg(feature = "vnc")]
+mod vnc_h264;
 #[cfg(feature = "vulkan_display")]
 pub mod vulkan;
 
@@ -633,8 +635,25 @@ trait DisplayT: AsRawDescriptor {
         true
     }
 
+    /// A number that changes whenever the set of consumers behind this sink changes.
+    ///
+    /// `has_consumer` is a bool, and a bool cannot say "a DIFFERENT consumer arrived while another
+    /// one was already there". That distinction did not exist while every sink fed one kind of
     /// client; the VNC sink now feeds two, a client on the pixel path and one on the H.264 stream,
     /// and they arrive independently.
+    ///
+    /// It matters because of what a producer does with a consumer arriving: it re-supplies a frame
+    /// that content-wise did not change, because content that sat still while nobody watched
+    /// hashes as unchanged and the arriving viewer would otherwise wait for the guest to paint
+    /// something -- possibly forever. A second kind of client arriving needs exactly the same
+    /// treatment, and on the bool alone it is invisible: the flag was already true.
+    ///
+    /// The default never changes, which is right for every backend that cannot tell its consumers
+    /// apart: those are covered by the `has_consumer` edge alone, as they always were.
+    fn consumer_generation(&self) -> u64 {
+        0
+    }
+
     /// Creates a surface with the given parameters.  The display backend is given a non-zero
     /// `surface_id` as a handle for subsequent operations.
     fn create_surface(
@@ -833,10 +852,15 @@ impl GpuDisplay {
         tablet: Option<EventDevice>,
         keyboard: Option<EventDevice>,
     ) -> GpuDisplayResult<GpuDisplay> {
+        let display = gpu_display_vnc::DisplayVnc::new_tcp(
+            addr,
+            width,
+            height,
+            password,
             hw_encode,
             tablet,
             keyboard,
-        let display = gpu_display_vnc::DisplayVnc::new_tcp(addr, width, height, password)?;
+        )?;
 
         let wait_ctx = WaitContext::new()?;
         wait_ctx.add(&display, DisplayEventToken::Display)?;
@@ -1115,6 +1139,11 @@ impl GpuDisplay {
     /// Whether anything is currently positioned to see a frame. See `DisplayT::has_consumer`.
     pub fn has_consumer(&self) -> bool {
         self.inner.has_consumer()
+    }
+
+    /// See `DisplayT::consumer_generation`.
+    pub fn consumer_generation(&self) -> u64 {
+        self.inner.consumer_generation()
     }
 
     /// Releases a previously imported resource identified by the given handle.

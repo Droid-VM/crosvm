@@ -184,6 +184,11 @@ pub fn create_gpu_device(
             .unwrap_or((1280, 720));
         display_backends.insert(
             0,
+            virtio::DisplayBackend::VncTcp {
+                addr,
+                width: w,
+                height: h,
+                password: vnc_cfg.password.clone(),
                 // Resolved from the ceiling here rather than inside the sink, because the ceiling
                 // belongs to the binding and one sink serves several of them. A binding capped
                 // below `gpu-hw` builds no broker at all, so a client that asks for encoding 50
@@ -192,6 +197,8 @@ pub fn create_gpu_device(
                 hw_encode: vnc_cfg.h264_enabled(),
                 // This screen's own devices, parked for whichever `build` call opens the sink.
                 vnc_input: std::sync::Arc::new(sync::Mutex::new(vnc_input)),
+            },
+        );
         transport_cap = vnc_cfg.transport_cap;
     }
 
@@ -219,6 +226,7 @@ pub fn create_gpu_device(
         cfg.gpu_cgroup_path.as_ref(),
     );
     #[cfg(any(feature = "vnc", feature = "android_display"))]
+    if !transport_cap.allows_gpu_copy() {
         dev.cap_transport_to_cpu();
     }
 

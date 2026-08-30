@@ -1697,8 +1697,15 @@ pub enum DisplayBackend {
     /// via this name, and pass the surface to it.
     Android(String),
     #[cfg(feature = "vnc")]
+    /// Start a VNC server for remote display access on a TCP address.
+    ///
     /// Named fields rather than a tuple: the list is long enough that "which of these is which" at
     /// the call site is exactly the kind of question a struct answers for free.
+    VncTcp {
+        addr: String,
+        width: u32,
+        height: u32,
+        password: Option<String>,
         /// Whether this binding may run the hardware H.264 encoder and serve the stream to RFB
         /// clients that ask for encoding 50. Resolved by the caller from the transport ceiling
         /// (see `VncConfig::h264_enabled`); there is no port, the stream rides `addr`.
@@ -1716,9 +1723,7 @@ pub enum DisplayBackend {
         /// is a different thing from devices already taken, but neither can reach a second `build`.
         /// The lock is an artifact of `&self`, not of sharing: after `build`, one thread owns them.
         vnc_input: Arc<Mutex<VncBindingInput>>,
-    /// Start a VNC server for remote display access.
-    /// VncTcp(addr, width, height, password) listens on a TCP address.
-    VncTcp(String, u32, u32, Option<String>),
+    },
 }
 
 impl DisplayBackend {
@@ -1739,6 +1744,7 @@ impl DisplayBackend {
             #[cfg(feature = "android_display")]
             DisplayBackend::Android(_) => "android",
             #[cfg(feature = "vnc")]
+            DisplayBackend::VncTcp { .. } => "vnc",
         }
     }
 
@@ -1769,17 +1775,24 @@ impl DisplayBackend {
             #[cfg(feature = "android_display")]
             DisplayBackend::Android(service_name) => GpuDisplay::open_android(service_name),
             #[cfg(feature = "vnc")]
+            DisplayBackend::VncTcp {
+                addr,
+                width,
+                height,
+                password,
                 hw_encode,
                 vnc_input,
             } => {
                 let input = std::mem::take(&mut *vnc_input.lock());
                 GpuDisplay::open_vnc_tcp(
+                    addr,
+                    *width,
+                    *height,
+                    password.clone(),
                     *hw_encode,
                     input.tablet,
                     input.keyboard,
                 )
-            DisplayBackend::VncTcp(addr, width, height, password) => {
-                GpuDisplay::open_vnc_tcp(addr, *width, *height, password.clone())
             }
         }
     }

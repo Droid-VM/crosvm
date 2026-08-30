@@ -1010,6 +1010,9 @@ pub struct RunCommand {
     ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
     ///         "simplefb". Defaults to gpu-0 when a GPU device is
     ///         configured, otherwise simplefb.
+    ///     transport-cap=CAP - ceiling on how the frame gets here,
+    ///         never a request: "auto" (default), "cpu", "gpu" or
+    ///         "gpu-hw". Only the first three change anything on
     ///         this exporter -- the hardware encoder belongs to the
     ///         VNC sink and this one presents instead.
     /// Examples:
@@ -2893,6 +2896,10 @@ pub struct RunCommand {
     ///     screen=SCREEN - "gpu-0" (virtio-gpu scanout 0) or
     ///         "simplefb". Defaults to gpu-0 when a GPU device is
     ///         configured, otherwise simplefb.
+    ///     transport-cap=CAP - ceiling on how the frame gets here,
+    ///         never a request: "auto" (default, whatever the two
+    ///         ends negotiate), "cpu" (refuse dmabuf import),
+    ///         "gpu" (Vulkan blit, no hardware encoder) or
     ///         "gpu-hw" (also allow the hardware H.264 encoder,
     ///         served on this same port to clients that ask for
     ///         RFB encoding 50).
