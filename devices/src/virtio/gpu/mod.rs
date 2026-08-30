@@ -49,6 +49,7 @@ use gpu_display::*;
 use hypervisor::MemCacheType;
 pub use parameters::AudioDeviceMode;
 pub use parameters::GpuParameters;
+pub use parameters::VramExceedPolicy;
 use rutabaga_gfx::*;
 use serde::Deserialize;
 use serde::Serialize;

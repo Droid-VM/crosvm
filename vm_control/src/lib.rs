@@ -647,6 +647,10 @@ fn drive_guest_accept(
         match tube.recv::<GunyahAcceptResponse>() {
             Ok(resp) if resp.seq == seq => {
                 return if resp.ret == 0 {
+                    info!(
+                        "gunyah-accept {:?} completed: seq={} handle={:#x} gpa={:#x} size={:#x}",
+                        op, seq, handle, gpa, size
+                    );
                     Ok(())
                 } else {
                     error!(
@@ -708,6 +712,8 @@ pub enum VmMemoryRequest {
     /// Register an eventfd with raw guest memory address.
     IoEventRaw(IoEventUpdateRequest),
     /// Fold `[offset, offset+size)` of `descriptor` into 2 MiB folios, leaving the rest of the
+    /// file alone. A growable pool's file is its whole declared window, so only a granted range
+    /// may be populated. Answered with `VmMemoryResponse::Ok`.
     PrepareBlobRange {
         descriptor: SafeDescriptor,
         offset: u64,
@@ -895,6 +901,10 @@ impl VmMemoryRequest {
                 // bare map_blob error (VK_ERROR_OUT_OF_DEVICE_MEMORY), so without these logs the
                 // failing stage (host mmap vs BAR allocation vs hypervisor share) is
                 // indistinguishable. Error path only.
+                let source_offset = match &source {
+                    VmMemorySource::Descriptor { offset, .. } => *offset,
+                    _ => 0,
+                };
                 let (mapped_region, size, descriptor) = match source.map(gralloc, prot) {
                     Ok((region, size, descriptor)) => (region, size, descriptor),
                     Err(e) => {
@@ -920,6 +930,8 @@ impl VmMemoryRequest {
                 let (slot, accept_handle) = match vm.runtime_share(
                     guest_addr,
                     mapped_region,
+                    descriptor.as_ref().map(AsRawDescriptor::as_raw_descriptor),
+                    source_offset,
                     prot == Protection::read(),
                     cache,
                     vm_accept,

@@ -219,10 +219,15 @@ pub trait Vm: Send {
         &mut self,
         guest_addr: GuestAddress,
         mem_region: Box<dyn MappedRegion>,
+        // Original mapping fd and byte offset when the region came from a descriptor.
+        // The fd remains valid for this synchronous call.
+        source_descriptor: Option<RawDescriptor>,
+        source_offset: u64,
         read_only: bool,
         cache: MemCacheType,
         accept: VmAccept,
     ) -> Result<(MemSlot, Option<u32>)> {
+        let _ = (source_descriptor, source_offset, accept);
         let slot = self.add_memory_region(guest_addr, mem_region, read_only, false, cache)?;
         Ok((slot, None))
     }
@@ -252,6 +257,8 @@ pub trait Vm: Send {
     }
 
     /// Fold a sub-range of `fd` into 2 MiB folios. Default no-op; only Gunyah protected acts.
+    /// The file is a growable VMM-owned pool, so only the granted range is populated and the rest
+    /// remains sparse.
     fn prepare_blob_range(
         &mut self,
         fd: &dyn AsRawDescriptor,
