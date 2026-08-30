@@ -7,6 +7,8 @@ mod aarch64;
 
 mod gunyah_sys;
 mod mthp;
+pub mod shim_abi;
+mod pin;
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
@@ -31,6 +33,7 @@ use base::pagesize;
 use base::warn;
 use base::Error;
 use base::FromRawDescriptor;
+use base::IntoRawDescriptor;
 use base::MemoryMapping;
 use base::MemoryMappingBuilder;
 use base::MmapError;
@@ -227,6 +230,9 @@ pub struct GunyahVm {
     mem_regions: Arc<Mutex<BTreeMap<MemSlot, (Box<dyn MappedRegion>, GuestAddress)>>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
     mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
+    /// Long-term pins held over runtime-shared blobs between the SHARE ioctl and the guest's
+    /// accept, keyed by the same label as `blob_regions`. See `pin.rs`.
+    blob_pins: Arc<Mutex<BTreeMap<u32, pin::LongtermPin>>>,
     routes: Arc<Mutex<HashSet<GunyahIrqRoute>>>,
     hv_cfg: crate::Config,
 }
@@ -256,6 +262,14 @@ impl GunyahVm {
             let lend = if cfg.protection_type.isolates_memory() {
                 match region.options.purpose {
                     MemoryRegionPurpose::Bios => true,
+                    // The window: neither lent nor shared before boot. It is handed over after
+                    // GH_VM_START as a memparcel the guest accepts, which is the whole point.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::SharedGuestRam => false,
+                    // The handoff page is SHARE'd like a pool, because the host has to keep
+                    // writing to it after the VM has started.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::ShimHandoff => false,
                     MemoryRegionPurpose::GuestMemoryRegion => true,
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::ProtectedFirmwareRegion => true,
@@ -354,6 +368,36 @@ impl GunyahVm {
                     }
                 }
             } else {
+                        | MemoryRegionPurpose::ShimHandoff
+                // The window of a pseudo-unprotected VM is not handed over here at all. It is
+                // SHARE'd after GH_VM_START, because the guest has to accept it itself and there
+                // is no guest to accept anything until then.
+                //
+                // What does happen here is the folio preparation, and it is not optional: the
+                // reserve pool serves order-9 folios, and a parcel built from 4 KiB pages carries
+                // one mem_entry per page -- a 4 GiB window would be a million of them. The same
+                // preparation the LEND'd guest RAM of an ordinary protected VM gets, for the same
+                // reason.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == MemoryRegionPurpose::SharedGuestRam {
+                    // SAFETY: host_addr is a valid mapping of region.size bytes.
+                    let prep = unsafe {
+                        mthp::prepare_lend_region(region.host_addr as *mut u8, full_size)
+                    };
+                    if !prep.populated || !prep.mlocked {
+                        error!(
+                            "GH-SHIM: window gpa={:#x} size={:#x} could not be populated and \
+                             pinned (reserve pool exhausted?) -- refusing to start, because the \
+                             share would either fail or hand the guest memory the host may still \
+                             move under it",
+                            region.guest_addr.offset(),
+                            full_size,
+                        );
+                        return Err(Error::new(libc::ENOMEM));
+                    }
+                    base::info!(
+                        "GH-SHIM: window gpa={:#x} size={:#x} prepared; it is shared after \
+                         GH_VM_START and accepted by the shim",
                 // SAFETY:
                 // Safe because the guest regions are guarnteed not to overlap.
                 unsafe {
@@ -362,9 +406,30 @@ impl GunyahVm {
                         region.index as MemSlot,
                         false,
                         region.guest_addr.offset(),
-                        region.size.try_into().unwrap(),
-                        region.host_addr as *mut u8,
-                    )?;
+                        full_size,
+                    );
+                    continue;
+                }
+
+                // Same pin probe as the LEND path above: a SHARE'd pool whose pages cannot be
+                // pinned takes the host down inside the ioctl, so find out here instead.
+                let _pin = if share_len != 0 {
+                    pin::LongtermPin::ensure_pinnable(
+                        region.host_addr as u64,
+                        share_len,
+                        pin::PinSite::PreBoot,
+                    )
+                    .map_err(|e| {
+                        error!(
+                            "GH: refusing to SHARE gpa={:#x} size={:#x} -- the host cannot pin it",
+                            region.guest_addr.offset(),
+                            share_len
+                        );
+                        e
+                    })?
+                } else {
+                    None
+                };
                 }
             }
         }
@@ -377,6 +442,7 @@ impl GunyahVm {
             guest_mem,
             mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
             mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
+            blob_pins: Arc::new(Mutex::new(BTreeMap::new())),
             routes: Arc::new(Mutex::new(HashSet::new())),
             hv_cfg: cfg,
         })
@@ -512,6 +578,7 @@ impl GunyahVm {
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
+            blob_pins: self.blob_pins.clone(),
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
         })
@@ -581,11 +648,151 @@ impl GunyahVm {
         // SAFETY: safe because memory is not modified and the return value is checked.
         let ret = unsafe { ioctl(self, GH_VM_START) };
         if ret == 0 {
+            self.share_probe();
+            self.share_guest_ram_window()?;
             Ok(())
         } else {
             base::error!("GH-DIAG: GH_VM_START failed");
             errno_result()
         }
+    }
+
+    /// Hand the guest's RAM over, now that there is a VM to hand it to.
+    ///
+    /// This is the whole of the pseudo-unprotected mode on the host side. The window has been
+    /// sitting in a memfd with the payload already written into it; sharing it makes a memparcel
+    /// the guest can accept, and the handles go in the handoff page for the shim to find. Nothing
+    /// here can happen earlier: a memparcel handle does not exist until the VM does.
+    ///
+    /// The order matters at the end. `ready` is written last, after every parcel is shared and
+    /// every handle recorded, because the shim spins on it and would otherwise read a handle of
+    /// zero and ask the resource manager to accept nothing.
+    fn share_guest_ram_window(&self) -> Result<()> {
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        {
+            use crate::gunyah::shim_abi as abi;
+
+            if !self.hv_cfg.protection_type.shares_guest_ram() {
+                return Ok(());
+            }
+            let mem = self.guest_mem.clone();
+            let window = mem
+                .regions()
+                .find(|r| r.options.purpose == MemoryRegionPurpose::SharedGuestRam);
+            let handoff = mem
+                .regions()
+                .find(|r| r.options.purpose == MemoryRegionPurpose::ShimHandoff);
+            let (Some(window), Some(handoff)) = (window, handoff) else {
+                base::error!("GH-SHIM: no window or no handoff region; refusing to start");
+                return Err(Error::new(EINVAL));
+            };
+
+            let size: u64 = window.size.try_into().unwrap();
+            let ho = handoff.guest_addr;
+
+            // DROIDVM_SHIM_PARCEL_MB: hand the window over in parcels of at most this many MiB.
+            //
+            // Zero, the default, means one parcel however big the window is. It is worth a knob
+            // because the cost of building a parcel is not the same everywhere: on android14-6.1
+            // the resource manager assembles it from every folio there and then (~3.4 s for
+            // 4 GiB), while the 6.12 driver demand-pages it (~60 ms). Splitting spends memparcels
+            // -- MAX_MEMPARCEL_PER_VM is 1024 for the whole VM, shared with Android's own -- and
+            // buys nothing unless something is measured to be faster for it, so nobody gets it
+            // without asking.
+            let chunk = std::env::var("DROIDVM_SHIM_PARCEL_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb << 20)
+                .filter(|c| *c != 0)
+                // A parcel is built out of folios; a chunk that is not a whole number of them
+                // would hand the guest a boundary in the middle of one.
+                .map(|c| c.next_multiple_of(2 << 20).min(size))
+                .unwrap_or(size);
+            let nparcels = size.div_ceil(chunk);
+            if nparcels > abi::SHIM_MAX_PARCELS as u64 {
+                base::error!(
+                    "GH-SHIM: {:#x} of window in {:#x} chunks needs {} parcels; the handoff page                      holds {}",
+                    size,
+                    chunk,
+                    nparcels,
+                    abi::SHIM_MAX_PARCELS,
+                );
+                return Err(Error::new(EINVAL));
+            }
+
+            let started = std::time::Instant::now();
+            for i in 0..nparcels {
+                let off = i * chunk;
+                let len = chunk.min(size - off);
+                let at = window
+                    .guest_addr
+                    .checked_add(off)
+                    .ok_or_else(|| Error::new(EINVAL))?;
+                // A second mapping of the region's own memfd, because share_blob wants something
+                // it can hold for as long as the parcel lives. The payload the host wrote into it
+                // before the VM started is already there and stays there: sharing does not
+                // sanitise, which is what lets the window arrive with a kernel in it.
+                let dup = base::clone_descriptor(&base::Descriptor(window.shm.as_raw_descriptor()))
+                    .map_err(|_| Error::new(EINVAL))?;
+                // SAFETY: the descriptor was just duplicated from the region's own memfd and is
+                // owned by this File from here on.
+                let file = unsafe { std::fs::File::from_raw_descriptor(dup.into_raw_descriptor()) };
+                let mapping = MemoryMappingBuilder::new(len.try_into().unwrap())
+                    .from_file(&file)
+                    .offset(window.shm_offset + off)
+                    .build()
+                    .map_err(|e| {
+                        base::error!("GH-SHIM: cannot map the window to share it: {:?}", e);
+                        Error::new(EINVAL)
+                    })?;
+                // exec: the payload runs from here.
+                let parcel = abi::ShimParcel {
+                    handle,
+                    reserved: 0,
+                    base: at.offset(),
+                    size: len,
+                };
+                let dst = ho
+                    .checked_add(core::mem::offset_of!(abi::ShimHandoff, parcel) as u64)
+                    .and_then(|a| {
+                        a.checked_add(i * core::mem::size_of::<abi::ShimParcel>() as u64)
+                    })
+                    .ok_or_else(|| Error::new(EINVAL))?;
+                // SAFETY: ShimParcel is repr(C) and made of integers; every byte pattern is valid.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        &parcel as *const abi::ShimParcel as *const u8,
+                        core::mem::size_of::<abi::ShimParcel>(),
+                    )
+                };
+                mem.write_all_at_addr(bytes, dst)
+                    .map_err(|_| Error::new(EINVAL))?;
+            }
+            base::info!(
+                "GH-SHIM: window {:#x}+{:#x} shared as {} parcel(s) in {:?}",
+                window.guest_addr.offset(),
+                size,
+                nparcels,
+                started.elapsed(),
+            );
+
+            mem.write_obj_at_addr(
+                nparcels as u32,
+                ho.checked_add(core::mem::offset_of!(abi::ShimHandoff, nparcels) as u64)
+                    .ok_or_else(|| Error::new(EINVAL))?,
+            )
+            .map_err(|_| Error::new(EINVAL))?;
+            // Last, and only now.
+            mem.write_obj_at_addr(
+                1u64,
+                ho.checked_add(core::mem::offset_of!(abi::ShimHandoff, ready) as u64)
+                    .ok_or_else(|| Error::new(EINVAL))?,
+            )
+            .map_err(|_| Error::new(EINVAL))?;
+
+            watch_shim(mem, ho);
+        }
+        Ok(())
     }
 
     fn handle_inflate(&self, guest_addr: GuestAddress, size: u64) -> Result<()> {
@@ -609,6 +816,204 @@ impl GunyahVm {
     }
 }
 
+/// Say what the shim did.
+///
+/// Everything the shim can go wrong at happens before there is a console, an interrupt controller
+/// or anyone listening, so the handoff page is the only way it can speak. Without something
+/// reading it, a shim that refuses to hand over is a VM that sits there: no output, no exit, no
+/// clue. This turns that into one log line.
+///
+/// It watches from a thread because the vcpus have not started yet when the window is shared --
+/// they are started by the caller, some way further up -- and stops as soon as the shim reaches
+/// the point where it jumps, which is the last thing it does.
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
+    use crate::gunyah::shim_abi as abi;
+
+    std::thread::Builder::new()
+        .name("gh_shim_watch".into())
+        .spawn(move || {
+            let status_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, status) as u64);
+            let error_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, error) as u64);
+            let probe_at =
+                handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, exec_probe) as u64);
+            let msg_at = handoff.unchecked_add(core::mem::offset_of!(abi::ShimHandoff, msg) as u64);
+            let mut last = 0u64;
+            // Ten seconds is far longer than the shim's own timeouts; past that it is not slow,
+            // it is not running, and the thread has nothing left to add.
+            for _ in 0..1000 {
+                // Volatile: this is a poll of memory another CPU is writing, and the read has to
+                // happen every time round rather than once.
+                let status: u64 = mem.read_obj_from_addr_volatile(status_at).unwrap_or(0);
+                if status != last {
+                    last = status;
+                    match status {
+                        abi::SHIM_STATUS_RUNNING => base::info!("GH-SHIM: shim is running"),
+                        abi::SHIM_STATUS_ACCEPTED => {
+                            let probe: u64 = mem.read_obj_from_addr(probe_at).unwrap_or(0);
+                            if probe != 0 {
+                                base::info!(
+                                    "GH-SHIM: window accepted; the guest executed out of it and \
+                                     got {} (42 means yes)",
+                                    probe
+                                );
+                            } else {
+                                base::info!("GH-SHIM: window accepted");
+                            }
+                        }
+                        abi::SHIM_STATUS_DT_DONE => base::info!("GH-SHIM: /memory now names the window"),
+                        abi::SHIM_STATUS_JUMPING => {
+                            base::info!("GH-SHIM: handing over to the payload");
+                            return;
+                        }
+                        s if s & abi::SHIM_STATUS_ERROR != 0 => {
+                            let mut msg = [0u8; 256];
+                            let _ = mem.read_exact_at_addr(&mut msg, msg_at);
+                            let end = msg.iter().position(|&c| c == 0).unwrap_or(msg.len());
+                            let error: u64 = mem.read_obj_from_addr(error_at).unwrap_or(0);
+                            base::error!(
+                                "GH-SHIM: gave up: {} (error {:#x})",
+                                String::from_utf8_lossy(&msg[..end]),
+                                error,
+                            );
+                            return;
+                        }
+                        other => base::info!("GH-SHIM: status {:#x}", other),
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if last == 0 {
+                base::error!(
+                    "GH-SHIM: nothing was written to the handoff page in ten seconds -- the shim \
+                     never ran, or never found it"
+                );
+            }
+        })
+        .map(|_| ())
+        .unwrap_or_else(|e| base::warn!("GH-SHIM: could not watch the handoff page: {}", e));
+}
+
+    /// Diagnostic: SHARE scratch regions at explicitly chosen GPAs, right after GH_VM_START, and
+    /// report what the host side says. Driven by
+    ///
+    ///   GH_SHARE_PROBE=<gpa>[:<size_kib>][,<gpa>[:<size_kib>]]...   (hex or decimal GPAs)
+    ///
+    /// This exists to test the claim behind virtio_gpu's `host_visible_guard`: that a blob landing
+    /// exactly at the host-visible BAR base cannot be shared. It deliberately involves no GPU, no
+    /// blob and no allocator -- just gh_vm_mem_alloc + gh_rm_mem_share for a GPA we pick. Each
+    /// scratch page is filled with a recognisable pattern (the GPA itself, repeated) so a guest
+    /// that accepts the parcel can prove the mapping really landed.
+    ///
+    /// The parcels are left shared (and the handles printed) so a guest-side test module can accept
+    /// them at the same GPA; nothing else in crosvm knows about these regions, so they are never
+    /// handed out to a device.
+    fn share_probe(&self) {
+        let Some(spec) = std::env::var_os("GH_SHARE_PROBE") else {
+            return;
+        };
+        let spec = spec.to_string_lossy().to_string();
+        for item in spec.split(',').filter(|s| !s.trim().is_empty()) {
+            let mut parts = item.trim().split(':');
+            let gpa_str = parts.next().unwrap_or("").trim();
+            let size_kib: u64 = parts
+                .next()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(2048);
+            let gpa = match gpa_str.strip_prefix("0x").or_else(|| gpa_str.strip_prefix("0X")) {
+                Some(hex) => u64::from_str_radix(hex, 16).ok(),
+                None => gpa_str.parse::<u64>().ok(),
+            };
+            let Some(gpa) = gpa else {
+                base::error!("GH-SHARE-PROBE: cannot parse gpa {:?}", gpa_str);
+                continue;
+            };
+            let size = size_kib * 1024;
+
+            let region = match MemoryMappingBuilder::new(size as usize).build() {
+                Ok(m) => m,
+                Err(e) => {
+                    base::error!("GH-SHARE-PROBE: gpa={:#x} scratch mmap failed: {:?}", gpa, e);
+                    continue;
+                }
+            };
+            // Pattern: the GPA repeated, so the guest can tell whose page it is looking at.
+            let pattern: Vec<u8> = gpa.to_le_bytes().repeat(512);
+            let _ = region.write_slice(&pattern, 0);
+
+                Ok(handle) => base::error!(
+                    "GH-SHARE-PROBE: gpa={:#x} size={:#x} => SHARED handle={:#x} \
+                     (accept it in the guest with gunyah_guest_mem_accept)",
+                    gpa,
+                    size,
+                    handle
+                ),
+                Err(e) => base::error!(
+                    "GH-SHARE-PROBE: gpa={:#x} size={:#x} => FAILED {:?}",
+                    gpa,
+                    size,
+                    e
+                ),
+            }
+        }
+    }
+
+        &self,
+        exec: bool,
+        // X in the guest's ACL entry. The boot-time SHARE path cannot have it -- the driver maps
+        // those regions non-executable and the guest faults on the first instruction fetch -- but
+        // a runtime memparcel carries whatever rights its ACL asks for, and the platform's SCM
+        // assign leaves HLOS its own RWX either way, so the host does not lose access. Measured on
+        // sm8650: with X the guest runs code out of the parcel, without it the same call raises
+        // SIGBUS while the same page still reads and writes.
+        //
+        // The window of a pseudo-unprotected VM needs it, because the payload runs from there.
+        // Host-visible blobs do not, and do not get it. GH_SHARE_EXEC forces it on for everything
+        // and exists only to repeat that measurement.
+        if exec || std::env::var_os("GH_SHARE_EXEC").is_some_and(|v| v != "0") {
+            flags |= GH_MEM_ALLOW_EXEC;
+        }
+        // Probe the pin before the module takes its own (see pin.rs). A blob whose pages cannot
+        // be pinned must fail as this one request -- the guest gets an allocation error and the
+        // VM keeps running -- rather than inside the SHARE, where the same condition has taken
+        // the whole host down. Dropped on the error paths below; on success it is held until the
+        // guest has accepted (or failed to), then released via `release_share_pin`.
+        let probe = pin::LongtermPin::ensure_pinnable(
+            mem_region.as_ptr() as u64,
+            size,
+            pin::PinSite::Share,
+        )?;
+
+        let share_started = std::time::Instant::now();
+        let share_elapsed = share_started.elapsed();
+            let e = Error::last();
+            base::error!(
+                "GUNYAH-SHARE-BLOB: gpa={:#x} size={:#x} flags={:#x} FAILED after {:?}: {}",
+                guest_addr.offset(),
+                size,
+                flags,
+                share_elapsed,
+                e,
+            );
+            return Err(e);
+        }
+        // One line per share at info level once the range is big enough to be a pool grant rather
+        // than a blob: the cost of a single RM MEM_SHARE as a function of its size is the number
+        // the pseudo-unprotected window sizing depends on, and it is not derivable from anything
+        // else the host prints.
+        if size >= (32 << 20) {
+            base::info!(
+                "GUNYAH-SHARE-BLOB: gpa={:#x} size={:#x} flags={:#x} handle={:#x} took {:?}",
+                guest_addr.offset(),
+                size,
+                flags,
+                blob.mem_handle,
+                share_elapsed,
+            );
+        }
+        if let Some(probe) = probe {
+            self.blob_pins.lock().insert(label, probe);
+        self.blob_pins.lock().remove(&label);
 impl Vm for GunyahVm {
     fn try_clone(&self) -> Result<Self>
     where
@@ -622,6 +1027,7 @@ impl Vm for GunyahVm {
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
+            blob_pins: self.blob_pins.clone(),
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
         })
@@ -659,6 +1065,15 @@ impl Vm for GunyahVm {
 
     fn get_memory(&self) -> &GuestMemory {
         &self.guest_mem
+    }
+
+        // Host-visible blobs are data: rings, buffers, framebuffers. Nothing executes from them.
+    fn release_share_pin(&self, guest_addr: GuestAddress) {
+        // Same deterministic label the SHARE used (gpa>>12). Under GH_NO_UNSHARE the SHARE uses
+        // monotonic labels and nothing is ever reclaimed, so the pin stays with the leaked
+        // parcel -- that flag is test-only and already leaks the parcel itself.
+        let label = (guest_addr.offset() >> 12) as u32;
+        self.blob_pins.lock().remove(&label);
     }
 
     fn add_memory_region(

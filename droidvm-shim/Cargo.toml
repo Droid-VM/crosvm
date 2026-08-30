@@ -1,0 +1,36 @@
+# Deliberately its own workspace rather than a member of crosvm's.
+#
+# crosvm's Android.bp files are generated from its Cargo.toml by cargo_embargo, and this crate is
+# not something soong can build: it targets bare metal, links against a script, and is emitted as
+# a flat binary. Detaching it keeps cargo_embargo from trying, and keeps `cargo build` inside
+# crosvm from tripping over a member it cannot compile for the host.
+[workspace]
+
+[package]
+name = "droidvm-shim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+# The device-tree walk, which is pure arithmetic over a byte slice: a library so it can be tested
+# on the host, where a wrong answer costs a second rather than a phone boot.
+name = "shim_fdt"
+path = "src/fdt.rs"
+
+[[bin]]
+name = "droidvm-shim"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+# The shim runs once, before anything else, out of a region measured in kilobytes: small and
+# predictable beats fast. `panic = "abort"` because there is nothing to unwind into, and the
+# panic handler's job is to leave a message in the handoff page and stop.
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+debug = true
+overflow-checks = true

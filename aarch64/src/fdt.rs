@@ -38,6 +38,7 @@ use rand::RngCore;
 use resources::AddressRange;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionPurpose;
 
 // These are GIC address-space location constants.
 use crate::AARCH64_GIC_CPUI_BASE;
@@ -95,12 +96,25 @@ const IRQ_TYPE_LEVEL_LOW: u32 = 0x00000008;
 fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     let mut mem_reg_prop = Vec::new();
     let mut previous_memory_region_end = None;
+    // A pseudo-unprotected VM's window is left out for the same reason and one more: nothing has
+    // been handed to the hypervisor for it yet, and the guest is not told it exists until the
+    // shim has accepted it and pointed `/memory` here itself. The handoff page is not the guest's
+    // RAM either -- it is the one place the host can still write once the boot region is lent.
+    let hidden: HashSet<u64> = guest_mem
+        .filter(|r| {
+            r.options.step_size != 0
+                || matches!(
+                    r.options.purpose,
+                    MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::ShimHandoff
+                )
+        })
     let mut regions = guest_mem.guest_memory_regions();
     regions.sort();
     for region in regions {
         if region.0.offset() == AARCH64_PROTECTED_VM_FW_START {
             continue;
         }
+        if hidden.contains(&region.0.offset()) {
         // Merge with the previous region if possible.
         if let Some(previous_end) = previous_memory_region_end {
             if region.0 == previous_end {
@@ -838,6 +852,7 @@ pub fn create_fdt(
     use_pmu: bool,
     psci_version: PsciVersion,
     swiotlb: Option<(Option<GuestAddress>, u64)>,
+    shim_handoff_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
     simplefb_cfg: Option<SimplefbDtConfig>,
@@ -903,6 +918,41 @@ pub fn create_fdt(
             None
         }
     };
+    // The shim's handoff page. It is a SHARE'd region like the pools, and it needs this node for
+    // the same reason they do: the resource manager blesses a memparcel by finding a
+    // `/reserved-memory` child whose `reg` matches it, and refuses to start a VM that was handed
+    // a parcel no node accounts for (measured on sm8650 / android14-6.1: without this node
+    // GH_VM_START answers NORESOURCE, and the whole VM never runs). The guest ignores it -- the
+    // compatible is a vendor string no Linux handler claims, and `no-map` keeps it out of the
+    // linear map -- and the shim does not read it either, since crosvm patches the address
+    // straight into the shim's header.
+    if let Some((gpa, size)) = shim_handoff_resv {
+        let resv = fdt.root_mut().subnode_mut("reserved-memory")?;
+        resv.set_prop("#address-cells", 0x2u32)?;
+        resv.set_prop("#size-cells", 0x2u32)?;
+        resv.set_prop("ranges", ())?;
+        let node = resv.subnode_mut(&format!("shim_handoff@{:x}", gpa))?;
+        // Its own compatible rather than `droidvm,pool`: edk2's GunyahPoolAcpiDxe turns every
+        // pool node into an ACPI device, and this is not a pool -- it is one page of protocol
+        // between the host and the shim, finished with before anything else runs.
+        node.set_prop("compatible", "droidvm,shim-handoff")?;
+        node.set_prop("reg", &[gpa, size])?;
+        node.set_prop("no-map", ())?;
+    }
+
+        // DROIDVM_POOL_HIDE=dt|shm|both (diagnostic): omit the reserved-memory node for the test
+        // pools. The sm8650-era RM refuses a `/reserved-memory` child whose `reg` does not match
+        // an accepted memparcel exactly, which is one of three tangled explanations for why a
+        // partially-shared pool fails to start there -- the others being the shm vdevice node and
+        // the region itself. Each has to be removable on its own or the cause stays unknown.
+        let hide = std::env::var("DROIDVM_POOL_HIDE").unwrap_or_default();
+        if hide == "dt" || hide == "both" {
+            base::warn!(
+                "GH-POOL: DROIDVM_POOL_HIDE={} -- omitting the {} reserved-memory node ({:#x}+{:#x})",
+                hide, name, gpa, size,
+            );
+            continue;
+        }
     create_cpu_nodes(
         &mut fdt,
         num_cpus,

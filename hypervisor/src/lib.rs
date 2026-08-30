@@ -178,6 +178,17 @@ pub trait Vm: Send {
         cache: MemCacheType,
     ) -> Result<MemSlot>;
 
+    /// Releases the long-term pin the VMM took over a runtime-shared region while handing it to
+    /// the hypervisor, once the guest has accepted it -- or failed to.
+    ///
+    /// The pin exists only to prove the pages are pinnable (and to migrate them out of CMA)
+    /// before the hypervisor tries the same thing somewhere we cannot recover from; see
+    /// `gunyah::pin`. Migration is not undone by unpinning, so there is nothing to keep. On
+    /// hypervisors that take no such pin this is a no-op.
+    fn release_share_pin(&self, guest_addr: GuestAddress) {
+        let _ = guest_addr;
+    }
+
     /// Does a synchronous msync of the memory mapped at `slot`, syncing `size` bytes starting at
     /// `offset` from the start of the region.  `offset` must be page aligned.
     fn msync_memory_region(&mut self, slot: MemSlot, offset: usize, size: usize) -> Result<()>;
@@ -598,6 +609,21 @@ pub enum ProtectionType {
     /// mode, protected VM firmware loaded, and simulating protected mode as much as possible.
     /// This is useful for debugging the protected VM firmware and other protected mode issues.
     UnprotectedWithFirmware,
+    /// Protected as far as the hypervisor is concerned, but with the guest's memory shared back to
+    /// it at run time instead of lent before boot, so the host can still reach it.
+    ///
+    /// Qualcomm's own unprotected VM mode is disabled on consumer parts, and a protected VM's
+    /// memory is lent: the host cannot see it, so every virtio buffer has to go through a bounce
+    /// pool, and a guest kernel without CONFIG_RESTRICTED_DMA_POOL -- which is to say every stock
+    /// distribution kernel -- cannot boot at all.
+    ///
+    /// A memparcel carries whatever rights its ACL asks for, though, and the platform's SCM
+    /// assign leaves the host its own access. So the VM is given a small lent region to boot in,
+    /// its real memory is SHARE'd afterwards, and a shim inside the VM accepts it before anything
+    /// else runs -- the host cannot accept on the guest's behalf, the resource manager refuses.
+    /// From the payload's point of view it is an ordinary machine whose RAM happens to start a
+    /// few megabytes above the bottom.
+    ProtectedPseudoUnprotected,
 }
 
 impl ProtectionType {
@@ -605,8 +631,20 @@ impl ProtectionType {
     pub fn isolates_memory(&self) -> bool {
         matches!(
             self,
-            Self::Protected | Self::ProtectedWithCustomFirmware | Self::ProtectedWithoutFirmware
+            Self::Protected
+                | Self::ProtectedWithCustomFirmware
+                | Self::ProtectedWithoutFirmware
+                // The boot region really is lent, and everything that decides how a region is
+                // handed over keys off this. The window is the exception, and it says so for
+                // itself through its own purpose rather than by weakening this answer.
+                | Self::ProtectedPseudoUnprotected
         )
+    }
+
+    /// Returns whether the guest's RAM is a window the guest accepts at run time rather than
+    /// memory lent to it before boot.
+    pub fn shares_guest_ram(&self) -> bool {
+        matches!(self, Self::ProtectedPseudoUnprotected)
     }
 
     /// Returns whether the VMM needs to load the pVM firmware.
@@ -622,6 +660,11 @@ impl ProtectionType {
         self.needs_firmware_loaded() || matches!(self, Self::Protected)
     }
 }
+
+/// The boot shim's ABI, re-exported so the arch code that loads the shim and the shim itself
+/// cannot disagree about it.
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+pub use crate::gunyah::shim_abi as gunyah_shim_abi;
 
 /// How an mTHP-prepared lend region is handed to Gunyah at VM start.
 ///

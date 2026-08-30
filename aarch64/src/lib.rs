@@ -113,6 +113,44 @@ pub const AARCH64_PHYS_MEM_START: u64 = 0x80000000;
 const AARCH64_PLATFORM_MMIO_SIZE: u64 = 0x800000;
 const AARCH64_PFLASH_MAX_SIZE: u64 = AARCH64_PLATFORM_MMIO_SIZE;
 
+/// The lent region a pseudo-unprotected VM boots in: the shim, then the device tree.
+///
+/// One folio, which is the smallest a lent region can usefully be -- the reserve pool serves 2 MiB
+/// folios and the tree has to live in lent memory, because the resource manager finds the guest's
+/// image through the parcel that contains it. Everything in it is overhead: a byte here is a byte
+/// the guest does not get as RAM.
+///
+/// Nothing in it is big -- the shim is ~13 KiB of code plus a 16 KiB stack, and the tree crosvm
+/// generates for these VMs is about 6 KiB -- so 4 MiB is almost all waste. It is not 2 MiB
+/// because of the resource manager: with the tree at 64 KiB in and declared 1 MiB long, a 2 MiB
+/// boot region works on android14-6.1 and the RM on 6.12 refuses VM_INIT outright
+/// (`RM rejected message 5600000b. Error: 10` = MEM_INVALID). That generation wants the tree
+/// where an ordinary VM puts it, at AARCH64_FDT_ALIGN and AARCH64_FDT_MAX_SIZE long, and a region
+/// holding both that and a shim at offset zero cannot be smaller than the two of them.
+///
+/// Everything above this is the window -- the guest's real RAM -- which is why this comes out of
+/// `--mem` rather than being added to it: the pools and the MMIO windows are placed relative to
+/// the top of the block `--mem` describes, so a VM in this mode has exactly the layout it would
+/// have had, with its RAM starting a few megabytes higher.
+const AARCH64_SHIM_BOOT_REGION_SIZE: u64 = AARCH64_FDT_ALIGN + AARCH64_FDT_MAX_SIZE;
+
+/// Where the device tree goes inside the boot region, and how much room it has there. Both are
+/// what an ordinary VM uses, for the resource manager's sake; see the note above.
+const AARCH64_SHIM_FDT_OFFSET: u64 = AARCH64_FDT_ALIGN;
+const AARCH64_SHIM_FDT_MAX_SIZE: u64 = AARCH64_FDT_MAX_SIZE;
+
+/// The page the host and the shim talk through. One folio, immediately above the boot region.
+const AARCH64_SHIM_HANDOFF_SIZE: u64 = 0x200000;
+
+/// The least guest RAM the Gunyah resource manager will start a VM with.
+///
+/// Checked because `--mem` is not the guest's RAM: the swiotlb, the framebuffer and every pool
+/// tagged `consume_system_mem` come out of it first, and each of those is configured somewhere
+/// else -- so it is entirely possible to ask for a VM whose parts add up to more than it has.
+/// Without this the subtraction is what notices, either by panicking on the overflow check or, if
+/// that is off, by wrapping into a region tens of exabytes long.
+const AARCH64_MIN_GUEST_RAM: u64 = 4 << 20;
+
 const AARCH64_PROTECTED_VM_FW_MAX_SIZE: u64 = 0x400000;
 const AARCH64_PROTECTED_VM_FW_START: u64 =
     AARCH64_PHYS_MEM_START - AARCH64_PROTECTED_VM_FW_MAX_SIZE;
@@ -381,6 +419,19 @@ pub enum Error {
     GetPsciVersion(base::Error),
     #[error("failed to get serial cmdline: {0}")]
     GetSerialCmdline(GetSerialCmdlineError),
+    #[error(
+        "--mem {mem:#x} leaves {ram:#x} for the guest, below the {floor:#x} the resource manager \
+         will start a VM with: {swiotlb:#x} swiotlb, {simplefb:#x} framebuffer and {pools:#x} of \
+         pools all come out of it"
+    )]
+    GuestRamTooSmall {
+        mem: u64,
+        ram: u64,
+        floor: u64,
+        swiotlb: u64,
+        simplefb: u64,
+        pools: u64,
+    },
     #[error("failed to initialize arm pvtime: {0}")]
     InitPvtimeError(base::Error),
     #[error("initrd could not be loaded: {0}")]
@@ -401,6 +452,11 @@ pub enum Error {
     PflashSetup(anyhow::Error),
     #[error("pflash image size {0} exceeds maximum {1}")]
     PflashTooLarge(u64, u64),
+    #[error(
+        "--mem {0:#x} leaves no room for the guest's RAM: a pseudo-unprotected VM spends the \
+         bottom of it on the shim, the device tree and the handoff page"
+    )]
+    PseudoUnprotectedTooSmall(u64),
     #[error("pVM firmware could not be loaded: {0}")]
     PvmFwLoadFailure(base::Error),
     #[error("ramoops address is different from high_mmio_base: {0} vs {1}")]
@@ -429,6 +485,10 @@ pub enum Error {
     SetReg(base::Error),
     #[error("failed to set up guest memory: {0}")]
     SetupGuestMemory(GuestMemoryError),
+    #[error("the compiled-in boot shim does not start with the header magic ({0:#x})")]
+    ShimBadImage(u64),
+    #[error("boot shim could not be written to guest memory: {0}")]
+    ShimLoadFailure(vm_memory::GuestMemoryError),
     #[error("this function isn't supported")]
     Unsupported,
     #[error("failed to initialize VCPU: {0}")]
@@ -479,27 +539,298 @@ fn get_block_size() -> u64 {
     block_size as u64
 }
 
+/// The boot shim, built before crosvm and compiled in.
+///
+/// A separate file would be one more thing that can be stale on the phone while looking right in
+/// the log, and the shim and crosvm share an ABI neither can check at run time: a mismatch is a VM
+/// that starts, hangs, and says nothing.
+const SHIM_IMAGE: &[u8] = include_bytes!("../../hypervisor/src/gunyah/shim.bin");
+
+/// Copy the shim to the base of the boot region and fill in the two addresses only the host knows.
+///
+/// Everything else in the shim is position-independent; these two are not, and there is no second
+/// chance to write them -- the region is lent immediately after this.
+fn load_shim(
+    mem: &GuestMemory,
+    at: GuestAddress,
+    payload: GuestAddress,
+    handoff: GuestAddress,
+    probe_exec: bool,
+) -> std::result::Result<(), Error> {
+    use hypervisor::gunyah_shim_abi as abi;
+
+    mem.write_all_at_addr(SHIM_IMAGE, at)
+        .map_err(Error::ShimLoadFailure)?;
+
+    let mut flags = 0u32;
+    if probe_exec {
+        flags |= abi::SHIM_FLAG_PROBE_EXEC;
+    }
+    let header = abi::ShimHeader {
+        magic: abi::SHIM_HEADER_MAGIC,
+        version: abi::SHIM_ABI_VERSION,
+        flags,
+        payload: payload.offset(),
+        handoff: handoff.offset(),
+        dtb_max_size: AARCH64_SHIM_FDT_MAX_SIZE,
+        reserved: [0; 3],
+    };
+    // The magic the image was built with has to be the magic we are about to overwrite: if the
+    // blob compiled in is not the shim this crosvm was built against, better to say so here than
+    // to hand the hypervisor an entry point and watch it go quiet.
+    let built_magic = u64::from_le_bytes(
+        SHIM_IMAGE[abi::SHIM_HEADER_OFFSET..abi::SHIM_HEADER_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    );
+    if built_magic != abi::SHIM_HEADER_MAGIC {
+        return Err(Error::ShimBadImage(built_magic));
+    }
+    let header_at = at
+        .checked_add(abi::SHIM_HEADER_OFFSET as u64)
+        .ok_or(Error::ShimBadImage(0))?;
+    // SAFETY: ShimHeader is repr(C) and made only of integers, so every byte pattern is a valid
+    // one and there is no padding to leak.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &header as *const abi::ShimHeader as *const u8,
+            std::mem::size_of::<abi::ShimHeader>(),
+        )
+    };
+    mem.write_all_at_addr(bytes, header_at)
+        .map_err(Error::ShimLoadFailure)?;
+    base::info!(
+        "GH-SHIM: {} bytes at {:#x}; payload {:#x}, handoff {:#x}, flags {:#x}",
+        SHIM_IMAGE.len(),
+        at.offset(),
+        payload.offset(),
+        handoff.offset(),
+        flags,
+    );
+    Ok(())
+}
+
+/// Put the handoff page into the state the shim expects to find it in.
+///
+/// Only the magic and the version: the parcels are filled in after the VM has started, because
+/// their handles do not exist until then. `ready` stays zero until they are, which is what stops a
+/// shim that outruns the host from accepting a handle of zero.
+fn init_handoff(mem: &GuestMemory, at: GuestAddress) -> std::result::Result<(), Error> {
+    use hypervisor::gunyah_shim_abi as abi;
+
+    let handoff = abi::ShimHandoff::default();
+    // SAFETY: repr(C), integers and a byte array; no padding to leak and no invalid pattern.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            &handoff as *const abi::ShimHandoff as *const u8,
+            std::mem::size_of::<abi::ShimHandoff>(),
+        )
+    };
+    mem.write_all_at_addr(bytes, at)
+        .map_err(Error::ShimLoadFailure)
+}
+
 fn get_vcpu_mpidr_aff<Vcpu: VcpuAArch64>(vcpus: &[Vcpu], index: usize) -> Option<u64> {
     const MPIDR_AFF_MASK: u64 = 0xff_00ff_ffff;
 
     Some(vcpus.get(index)?.get_mpidr().ok()? & MPIDR_AFF_MASK)
 }
 
+/// One pre-allocated pool, as both the layout and the sys-RAM accounting need to see it.
+struct PoolSpec {
+    /// For the log line that reports the layout.
+    name: &'static str,
+    size: u64,
+    purpose: MemoryRegionPurpose,
+    /// Whether this pool's `prealloc` comes out of `--mem` rather than being added on top of it.
+    ///
+    /// Purely accounting, and nothing else: the pool is laid out in the same place either way, at
+    /// the same size, shared and grown the same. All this decides is whether `--mem` is made
+    /// smaller by the pool's pre-shared prefix first -- which is the same VM the operator would
+    /// get by typing that smaller number themselves, and exactly why it is safe to set on any
+    /// pool whatever it is for and whether or not it grows.
+    ///
+    /// Internal to crosvm on purpose: no CLI reaches it. A pool is either the kind that belongs
+    /// inside a VM's memory budget or it is not, and that is a property of what the pool is for,
+    /// not something an operator should have to get right per VM.
+    consume_system_mem: bool,
+    /// Bytes SHARE'd before boot; the rest is granted at runtime in `step` chunks.
+    prealloc: u64,
+    step: u64,
+    max_grants: u32,
+    /// Guest-physical address space to leave empty in front of the pool. Diagnostic; test only.
+    gap_before: u64,
+}
+
+/// Every pool the layout can create, in the order it lays them out.
+///
+/// This list is the only place a pool is written down. It used to be written down twice -- an
+/// env-var array for the accounting and a block per pool in the layout -- and the two could
+/// disagree, which the reconciliation log at the end of the layout existed to notice after the
+/// fact. A pool added to one and not the other silently came out of the space above the pools,
+/// which belongs to the swiotlb and the framebuffer.
+///
+/// `consume_system_mem` is per pool, and the three HOST pools fix it to true. They hold a
+/// renderer's own command-stream buffers -- tens of MiB, and only for whichever renderer the VM
+/// happens to run -- so adding them on top of `--mem` would make what a VM costs depend on a
+/// choice that has nothing to do with how much memory it was given. Splitting a fixed reserve
+/// between VMs then means doing that arithmetic by hand, per VM, to answer "will two of these
+/// fit". The guest pool is the opposite: it is the VM's VRAM, it is sized deliberately, and it is
+/// already in anyone's budget, so it stays additive unless asked otherwise.
+fn pool_specs() -> Vec<PoolSpec> {
+    let mb = |name: &str| -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            << 20
+    };
+    let mut out = Vec::new();
+
+    let gfx = mb("NCTX_GFX_POOL_MB");
+    if gfx != 0 {
+        out.push(PoolSpec {
+            name: "gfx_host",
+            size: gfx,
+            purpose: MemoryRegionPurpose::GpuPool,
+            consume_system_mem: true,
+            prealloc: gfx,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    let guest = mb("NCTX_GFX_GUEST_POOL_MB");
+    if guest != 0 {
+        let prealloc = std::env::var("NCTX_GFX_GUEST_POOL_PREALLOC_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|v| v << 20)
+            .unwrap_or(guest);
+        out.push(PoolSpec {
+            name: "gpu_guest",
+            size: guest,
+            purpose: MemoryRegionPurpose::GpuPoolGuest,
+            // The VRAM the operator asked for, on top of the RAM they asked for. Flipping this
+            // to true would fold it into `--mem` like the host pools -- a one-word change, but it
+            // redefines what the app's "video memory" field means against the memory field beside
+            // it, so it is the app's decision to make, not a default to drift into.
+            consume_system_mem: false,
+            prealloc: prealloc.min(guest),
+            step: mb("NCTX_GFX_GUEST_POOL_STEP_MB"),
+            max_grants: std::env::var("NCTX_GFX_GUEST_POOL_MAX_GRANTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            gap_before: 0,
+        });
+    }
+
+    let drm = mb("NCTX_DRM2KGSL_POOL_MB");
+    if drm != 0 {
+        out.push(PoolSpec {
+            name: "drm2kgsl_host",
+            size: drm,
+            purpose: MemoryRegionPurpose::Drm2KgslPool,
+            consume_system_mem: true,
+            prealloc: drm,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    let venus = mb("NCTX_VENUS_POOL_MB");
+    if venus != 0 {
+        out.push(PoolSpec {
+            name: "venus_host",
+            size: venus,
+            purpose: MemoryRegionPurpose::VenusPool,
+            consume_system_mem: true,
+            prealloc: venus,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    for suffix in ["", "_2"] {
+        let size = mb(&format!("DROIDVM_TEST_POOL{}_MB", suffix));
+        if size == 0 {
+            continue;
+        }
+        let prealloc = std::env::var(format!("DROIDVM_TEST_POOL{}_PREALLOC_MB", suffix))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|v| v << 20)
+            .unwrap_or(size);
+        out.push(PoolSpec {
+            name: if suffix.is_empty() { "test" } else { "test_2" },
+            size,
+            purpose: MemoryRegionPurpose::DynamicTestPool,
+            // Test scaffolding: additive, so a test pool never moves the guest's RAM out from
+            // under whatever is being measured.
+            consume_system_mem: false,
+            prealloc: prealloc.min(size),
+            step: mb(&format!("DROIDVM_TEST_POOL{}_STEP_MB", suffix)),
+            // One grant is one memparcel and the VM-wide limit is 1024, shared with Android's
+            // own. 64 is deliberately far below it: this pool is for testing, and exhausting
+            // the quota takes the phone down until it reboots.
+            max_grants: 64,
+            gap_before: mb(&format!("DROIDVM_TEST_POOL{}_GAP_MB", suffix)),
+        });
+    }
+    out
+}
+
+/// How much of `--mem` the pools take out of it, rounded to the folios the host backs them in.
+///
+/// A pool's `prealloc`, not its `size`: that is what is really held when the VM boots. The rest of
+/// a growable pool's window is address space with nothing behind it until the guest asks for a
+/// grant, and a grant is memory the VM did not have a moment earlier -- so charging for it up
+/// front would make a VM cost less than `--mem` at boot, which is the same kind of arithmetic by
+/// hand this is trying to remove, only in the other direction.
+///
+/// `gap_before` is not counted: it is address space, and address space no longer comes out of
+/// `--mem` now that the pools sit above the block rather than inside it.
+fn sys_ram_pool_bytes() -> u64 {
+    let folio = 2 << 20;
+    pool_specs()
+        .iter()
+        .filter(|p| p.consume_system_mem)
+        .map(|p| p.prealloc.next_multiple_of(folio))
+        .sum()
+}
+
+/// The height of the block `--mem` describes: guest RAM, the simplefb and the swiotlb, and nothing
+/// else. Everything anchored to the top of the VM's memory is anchored to this.
+///
+/// `--mem` minus what the pools take out of it. The pools' windows then start where this ends, so
+/// what the VM holds at boot is the block plus every pool's pre-shared prefix -- which adds back
+/// up to `--mem` exactly when every pool comes out of it, and grows past `--mem` only when a
+/// growable pool is actually granted more.
+fn vm_block_size(components: &VmComponents) -> u64 {
+    // Saturating, and deliberately not the place that complains: this is called from eight places
+    // that have no way to refuse, and they all have to agree on one number. `guest_memory_layout`
+    // makes the judgement once, before anything is laid out at all -- so by the time the rest of
+    // these run, a block this arithmetic could not produce honestly has already been rejected.
+    components.memory_size.saturating_sub(sys_ram_pool_bytes())
+}
+
 fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?Sized)) -> u64 {
-    // Static swiotlb and simplefb are allocated from the end of RAM as separate
-    // memory regions (for Gunyah), so make the main region smaller.
-    let mut main_memory_size = components.memory_size;
+    // Static swiotlb and simplefb are allocated from the end of the block as separate memory
+    // regions (for Gunyah), so make the main region smaller. The block itself is already smaller
+    // than `--mem` by whatever the pools took; see `vm_block_size`.
+    let block = vm_block_size(components);
+    let mut main_memory_size = block;
     if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
         if let Some(size) = components.swiotlb {
-            main_memory_size -= size;
+            main_memory_size = main_memory_size.saturating_sub(size);
         }
         if let Some(ref sfb) = components.simplefb {
-            main_memory_size -= get_simplefb_size(
-                sfb,
-                components.memory_size,
-                components.swiotlb,
-                hypervisor,
-            );
+            main_memory_size = main_memory_size
+                .saturating_sub(get_simplefb_size(sfb, block, components.swiotlb, hypervisor));
         }
     }
     main_memory_size
@@ -576,12 +907,72 @@ impl arch::LinuxArch for AArch64 {
         hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
         let main_memory_size = main_memory_size(components, hypervisor);
+        // Everything below reads this, and several things subtract from it again, so it is checked
+        // here rather than where each of them would notice. A VM whose swiotlb, framebuffer and
+        // pools add up to more than `--mem` is a configuration mistake in whichever of those was
+        // set last, and saying which one it was costs nothing here.
+        if main_memory_size < AARCH64_MIN_GUEST_RAM {
+            let block = vm_block_size(components);
+            return Err(Error::GuestRamTooSmall {
+                mem: components.memory_size,
+                ram: main_memory_size,
+                floor: AARCH64_MIN_GUEST_RAM,
+                swiotlb: components.swiotlb.unwrap_or(0),
+                simplefb: components
+                    .simplefb
+                    .as_ref()
+                    .map(|sfb| get_simplefb_size(sfb, block, components.swiotlb, hypervisor))
+                    .unwrap_or(0),
+                pools: sys_ram_pool_bytes(),
+            });
+        }
 
-        let mut memory_regions = vec![(
-            GuestAddress(AARCH64_PHYS_MEM_START),
-            main_memory_size,
-            MemoryRegionOptions::new().align(get_block_size()),
-        )];
+        // In a pseudo-unprotected VM the guest's RAM is not lent to it: the region at the bottom
+        // holds only the shim and the device tree, and everything above it is a window the host
+        // shares after the VM has started and the shim accepts before the payload runs. The
+        // handoff page sits between them because the host needs somewhere it can still write to
+        // once the boot region has been lent away.
+        let mut memory_regions = if components.hv_cfg.protection_type.shares_guest_ram() {
+            // The boot region is as small as it can be and still hold the shim and the device
+            // tree; DROIDVM_SHIM_BOOT_MB moves it, because "as small as it can be" is a claim
+            // about a payload nobody has met yet.
+            let boot = std::env::var("DROIDVM_SHIM_BOOT_MB")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .map(|mb| mb << 20)
+                .unwrap_or(AARCH64_SHIM_BOOT_REGION_SIZE);
+            let handoff = AARCH64_SHIM_HANDOFF_SIZE;
+            let window = main_memory_size
+                .checked_sub(boot + handoff)
+                .ok_or(Error::PseudoUnprotectedTooSmall(main_memory_size))?;
+            vec![
+                (
+                    GuestAddress(AARCH64_PHYS_MEM_START),
+                    boot,
+                    MemoryRegionOptions::new().align(get_block_size()),
+                ),
+                (
+                    GuestAddress(AARCH64_PHYS_MEM_START + boot),
+                    handoff,
+                    MemoryRegionOptions::new()
+                        .purpose(MemoryRegionPurpose::ShimHandoff)
+                        .align(2 << 20),
+                ),
+                (
+                    GuestAddress(AARCH64_PHYS_MEM_START + boot + handoff),
+                    window,
+                    MemoryRegionOptions::new()
+                        .purpose(MemoryRegionPurpose::SharedGuestRam)
+                        .align(2 << 20),
+                ),
+            ]
+        } else {
+            vec![(
+                GuestAddress(AARCH64_PHYS_MEM_START),
+                main_memory_size,
+                MemoryRegionOptions::new().align(get_block_size()),
+            )]
+        };
 
         // Allocate memory for the pVM firmware.
         if components.hv_cfg.protection_type.runs_firmware() {
@@ -593,13 +984,74 @@ impl arch::LinuxArch for AArch64 {
         }
 
         if let Some(size) = components.swiotlb {
-            if let Some(addr) = get_swiotlb_addr(components.memory_size, size, hypervisor) {
+            if let Some(addr) = get_swiotlb_addr(vm_block_size(components), size, hypervisor) {
                 memory_regions.push((
                     addr,
                     size,
                     MemoryRegionOptions::new().purpose(MemoryRegionPurpose::StaticSwiotlbRegion),
                 ));
             }
+        }
+
+        // The DroidVM pre-alloc pools. Each is a swiotlb-style purpose region: GunyahVm::new
+        // SHARE-blesses it (lend=false) and hugepage-prepares it, build_vm hands its memfd view
+        // to the renderer that owns it, and the DT gets the no-map reserved-memory node the
+        // Gunyah RM matches by `reg`. The platform-MMIO and PCI windows stack above end_addr(),
+        // so they move up past whatever these take -- no window overlap, no special GPA formula.
+        // A guest learns a pool's GPA dynamically (map_blob response), so moving one is
+        // transparent to it.
+        //
+        // What each pool is, how big, and whether it comes out of `--mem`: `pool_specs`.
+        // One cursor, above everything `--mem` describes. A pool's window never sits inside the
+        // block: the block is only as tall as what the pools charged for, and a growable pool's
+        // window is larger than that by the part nothing is backing yet. Putting every window
+        // above the block instead is what lets `consume_system_mem` be about accounting alone --
+        // it decides how much shorter the block is, never where the pool goes -- so a pool can be
+        // growable and come out of `--mem` at the same time, which is the useful combination:
+        // it costs its `prealloc` at boot and costs more only when the guest is granted more.
+        //
+        // The platform-MMIO and PCI windows stack above end_addr(), so they move up past whatever
+        // this takes on their own.
+        let mut top = AARCH64_PHYS_MEM_START + vm_block_size(components);
+        for spec in pool_specs() {
+            if spec.gap_before != 0 {
+                // A hole of guest-physical address space in FRONT of the pool -- no region, no
+                // DT node, no shm vdevice, nothing SHARE'd. The pseudo-unprotected window in
+                // miniature: the layout covers it, the guest is never told it exists, and the
+                // only way anything appears there is a runtime SHARE plus the guest's own
+                // MEM_ACCEPT. Measuring that on the sm8650-era RM is what the flag is for.
+                let at = top.next_multiple_of(2 << 20);
+                base::info!(
+                    "GH-POOL: leaving a {:#x} byte hole at {:#x} before the {} pool",
+                    spec.gap_before,
+                    at,
+                    spec.name,
+                );
+                top = at + spec.gap_before;
+            }
+            let base = top.next_multiple_of(2 << 20);
+            memory_regions.push((
+                GuestAddress(base),
+                spec.size,
+                MemoryRegionOptions::new()
+                    .purpose(spec.purpose)
+                    .align(2 << 20)
+                    // Written out even where it is the default the builder already produces, so
+                    // that turning one of these into a growable pool is a visible edit to its
+                    // entry in `pool_specs` rather than an absent field here.
+                    .growable_pool(spec.prealloc, spec.step)
+                    .max_grants(spec.max_grants),
+            ));
+            base::info!(
+                "GH-POOL: {} pool {:#x}..{:#x} prealloc {:#x} step {:#x} ({} --mem)",
+                spec.name,
+                base,
+                base + spec.size,
+                spec.prealloc,
+                spec.step,
+                if spec.consume_system_mem { "out of" } else { "on top of" },
+            );
+            top = base + spec.size;
         }
 
         // Add simplefb region as SharedFramebuffer.
@@ -611,8 +1063,8 @@ impl arch::LinuxArch for AArch64 {
         // regular RAM, while allowing ioremap_wc() from the simplefb driver.
         // For non-Gunyah, the region stays at a fixed MMIO address (0x50000000).
         if let Some(ref sfb) = components.simplefb {
-            let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, hypervisor);
-            let fb_alloc = get_simplefb_size(sfb, components.memory_size, components.swiotlb, hypervisor);
+            let fb_addr = get_simplefb_addr(sfb, vm_block_size(components), components.swiotlb, hypervisor);
+            let fb_alloc = get_simplefb_size(sfb, vm_block_size(components), components.swiotlb, hypervisor);
             memory_regions.push((
                 GuestAddress(fb_addr),
                 fb_alloc,
@@ -684,17 +1136,54 @@ impl arch::LinuxArch for AArch64 {
         let mem = vm.get_memory().clone();
 
         let main_memory_size = main_memory_size(&components, vm.get_hypervisor());
+        // Once, here: `components` is consumed field by field further down, and every anchor below
+        // needs the same number the layout used.
+        let vm_block = vm_block_size(&components);
+
+        // Where the guest's RAM begins. In a pseudo-unprotected VM the bottom of the address
+        // space is the shim's, the device tree's and the handoff page's; everything the payload
+        // will ever see starts above them.
+        let shares_guest_ram = components.hv_cfg.protection_type.shares_guest_ram();
+        let window_start = if shares_guest_ram {
+            mem.regions()
+                .find(|r| r.options.purpose == MemoryRegionPurpose::SharedGuestRam)
+                .map(|r| r.guest_addr.offset())
+                .ok_or(Error::PseudoUnprotectedTooSmall(main_memory_size))?
+        } else {
+            AARCH64_PHYS_MEM_START
+        };
+        // Where the handoff page ended up, read back off the layout for the same reason: one place
+        // decides it, everything else asks.
+        let handoff_addr = mem
+            .regions()
+            .find(|r| r.options.purpose == MemoryRegionPurpose::ShimHandoff)
+            .map(|r| r.guest_addr);
 
         let fdt_position = fdt_position.unwrap_or(if has_bios {
             FdtPosition::Start
         } else {
             FdtPosition::End
         });
-        let payload_address = match fdt_position {
-            // If FDT is at the start RAM, the payload needs to go somewhere after it.
-            FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_FDT_MAX_SIZE),
-            // Otherwise, put the payload at the start of RAM.
-            FdtPosition::End | FdtPosition::AfterPayload => GuestAddress(AARCH64_PHYS_MEM_START),
+        // The device tree stays in the lent boot region even in the pseudo-unprotected mode: the
+        // resource manager locates the guest's image through the parcel that carries the tree, so
+        // it cannot live in a window that does not exist yet. The payload goes to the bottom of
+        // the window instead, and the shim is what the hypervisor starts.
+        let fdt_position = if shares_guest_ram {
+            FdtPosition::Start
+        } else {
+            fdt_position
+        };
+        let payload_address = if shares_guest_ram {
+            GuestAddress(window_start)
+        } else {
+            match fdt_position {
+                // If FDT is at the start RAM, the payload needs to go somewhere after it.
+                FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_FDT_MAX_SIZE),
+                // Otherwise, put the payload at the start of RAM.
+                FdtPosition::End | FdtPosition::AfterPayload => {
+                    GuestAddress(AARCH64_PHYS_MEM_START)
+                }
+            }
         };
 
         // separate out image loading from other setup to get a specific error for
@@ -724,8 +1213,12 @@ impl arch::LinuxArch for AArch64 {
                         let mut initrd_file = initrd_file;
                         let initrd_addr = (kernel_end + 1 + (AARCH64_INITRD_ALIGN - 1))
                             & !(AARCH64_INITRD_ALIGN - 1);
+                        // Measured from where the payload actually lives: in the
+                        // pseudo-unprotected mode that is the window, which starts above the boot
+                        // region rather than at the bottom of the address space.
                         let initrd_max_size =
-                            main_memory_size.saturating_sub(initrd_addr - AARCH64_PHYS_MEM_START);
+                            (AARCH64_PHYS_MEM_START + main_memory_size)
+                                .saturating_sub(initrd_addr);
                         let initrd_addr = GuestAddress(initrd_addr);
                         let initrd_size =
                             arch::load_image(&mem, &mut initrd_file, initrd_addr, initrd_max_size)
@@ -745,6 +1238,11 @@ impl arch::LinuxArch for AArch64 {
         let memory_end = GuestAddress(AARCH64_PHYS_MEM_START + main_memory_size);
 
         let fdt_address = match fdt_position {
+            // In the pseudo-unprotected mode the bottom of the boot region belongs to the shim,
+            // and the tree follows it; everywhere else "start" means the very bottom of RAM.
+            FdtPosition::Start if shares_guest_ram => {
+                GuestAddress(AARCH64_PHYS_MEM_START + AARCH64_SHIM_FDT_OFFSET)
+            }
             FdtPosition::Start => GuestAddress(AARCH64_PHYS_MEM_START),
             FdtPosition::End => {
                 let addr = memory_end
@@ -1161,8 +1659,8 @@ impl arch::LinuxArch for AArch64 {
         // For Gunyah: placed in RAM range, shared via set_user_memory_region + SHM node.
         // A reserved-memory no-map node prevents the kernel from using it as regular RAM.
         if let Some(ref sfb) = components.simplefb {
-            let fb_size_aligned = get_simplefb_size(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
-            let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
+            let fb_size_aligned = get_simplefb_size(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
+            let fb_addr = get_simplefb_addr(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
             let bpp: u32 = match sfb.format.as_str() {
                 "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
                 "r8g8b8" => 3,
@@ -1188,8 +1686,20 @@ impl arch::LinuxArch for AArch64 {
             timeout_sec: VMWDT_DEFAULT_TIMEOUT_SEC,
         };
 
+        // The handoff page, read back off the layout like every other region the tree describes.
+        let shim_handoff_resv: Option<(u64, u64)> = mem
+            .regions()
+            .find(|r| r.options.purpose == MemoryRegionPurpose::ShimHandoff)
+            .map(|r| (r.guest_addr.offset(), r.size as u64));
+        // The tree has a smaller slot in a pseudo-unprotected VM: it shares a 2 MiB lent region
+        // with the shim instead of sitting in 2 MiB of its own at the top of RAM.
+        let fdt_max_size = if shares_guest_ram {
+            AARCH64_SHIM_FDT_MAX_SIZE
+        } else {
+            AARCH64_FDT_MAX_SIZE
+        };
         fdt::create_fdt(
-            AARCH64_FDT_MAX_SIZE as usize,
+            fdt_max_size as usize,
             &mem,
             pci_irqs,
             pci_cfg,
@@ -1212,10 +1722,11 @@ impl arch::LinuxArch for AArch64 {
             psci_version,
             components.swiotlb.map(|size| {
                 (
-                    get_swiotlb_addr(components.memory_size, size, vm.get_hypervisor()),
+                    get_swiotlb_addr(vm_block, size, vm.get_hypervisor()),
                     size,
                 )
             }),
+            shim_handoff_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,
             components.simplefb.as_ref().map(|sfb| {
@@ -1226,8 +1737,8 @@ impl arch::LinuxArch for AArch64 {
                     _ => 4,
                 };
                 let stride = sfb.width * bpp;
-                let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
-                let fb_alloc = get_simplefb_size(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
+                let fb_addr = get_simplefb_addr(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
+                let fb_alloc = get_simplefb_size(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
                 fdt::SimplefbDtConfig {
                     addr: fb_addr,
                     size: fb_alloc,
@@ -1250,11 +1761,36 @@ impl arch::LinuxArch for AArch64 {
         )
         .map_err(Error::CreateFdt)?;
 
-        vm.init_arch(
-            payload.entry(),
-            fdt_address,
-            AARCH64_FDT_MAX_SIZE.try_into().unwrap(),
-        )
+        // The shim, and the entry point that goes with it.
+        //
+        // In a pseudo-unprotected VM the hypervisor does not start the payload: it starts the
+        // shim, at the base of the lent region, because the payload's memory does not exist yet.
+        // The shim is copied in here and its header patched with the two addresses only the host
+        // knows -- where the payload is, and where the page they talk through is -- since after
+        // this the region is lent and the host cannot write to it again.
+        let entry = if shares_guest_ram {
+            let handoff_addr = handoff_addr.unwrap_or(GuestAddress(0));
+            load_shim(
+                &mem,
+                GuestAddress(AARCH64_PHYS_MEM_START),
+                payload.entry(),
+                handoff_addr,
+                // DROIDVM_SHIM_PROBE_EXEC (diagnostic): have the shim execute two instructions
+                // out of the window before handing over. It is the only place the question can
+                // be asked -- the MMU is off there, so a fault is stage 2 and nothing else -- and
+                // it is off by default because a VM that dies proving a point is still a VM that
+                // died.
+                std::env::var_os("DROIDVM_SHIM_PROBE_EXEC").is_some_and(|v| v != "0"),
+            )?;
+            if handoff_addr.offset() != 0 {
+                init_handoff(&mem, handoff_addr)?;
+            }
+            GuestAddress(AARCH64_PHYS_MEM_START)
+        } else {
+            payload.entry()
+        };
+
+        vm.init_arch(entry, fdt_address, fdt_max_size.try_into().unwrap())
         .map_err(Error::InitVmError)?;
 
         let vm_request_tubes = vec![vmwdt_host_tube, vcpufreq_host_tube];

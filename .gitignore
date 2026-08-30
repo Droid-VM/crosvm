@@ -9,3 +9,6 @@ lcov.info
 .idea
 .vscode/*
 !.vscode/settings.json
+
+# Built by 2-0_build_shim.sh and embedded with include_bytes!; not a source file.
+hypervisor/src/gunyah/shim.bin

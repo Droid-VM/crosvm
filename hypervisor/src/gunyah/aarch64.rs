@@ -134,6 +134,32 @@ impl VmAArch64 for GunyahVm {
         for region in self.guest_mem.regions() {
             let create_shm_node = match region.options.purpose {
                 MemoryRegionPurpose::Bios => false,
+                //
+                // DROIDVM_POOL_HIDE=shm|both (diagnostic) drops it. On android14-6.1 this node is
+                // how the RM ties a SHARE'd memparcel to the guest -- it is the reason the shm
+                // vdevice exists at all (see fdt_create_shm_device) -- so a pool that is declared
+                // but never SHARE'd may be refused because of THIS node rather than because of
+                // its reserved-memory node or its region. Separating the three is the point.
+                MemoryRegionPurpose::DynamicTestPool => {
+                    let hide = std::env::var("DROIDVM_POOL_HIDE").unwrap_or_default();
+                    if hide == "shm" || hide == "both" {
+                        base::warn!(
+                            "GH-POOL: DROIDVM_POOL_HIDE={} -- no shm vdevice for the test pool at {:#x}",
+                            hide,
+                            region.guest_addr.offset(),
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                // The window gets no shm vdevice: nothing about it is handed over at VM
+                // creation, and a node describing memory the resource manager has not been given
+                // is exactly what it refuses to start a VM over.
+                MemoryRegionPurpose::SharedGuestRam => false,
+                // The handoff page does, like every other SHARE'd region: on android14-6.1 this
+                // node's `base` is what pins the memparcel at the address crosvm chose.
+                MemoryRegionPurpose::ShimHandoff => true,
                 MemoryRegionPurpose::GuestMemoryRegion => false,
                 // Described by the "firmware-address" property
                 MemoryRegionPurpose::ProtectedFirmwareRegion => false,
