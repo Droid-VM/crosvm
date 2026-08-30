@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright DroidVM contributors
+// Binds LibVNCServer (GPL-2.0-or-later); no LibVNCServer code is included here.
+// Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
+
 #define _GNU_SOURCE
 #include "vnc_server_bridge.h"
 

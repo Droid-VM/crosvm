@@ -1,3 +1,9 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright DroidVM contributors
+// Derived from QEMU (GPL-2.0-or-later): gunyah_add_mem() in gunyah-all.c.
+// The additional permissions do not extend to QEMU copyright in this file.
+// Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
+
 //! Multi-size Transparent Huge Page (mTHP) preparation and LEND chunking
 //! for Gunyah memory regions.
 //!
