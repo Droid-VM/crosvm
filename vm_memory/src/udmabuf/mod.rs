@@ -26,6 +26,8 @@ pub enum UdmabufError {
     InvalidOffset(GuestMemoryError),
     #[error("All guest addresses must aligned to 4KiB")]
     NotPageAligned,
+    #[error("scatter-gather list of {0} entries exceeds the {1}-entry limit")]
+    TooManyEntries(usize, usize),
     #[error("udmabuf is not supported on this platform")]
     UdmabufUnsupported,
 }

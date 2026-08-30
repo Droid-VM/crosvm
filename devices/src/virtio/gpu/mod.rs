@@ -100,6 +100,43 @@ use crate::PciAddress;
 // there to be fewer of.
 const QUEUE_SIZES: &[u16] = &[512, 16];
 
+/// Most `virtio_gpu_mem_entry` records this will build a list from in one command.
+///
+/// `nr_entries` arrives as a raw Le32 in the command header and is not validated anywhere
+/// upstream: the sites below used it directly as a `Vec::with_capacity`, before reading a single
+/// entry. Two things follow from that, and both need bounding.
+///
+/// The obvious one -- a guest claiming 0xFFFFFFFF entries while supplying none -- is less bad than
+/// it looks: `with_capacity` reserves without touching, and the first short read drops the Vec. It
+/// still has to go, because `Vec::with_capacity` is infallible, so a refused reservation is
+/// `handle_alloc_error()` and the GPU device runs in-process: that aborts the VM.
+///
+/// The one that actually costs memory needs no lying at all. The ctrl queue has 512 descriptors
+/// and the chain walk only stops at `count >= queue_size` -- it does not require the descriptors to
+/// be distinct -- so 512 of them may all point at one guest buffer. A guest can then honestly
+/// present ~4 GiB of readable payload (the chain length is summed into a u32, which is the only
+/// existing ceiling) out of ~8 MiB of its own memory, with every entry naming the same valid page.
+/// Every read succeeds, and the result is RETAINED in `resource.backing_iovecs` until detach or
+/// unref -- twice, once here and once in rutabaga. That is ~8.5 GB of host heap per resource id
+/// for 8 MiB of guest memory, repeatable, and it never exceeds the guest's own memory quota.
+///
+/// 1M entries is a 16 MiB Vec, enough to describe a 4 GiB scatter-gather list of 4 KiB pages, so
+/// it bounds the retained cost without rejecting anything a real driver produces.
+const MAX_MEM_ENTRIES: usize = 1 << 20;
+
+/// Entries the guest actually presented, or an error. Clamping to `available_bytes` is what kills
+/// the over-reservation: capacity can no longer exceed the bytes really in the chain.
+fn checked_entry_count(
+    nr_entries: u32,
+    available_bytes: usize,
+) -> std::result::Result<usize, GpuResponse> {
+    let n = nr_entries as usize;
+    if n > MAX_MEM_ENTRIES || n > available_bytes / size_of::<virtio_gpu_mem_entry>() {
+        return Err(GpuResponse::ErrUnspec);
+    }
+    Ok(n)
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GpuMode {
     #[serde(rename = "2d", alias = "2D")]
@@ -468,7 +505,8 @@ impl Frontend {
             GpuCommand::ResourceAttachBacking(info) => {
                 let available_bytes = reader.available_bytes();
                 if available_bytes != 0 {
-                    let entry_count = info.nr_entries.to_native() as usize;
+                    let entry_count =
+                        checked_entry_count(info.nr_entries.to_native(), available_bytes)?;
                     let mut vecs = Vec::with_capacity(entry_count);
                     for _ in 0..entry_count {
                         match reader.read_obj::<virtio_gpu_mem_entry>() {
@@ -595,6 +633,13 @@ impl Frontend {
                 if reader.available_bytes() != 0 {
                     let num_in_fences = info.num_in_fences.to_native() as usize;
                     let cmd_size = info.size.to_native() as usize;
+                    // Same shape as nr_entries above: both are guest u32s used as an allocation
+                    // size before anything is read. This one is transient rather than retained,
+                    // but `vec![0; n]` writes, so it is the one that actually touches the pages.
+                    let avail = reader.available_bytes();
+                    if cmd_size > avail || num_in_fences > avail / size_of::<Le64>() {
+                        return Err(GpuResponse::ErrUnspec);
+                    }
                     let mut cmd_buf = vec![0; cmd_size];
                     let mut fence_ids: Vec<u64> = Vec::with_capacity(num_in_fences);
                     let ctx_id = info.hdr.ctx_id.to_native();
@@ -635,8 +680,9 @@ impl Frontend {
                 if reader.available_bytes() == 0 && entry_count > 0 {
                     return Err(GpuResponse::ErrUnspec);
                 }
+                let entry_count = checked_entry_count(entry_count, reader.available_bytes())?;
 
-                let mut vecs = Vec::with_capacity(entry_count as usize);
+                let mut vecs = Vec::with_capacity(entry_count);
                 for _ in 0..entry_count {
                     match reader.read_obj::<virtio_gpu_mem_entry>() {
                         Ok(entry) => {
