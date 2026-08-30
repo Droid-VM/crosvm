@@ -567,6 +567,94 @@ impl GuestMemory {
             .clone()
     }
 
+            let start = addr.offset();
+            let end = start
+                .checked_add(*len as u64)
+                .ok_or(GrantError::NotBacked)?;
+                let pool_end = base
+                    .checked_add(pool.size())
+                    .ok_or(GrantError::NotBacked)?;
+                if start < pool_end && *base < end {
+                    // An iovec that crosses a pool boundary cannot be safely represented by a
+                    // single pool grant lookup. Reject it even when it starts outside the pool;
+                    // otherwise a guest could smuggle an unbacked suffix into an otherwise valid
+                    // dma-buf by choosing a start address in ordinary RAM.
+                    if start < *base || end > pool_end {
+                        return Err(GrantError::NotBacked);
+                    }
+                    if !pool.range_backed(start - *base, *len as u64) {
+                    pool.ref_range_available(start - *base, *len as u64)?;
+                    pool.ref_range(a - *base, *len as u64)
+                        .expect("pool iovec was validated immediately above");
+    /// Query whether a specific range in a growable pool is backed. This is used to reconcile a
+    /// request whose guest-side wait timed out: the host may have completed the SHARE/UNSHARE even
+    /// though the response was lost, and a count alone cannot identify that range.
+    pub fn pool_range_backed(&self, pool_id: u32, offset: u64, len: u64) -> Option<bool> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values()
+            .nth(pool_id as usize)
+            .map(|p| p.range_backed(offset, len))
+    }
+
+    /// Reserve a guest-originated shrink request while the host unregisters the mapping. This
+    /// blocks new dma-buf references until [`Self::pool_finish_unshare`] or
+    /// [`Self::pool_cancel_unshare`] is called.
+    pub fn pool_begin_unshare(
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+            .values_mut()
+            .begin_unshare(offset, len)
+    }
+
+    /// Undo a failed guest-originated shrink reservation.
+    pub fn pool_cancel_unshare(&self, pool_id: u32, offset: u64, len: u64) {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        if let Some(pool) = grants.values_mut().nth(pool_id as usize) {
+            pool.cancel_unshare(offset, len);
+        }
+    /// Complete a previously reserved guest-originated shrink and return the RM handle recorded
+    /// for it. The range must name a grant exactly: the RM reclaims a parcel whole.
+    pub fn pool_finish_unshare(
+            .finish_unshare(offset, len)
+    fn check_pool_backed_range(
+        &self,
+        region: &MemoryRegion,
+        guest_addr: GuestAddress,
+        len: u64,
+    ) -> Result<()> {
+        let offset = guest_addr
+            .offset()
+            .checked_sub(region.guest_base.offset())
+            .ok_or(Error::InvalidGuestAddress(guest_addr))?;
+            Some(p) if p.range_backed(offset, len) => Ok(()),
+    /// Check a complete host-access range, including the part after the first byte. The mapping
+    /// APIs otherwise only identify the region from their start address, which would let an
+    /// access beginning in a backed prefix run into an unbacked suffix of a growable pool.
+    fn check_host_access_range(&self, guest_addr: GuestAddress, len: usize) -> Result<()> {
+        self.check_host_access(guest_addr)?;
+        if len == 0 || !self.protected.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let end = guest_addr
+            .offset()
+            .checked_add(len as u64)
+            .ok_or(Error::InvalidGuestAddress(guest_addr))?;
+        let region = self
+            .regions
+            .iter()
+            .find(|r| r.contains(guest_addr))
+            .ok_or(Error::InvalidGuestAddress(guest_addr))?;
+        if end > region.end().offset() {
+            return Err(Error::InvalidGuestAddress(guest_addr));
+        }
+
+        if region.options.step_size != 0 {
+            self.check_pool_backed_range(region, guest_addr, len as u64)?;
+        }
+        Ok(())
+    }
+
     /// Check whether `guest_addr` falls in a host-accessible region.
     /// Returns `Ok(())` when the access is safe, or an error describing why
     /// the host must not touch that address.
@@ -583,9 +671,19 @@ impl GuestMemory {
             // The GPU pool is SHARE'd (never lent), so the host keeps access — same as the
             // framebuffer/swiotlb regions (crosvm reads scanout data straight from the pool).
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::GpuPool => self.check_pool_backed_range(region, guest_addr, 1),
             // Guest-alloc pool: SHARE'd like GpuPool; the host resolves guest-blob mem-entries
             // that point into it via get_slice_at_addr (the whole point of guest-alloc).
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::GpuPoolGuest => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            MemoryRegionPurpose::Drm2KgslPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            MemoryRegionPurpose::DynamicTestPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
             // The window of a pseudo-unprotected VM, and the page the shim is told about it
             // through. Both are SHARE'd rather than lent -- that is the whole of the mode -- so
             // the host keeps its access, and needs it: the window IS the guest's RAM, and every
@@ -725,7 +823,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn write_at_addr(&self, buf: &[u8], guest_addr: GuestAddress) -> Result<usize> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, buf.len())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .write_slice(buf, offset)
@@ -784,7 +882,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn read_at_addr(&self, buf: &mut [u8], guest_addr: GuestAddress) -> Result<usize> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, buf.len())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .read_slice(buf, offset)
@@ -840,7 +938,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn read_obj_from_addr<T: FromBytes>(&self, guest_addr: GuestAddress) -> Result<T> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .read_obj(offset)
@@ -872,7 +970,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn read_obj_from_addr_volatile<T: FromBytes>(&self, guest_addr: GuestAddress) -> Result<T> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .read_obj_volatile(offset)
@@ -899,7 +997,7 @@ impl GuestMemory {
         val: T,
         guest_addr: GuestAddress,
     ) -> Result<()> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .write_obj(val, offset)
@@ -929,7 +1027,7 @@ impl GuestMemory {
         val: T,
         guest_addr: GuestAddress,
     ) -> Result<()> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .write_obj_volatile(val, offset)
@@ -954,7 +1052,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn get_slice_at_addr(&self, addr: GuestAddress, len: usize) -> Result<VolatileSlice> {
-        self.check_host_access(addr)?;
+        self.check_host_access_range(addr, len)?;
         self.regions
             .iter()
             .find(|region| region.contains(addr))
@@ -989,6 +1087,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn get_host_address(&self, guest_addr: GuestAddress) -> Result<*const u8> {
+        self.check_host_access(guest_addr)?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         Ok(
             // SAFETY:
@@ -1027,6 +1126,8 @@ impl GuestMemory {
         if size == 0 {
             return Err(Error::InvalidSize(size));
         }
+
+        self.check_host_access_range(guest_addr, size)?;
 
         // Assume no overlap among regions
         let (mapping, offset, _) = self.find_region(guest_addr)?;

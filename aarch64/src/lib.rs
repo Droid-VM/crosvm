@@ -1747,6 +1747,7 @@ impl arch::LinuxArch for AArch64 {
         // mode the host-visible blobs sub-allocate from this pool (no runtime SHARE); without
         // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
         // pool region emitted).
+        let mut gpu_guest_resv: Option<(u64, u64, u64, u64)> = None;
         // The handoff page, read back off the layout like every other region the tree describes.
         let shim_handoff_resv: Option<(u64, u64)> = mem
             .regions()
@@ -1787,9 +1788,20 @@ impl arch::LinuxArch for AArch64 {
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 if region.options.purpose == vm_memory::MemoryRegionPurpose::GpuPoolGuest {
                     let gpa = region.guest_addr.offset();
+                    let size = region.size as u64;
                     base::warn!(
+                        "GPU-POOL: GpuPoolGuest region gpa={:#x} size={:#x} prealloc={:#x} step={:#x} (blessed, guest-owned)",
                         gpa,
+                        size,
+                        region.options.boot_share_len(size),
+                        region.options.step_size,
                     );
+                    gpu_guest_resv = Some((
+                        gpa,
+                        size,
+                        region.options.boot_share_len(size),
+                        region.options.step_size,
+                    ));
                 }
             }
             found

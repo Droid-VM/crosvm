@@ -2018,12 +2018,16 @@ pub struct RunCommand {
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
+    #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB")]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
     /// host-owned pre-allocated GPU pool sizes (MB). Boot-blessed regions the in-process renderer
     /// sub-allocates host-visible blobs from (no runtime per-blob SHARE). crosvm exports these to
     /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
     ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
+    ///     gpu-guest-prealloc-mb=<MB> - boot-SHARE'd floor; defaults to gpu-guest-mb
+    ///     gpu-guest-step-mb=<MB> - runtime grow/reclaim granularity (0 = fully pre-shared)
+    ///     gpu-guest-max-grants=<N> - per-pool live runtime grant cap (0 = no local cap)
     pub pre_alloc: Option<PreAllocConfig>,
 
     #[argh(switch)]

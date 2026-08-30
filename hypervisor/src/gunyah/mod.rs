@@ -580,7 +580,24 @@ impl GunyahVm {
                     }
                 }
             } else {
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let is_pool = matches!(
+                    region.options.purpose,
+                    MemoryRegionPurpose::GpuPool
+                        | MemoryRegionPurpose::GpuPoolGuest
+                        | MemoryRegionPurpose::Drm2KgslPool
+                        | MemoryRegionPurpose::DynamicTestPool
                         | MemoryRegionPurpose::ShimHandoff
+                );
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let full_size: u64 = region.size.try_into().unwrap();
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                let boot_share_len = if is_pool {
+                    region.options.boot_share_len(full_size)
+                } else {
+                    full_size
+                };
+
                 // GPU pre-alloc pool: force order-9 backing (MADV_HUGEPAGE + populate +
                 // cascading COLLAPSE + mlock) BEFORE the SHARE so the gh_hugepage_reserve
                 // supply hook serves the pool from reserved 2MB folios, exactly like the
@@ -589,11 +606,13 @@ impl GunyahVm {
                 // exists for the Qualcomm reserve-pool hook, so it's opt-in via
                 // --prepare-lend-mthp-mode, not unconditional for every arm/aarch64 host.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if cfg.prepare_lend_mthp.is_some() && is_pool && boot_share_len != 0
                 {
                     // SAFETY: host_addr is a valid mapping of region.size bytes.
                     let prep = unsafe {
                         mthp::prepare_lend_region(
                             region.host_addr as *mut u8,
+                            boot_share_len,
                         )
                     };
                     if !prep.populated {
@@ -606,6 +625,7 @@ impl GunyahVm {
                              (reserve pool exhausted?) -- refusing to share unbacked memory",
                             region.options.purpose,
                             region.guest_addr.offset(),
+                            boot_share_len
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
@@ -619,6 +639,7 @@ impl GunyahVm {
                              refusing to share memory the kernel may still migrate",
                             region.options.purpose,
                             region.guest_addr.offset(),
+                            boot_share_len
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
@@ -652,13 +673,6 @@ impl GunyahVm {
                     base::info!(
                         "GH-SHIM: window gpa={:#x} size={:#x} prepared; it is shared after \
                          GH_VM_START and accepted by the shim",
-                // SAFETY:
-                // Safe because the guest regions are guarnteed not to overlap.
-                unsafe {
-                    set_user_memory_region(
-                        &vm_descriptor,
-                        region.index as MemSlot,
-                        false,
                         region.guest_addr.offset(),
                         full_size,
                     );
@@ -679,8 +693,21 @@ impl GunyahVm {
                     guest_mem.set_framebuffer_prep(prep);
                 }
 
+                // A zero-prefix pool is a valid demand-backed window. It must remain entirely
+                // absent from stage-2 until the first runtime grant; mapping the whole region
+                // here would both consume the backing and collide with the first SHARE at offset
+                // zero.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if is_pool && boot_share_len == 0 {
+                    base::warn!(
+                        "GH-POOL: {:?} gpa={:#x} window={:#x} -- no boot SHARE; \
+                         the guest will grant the window at runtime",
                         region.options.purpose,
+                        region.guest_addr.offset(),
+                        full_size,
+                    continue;
+                }
+
                 // Every SHARE'd region -- swiotlb, the framebuffer, and every GPU / test pool --
                 // is shared with ONE whole-region SET_USER_MEM_REGION, exactly the way swiotlb
                 // always was. The RM builds a single multi-entry mem parcel from the region's
@@ -696,6 +723,7 @@ impl GunyahVm {
                 // gate that selected it, are gone. (The belief that a whole-region pool SHARE
                 // "hard-resets sm8650" was a separate misdiagnosis: that reset was a kernel-CFI
                 // fault in the udmabuf module's memfd_fcntl call, since fixed.)
+                let share_len = boot_share_len;
                 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
                 let share_len: u64 = region.size.try_into().unwrap();
                 // Announce a SPARSE pool -- one declared larger than the prefix we SHARE at boot,
@@ -707,6 +735,8 @@ impl GunyahVm {
                 if is_pool && share_len != full_size {
                         "GH-POOL: SPARSE {:?} gpa={:#x} window={:#x} -- SHARE {:#x} at boot, \
                          {:#x} demand-grown (step={:#x}); older RMs reject this at VM_START",
+                        full_size,
+                        full_size - share_len,
                 // Same pin probe as the LEND path above: a SHARE'd pool whose pages cannot be
                 // pinned takes the host down inside the ioctl, so find out here instead.
                 let _pin = if share_len != 0 {
@@ -1434,7 +1464,18 @@ impl GunyahVm {
         // SAFETY: the ioctl only reads the request; the return value is checked.
         let ret = unsafe { ioctl_with_ref(&share_dev, GHSM_UNSHARE_BLOB, &unshare) };
         if ret != 0 {
+            let err = Error::last();
             // ENOENT just means it was already reclaimed (e.g. by a prior overlap) -- not fatal.
+            if err.errno() != ENOENT {
+                warn!(
+                    "GUNYAH-UNSHARE-BLOB: label={} ioctl ret={} errno={}",
+                    label,
+                    ret,
+                    err.errno()
+                );
+                return Err(err);
+            }
+            warn!("GUNYAH-UNSHARE-BLOB: label={} already reclaimed", label);
         } else {
             debug!("GUNYAH-UNSHARE-BLOB: label={} reclaimed", label);
         }

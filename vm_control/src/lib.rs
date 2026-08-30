@@ -84,9 +84,11 @@ use hypervisor::VmCap;
 use libc::EINVAL;
 use libc::EIO;
 use libc::ENODEV;
+use libc::ENOENT;
 use libc::ENOTSUP;
 use libc::ERANGE;
 use libc::ETIMEDOUT;
+use libc::EUCLEAN;
 #[cfg(feature = "registered_events")]
 use protos::registered_events;
 use remain::sorted;
@@ -734,6 +736,11 @@ enum RegisteredMemory {
         /// True when the attach was accepted by the in-VM module via the Sync transport; the
         /// detach must then drive the symmetric guest-side release before unsharing.
         guest_synced: bool,
+        /// Keep the handle until host-side unshare succeeds so a failed reclaim can restore the
+        /// guest stage-2 mapping after its acceptance was released.
+        guest_accept_handle: Option<u32>,
+        /// Rounded source size, needed when restoring guest-side acceptance.
+        size: u64,
     },
 }
 
@@ -927,6 +934,7 @@ impl VmMemoryRequest {
                 // which drives the guest accept itself. `Sync` consumes the handle HERE: the
                 // in-VM accept module performs the accept over the virtio-gunyah-accept
                 // transport before we return, so the caller sees plain upstream semantics.
+                let (accept_handle, guest_synced, guest_accept_handle) = match (vm_accept, accept_handle) {
                     (VmAccept::Sync, Some(handle)) => {
                         let Some(accept_tube) = gunyah_accept_tube else {
                             error!(
@@ -954,6 +962,7 @@ impl VmMemoryRequest {
                             let _ = vm.runtime_unshare(guest_addr, slot, VmAccept::Off);
                             return VmMemoryResponse::Err(e);
                         }
+                        (None, true, Some(handle))
                     }
                     (VmAccept::Async, Some(_)) => {
                         error!("VmAccept::Async transport not implemented");
@@ -995,6 +1004,12 @@ impl VmMemoryRequest {
 
                 region_state.registered_memory.insert(
                     region_id,
+                    RegisteredMemory::DynamicMapping {
+                        slot,
+                        guest_synced,
+                        guest_accept_handle,
+                        size,
+                    },
                 );
                 VmMemoryResponse::RegisterMemory {
                     region_id,
@@ -1098,6 +1113,8 @@ impl VmMemoryRequest {
                     RegisteredMemory::DynamicMapping {
                         slot,
                         guest_synced: false,
+                        guest_accept_handle: None,
+                        size: size as u64,
                     },
                 );
 
@@ -1108,19 +1125,67 @@ impl VmMemoryRequest {
                 }
             }
             UnregisterMemory(id) => match region_state.registered_memory.remove(&id) {
+                Some(RegisteredMemory::DynamicMapping {
+                    slot,
+                    mut guest_synced,
+                    guest_accept_handle,
+                    size,
+                }) => {
                     // Sync-attached regions: the in-VM module owns the acceptance, so drive the
                     // symmetric guest-side release BEFORE the host unshare (same ordering
                     // invariant as the virtio-gpu Off path: release first, reclaim second).
                     if guest_synced {
+                        let Some(handle) = guest_accept_handle else {
+                            error!(
+                                "sync-attached region {:#x} has no accept handle; keeping the \
+                                 host mapping registered",
+                                id.0.offset()
+                            );
+                            region_state.registered_memory.insert(
+                                id,
+                                RegisteredMemory::DynamicMapping {
+                                    slot,
+                                    guest_synced,
+                                    guest_accept_handle,
+                                    size,
+                                },
+                            );
+                            return VmMemoryResponse::Err(SysError::new(EIO));
+                        };
+                        let release_result = match gunyah_accept_tube {
+                            Some(accept_tube) => drive_guest_accept(
                                 accept_tube,
                                 GunyahAcceptOp::Release,
+                                handle,
                                 id.0.offset(),
                                 0,
+                            ),
+                            None => Err(SysError::new(ENODEV)),
+                        };
+                        match release_result {
+                            Ok(()) => guest_synced = false,
+                            // A previous unregister may have released the guest parcel before
+                            // its host-side reclaim failed. Treat the missing guest entry as
+                            // already released, then retry only the host-side operation.
+                            Err(e) if e.errno() == ENOENT => guest_synced = false,
+                            Err(e) => {
                                 error!(
+                                    "guest-side release for {:#x} failed ({}); keeping the host \
+                                     mapping registered",
                                     id.0.offset(),
                                     e
                                 );
+                                region_state.registered_memory.insert(
+                                    id,
+                                    RegisteredMemory::DynamicMapping {
+                                        slot,
+                                        guest_synced,
+                                        guest_accept_handle,
+                                        size,
+                                    },
                                 );
+                                return VmMemoryResponse::Err(e);
+                            }
                         }
                     }
                     match vm.runtime_unshare(
@@ -1132,9 +1197,6 @@ impl VmMemoryRequest {
                             VmAccept::Off
                         },
                     ) {
-                Some(RegisteredMemory::DynamicMapping { slot }) => match vm
-                    .remove_memory_region(slot)
-                {
                     Ok(_) => {
                         if let Some(iommu_client) = iommu_client {
                             if iommu_client.registered_memory.remove(&id) {
@@ -1158,10 +1220,58 @@ impl VmMemoryRequest {
                             VmMemoryResponse::Ok
                         }
                     }
+                    Err(e) => {
+                        // The guest-side release, when required, has already completed. Restore
+                        // the acceptance before returning the error; otherwise the guest would
+                        // keep treating this suffix as backed and could access an unmapped GPA.
+                        let mut guest_restore_failed = false;
+                        if !guest_synced {
+                            if let (Some(handle), Some(accept_tube)) =
+                                (guest_accept_handle, gunyah_accept_tube)
+                            {
+                                match drive_guest_accept(
+                                    accept_tube,
+                                    GunyahAcceptOp::Accept,
+                                    handle,
+                                    id.0.offset(),
+                                    size,
+                                ) {
+                                    Ok(()) => guest_synced = true,
+                                    Err(restore_err) => error!(
+                                        "failed to restore guest acceptance for {:#x} after \
+                                         host unshare failure ({}); mapping remains unavailable \
+                                         to the guest",
+                                        id.0.offset(),
+                                        restore_err
+                                    ),
+                                }
+                            } else if guest_accept_handle.is_some() {
+                                guest_restore_failed = true;
+                            }
+                        }
+                        if guest_accept_handle.is_some() && !guest_synced {
+                            // EUCLEAN is a private crosvm/guest-driver contract: the host
+                            // mapping is retained for retry, but the guest stage-2 mapping could
+                            // not be restored. The guest must stop using this suffix.
+                            guest_restore_failed = true;
+                        }
+                        region_state.registered_memory.insert(
+                            id,
+                            RegisteredMemory::DynamicMapping {
+                                slot,
+                                guest_synced,
+                                guest_accept_handle,
+                                size,
+                            },
+                        );
+                        VmMemoryResponse::Err(if guest_restore_failed {
+                            SysError::new(EUCLEAN)
+                        } else {
+                            e
+                        })
+                    }
                     }
                 }
-                    Err(e) => VmMemoryResponse::Err(e),
-                },
                 Some(RegisteredMemory::FixedMapping { slot, offset, size }) => {
                     match vm.remove_mapping(slot, offset, size) {
                         Ok(()) => VmMemoryResponse::Ok,

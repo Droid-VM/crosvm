@@ -2065,6 +2065,15 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         }
             std::env::set_var("NCTX_GFX_GUEST_POOL_MB", mb.to_string());
         }
+        if let Some(mb) = pa.gpu_guest_prealloc_mb {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_PREALLOC_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.gpu_guest_step_mb {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_STEP_MB", mb.to_string());
+        }
+        if let Some(n) = pa.gpu_guest_max_grants {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_MAX_GRANTS", n.to_string());
+        }
     }
 
     let components = setup_vm_components(&cfg)?;
