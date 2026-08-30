@@ -13,9 +13,11 @@ use base::info;
 use base::AsRawDescriptor;
 use base::SafeDescriptor;
 use base::WaitContext;
-use gpu_display::EventDevice;
+use gpu_display::Damage;
 use gpu_display::GpuDisplay;
 use gpu_display::GpuDisplayExt;
+use gpu_display::PresentOutcome;
+use gpu_display::ScanoutFrame;
 use gpu_display::SurfaceType;
 use vm_control::gpu::DisplayMode;
 use vm_control::gpu::DisplayParameters;
@@ -30,6 +32,31 @@ pub struct SimplefbDisplayParams {
     pub stride: u32,
     pub bpp: u32,
     pub size: u64,
+    /// DRM fourcc of the framebuffer, from the same DT `format` string the guest is handed.
+    pub fourcc: u32,
+}
+
+const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+
+/// The DRM fourcc named by a simplefb device-tree `format` string.
+///
+/// The DT string is the only statement anyone makes about this framebuffer's byte order, and the
+/// host has been acting on it implicitly: the default `a8r8g8b8` is ARGB8888, which in memory is
+/// B,G,R,A. Naming it lets the CPU edge compare the source with each sink's real layout, and lets
+/// the GPU path pick its VkFormat from the same fact instead of assuming one byte order.
+///
+/// The fallback matches the one the bpp lookup uses on an unrecognised string, for the same reason:
+/// `a8r8g8b8` is what the device tree defaults to when nobody says otherwise.
+pub fn simplefb_format_fourcc(format: &str) -> u32 {
+    match format {
+        "x8r8g8b8" => drm_fourcc(b'X', b'R', b'2', b'4'),
+        "a8b8g8r8" => drm_fourcc(b'A', b'B', b'2', b'4'),
+        "r8g8b8" => drm_fourcc(b'R', b'G', b'2', b'4'),
+        "r5g6b5" => drm_fourcc(b'R', b'G', b'1', b'6'),
+        _ => drm_fourcc(b'A', b'R', b'2', b'4'),
+    }
 }
 
 pub enum SimplefbDisplayTarget {
@@ -41,9 +68,6 @@ pub enum SimplefbDisplayTarget {
     /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
     /// the virtio-gpu native-display path.
     Android { service_name: String },
-pub struct VncDisplayTarget {
-    pub addr: String,
-    pub password: Option<String>,
 }
 
 const DEFAULT_FPS: u32 = 30;
@@ -116,6 +140,10 @@ pub fn start_simplefb_display_thread(
         }
     }
 
+    // THE CROSSING (plan §4.4). Both transports now carry this source fourcc explicitly: the CPU
+    // edge compares it with the sink framebuffer, while the GPU sink picks a VkFormat from it
+    // (`vkFormatFromDrmFourcc`). The device tree's default `a8r8g8b8` is AR24, so declaring it lands
+    // on B8G8R8A8_UNORM. Declare it wrong and every
 fn simplefb_display_loop(
     guest_mem: GuestMemory,
     params: &SimplefbDisplayParams,
@@ -171,6 +199,18 @@ fn simplefb_display_loop(
             break;
         }
 
+                let frame = ScanoutFrame {
+                    bytes: &read_buf,
+                    stride: params.stride,
+                    width: params.width,
+                    height: params.height,
+                    fourcc: params.fourcc,
+                    damage: Damage::Full,
+                };
+                match display.present_frame(surface_id, &frame) {
+                    PresentOutcome::NoFramebuffer => {
+                    }
+                }
         if let Some(fb) = display.framebuffer(surface_id) {
             let dst = fb.as_volatile_slice();
             let copy_len = dst.size().min(read_buf.len());

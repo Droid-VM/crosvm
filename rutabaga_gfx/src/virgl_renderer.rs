@@ -444,6 +444,28 @@ impl VirglRenderer {
             handle_type,
         }))
     }
+
+    fn export_display_blob(&self, resource_id: u32) -> RutabagaResult<RutabagaHandle> {
+        let mut fd_type = 0;
+        let mut fd = -1;
+        // SAFETY: virglrenderer owns the resource and returns a new fd on success.
+        let ret = unsafe {
+            virgl_renderer_resource_export_display_blob(resource_id, &mut fd_type, &mut fd)
+        };
+        ret_to_res(ret)?;
+        if fd_type != VIRGL_RENDERER_BLOB_FD_TYPE_DMABUF || fd < 0 {
+            if fd >= 0 {
+                // The C API only returns ownership for the DMABUF case.
+                unsafe { libc::close(fd) };
+            }
+            return Err(RutabagaError::Unsupported);
+        }
+        // SAFETY: fd is newly returned and owned by this handle.
+        Ok(RutabagaHandle {
+            os_handle: unsafe { OwnedDescriptor::from_raw_descriptor(fd) },
+            handle_type: RUTABAGA_HANDLE_TYPE_MEM_DMABUF,
+        })
+    }
 }
 
 impl Drop for VirglRenderer {
@@ -461,6 +483,10 @@ impl Drop for VirglRenderer {
 }
 
 impl RutabagaComponent for VirglRenderer {
+    fn export_display_blob(&self, resource_id: u32) -> RutabagaResult<RutabagaHandle> {
+        VirglRenderer::export_display_blob(self, resource_id)
+    }
+
     fn get_capset_info(&self, capset_id: u32) -> (u32, u32) {
         let mut version = 0;
         let mut size = 0;

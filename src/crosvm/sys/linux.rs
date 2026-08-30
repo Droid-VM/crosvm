@@ -3925,6 +3925,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             _ => 4,
         };
         let stride = sfb_cfg.width * bpp;
+        // The same DT string the guest reads, resolved once here rather than assumed downstream:
+        // the bridge hands it to the sink as part of every frame it produces.
+        let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
 
         #[cfg(target_arch = "aarch64")]
         let (fb_size, guest_addr) = {
@@ -3948,6 +3951,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             stride,
             bpp,
             size: fb_size,
+            fourcc,
         };
 
         #[cfg(feature = "android_display")]
