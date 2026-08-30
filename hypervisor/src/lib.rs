@@ -29,6 +29,7 @@ pub mod x86_64;
 pub mod geniezone;
 
 use base::AsRawDescriptor;
+use base::RawDescriptor;
 use base::Event;
 use base::MappedRegion;
 use base::Protection;
@@ -50,11 +51,26 @@ pub use crate::x86_64::*;
 /// An index in the list of guest-mapped memory regions.
 pub type MemSlot = u32;
 
+/// Per-operation policy for how a runtime-attached host region is accepted into a *protected*
+/// guest's stage-2 (Gunyah). Ignored (a plain no-op) by hypervisors whose runtime attach is a
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VmAccept {
+    /// Transparent: notify the in-VM accept module over the transport and WAIT for it to
+    /// `gh_rm_mem_accept` before returning. Any component uses add/remove exactly like upstream;
+    /// the RM handle is delivered to the generic guest-accept module (not the caller).
+    #[default]
+    Sync,
+    Off,
+    /// Notify the transport but return without waiting for the accept to complete. (Future.)
+    Async,
+}
+
 /// Range of GPA space. Starting from `guest_address` up to `size`.
 pub struct MemRegion {
     pub guest_address: GuestAddress,
     pub size: u64,
 }
+
 
 /// Signal to the hypervisor on kernels that support the KVM_CAP_USER_CONFIGURE_NONCOHERENT_DMA (or
 /// equivalent) that during user memory region (memslot) configuration, a guest page's memtype
@@ -177,6 +193,37 @@ pub trait Vm: Send {
         log_dirty_pages: bool,
         cache: MemCacheType,
     ) -> Result<MemSlot>;
+
+    /// Runtime (post-boot) attach of a host-backed region at `guest_addr` into the running guest.
+    /// This is the universal dynamic-memory op the transparent `VmMemoryRequest::RegisterMemory`
+    /// path routes through, so gfxstream (and any component) calls add/remove exactly like upstream.
+    ///
+    /// Default (KVM / geniezone / Gunyah unprotected): a plain removable memslot via
+    /// [`Vm::add_memory_region`]; `accept` is ignored and it returns `None` (no guest-side accept
+    /// needed). Gunyah protected overrides this to SHARE the region and return the RM memparcel
+    /// handle. `Some(handle)` means a guest-side `gh_rm_mem_accept` is still required; who performs
+    /// it depends on `accept` (see [`VmAccept`]): `Off` hands the handle to the caller, `Sync`/`Async`
+    /// route it to the in-VM accept module over the transport.
+    fn runtime_share(
+        &mut self,
+        guest_addr: GuestAddress,
+        mem_region: Box<dyn MappedRegion>,
+        read_only: bool,
+        cache: MemCacheType,
+        accept: VmAccept,
+    ) -> Result<(MemSlot, Option<u32>)> {
+        let slot = self.add_memory_region(guest_addr, mem_region, read_only, false, cache)?;
+        Ok((slot, None))
+    /// Runtime detach of a region attached with [`Vm::runtime_share`]. Default: remove the memslot.
+    /// Gunyah protected overrides to reclaim the SHARE by label (`gpa >> 12`). The guest-side release
+    /// must already have happened, driven per `accept` symmetrically with the attach.
+    fn runtime_unshare(
+        guest_addr: GuestAddress,
+        slot: MemSlot,
+        accept: VmAccept,
+        let _ = (guest_addr, accept);
+        self.remove_memory_region(slot).map(|_| ())
+    }
 
     /// Releases the long-term pin the VMM took over a runtime-shared region while handing it to
     /// the hypervisor, once the guest has accepted it -- or failed to.

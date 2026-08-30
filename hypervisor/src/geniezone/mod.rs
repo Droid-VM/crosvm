@@ -603,6 +603,11 @@ impl GeniezoneVm {
         for region in guest_mem.regions() {
             let flags = match region.options.purpose {
                 MemoryRegionPurpose::Bios => GZVM_USER_MEM_REGION_GUEST_MEM,
+                // DroidVM GpuPool is a Gunyah concept; treat as plain guest memory here.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::GpuPool => GZVM_USER_MEM_REGION_GUEST_MEM,
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::GpuPoolGuest => GZVM_USER_MEM_REGION_GUEST_MEM,
                 // Pseudo-unprotected is a Gunyah shape; here guest RAM is guest RAM and the
                 // handoff page is a page nobody needs to hand anything over through.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

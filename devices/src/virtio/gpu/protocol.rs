@@ -85,6 +85,7 @@ pub const VIRTIO_GPU_RESP_OK_EDID: u32 = 0x1104;
 pub const VIRTIO_GPU_RESP_OK_RESOURCE_UUID: u32 = 0x1105;
 pub const VIRTIO_GPU_RESP_OK_MAP_INFO: u32 = 0x1106;
 
+// GpuPool-resident. The `pool_offset` field then carries the pool BYTE OFFSET (not a memparcel
 /* CHROMIUM(b/277982577): success responses */
 pub const VIRTIO_GPU_RESP_OK_RESOURCE_PLANE_INFO: u32 = 0x11FF;
 
@@ -528,7 +529,9 @@ pub struct virtio_gpu_resource_unmap_blob {
 pub struct virtio_gpu_resp_map_info {
     pub hdr: virtio_gpu_ctrl_hdr,
     pub map_info: Le32,
-    pub padding: u32,
+    // Was `padding`. Carries the pool byte offset when VIRTIO_GPU_MAP_INFO_POOL is set in
+    // `map_info` (the blob was sub-allocated from the boot-shared pool); 0 otherwise.
+    pub pool_offset: Le32,
 }
 
 #[derive(Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -753,6 +756,8 @@ pub enum GpuResponse {
     },
     OkMapInfo {
         map_info: u32,
+        /// Byte offset within the pre-shared pool, when `map_info` sets VIRTIO_GPU_MAP_INFO_POOL.
+        pool_offset: Option<u32>,
     },
     ErrUnspec,
     ErrTube(TubeError),
@@ -806,7 +811,7 @@ impl Display for GpuResponse {
             OkEdid(_) => write!(f, "ok edid"),
             OkResourcePlaneInfo { .. } => write!(f, "ok resource plane info"),
             OkResourceUuid { .. } => write!(f, "ok resource uuid"),
-            OkMapInfo { map_info } => write!(f, "ok map info: {}", map_info),
+            OkMapInfo { map_info, .. } => write!(f, "ok map info: {}", map_info),
             ErrUnspec => write!(f, "unspecified error"),
             ErrTube(e) => write!(f, "tube error: {}", e),
             ErrBase(e) => write!(f, "base error: {}", e),
@@ -957,11 +962,14 @@ impl GpuResponse {
                 resp.write_obj(resp_info)?;
                 size_of_val(&resp_info)
             }
-            GpuResponse::OkMapInfo { map_info } => {
+            GpuResponse::OkMapInfo {
+                map_info,
+                pool_offset,
+            } => {
                 let resp_info = virtio_gpu_resp_map_info {
                     hdr,
                     map_info: Le32::from(map_info),
-                    padding: Default::default(),
+                    pool_offset: Le32::from(pool_offset.unwrap_or(0)),
                 };
 
                 resp.write_obj(resp_info)?;

@@ -26,8 +26,11 @@ use anyhow::Context;
 use base::errno_result;
 use base::error;
 use base::info;
+use base::AsRawDescriptor;
 use base::ioctl;
+use base::ioctl_with_mut_ref;
 use base::ioctl_with_ref;
+use base::debug;
 use base::ioctl_with_val;
 use base::pagesize;
 use base::warn;
@@ -38,6 +41,8 @@ use base::MemoryMapping;
 use base::MemoryMappingBuilder;
 use base::MmapError;
 use base::RawDescriptor;
+use base::Protection;
+use base::SharedMemory;
 use gunyah_sys::*;
 use libc::open;
 use libc::EFAULT;
@@ -55,6 +60,8 @@ use vm_memory::MemoryRegionPurpose;
 
 use crate::*;
 
+                            "/dev/gh_pinprobe is absent (no gh_hugepage_reserve.ko providing it), \
+                             so where the folios came from cannot be established"
 pub struct Gunyah {
     gunyah: SafeDescriptor,
 }
@@ -150,13 +157,21 @@ unsafe fn set_user_memory_region(
     vm: &SafeDescriptor,
     slot: MemSlot,
     read_only: bool,
+    allow_exec: bool,
     guest_addr: u64,
     memory_size: u64,
     userspace_addr: *mut u8,
 ) -> Result<()> {
     let mut flags = 0;
 
-    flags |= GH_MEM_ALLOW_READ | GH_MEM_ALLOW_EXEC;
+    // In protected VMs, SHARE'd memory (GH_VM_SET_USER_MEM_REGION) cannot be made executable —
+    // requesting GH_MEM_ALLOW_EXEC prevents Gunyah from creating valid stage-2 mappings, so the
+    // guest faults (SIGBUS) on access. Only LEND'd memory gets exec at stage-2. Host-visible
+    // virtio-gpu blobs (gfxstream ASG rings) are data-only and must be SHARE'd without exec.
+    flags |= GH_MEM_ALLOW_READ;
+    if allow_exec {
+        flags |= GH_MEM_ALLOW_EXEC;
+    }
     if !read_only {
         flags |= GH_MEM_ALLOW_WRITE;
     }
@@ -230,6 +245,16 @@ pub struct GunyahVm {
     mem_regions: Arc<Mutex<BTreeMap<MemSlot, (Box<dyn MappedRegion>, GuestAddress)>>>,
     /// A min heap of MemSlot numbers that were used and then removed and can now be re-used
     mem_slot_gaps: Arc<Mutex<BinaryHeap<Reverse<MemSlot>>>>,
+    /// Host mappings whose slots were "removed" at runtime but must be kept alive.
+    ///
+    /// Gunyah SHARE mappings (used for host-visible virtio-gpu blobs) are permanent and
+    /// cannot be safely unshared, so we never munmap the host backing nor recycle the slot.
+    /// See `remove_memory_region`.
+    pinned_regions: Arc<Mutex<Vec<Box<dyn MappedRegion>>>>,
+    /// Host backings for runtime-shared virtio-gpu blobs, keyed by label (BAR page).
+    /// Re-sharing a label drops the previous backing (host already reclaimed it),
+    /// so this does not grow with blob map/unmap churn.
+    blob_regions: Arc<Mutex<BTreeMap<u32, Box<dyn MappedRegion>>>>,
     /// Long-term pins held over runtime-shared blobs between the SHARE ioctl and the guest's
     /// accept, keyed by the same label as `blob_regions`. See `pin.rs`.
     blob_pins: Arc<Mutex<BTreeMap<u32, pin::LongtermPin>>>,
@@ -262,6 +287,13 @@ impl GunyahVm {
             let lend = if cfg.protection_type.isolates_memory() {
                 match region.options.purpose {
                     MemoryRegionPurpose::Bios => true,
+                    // GPU pre-alloc pool: SHARE'd like swiotlb (host keeps access), never lent.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::GpuPool => false,
+                    // Guest-alloc pool: SHARE'd like the host pool (host resolves guest-blob
+                    // mem-entries into it), never lent.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::GpuPoolGuest => false,
                     // The window: neither lent nor shared before boot. It is handed over after
                     // GH_VM_START as a memparcel the guest accepts, which is the whole point.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -303,6 +335,45 @@ impl GunyahVm {
                     // populate in batches, cascading MADV_COLLAPSE, mlock.
                     // SAFETY: host_ptr is a valid mapping of region_size bytes.
                     let prep = unsafe { mthp::prepare_lend_region(host_ptr, region_size) };
+                    if !prep.populated {
+                        error!(
+                            "GH: guest RAM region gpa={:#x} size={:#x} failed to populate \
+                             (reserve pool exhausted?) -- refusing to LEND unbacked memory",
+                            guest_base, region_size
+                        );
+                        return Err(Error::new(libc::ENOMEM));
+                    }
+
+                    // Take the FOLL_LONGTERM pin ourselves before the LEND ioctl does (see
+                    // pin.rs): it migrates the region out of CMA and turns "these pages cannot be
+                    // pinned" into a refusal here, instead of a hypervisor call that has been
+                    // observed to stall the whole host for minutes or reset the phone. Dropped at
+                    // the end of this block, once the LEND has returned and gunyah holds its own.
+                    //
+                    // After the preparation, not before it, and that ordering is the whole
+                    // difference between measuring this region and inventing it: the probe reads
+                    // one page per 2 MB through an ordinary get_user_pages, which FAULTS AN
+                    // ABSENT PAGE IN. Run first, it therefore populated the region itself, one
+                    // 4 KB page per 2 MB, order-0 -- allocations the reserve's hook does not
+                    // intercept (it only replaces order-9), so they came from the buddy allocator
+                    // and could land in CMA. The probe then reported those pages as unpinnable,
+                    // and re-probing could never clear them, because they were already there.
+                    // Prepared first, the region is populated, collapsed to 2 MB folios and
+                    // pool-served before anyone looks at it, and the probe answers about the
+                    // memory the hypervisor is actually being handed.
+                    let _pin = pin::LongtermPin::ensure_pinnable(
+                        host_ptr as u64,
+                        region_size,
+                        pin::PinSite::PreBoot,
+                        Some(&prep),
+                    )
+                    .map_err(|e| {
+                        error!(
+                            "GH: refusing to LEND gpa={:#x} size={:#x} -- the host cannot pin it",
+                            guest_base, region_size
+                        );
+                        e
+                    })?;
 
                     let chunks = match mthp_mode {
                         // Single-parcel: keep the whole prepared region in one
@@ -354,7 +425,23 @@ impl GunyahVm {
                         }
                     }
                 } else {
-                    // No mTHP preparation – simple single-slot LEND.
+                    // No mTHP preparation – simple single-slot LEND. Nothing has populated this
+                    // region, so the probe would fault it in itself (see the note above); ask
+                    // anyway, because without the preparation there is nothing else standing
+                    // between an unpinnable region and the hypervisor call.
+                    let _pin = pin::LongtermPin::ensure_pinnable(
+                        host_ptr as u64,
+                        region_size,
+                        pin::PinSite::PreBoot,
+                        None,
+                    )
+                    .map_err(|e| {
+                        error!(
+                            "GH: refusing to LEND gpa={:#x} size={:#x} -- the host cannot pin it",
+                            guest_base, region_size
+                        );
+                        e
+                    })?;
                     // SAFETY: guest regions are guaranteed not to overlap.
                     unsafe {
                         android_lend_user_memory_region(
@@ -369,6 +456,35 @@ impl GunyahVm {
                 }
             } else {
                         | MemoryRegionPurpose::ShimHandoff
+                // GPU pre-alloc pool: force order-9 backing (MADV_HUGEPAGE + populate +
+                // cascading COLLAPSE + mlock) BEFORE the SHARE so the gh_hugepage_reserve
+                // supply hook serves the pool from reserved 2MB folios, exactly like the
+                // mTHP-prepared LEND'd guest RAM.
+                // Same gate as the guest-RAM LEND path below: this whole mechanism only
+                // exists for the Qualcomm reserve-pool hook, so it's opt-in via
+                // --prepare-lend-mthp-mode, not unconditional for every arm/aarch64 host.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                {
+                    // SAFETY: host_addr is a valid mapping of region.size bytes.
+                    let prep = unsafe {
+                        mthp::prepare_lend_region(
+                            region.host_addr as *mut u8,
+                        )
+                    };
+                    if !prep.populated {
+                        // Host-alloc must fail loudly: proceeding to SHARE an unbacked
+                        // pool means the guest eventually SIGBUSes deep inside its GPU
+                        // stack (e.g. gnome-shell's ASG ring init) instead of crosvm
+                        // failing cleanly at boot with a clear cause.
+                        error!(
+                            "GH: {:?} region gpa={:#x} size={:#x} failed to populate \
+                             (reserve pool exhausted?) -- refusing to share unbacked memory",
+                            region.options.purpose,
+                            region.guest_addr.offset(),
+                        );
+                        return Err(Error::new(libc::ENOMEM));
+                    }
+                }
                 // The window of a pseudo-unprotected VM is not handed over here at all. It is
                 // SHARE'd after GH_VM_START, because the guest has to accept it itself and there
                 // is no guest to accept anything until then.
@@ -411,6 +527,8 @@ impl GunyahVm {
                     continue;
                 }
 
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                        region.options.purpose,
                 // Same pin probe as the LEND path above: a SHARE'd pool whose pages cannot be
                 // pinned takes the host down inside the ioctl, so find out here instead.
                 let _pin = if share_len != 0 {
@@ -418,6 +536,7 @@ impl GunyahVm {
                         region.host_addr as u64,
                         share_len,
                         pin::PinSite::PreBoot,
+                        None,
                     )
                     .map_err(|e| {
                         error!(
@@ -430,6 +549,11 @@ impl GunyahVm {
                 } else {
                     None
                 };
+                            // SHARE'd memory is executable only in non-protected VMs (where
+                            // guest RAM itself is SHARE'd). In protected VMs these are
+                            // data-only regions.
+                            !cfg.protection_type.isolates_memory(),
+                            region.guest_addr.offset(),
                 }
             }
         }
@@ -442,6 +566,8 @@ impl GunyahVm {
             guest_mem,
             mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
             mem_slot_gaps: Arc::new(Mutex::new(BinaryHeap::new())),
+            pinned_regions: Arc::new(Mutex::new(Vec::new())),
+            blob_regions: Arc::new(Mutex::new(BTreeMap::new())),
             blob_pins: Arc::new(Mutex::new(BTreeMap::new())),
             routes: Arc::new(Mutex::new(HashSet::new())),
             hv_cfg: cfg,
@@ -578,6 +704,8 @@ impl GunyahVm {
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
+            pinned_regions: self.pinned_regions.clone(),
+            blob_regions: self.blob_regions.clone(),
             blob_pins: self.blob_pins.clone(),
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
@@ -894,6 +1022,8 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
         .unwrap_or_else(|e| base::warn!("GH-SHIM: could not watch the handoff page: {}", e));
 }
 
+/// Gunyah-specific runtime blob SHARE helpers, driven by `runtime_share`/`runtime_unshare`.
+impl GunyahVm {
     /// Diagnostic: SHARE scratch regions at explicitly chosen GPAs, right after GH_VM_START, and
     /// report what the host side says. Driven by
     ///
@@ -958,8 +1088,43 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
         }
     }
 
+    /// Runtime-SHARE a host blob to the running guest and return the resource-manager memparcel
+    /// handle. Unlike `add_memory_region` (which SHARE's but never reaches a protected guest's
+    /// stage-2 -> SIGBUS), this exposes the handle so the guest can `gh_rm_mem_accept` it itself
+    /// at `guest_addr`. The host keeps access (SHARE), as gfxstream host-visible blobs require.
+    /// The backing is pinned for the VM's lifetime (SHARE is permanent).
+    fn share_blob(
         &self,
+        guest_addr: GuestAddress,
+        mem_region: Box<dyn MappedRegion>,
+        read_only: bool,
         exec: bool,
+    ) -> Result<u32> {
+        let pgsz = pagesize() as u64;
+        let size = (mem_region.size() as u64 + pgsz - 1) / pgsz * pgsz;
+
+        // Deterministic label per BAR page: the same GPA reused over time (blobs are
+        // mapped/freed at the same host-visible BAR offsets) maps to the same label, so the
+        // host kernel reclaims the stale parcel before re-sharing the new backing. Distinct
+        // concurrent blobs sit at distinct GPAs -> distinct labels (no false collision).
+        //
+        // GH_NO_UNSHARE (diagnostic): parcels are never reclaimed, so a reused BAR offset
+        // would collide with its still-shared predecessor (module returns EBUSY). Use a
+        // monotonic label instead; every SHARE is a fresh parcel and nothing is ever
+        // reclaimed (bounded leak, test-only).
+        let label = if std::env::var_os("GH_NO_UNSHARE").is_some() {
+            static NEXT_LABEL: std::sync::atomic::AtomicU32 =
+                std::sync::atomic::AtomicU32::new(0x4000_0000);
+            NEXT_LABEL.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            (guest_addr.offset() >> 12) as u32
+        };
+
+        // Host-visible blobs are data-only: READ|WRITE, never EXEC.
+        let mut flags = GH_MEM_ALLOW_READ;
+        if !read_only {
+            flags |= GH_MEM_ALLOW_WRITE;
+        }
         // X in the guest's ACL entry. The boot-time SHARE path cannot have it -- the driver maps
         // those regions non-executable and the guest faults on the first instruction fetch -- but
         // a runtime memparcel carries whatever rights its ACL asks for, and the platform's SCM
@@ -973,6 +1138,23 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
         if exec || std::env::var_os("GH_SHARE_EXEC").is_some_and(|v| v != "0") {
             flags |= GH_MEM_ALLOW_EXEC;
         }
+
+        // The runtime-SHARE ioctl is served by the out-of-tree `gunyah_share_mod` module via its
+        // own `/dev/gunyah_share` char device (the in-tree gh_vm_ioctl has no such case), so the
+        // gunyah VM fd is passed as a request field rather than as the ioctl target.
+        let share_dev = File::open("/dev/gunyah_share")
+            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+
+        let mut blob = ghsm_share_blob {
+            vm_fd: self.vm.as_raw_descriptor(),
+            label,
+            flags,
+            mem_handle: 0,
+            guest_phys_addr: guest_addr.offset(),
+            memory_size: size,
+            userspace_addr: mem_region.as_ptr() as u64,
+        };
+
         // Probe the pin before the module takes its own (see pin.rs). A blob whose pages cannot
         // be pinned must fail as this one request -- the guest gets an allocation error and the
         // VM keeps running -- rather than inside the SHARE, where the same condition has taken
@@ -982,10 +1164,15 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
             mem_region.as_ptr() as u64,
             size,
             pin::PinSite::Share,
+            None,
         )?;
 
+        // SAFETY: the ioctl reads the request and writes back mem_handle into `blob`; the return
+        // value is checked.
         let share_started = std::time::Instant::now();
+        let ret = unsafe { ioctl_with_mut_ref(&share_dev, GHSM_SHARE_BLOB, &mut blob) };
         let share_elapsed = share_started.elapsed();
+        if ret != 0 {
             let e = Error::last();
             base::error!(
                 "GUNYAH-SHARE-BLOB: gpa={:#x} size={:#x} flags={:#x} FAILED after {:?}: {}",
@@ -1013,7 +1200,63 @@ fn watch_shim(mem: GuestMemory, handoff: GuestAddress) {
         }
         if let Some(probe) = probe {
             self.blob_pins.lock().insert(label, probe);
+        }
+
+        // Keep the host backing mapped while the parcel is shared, keyed by label. The host
+        // kernel already reclaimed+unpinned the previous parcel for this label, so dropping the
+        // old crosvm mapping here is safe and bounds RSS under blob map/unmap churn.
+        let old = self.blob_regions.lock().insert(label, mem_region);
+        drop(old);
+        debug!(
+            "GUNYAH-SHARE-BLOB: gpa=0x{:x} size=0x{:x} label={} handle=0x{:x}",
+            guest_addr.offset(),
+            size,
+            label,
+            blob.mem_handle,
+        );
+        Ok(blob.mem_handle)
+    }
+
+    fn unshare_blob(&mut self, label: u32) -> Result<()> {
+        // GH_NO_UNSHARE (diagnostic): skip the RM reclaim entirely. Every rm_mem_reclaim does a
+        // platform unprotect (SCM assign) over the parcel's scattered 4K phys ranges; this flag
+        // exists to A/B-test whether that churn is what transiently kills stage-2 of neighboring
+        // lent guest RAM (SEA/BUS_OBJERR page deaths). Parcels and pinned pages leak (bounded,
+        // test-only); share_blob uses monotonic labels under this flag so BAR-offset reuse
+        // cannot EBUSY against the leaked parcels. Keep the backing region alive too.
+        if std::env::var_os("GH_NO_UNSHARE").is_some() {
+            warn!("GUNYAH-UNSHARE-BLOB: label={} SKIPPED (GH_NO_UNSHARE leak-test)", label);
+            return Ok(());
+        }
+        // The guest has unmapped this host-visible blob and (per the virtio-gpu guest driver)
+        // already released its own stage-2 acceptance, so it is now safe to reclaim the SHARE on
+        // the host side: the GHSM module does gh_rm_mem_reclaim + unpin and drops it from the VM's
+        // memory_mappings list. This keeps host and guest in sync so the BAR offset can be reused
+        // without colliding with a stale parcel (the old PIN no-op left it shared forever, forcing
+        // an unsafe lazy overlap-reclaim that orphaned still-live parcels -> mem_share EINVAL).
+        let share_dev = File::open("/dev/gunyah_share")
+            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))?;
+
+        let unshare = ghsm_unshare_blob {
+            vm_fd: self.vm.as_raw_descriptor(),
+            label,
+        };
+
+        // SAFETY: the ioctl only reads the request; the return value is checked.
+        let ret = unsafe { ioctl_with_ref(&share_dev, GHSM_UNSHARE_BLOB, &unshare) };
+        if ret != 0 {
+            // ENOENT just means it was already reclaimed (e.g. by a prior overlap) -- not fatal.
+        } else {
+            debug!("GUNYAH-UNSHARE-BLOB: label={} reclaimed", label);
+        }
+
+        // Drop the host backing mapping we kept alive while shared.
         self.blob_pins.lock().remove(&label);
+        self.blob_regions.lock().remove(&label);
+        Ok(())
+    }
+}
+
 impl Vm for GunyahVm {
     fn try_clone(&self) -> Result<Self>
     where
@@ -1027,6 +1270,8 @@ impl Vm for GunyahVm {
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             mem_slot_gaps: self.mem_slot_gaps.clone(),
+            pinned_regions: self.pinned_regions.clone(),
+            blob_regions: self.blob_regions.clone(),
             blob_pins: self.blob_pins.clone(),
             routes: self.routes.clone(),
             hv_cfg: self.hv_cfg,
@@ -1067,13 +1312,38 @@ impl Vm for GunyahVm {
         &self.guest_mem
     }
 
+    fn runtime_share(
+        mem_region: Box<dyn MappedRegion>,
+        read_only: bool,
+        _cache: MemCacheType,
+        _accept: crate::VmAccept,
+    ) -> Result<(MemSlot, Option<u32>)> {
+        // Gunyah is a protected guest: runtime attach is always a SHARE whose RM memparcel handle
+        // the guest must `gh_rm_mem_accept` itself. Return the handle; the slot is a don't-care
+        // (the SHARE is reclaimed by label = gpa>>12, not a slot). `vm_accept` selects WHO drives
+        // the guest accept (Off -> caller/virtio-gpu; Sync/Async -> in-VM module via transport);
+        // that routing happens above this layer, so nothing to branch on here.
         // Host-visible blobs are data: rings, buffers, framebuffers. Nothing executes from them.
+        Ok((0, Some(handle)))
+    }
+
     fn release_share_pin(&self, guest_addr: GuestAddress) {
         // Same deterministic label the SHARE used (gpa>>12). Under GH_NO_UNSHARE the SHARE uses
         // monotonic labels and nothing is ever reclaimed, so the pin stays with the leaked
         // parcel -- that flag is test-only and already leaks the parcel itself.
         let label = (guest_addr.offset() >> 12) as u32;
         self.blob_pins.lock().remove(&label);
+    }
+
+    fn runtime_unshare(
+        &mut self,
+        guest_addr: GuestAddress,
+        _slot: MemSlot,
+        _accept: crate::VmAccept,
+        // Reclaim by deterministic label (gpa>>12). The guest already released its acceptance
+        // (driven per vm_accept, symmetric with the attach) before this runs.
+        let label = (guest_addr.offset() >> 12) as u32;
+        self.unshare_blob(label)
     }
 
     fn add_memory_region(
@@ -1102,12 +1372,29 @@ impl Vm for GunyahVm {
             None => (regions.len() + self.guest_mem.num_regions() as usize) as MemSlot,
         };
 
+        // Diagnostic: log what we are about to SHARE. (Do not read the mapping here — for the
+        // SingleMappingOnFirst BAR arena it is PROT_NONE until blobs are mapped into it.)
+        warn!(
+            "GUNYAH-ADD: slot={} gpa=0x{:x} share_size=0x{:x} region_size=0x{:x} hva={:p} exec={} ro={}",
+            slot,
+            guest_addr.offset(),
+            size,
+            mem_region.size(),
+            mem_region.as_ptr(),
+            !self.hv_cfg.protection_type.isolates_memory(),
+            read_only,
+        );
+
         // SAFETY: safe because memory is not modified and the return value is checked.
         let res = unsafe {
             set_user_memory_region(
                 &self.vm,
                 slot,
                 read_only,
+                // Host-visible virtio-gpu blobs (gfxstream ASG rings) are SHARE'd data — never
+                // executable. In protected VMs, requesting exec on SHARE'd memory breaks the
+                // stage-2 mapping and the guest SIGBUSes on access.
+                !self.hv_cfg.protection_type.isolates_memory(),
                 guest_addr.offset(),
                 size,
                 mem_region.as_ptr(),
@@ -1116,24 +1403,22 @@ impl Vm for GunyahVm {
 
         let res = if let Err(ref e) = res {
             if e.errno() == EEXIST {
+                // Gunyah workaround: this GPA was already SHARE'd and a Gunyah SHARE is
+                // permanent. This happens when the guest re-maps a host-visible virtio-gpu
+                // blob at a BAR offset that was used before. We must NOT fall back to
+                // android_lend here: LEND would hand the pages to the guest exclusively, so
+                // the host (gfxstream) could no longer see them. Instead, treat EEXIST as a
+                // successful re-use of the existing SHARE. The backing physical pages stay
+                // stable because gfxstream pins RingBlob memory (GFXSTREAM_GUNYAH_PIN_RINGBLOB),
+                // so the existing SHARE already points at the correct pages.
                 warn!(
-                    "Gunyah set_user_memory_region failed with EEXIST for slot {} \
-                     at GPA 0x{:x} size 0x{:x}, trying android_lend fallback",
+                    "Gunyah set_user_memory_region returned EEXIST for slot {} \
+                     at GPA 0x{:x} size 0x{:x}; reusing existing SHARE",
                     slot,
                     guest_addr.offset(),
                     size,
                 );
-                // SAFETY: safe because memory is not modified and the return value is checked.
-                unsafe {
-                    android_lend_user_memory_region(
-                        &self.vm,
-                        slot,
-                        read_only,
-                        guest_addr.offset(),
-                        size,
-                        mem_region.as_ptr(),
-                    )
-                }
+                Ok(())
             } else {
                 res
             }
@@ -1145,6 +1430,12 @@ impl Vm for GunyahVm {
             gaps.push(Reverse(slot));
             return Err(e);
         }
+        warn!(
+            "GUNYAH-ADD: SHARE established slot={} gpa=0x{:x} size=0x{:x}",
+            slot,
+            guest_addr.offset(),
+            size,
+        );
         regions.insert(slot, (mem_region, guest_addr));
         Ok(slot)
     }
@@ -1181,28 +1472,29 @@ impl Vm for GunyahVm {
 
     fn remove_memory_region(&mut self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
         let mut regions = self.mem_regions.lock();
-        let guest_addr = match regions.get(&slot) {
-            Some((_, addr)) => addr.offset(),
-            None => return Err(Error::new(ENOENT)),
-        };
-        // SAFETY:
-        // Safe because the slot is checked against the list of memory slots.
-        // Passing memory_size=0 signals the hypervisor to remove the region.
-        let res = unsafe {
-            set_user_memory_region(
-                &self.vm,
-                slot,
-                false,
-                guest_addr,
-                0,
-                std::ptr::null_mut(),
-            )
-        };
-        if let Err(e) = res {
-            warn!("Gunyah remove_memory_region ioctl failed for slot {}: {}", slot, e);
-        }
-        self.mem_slot_gaps.lock().push(Reverse(slot));
-        Ok(regions.remove(&slot).unwrap().0)
+        let (region, guest_addr) = regions.remove(&slot).ok_or_else(|| Error::new(ENOENT))?;
+
+        // Gunyah workaround: a Gunyah SHARE is permanent and cannot be reliably unshared.
+        // Removing it and later re-SHARE'ing a different physical page at the same GPA makes
+        // the guest read stale data. So instead of unsharing, we:
+        //   * skip the memory_size=0 ioctl (it does not reliably unshare on Gunyah),
+        //   * keep the host mapping alive forever so its pages are never munmap'd (the
+        //     gfxstream-side RingBlob backing is likewise pinned), and
+        //   * do NOT recycle the slot, so a later mapping is given a fresh slot/GPA.
+        // The caller is handed a tiny placeholder mapping to satisfy the API; dropping it is
+        // harmless and does not affect the still-active SHARE.
+        warn!(
+            "Gunyah: not unsharing slot {} (GPA 0x{:x}); keeping host mapping alive \
+             (SHARE is permanent)",
+            slot,
+            guest_addr.offset(),
+        );
+        self.pinned_regions.lock().push(region);
+
+        let placeholder = MemoryMappingBuilder::new(pagesize())
+            .build()
+            .map_err(|_| Error::new(EINVAL))?;
+        Ok(Box::new(placeholder))
     }
 
     fn create_device(&self, _kind: DeviceKind) -> Result<SafeDescriptor> {

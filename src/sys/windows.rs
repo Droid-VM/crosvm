@@ -1202,6 +1202,7 @@ fn vm_memory_handler_thread(
                                     &mut gralloc,
                                     None,
                                     &mut region_state,
+                                    None,
                                 );
                                 if let Err(e) = tube.send(&response) {
                                     error!("failed to send VmMemoryControlResponse: {}", e);

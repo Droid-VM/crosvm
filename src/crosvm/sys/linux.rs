@@ -1958,6 +1958,7 @@ fn run_gunyah(
     // The Gunyah RingBlob-pin workaround (GFXSTREAM_GUNYAH_PIN_RINGBLOB) is now driven by the
     // `--gpu gunyah-pvm=true` sub-option, plumbed in create_gpu_device(), so it can be turned
     // off on non-Gunyah SoCs.
+
     let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
     let gunyah = Gunyah::new_with_path(device_path)
         .with_context(|| format!("failed to open Gunyah device {}", device_path.display()))?;
@@ -2059,7 +2060,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         ))]
         HypervisorKind::Gunyah { device,
                                  qcom_trusted_vm_id,
-                                 qcom_trusted_vm_pas_id
+                                 qcom_trusted_vm_pas_id,
                                } => run_gunyah(
                                         device.as_deref(),
                                         qcom_trusted_vm_id,

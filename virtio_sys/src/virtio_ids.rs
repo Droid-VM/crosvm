@@ -14,6 +14,9 @@
 // Added by virtio_sys/bindgen.sh - do not edit the generated file.
 // TODO(b/236144983): Fix this id when an official virtio-id is assigned to this device.
 pub const VIRTIO_ID_PVCLOCK: u32 = 61;
+// DroidVM: host->guest transport for Gunyah runtime memparcel accept (VmAccept::Sync).
+// Nonstandard; must match the guest module (droidvm-guest-additions/virtio_gunyah_accept).
+pub const VIRTIO_ID_GUNYAH_ACCEPT: u32 = 60;
 // TODO: Remove this once the ID is included in the Linux headers.
 pub const VIRTIO_ID_MEDIA: u32 = 48;
 

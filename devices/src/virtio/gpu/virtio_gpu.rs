@@ -1216,6 +1216,8 @@ impl VirtioGpu {
     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
     pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> VirtioGpuResult {
+                // A 2 GiB pool keeps the offset within u32.
+                pool_offset: Some(pool_offset as u32),
         let resource = self
             .resources
             .get_mut(&resource_id)
@@ -1227,9 +1229,13 @@ impl VirtioGpu {
         let mut source: Option<VmMemorySource> = None;
         match self.rutabaga.export_blob(resource_id) {
             Ok(export) => {
-                debug!(
-                    "resource_map_blob: export_blob OK for resource {}, handle_type=0x{:x}, size={}",
-                    resource_id, export.handle_type, resource.size
+                let has_vk = self.rutabaga.vulkan_info(resource_id).is_ok();
+                base::debug!(
+                    "GPU-MAPBLOB: res={} export OK handle_type=0x{:x} vulkan_info={} offset={}",
+                    resource_id,
+                    export.handle_type,
+                    has_vk,
+                    offset,
                 );
                 if let Ok(vulkan_info) = self.rutabaga.vulkan_info(resource_id) {
                     source = Some(VmMemorySource::Vulkan {
@@ -1246,33 +1252,40 @@ impl VirtioGpu {
                         offset: 0,
                         size: resource.size,
                     });
-                } else {
-                    debug!(
-                        "resource_map_blob: handle_type is MEM_OPAQUE_FD, cannot use Descriptor source"
-                    );
                 }
             }
             Err(e) => {
-                debug!("resource_map_blob: export_blob failed for resource {}: {}", resource_id, e);
+                // Not an error: expected for ColorBuffers whose Vulkan memory this Adreno can't
+                // export as AHB/dmabuf; falls through to the rutabaga host-ptr map below.
+                base::debug!(
+                    "GPU-MAPBLOB: res={} export_blob ERR {:?} offset={}",
+                    resource_id,
+                    e,
+                    offset,
+                );
             }
         }
 
-        // fallback to ExternalMapping via rutabaga if sandboxing (hence external_blob) and fixed
-        // mapping are both disabled as neither is currently compatible.
+        // qemu-android-gunyah parity: when export_blob yields no usable OS handle (e.g. a
+        // ColorBuffer whose Vulkan memory this Adreno can't export as AHB/dmabuf), fall back to
+        // rutabaga's host-pointer mapping — exactly what qemu does for every blob
+        // (rutabaga_resource_map -> memory_region_init_ram_ptr(mapping.ptr)). This avoids the
+        // InvalidRutabagaHandle dead-end. ExternalMapping (a raw host VA) is only unsafe when the
+        // GPU device is sandboxed; this VM runs --disable-sandbox, so the pointer is valid in-proc.
+        // NOTE: the original gate returned ErrUnspec here when external_blob/fixed_blob_mapping
+        // were set; we deliberately relax it for the Gunyah + disable-sandbox configuration.
         if source.is_none() {
-            if self.external_blob || self.fixed_blob_mapping {
-                error!(
-                    "resource_map_blob: no source and external_blob={} fixed_blob_mapping={}, cannot fallback",
-                    self.external_blob, self.fixed_blob_mapping
-                );
+            if self.fixed_blob_mapping {
                 return Err(ErrUnspec);
             }
 
             match self.rutabaga.map(resource_id) {
                 Ok(mapping) => {
-                    debug!(
-                        "resource_map_blob: ExternalMapping fallback, ptr={:?} size={}",
-                        mapping.ptr, mapping.size
+                    base::debug!(
+                        "GPU-MAPBLOB: res={} export failed, fallback rutabaga.map() OK ptr=0x{:x} size={} (qemu host-ptr path)",
+                        resource_id,
+                        mapping.ptr,
+                        mapping.size,
                     );
                     // resources mapped via rutabaga must also be marked for unmap via rutabaga.
                     resource.rutabaga_external_mapping = true;
@@ -1282,8 +1295,12 @@ impl VirtioGpu {
                     });
                 }
                 Err(e) => {
-                    error!("resource_map_blob: rutabaga.map() failed: {}", e);
-                    return Err(ErrRutabaga(e));
+                    base::warn!(
+                        "GPU-MAPBLOB: res={} export failed AND rutabaga.map() ERR {:?} (not host-mappable)",
+                        resource_id,
+                        e,
+                    );
+                    return Err(ErrUnspec);
                 }
             }
         };
@@ -1303,25 +1320,35 @@ impl VirtioGpu {
             MemCacheType::CacheCoherent
         };
 
+        // The guest-side memparcel accept is always driven host-side over the
+        // virtio-gunyah-accept transport (VmAccept::Sync), so nothing about it reaches the
+        // virtio-gpu protocol: no handle in the response, no accept in the guest driver.
+        match self
+            .mapper
         if let Err(e) = self.mapper
             .lock()
             .as_mut()
             .expect("No backend request connection found")
-            .add_mapping(source.unwrap(), offset, prot, cache)
+            .add_mapping_blob(source.unwrap(), offset, prot, cache, VmAccept::Sync)
         {
-            error!("resource_map_blob: add_mapping failed at offset 0x{:x}: {:#}", offset, e);
-            return Err(ErrUnspec);
-        }
+            Ok(_) => (),
 
         resource.shmem_offset = Some(offset);
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+            pool_offset: None,
         })
     }
 
     /// Uses the hypervisor to unmap the blob resource.
     pub fn resource_unmap_blob(&mut self, resource_id: u32) -> VirtioGpuResult {
+        // Gunyah: actually reclaim the SHARE'd blob now (instead of the old PIN no-op that left it
+        // shared forever). remove_mapping -> UnregisterMemory -> Vm::unshare_blob does the
+        // gh_rm_mem_reclaim. The guest's virtio-gpu driver releases its own stage-2 acceptance
+        // (gunyah_guest_mem_release) BEFORE sending this UNMAP, so the host-side reclaim here is
+        // safe and keeps the BAR offset free for clean reuse -- fixing the offset-0 mem_share
+        // EINVAL that the lazy overlap-reclaim caused by orphaning still-live parcels.
         let resource = self
             .resources
             .get_mut(&resource_id)

@@ -140,6 +140,8 @@ pub enum DeviceControlTube {
     // Sends `GpuControlCommand`.
     #[cfg(feature = "gpu")]
     Gpu(Tube),
+    // Sends `GunyahAcceptRequest` (VmAccept::Sync transport); held by the vm_memory handler.
+    GunyahAccept(Tube),
     // Sends `PvClockCommand`.
     #[cfg(feature = "pvclock")]
     PvClock(Tube),
@@ -522,6 +524,19 @@ pub fn create_rng_device(
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
         jail: simple_jail(jail_config, "rng_device")?,
+    })
+}
+
+/// virtio-gunyah-accept: transport for VmAccept::Sync runtime attaches on protected Gunyah.
+pub fn create_gunyah_accept_device(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    tube: Tube,
+) -> DeviceResult {
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "gunyah_accept_device")?,
     })
 }
 

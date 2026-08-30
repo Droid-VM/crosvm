@@ -10,7 +10,9 @@ use anyhow::anyhow;
 use anyhow::Result;
 use base::Protection;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use hypervisor::MemCacheType;
+use hypervisor::VmAccept;
 use resources::AddressRange;
 use snapshot::AnySnapshot;
 use vm_control::VmMemorySource;
@@ -49,6 +51,25 @@ pub trait SharedMemoryMapper: Send {
         prot: Protection,
         cache: MemCacheType,
     ) -> Result<()>;
+
+    /// Maps a host-visible virtio-gpu blob into the shared memory region at |offset|. On a
+    /// blob-sharing hypervisor (Gunyah) this SHARE's the blob; `vm_accept` selects who drives
+    /// the guest-side accept: `Off` returns the memparcel handle for the caller (virtio-gpu ->
+    /// guest driver) to accept itself (returned `Some`); `Sync` has the in-VM accept module do
+    /// it before this returns (returned `None`). On plain-memslot hypervisors it behaves like
+    /// `add_mapping` and returns `None`. The default falls back to `add_mapping`.
+    fn add_mapping_blob(
+        &mut self,
+        source: VmMemorySource,
+        offset: u64,
+        prot: Protection,
+        cache: MemCacheType,
+        vm_accept: VmAccept,
+    ) -> Result<Option<u32>> {
+        let _ = vm_accept;
+        self.add_mapping(source, offset, prot, cache)?;
+        Ok(None)
+    }
 
     /// Removes the mapping beginning at |offset|.
     fn remove_mapping(&mut self, offset: u64) -> Result<()>;
