@@ -431,6 +431,16 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn virgl_renderer_resource_get_map_ptr(
+        res_handle: u32,
+        out_map: *mut *mut ::std::os::raw::c_void,
+        out_size: *mut u64,
+    ) -> ::std::os::raw::c_int;
+    pub fn virgl_renderer_resource_set_guest_blob_fd(
+        ctx_id: u32,
+        blob_id: u64,
+        fd: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
     pub fn virgl_renderer_resource_map(
         res_handle: u32,
         map: *mut *mut ::std::os::raw::c_void,

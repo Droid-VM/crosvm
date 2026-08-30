@@ -1771,6 +1771,7 @@ impl arch::LinuxArch for AArch64 {
             .regions()
             .find(|r| r.options.purpose == MemoryRegionPurpose::ShimHandoff)
             .map(|r| (r.guest_addr.offset(), r.size as u64));
+        let mut drm2kgsl_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
             let mut found = None;
             for region in vm.get_memory().regions() {
@@ -1821,6 +1822,36 @@ impl arch::LinuxArch for AArch64 {
                         region.options.step_size,
                     ));
                 }
+                // drm2kgsl arena: hand virglrenderer's drm2kgsl backend the memfd view. It lives in this
+                // process, so the host VA crosvm already mapped is directly usable and saves the
+                // backend a second mapping of the same pages; the fd + offset are exported too so
+                // it can build per-BO udmabuf windows over the arena.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool {
+                    let fd = region.shm.as_raw_descriptor();
+                    let gpa = region.guest_addr.offset();
+                    std::env::set_var("CROSVM_DRM2KGSL_ARENA_FD", fd.to_string());
+                    std::env::set_var(
+                        "CROSVM_DRM2KGSL_ARENA_FD_OFFSET",
+                        region.shm_offset.to_string(),
+                    );
+                    std::env::set_var(
+                        "CROSVM_DRM2KGSL_ARENA_HOST_VA",
+                        (region.host_addr as u64).to_string(),
+                    );
+                    std::env::set_var("CROSVM_DRM2KGSL_ARENA_GPA", format!("{:#x}", gpa));
+                    std::env::set_var("CROSVM_DRM2KGSL_ARENA_SIZE", (region.size as u64).to_string());
+                    base::warn!(
+                        "GPU-POOL: Drm2KgslPool region gpa={:#x} size={:#x} fd={} off={:#x} \
+                         hva={:#x} (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        fd,
+                        region.shm_offset,
+                        region.host_addr,
+                    );
+                    drm2kgsl_resv = Some((gpa, region.size as u64));
+                }
             }
             found
         };
@@ -1864,6 +1895,7 @@ impl arch::LinuxArch for AArch64 {
             gpu_guest_resv,
             test_pool_resv,
             shim_handoff_resv,
+            drm2kgsl_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,
             components.simplefb.as_ref().map(|sfb| {

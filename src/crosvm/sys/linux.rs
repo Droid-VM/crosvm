@@ -2351,6 +2351,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Some(mb) = pa.gfx_host_mb {
             std::env::set_var("NCTX_GFX_POOL_MB", mb.to_string());
         }
+        if let Some(mb) = pa.gpu_guest_mb {
             std::env::set_var("NCTX_GFX_GUEST_POOL_MB", mb.to_string());
         }
         if let Some(mb) = pa.gpu_guest_prealloc_mb {
@@ -2361,6 +2362,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         }
         if let Some(n) = pa.gpu_guest_max_grants {
             std::env::set_var("NCTX_GFX_GUEST_POOL_MAX_GRANTS", n.to_string());
+        }
+        if let Some(mb) = pa.drm_host_mb {
+            std::env::set_var("NCTX_DRM2KGSL_POOL_MB", mb.to_string());
         }
         if let Some(mb) = pa.test_pool_mb {
             std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());

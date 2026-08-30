@@ -439,6 +439,10 @@ impl GunyahVm {
                     // mem-entries into it), never lent.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::GpuPoolGuest => false,
+                    // drm2kgsl arena: SHARE'd like the gfx pools; that backend runs in this
+                    // process and must keep reaching it.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::Drm2KgslPool => false,
                     // Growable test pool: SHARE'd like the others. Only its pre_alloc prefix is
                     // shared at boot; the remainder is granted at runtime.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]

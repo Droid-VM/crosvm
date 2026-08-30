@@ -167,7 +167,14 @@ pub enum MemoryRegionPurpose {
     /// BIOS/firmware ROM
     Bios,
 
+    /// DroidVM: drm2kgsl native-context arena. A third SHARE-blessed pool, treated exactly like
+    /// GpuPool for access/bless/hugepage, that virglrenderer's drm2kgsl backend sub-allocates every
+    /// GPU BO from. Distinct from GpuPool so a build carrying both renderers cannot hand the
+    /// drm2kgsl arena to gfxstream's HostVisiblePool (which is handed any GpuPool region), so the
     /// two can be sized independently, and so it gets its own `drm2kgsl_host` DT node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    Drm2KgslPool,
+
     /// DroidVM: a GROWABLE test pool. Declared to the guest at its full size but SHARE'd only up
     /// to `pre_alloc_size` at boot; the rest is granted at runtime over virtio-gunyah-accept's
     /// pool queue. Exists so the growable path can be exercised end to end without disturbing the
@@ -1024,6 +1031,9 @@ impl GuestMemory {
             MemoryRegionPurpose::GpuPoolGuest => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
+            // drm2kgsl arena: SHARE'd like the gfx pools. that backend lives in this
+            // process and sub-allocates BOs out of it, so the host needs access.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::Drm2KgslPool => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }

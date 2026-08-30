@@ -738,6 +738,20 @@ pub struct BatteryConfig {
     pub type_: BatteryType,
 }
 
+/// Pre-allocated GPU pool sizes (MB). Every one of these is a boot-blessed region -- SHARE'd once,
+/// folio-backed -- that something sub-allocates from, so no blob needs a runtime per-blob SHARE.
+///
+/// The names are `<route>-<who allocates>-mb`. The route prefix is `gfx` for gfxstream and `drm`
+/// for the DRM native context; the middle word says which side owns the allocator inside the pool,
+/// which is the distinction that actually changes behaviour:
+///   host   the renderer sub-allocates, and the guest is handed offsets into the region.
+///   guest  the guest virtio-gpu driver sub-allocates with drm_buddy and hands the host pages.
+///
+/// Sizes are needed very early (they shape the guest memory layout), so crosvm exports them to the
+/// renderer as env before the GPU process forks rather than expecting the user to hand-export them.
+///
+/// `--pre-alloc "gfx-host-mb=256,gfx-guest-mb=1024"`
+/// `--pre-alloc "drm-host-mb=8,drm-guest-mb=1024"`
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct PreAllocConfig {
@@ -745,7 +759,17 @@ pub struct PreAllocConfig {
     /// sub-allocates from (ASG rings + host-visible blobs). Absent => 0 (host pre-alloc off ->
     /// runtime-share). Its own SHARE-blessed GpuPool region + `gfx_host` DT node.
     pub gfx_host_mb: Option<u64>,
+    /// GUEST-allocated pool size (MB): a SHARE-blessed region the guest virtio-gpu driver owns
+    /// and sub-allocates every guest-alloc blob from with drm_buddy, handing the host dma-bufs
+    /// built over those pages. Absent => 0 (no guest-alloc pool). Its own GpuPoolGuest region +
     /// `gpu_guest` DT node.
+    ///
+    /// One knob for both renderers on purpose. The guest driver keeps a single pool and a single
+    /// allocator and cannot tell which renderer is asking -- it takes whichever reserved-memory
+    /// node it finds -- and only one renderer runs in a VM anyway. Two per-route names would be
+    /// two names for one thing, and setting both would silently pin a whole second pool the guest
+    /// never touches.
+    pub gpu_guest_mb: Option<u64>,
     /// Bytes of the guest-alloc pool SHARE'd before boot. Defaults to `gpu-guest-mb`, preserving
     /// the current fully pre-shared pool. A smaller value enables runtime growth in `step` chunks.
     pub gpu_guest_prealloc_mb: Option<u64>,
@@ -755,7 +779,14 @@ pub struct PreAllocConfig {
     /// Maximum number of simultaneously live runtime memparcels for the guest-alloc pool. Zero
     /// leaves the host-side cap unset; the actual RM quota is shared by the whole VM.
     pub gpu_guest_max_grants: Option<u32>,
+
+    /// DRM native context HOST-allocated pool size (MB): the region virglrenderer's DRM backend
+    /// sub-allocates from. Since BO backing moved to the guest this holds only the per-context msm
+    /// shmem rings -- 16 KiB each -- so single-digit MB is the right size, not the gigabyte the
+    /// BO pool needed. Absent => 0, and the rings fall back to a runtime SHARE apiece, which is
     /// the round trip this route exists to avoid. Its own Drm2KgslPool region + `drm2kgsl_host` DT
+    /// node. Only meaningful with `--gpu backend=virglrenderer`.
+    pub drm_host_mb: Option<u64>,
 
     /// Growable TEST pool: total window size (MB). Declared to the guest whole but backed only up
     /// to `test-pool-prealloc-mb`; the rest is granted at runtime as the guest asks, a

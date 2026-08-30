@@ -347,6 +347,7 @@ pub unsafe fn prepare_lend_region(host_addr: *mut u8, size: u64) -> LendPrepResu
     // sitting dirty in this CPU's caches. The GPU then reaches the same physical pages either
     // non-coherently or through a write-combining guest mapping, so a line that has not reached
     // the point of coherency can still be written back later, on top of what the guest wrote --
+    // or read back as the zeros we populated with. virglrenderer's drm2kgsl backend attributes a
     // hard glmark2 DEVICE LOST to exactly this (the CP executing stale zero lines that alias
     // WC guest writes, giving a type-0 write to register 0 and an AHB error).
     clean_dcache_to_poc(host_addr, size as usize);

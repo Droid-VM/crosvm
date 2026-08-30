@@ -988,6 +988,7 @@ pub fn create_fdt(
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
     test_pool_resv: Vec<(u64, u64, u64, u64)>,
     shim_handoff_resv: Option<(u64, u64)>,
+    drm2kgsl_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
     simplefb_cfg: Option<SimplefbDtConfig>,
@@ -1138,7 +1139,10 @@ pub fn create_fdt(
     // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's
     // own msm shmem rings -- so nothing in the guest matches this name. It is announced anyway so
     // the RM blesses the range.
+    if let Some((gpa, size)) = drm2kgsl_resv {
         create_pool_node(&mut fdt, "drm2kgsl_host", gpa, size, None, None)?;
+    }
+
     create_cpu_nodes(
         &mut fdt,
         num_cpus,

@@ -33,6 +33,7 @@ use crate::renderer_utils::*;
 use crate::rutabaga_core::RutabagaComponent;
 use crate::rutabaga_core::RutabagaContext;
 use crate::rutabaga_core::RutabagaResource;
+use crate::rutabaga_os::AsRawDescriptor;
 use crate::rutabaga_os::FromRawDescriptor;
 use crate::rutabaga_os::IntoRawDescriptor;
 use crate::rutabaga_os::OwnedDescriptor;
@@ -328,6 +329,31 @@ fn export_query(resource_id: u32) -> RutabagaResult<Query> {
     Ok(query)
 }
 
+            (va != 0 && size != 0).then_some((va, size))
+    })
+}
+
+/// Byte offset of a resource inside a host-owned renderer pool (drm2kgsl arena or venus_host),
+/// or None if it does not live in one.
+///
+/// Asked at creation, when the drm2kgsl backend has just recorded the arena pointer on the
+/// resource, and asked through an accessor that only READS it. The obvious alternative --
+/// map() then unmap() -- is not a query: virglrenderer's map records res->mapped and its
+/// unmap munmaps a dmabuf, so probing with the pair tears down mappings the renderer is
+/// still using.
+fn virgl_pool_offset(resource_id: u32) -> Option<u64> {
+    let mut ptr: *mut c_void = null_mut();
+    let mut size: u64 = 0;
+    // SAFETY: the accessor only reads virgl_resource fields and writes the two out params.
+    let ret = unsafe { virgl_renderer_resource_get_map_ptr(resource_id, &mut ptr, &mut size) };
+    if ret != 0 {
+        return None;
+    }
+    let addr = ptr as u64;
+    let end = addr.checked_add(size)?;
+        (addr >= pool_va && end <= pool_va.checked_add(pool_size)?).then(|| addr - pool_va)
+}
+
 impl VirglRenderer {
     pub fn init(
         virglrenderer_flags: VirglRendererFlags,
@@ -520,9 +546,26 @@ impl RutabagaComponent for VirglRenderer {
     }
 
     fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        // A fence carrying a ring index belongs to a per-context timeline (venus
+        // queue rings, drm native-context submit queues); handing it to the global
+        // virgl_renderer_create_fence retires it on vrend's GL timeline instead and
+        // the guest's per-ring fence never signals. Venus's WSI present blocked on
+        // exactly that (sync_wait(-1) on the EXECBUF out-fence), wedging the whole
+        // desktop behind the first swapchain buffer.
         // TODO(b/315870313): Add safety comment
         #[allow(clippy::undocumented_unsafe_blocks)]
-        let ret = unsafe { virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) };
+        let ret = if fence.flags & RUTABAGA_FLAG_INFO_RING_IDX != 0 {
+            unsafe {
+                virgl_renderer_context_create_fence(
+                    fence.ctx_id,
+                    VIRGL_RENDERER_FENCE_FLAG_MERGEABLE,
+                    fence.ring_idx.into(),
+                    fence.fence_id,
+                )
+            }
+        } else {
+            unsafe { virgl_renderer_create_fence(fence.fence_id as i32, fence.ctx_id) }
+        };
         ret_to_res(ret)
     }
 
@@ -721,13 +764,57 @@ impl RutabagaComponent for VirglRenderer {
         resource_id: u32,
         resource_create_blob: ResourceCreateBlob,
         mut iovec_opt: Option<Vec<RutabagaIovec>>,
-        _handle_opt: Option<RutabagaHandle>,
+        handle_opt: Option<RutabagaHandle>,
     ) -> RutabagaResult<RutabagaResource> {
         let mut iovec_ptr = null_mut();
         let mut num_iovecs = 0;
         if let Some(ref mut iovecs) = iovec_opt {
             iovec_ptr = iovecs.as_mut_ptr();
             num_iovecs = iovecs.len();
+        }
+
+        // GUEST-ALLOC: the guest allocated these pages and the GPU device turned the blob's
+        // iovecs into a dma-buf. virglrenderer's create_blob has nowhere to put it -- the DRM
+        // backend needs it inside get_blob() -- so park it on the context first. Only the VMM
+        // can build it: it alone holds the guest memfd the pages live in.
+        //
+        // Errors are not fatal here on purpose. -ENOTSUP means this context does not implement
+        // guest-allocated blobs, in which case create_blob below behaves exactly as it did
+        // before and the resource is backed the old way.
+        if let Some(ref handle) = handle_opt {
+            if handle.handle_type == RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+                // Hand over a DUP, not the descriptor itself. virgl_renderer_resource_set_guest_blob_fd
+                // takes ownership, and `handle` still owns os_handle and closes it when this
+                // function returns -- passing the raw fd makes both sides close the same one.
+                //
+                // The second close lands on whatever inherited that fd number in between, which
+                // is a long-lived socket often enough to matter: it showed up as the VNC server
+                // failing a read with EBADF and dropping its client, a symptom with nothing in it
+                // to suggest a blob descriptor.
+                let dup_fd = handle.os_handle.try_clone()?.into_raw_descriptor();
+                // SAFETY: dup_fd is a fresh descriptor this call gives away; nothing here closes it.
+                let ret = unsafe {
+                    virgl_renderer_resource_set_guest_blob_fd(
+                        ctx_id,
+                        resource_create_blob.blob_id,
+                        dup_fd,
+                    )
+                };
+                if ret != 0 {
+                    // SAFETY: ownership only transfers on success, so the dup is still ours.
+                    unsafe { libc::close(dup_fd) };
+                    // -ENOTSUP just means this context does not implement guest-allocated
+                    // blobs, which is not a problem: create_blob below behaves as before.
+                    if ret != -(libc::ENOTSUP as i32) {
+                        log::warn!(
+                            "set_guest_blob_fd(ctx={} blob_id={}) failed: {}",
+                            ctx_id,
+                            resource_create_blob.blob_id,
+                            ret
+                        );
+                    }
+                }
+            }
         }
 
         let resource_create_args = virgl_renderer_resource_create_blob_args {
@@ -762,6 +849,7 @@ impl RutabagaComponent for VirglRenderer {
             component_mask: 1 << (RutabagaComponentType::VirglRenderer as u8),
             size: resource_create_blob.size,
             mapping: None,
+            pool_offset: virgl_pool_offset(resource_id),
         })
     }
 
