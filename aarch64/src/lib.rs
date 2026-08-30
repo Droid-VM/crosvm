@@ -1772,6 +1772,7 @@ impl arch::LinuxArch for AArch64 {
             .find(|r| r.options.purpose == MemoryRegionPurpose::ShimHandoff)
             .map(|r| (r.guest_addr.offset(), r.size as u64));
         let mut drm2kgsl_resv: Option<(u64, u64)> = None;
+        let mut venus_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
             let mut found = None;
             for region in vm.get_memory().regions() {
@@ -1852,6 +1853,30 @@ impl arch::LinuxArch for AArch64 {
                     );
                     drm2kgsl_resv = Some((gpa, region.size as u64));
                 }
+                // venus transport pool (pool merge, landed): hand vkr the memfd view it
+                // sub-allocates blob_id==0 shmems from, and announce `venus_host` so the guest
+                // maps those ring/CS/reply blobs by pool-relative offset (no runtime SHARE).
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::VenusPool {
+                    let fd = region.shm.as_raw_descriptor();
+                    let gpa = region.guest_addr.offset();
+                    std::env::set_var("VENUS_POOL_FD", fd.to_string());
+                    std::env::set_var("VENUS_POOL_FD_OFFSET", region.shm_offset.to_string());
+                    std::env::set_var(
+                        "VENUS_POOL_HOST_VA",
+                        (region.host_addr as u64).to_string(),
+                    );
+                    std::env::set_var("VENUS_POOL_GPA", format!("{:#x}", gpa));
+                    std::env::set_var("VENUS_POOL_SIZE", (region.size as u64).to_string());
+                    base::warn!(
+                        "GPU-POOL: VenusPool region gpa={:#x} size={:#x} fd={} off={:#x}                          (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        fd,
+                        region.shm_offset,
+                    );
+                    venus_resv = Some((gpa, region.size as u64));
+                }
             }
             found
         };
@@ -1893,6 +1918,7 @@ impl arch::LinuxArch for AArch64 {
             }),
             gpu_resv,
             gpu_guest_resv,
+            venus_resv,
             test_pool_resv,
             shim_handoff_resv,
             drm2kgsl_resv,

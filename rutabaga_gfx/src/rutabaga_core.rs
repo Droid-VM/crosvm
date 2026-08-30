@@ -1473,6 +1473,9 @@ impl RutabagaBuilder {
                 // which the 2D path displays fine.
                 .use_virgl(supports_virglrenderer)
                 .use_venus(capset_enabled(RUTABAGA_CAPSET_VENUS))
+                // Gunyah protected VM: venus without guest-allocated VkDeviceMemory cannot
+                // work here (host pages are not injectable), so venus implies guest_vram.
+                .use_guest_vram(capset_enabled(RUTABAGA_CAPSET_VENUS))
                 .use_drm(capset_enabled(RUTABAGA_CAPSET_DRM));
 
             self.gfxstream_flags = self
