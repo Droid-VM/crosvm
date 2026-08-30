@@ -97,6 +97,7 @@ pub struct SharedDir {
     pub ugid: (Option<u32>, Option<u32>),
     pub uid_map: String,
     pub gid_map: String,
+    pub supp_gids: Vec<u32>,
     pub fs_cfg: devices::virtio::fs::Config,
     pub p9_cfg: p9::Config,
 }
@@ -112,6 +113,7 @@ impl Default for SharedDir {
             uid_map: format!("0 {} 1", unsafe { geteuid() }),
             // SAFETY: trivially safe
             gid_map: format!("0 {} 1", unsafe { getegid() }),
+            supp_gids: Vec::new(),
             fs_cfg: Default::default(),
             p9_cfg: Default::default(),
         }
@@ -123,6 +125,7 @@ struct UgidConfig {
     gid: Option<u32>,
     uid_map: String,
     gid_map: String,
+    supp_gids: Vec<u32>,
 }
 
 impl Default for UgidConfig {
@@ -134,6 +137,9 @@ impl Default for UgidConfig {
             uid_map: format!("0 {} 1", unsafe { geteuid() }),
             // SAFETY: getegid never fails.
             gid_map: format!("0 {} 1", unsafe { getegid() }),
+            // Empty is the safe default: the VMM's own groups are root's, and carrying any of
+            // them into a process that has just given up root would be a privilege leak.
+            supp_gids: Vec::new(),
         }
     }
 }
@@ -151,6 +157,20 @@ impl UgidConfig {
             }
             "uidmap" => self.uid_map = value.into(),
             "gidmap" => self.gid_map = value.into(),
+            // Accepts "1015 1023" and "[1015,1023]" alike: the sibling options on this flag are
+            // space-separated while --virtio-snd spells the same list as a serde_keyvalue array,
+            // and a caller should not have to remember which flag it is talking to.
+            "supp_gids" => {
+                self.supp_gids = value
+                    .trim_matches(|c| c == '[' || c == ']')
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse::<u32>()
+                            .with_context(|| format!("`supp_gids` entry `{s}` must be an integer"))
+                    })
+                    .collect::<anyhow::Result<Vec<u32>>>()?;
+            }
             _ => {
                 return Ok(false);
             }
@@ -176,6 +196,9 @@ impl FromStr for SharedDir {
         //   directory contents should be considered valid (default: 5)
         // * cache=CACHE - one of "never", "always", or "auto" (default: auto)
         // * writeback=BOOL - indicates whether writeback caching should be enabled (default: false)
+        // * supp_gids=GIDS - supplementary groups for the device process, as a comma- or
+        //   space-separated list. Empty (default) drops all of them. Only honoured when
+        //   sandboxing is off; see `create_fs_device`.
         // * uid=UID - uid of the device process in the user namespace created by minijail.
         //   (default: 0)
         // * gid=GID - gid of the device process in the user namespace created by minijail.
@@ -242,6 +265,7 @@ impl FromStr for SharedDir {
         shared_dir.ugid = (ugid_cfg.uid, ugid_cfg.gid);
         shared_dir.uid_map = ugid_cfg.uid_map;
         shared_dir.gid_map = ugid_cfg.gid_map;
+        shared_dir.supp_gids = ugid_cfg.supp_gids;
 
         match shared_dir.kind {
             SharedDirKind::FS => {

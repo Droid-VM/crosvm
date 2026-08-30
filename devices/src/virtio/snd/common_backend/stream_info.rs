@@ -25,6 +25,7 @@ use serde::Serialize;
 use super::Error;
 use super::PcmResponse;
 use super::WorkerStatus;
+use crate::virtio::snd::parameters::UnderrunMode;
 use crate::virtio::snd::common::*;
 use crate::virtio::snd::common_backend::async_funcs::*;
 use crate::virtio::snd::common_backend::DirectionalStream;
@@ -54,6 +55,7 @@ pub struct StreamInfoBuilder {
     stream_source_generator: Arc<SysAudioStreamSourceGenerator>,
     effects: Vec<StreamEffect>,
     card_index: usize,
+    underrun: UnderrunMode,
     #[cfg(windows)]
     audio_client_guid: Option<String>,
 }
@@ -72,6 +74,7 @@ impl StreamInfoBuilder {
             stream_source_generator,
             effects: vec![],
             card_index,
+            underrun: UnderrunMode::Silence,
             #[cfg(windows)]
             audio_client_guid: None,
         }
@@ -81,6 +84,12 @@ impl StreamInfoBuilder {
     /// [`StreamInfo::prepare()`]. The default value is no effects.
     pub fn effects(mut self, effects: Vec<StreamEffect>) -> Self {
         self.effects = effects;
+        self
+    }
+
+    /// What the device plays when the guest misses a period. The default is silence.
+    pub fn underrun(mut self, underrun: UnderrunMode) -> Self {
+        self.underrun = underrun;
         self
     }
 
@@ -112,6 +121,8 @@ pub struct StreamInfo {
     pub state: u32, // VIRTIO_SND_R_PCM_SET_PARAMS -> VIRTIO_SND_R_PCM_STOP, or 0 (uninitialized)
     // Stream effects to use when creating a new stream on [`prepare()`].
     pub(crate) effects: Vec<StreamEffect>,
+    // What to play when the guest misses a period; see [`UnderrunMode`].
+    pub(crate) underrun: UnderrunMode,
 
     // just_reset set to true after reset. Make invalid state transition return Ok. Set to false
     // after a valid state transition to SET_PARAMS or PREPARE.
@@ -197,6 +208,7 @@ impl From<StreamInfoBuilder> for StreamInfo {
             direction: 0,
             state: 0,
             effects: builder.effects,
+            underrun: builder.underrun,
             just_reset: false,
             status_mutex: Rc::new(AsyncRwLock::new(WorkerStatus::Pause)),
             sender: None,

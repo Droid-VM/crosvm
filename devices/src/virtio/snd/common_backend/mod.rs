@@ -42,7 +42,11 @@ use serde::Serialize;
 use snapshot::AnySnapshot;
 use thiserror::Error as ThisError;
 use vm_memory::GuestMemory;
+use data_model::Le32;
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
 use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 
 use crate::virtio::async_utils;
 use crate::virtio::copy_config;
@@ -56,6 +60,7 @@ use crate::virtio::snd::file_backend::create_file_stream_source_generators;
 use crate::virtio::snd::file_backend::Error as FileError;
 use crate::virtio::snd::layout::*;
 use crate::virtio::snd::null_backend::create_null_stream_source_generators;
+use crate::virtio::snd::parameters::PCMDeviceParameters;
 use crate::virtio::snd::parameters::Parameters;
 use crate::virtio::snd::parameters::StreamSourceBackend;
 use crate::virtio::snd::sys::create_stream_source_generators as sys_create_stream_source_generators;
@@ -69,6 +74,7 @@ use crate::virtio::Interrupt;
 use crate::virtio::Queue;
 use crate::virtio::VirtioDevice;
 
+pub mod underrun;
 pub mod async_funcs;
 pub mod stream_info;
 
@@ -181,10 +187,16 @@ impl SndData {
     }
 }
 
-const SUPPORTED_FORMATS: u64 = 1 << VIRTIO_SND_PCM_FMT_U8
-    | 1 << VIRTIO_SND_PCM_FMT_S16
-    | 1 << VIRTIO_SND_PCM_FMT_S24
-    | 1 << VIRTIO_SND_PCM_FMT_S32;
+// Only the ones an Android endpoint can be handed byte for byte. U8 has no AAudio equivalent,
+// and virtio's S24 -- 24 significant bits in a four-byte container -- is not AAudio's 24-bit
+// format, which packs them into three. Offering either meant the guest could pick a layout the
+// host would then have to describe as some other layout of a different frame size.
+//
+// FLOAT is here because it is what the endpoints natively run at: without it every sample is
+// converted on the way to the device no matter what the guest chose.
+const SUPPORTED_FORMATS: u64 = 1 << VIRTIO_SND_PCM_FMT_S16
+    | 1 << VIRTIO_SND_PCM_FMT_S32
+    | 1 << VIRTIO_SND_PCM_FMT_FLOAT;
 const SUPPORTED_FRAME_RATES: u64 = 1 << VIRTIO_SND_PCM_RATE_8000
     | 1 << VIRTIO_SND_PCM_RATE_11025
     | 1 << VIRTIO_SND_PCM_RATE_16000
@@ -202,7 +214,7 @@ pub struct PcmResponse {
 
 pub struct VirtioSnd {
     control_tube: Option<Tube>,
-    cfg: virtio_snd_config,
+    cfg: DroidVmSndConfig,
     snd_data: SndData,
     stream_info_builders: Vec<StreamInfoBuilder>,
     avail_features: u64,
@@ -230,8 +242,9 @@ impl VirtioSnd {
         control_tube: Tube,
     ) -> Result<VirtioSnd, Error> {
         let params = resize_parameters_pcm_device_config(params);
-        let cfg = hardcoded_virtio_snd_config(&params);
+        // Descriptors first: the config declares how many of them there are.
         let snd_data = hardcoded_snd_data(&params);
+        let cfg = droidvm_snd_config(&params, &snd_data);
         let avail_features = base_features;
         let mut keep_rds: Vec<RawDescriptor> = Vec::new();
         keep_rds.push(control_tube.as_raw_descriptor());
@@ -290,24 +303,395 @@ pub(crate) fn create_stream_info_builders(
             let device_params = params.get_device_params(pcm_info).unwrap_or_default();
             StreamInfo::builder(generator, card_index)
                 .effects(device_params.effects.unwrap_or_default())
+                .underrun(params.underrun)
         })
         .collect())
 }
 
 // To be used with hardcoded_snd_data
-pub fn hardcoded_virtio_snd_config(params: &Parameters) -> virtio_snd_config {
+/// Offset of the DroidVM vendor block within the device config space.
+///
+/// The spec's layout is four u32s -- jacks, streams, chmaps, controls -- ending at 16, and a
+/// stock driver reads exactly those by `offsetof`, so anything past 16 is already invisible to
+/// it. The block sits at 64 rather than 16 anyway, because "invisible today" is not the same as
+/// "safe": if a future virtio-snd revision grows the config, a vendor field parked immediately
+/// after the current end would be read as whatever the spec put there. 48 bytes of room is
+/// cheap insurance, and the magic below is the second line of defence.
+pub const DROIDVM_SND_CFG_OFFSET: usize = 64;
+/// Magic for the DroidVM vendor block: "DVMS".
+pub const DROIDVM_SND_CFG_MAGIC: u32 = 0x534d5644;
+/// Version of the vendor block layout. Bumped when fields are appended; a driver that knows
+/// only an older version reads the prefix it understands and ignores the rest, so this never
+/// needs to break one.
+pub const DROIDVM_SND_CFG_VERSION: u32 = 2;
+/// Per-direction cap on the `preferred_*` arrays. Fixed so the block stays a plain struct the
+/// guest can read at a known offset; devices past it simply get no hint.
+pub const DROIDVM_SND_CFG_MAX_DEVICES: usize = 8;
+
+/// The config space this device publishes: the spec's fields, reserved room for the spec to
+/// grow into, then a DroidVM vendor block carrying the settings that belong to the guest driver
+/// but are chosen host-side.
+///
+/// `controls` is the spec's fourth field, valid only with VIRTIO_SND_F_CTLS and zero otherwise;
+/// crosvm's `virtio_snd_config` stops at `chmaps`, so publishing it explicitly also stops a
+/// spec-conformant driver from reading whatever happened to be past the end.
+#[derive(Copy, Clone, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C, packed)]
+pub struct DroidVmSndConfig {
+    pub spec: virtio_snd_config,
+    pub controls: Le32,
+    /// Reserved for future spec fields. Never interpreted here.
+    pub spec_reserved: [u8; DROIDVM_SND_CFG_OFFSET - 16],
+    pub magic: Le32,
+    pub version: Le32,
+    /// Periods the guest driver should try to keep in flight; 0 = driver's own default.
+    pub outstanding_packets: Le32,
+    /// Preferred period size in bytes; 0 = no preference.
+    pub period_bytes: Le32,
+    /// Valid entries in `preferred_output` / `preferred_input`.
+    pub preferred_output_count: Le32,
+    pub preferred_input_count: Le32,
+    /// What each output PCM device's host endpoint runs at natively, indexed the same way as
+    /// `output_device_config` -- that is, by the device's `hda_fn_nid`.
+    ///
+    /// The spec's `formats`/`rates` are bitmasks with no way to say which entry the device would
+    /// rather have, so a guest that supports several has no reason to pick the one the host runs
+    /// at natively -- and every mismatch is a resample the host then has to do. Naming the host's
+    /// rate here lets the guest's mixer land on it directly. It stays a hint: everything in
+    /// `rates` still works, it just costs a conversion.
+    ///
+    /// Per device rather than per card because one card can carry several endpoints and they
+    /// need not share a host device, let alone its rate. Output and input are separate arrays
+    /// because their `hda_fn_nid`s are numbered independently -- output device 0 and input
+    /// device 0 both report nid 0.
+    pub preferred_output: [DroidVmSndPreferred; DROIDVM_SND_CFG_MAX_DEVICES],
+    pub preferred_input: [DroidVmSndPreferred; DROIDVM_SND_CFG_MAX_DEVICES],
+}
+
+/// What one host endpoint is and what it runs at natively. Zero in any field means "not known";
+/// a driver that sees zero should fall back to whatever it would have chosen anyway.
+#[derive(Copy, Clone, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C, packed)]
+pub struct DroidVmSndPreferred {
+    pub rate: Le32,
+    pub channels: Le32,
+    /// What kind of thing the host endpoint is, as a [`DroidVmSndEndpointKind`].
+    ///
+    /// A guest driver has no other way to tell a speaker from a headset: virtio-snd's jacks
+    /// would carry it, but they describe connectors on the emulated card, not the host endpoint
+    /// behind it, and nothing populates them here. Naming it lets the guest present the endpoint
+    /// as what it actually is -- which on Windows also settles the name the user reads and the
+    /// icon next to it.
+    pub kind: Le32,
+}
+
+/// Endpoint kinds, kept deliberately coarse: this has to mean the same thing to every guest, so
+/// it names the sort of thing a listener would recognise rather than the host's own device
+/// taxonomy.
+#[repr(u32)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum DroidVmSndEndpointKind {
+    Unknown = 0,
+    Speaker = 1,
+    Headphones = 2,
+    Headset = 3,
+    LineOut = 4,
+    Digital = 5,
+    Microphone = 6,
+    Telephony = 7,
+}
+
+impl Default for DroidVmSndConfig {
+    fn default() -> Self {
+        // `[u8; 48]` has no Default of its own -- the std impls stop at 32 -- so this cannot be
+        // derived.
+        DroidVmSndConfig {
+            spec: virtio_snd_config::default(),
+            controls: 0.into(),
+            spec_reserved: [0u8; DROIDVM_SND_CFG_OFFSET - 16],
+            magic: 0.into(),
+            version: 0.into(),
+            outstanding_packets: 0.into(),
+            period_bytes: 0.into(),
+            preferred_output_count: 0.into(),
+            preferred_input_count: 0.into(),
+            preferred_output: [DroidVmSndPreferred::default(); DROIDVM_SND_CFG_MAX_DEVICES],
+            preferred_input: [DroidVmSndPreferred::default(); DROIDVM_SND_CFG_MAX_DEVICES],
+        }
+    }
+}
+
+/// Takes the built descriptors, not just the parameters: the spec half of the config declares how
+/// many of them the guest should ask for, and that has to be their actual number.
+pub fn droidvm_snd_config(params: &Parameters, snd_data: &SndData) -> DroidVmSndConfig {
+    let (preferred_output, preferred_output_count) =
+        collect_preferred(&params.output_device_config, &params.device_table, false);
+    let (preferred_input, preferred_input_count) =
+        collect_preferred(&params.input_device_config, &params.device_table, true);
+    DroidVmSndConfig {
+        spec: hardcoded_virtio_snd_config(params, snd_data),
+        controls: 0.into(),
+        spec_reserved: [0u8; DROIDVM_SND_CFG_OFFSET - 16],
+        magic: DROIDVM_SND_CFG_MAGIC.into(),
+        version: DROIDVM_SND_CFG_VERSION.into(),
+        outstanding_packets: params.guest_outstanding_packets.into(),
+        period_bytes: params.guest_period_bytes.into(),
+        preferred_output_count: preferred_output_count.into(),
+        preferred_input_count: preferred_input_count.into(),
+        preferred_output,
+        preferred_input,
+    }
+}
+
+/// Copies the per-device host hints into the fixed-size array the vendor block publishes.
+/// Devices past the cap are dropped with a warning rather than silently: a hint that is missing
+/// and a hint that is zero look the same to the guest, and only one of them is intentional.
+/// What the host says the endpoint is, from the table the launcher publishes: `(rate, channels,
+/// kind)`, any of them zero for "not stated".
+///
+/// Only the Android backend has a table to read; elsewhere there is nothing to ask, and the
+/// configuration is the only source.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn endpoint_properties(device_table: &str, key: &str, input: bool) -> (u32, u8, u32) {
+    if device_table.is_empty() {
+        return (0, 0, 0);
+    }
+    let path = std::path::Path::new(device_table);
+    // The table says what the endpoint will accept and what kind of thing it is; only the
+    // endpoint itself can say what it runs at, and it is asked once here rather than guessed
+    // from a list of accepted values.
+    let (table_rate, table_channels, kind) =
+        android_audio::device_table::properties(path, key, input).unwrap_or((0, 0, 0));
+    match probe_once(path, key, input) {
+        Some(native) => (native.frame_rate, native.num_channels, kind),
+        None => (table_rate, table_channels, kind),
+    }
+}
+
+/// What the endpoint runs at, for a device that names one. `None` where there is nothing to ask.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn endpoint_native(
+    device_table: &str,
+    device: Option<&PCMDeviceParameters>,
+    input: bool,
+) -> Option<android_audio::NativeConfig> {
+    if device_table.is_empty() {
+        return None;
+    }
+    let key = device?.host_device.as_deref()?;
+    probe_once(std::path::Path::new(device_table), key, input)
+}
+
+/// One probe per endpoint per process. Opening a stream is cheap but not free, and both the PCM
+/// descriptors and the vendor block want the same answer.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn probe_once(
+    path: &std::path::Path,
+    key: &str,
+    input: bool,
+) -> Option<android_audio::NativeConfig> {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static CACHE: OnceLock<Mutex<BTreeMap<(String, bool), Option<android_audio::NativeConfig>>>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut cache = cache.lock().unwrap();
+    *cache
+        .entry((key.to_string(), input))
+        .or_insert_with(|| android_audio::probe_native(path, key, input))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn endpoint_properties(_device_table: &str, _key: &str, _input: bool) -> (u32, u8, u32) {
+    (0, 0, 0)
+}
+
+fn collect_preferred(
+    devices: &[PCMDeviceParameters],
+    device_table: &str,
+    input: bool,
+) -> ([DroidVmSndPreferred; DROIDVM_SND_CFG_MAX_DEVICES], u32) {
+    let mut out = [DroidVmSndPreferred::default(); DROIDVM_SND_CFG_MAX_DEVICES];
+    let count = devices.len().min(DROIDVM_SND_CFG_MAX_DEVICES);
+    if devices.len() > DROIDVM_SND_CFG_MAX_DEVICES {
+        warn!(
+            "virtio-snd: {} PCM devices configured but the vendor block carries hints for {}; \
+             devices {}.. get none",
+            devices.len(),
+            DROIDVM_SND_CFG_MAX_DEVICES,
+            DROIDVM_SND_CFG_MAX_DEVICES
+        );
+    }
+    for (slot, dev) in out.iter_mut().zip(devices.iter()).take(count) {
+        // Whoever wrote the configuration wins; otherwise ask the table, which is where the only
+        // process that can enumerate Android's audio devices publishes what it found. Leaving
+        // this empty is not neutral: the guest then picks a format of its own, and the host
+        // converts every sample to reach the endpoint's real one.
+        let (rate, channels, kind) = match (
+            dev.preferred_rate,
+            dev.preferred_channels,
+            dev.endpoint_kind,
+        ) {
+            (Some(r), Some(c), Some(k)) => (r, c, k),
+            _ => {
+                let looked_up = dev
+                    .host_device
+                    .as_deref()
+                    .map(|key| endpoint_properties(device_table, key, input))
+                    .unwrap_or((0, 0, 0));
+                (
+                    dev.preferred_rate.unwrap_or(looked_up.0),
+                    dev.preferred_channels.unwrap_or(looked_up.1),
+                    dev.endpoint_kind.unwrap_or(looked_up.2),
+                )
+            }
+        };
+        slot.rate = rate.into();
+        slot.channels = u32::from(channels).into();
+        slot.kind = kind.into();
+    }
+    (out, count as u32)
+}
+
+/// The counts the guest reads before it asks for anything, which is what makes them binding:
+/// Linux requests exactly `chmaps` descriptors in a single query and fails the whole probe with
+/// -EINVAL when the backend returns fewer, so declaring too many is not a harmless over-estimate
+/// but a guest with no sound card.
+///
+/// `chmaps` is therefore the length of the list that was actually built, taken from the built
+/// [`SndData`] rather than recomputed here. `hardcoded_snd_data` gives each device only the
+/// layouts that fit under its `channels_max`, deliberately (see there), so any second expression
+/// of "how many that comes to" is a separate thing to keep in agreement -- and the one that used
+/// to be here, three per output device, disagreed on every stereo endpoint.
+pub fn hardcoded_virtio_snd_config(params: &Parameters, snd_data: &SndData) -> virtio_snd_config {
     virtio_snd_config {
         jacks: 0.into(),
         streams: params.get_total_streams().into(),
-        chmaps: (params.num_output_devices * 3 + params.num_input_devices).into(),
+        chmaps: (snd_data.chmap_info.len() as u32).into(),
     }
 }
 
 // To be used with hardcoded_virtio_snd_config
+/// What one device should advertise, narrowed to what its host endpoint actually runs.
+///
+/// Wider is not free. The guest treats the widest thing it is shown as a reasonable default, and
+/// every sample outside the endpoint's own layout is converted on the way through. Narrowing is
+/// not a claim that the rest would be refused -- Android converts whatever it is given -- it is a
+/// way of not asking it to.
+struct DeviceCaps {
+    formats: u64,
+    rates: u64,
+    channels_max: u8,
+}
+
+/// Every rate this device would otherwise offer, up to and including the endpoint's own.
+///
+/// A ceiling rather than a single value: the guest resamples in one step to reach the endpoint,
+/// so a source already at 16kHz is better sent as 16kHz than upsampled here and downsampled
+/// again there.
+fn rates_up_to(hz: u32) -> u64 {
+    const RATES: [(u8, u32); 14] = [
+        (VIRTIO_SND_PCM_RATE_5512, 5512),
+        (VIRTIO_SND_PCM_RATE_8000, 8000),
+        (VIRTIO_SND_PCM_RATE_11025, 11025),
+        (VIRTIO_SND_PCM_RATE_16000, 16000),
+        (VIRTIO_SND_PCM_RATE_22050, 22050),
+        (VIRTIO_SND_PCM_RATE_32000, 32000),
+        (VIRTIO_SND_PCM_RATE_44100, 44100),
+        (VIRTIO_SND_PCM_RATE_48000, 48000),
+        (VIRTIO_SND_PCM_RATE_64000, 64000),
+        (VIRTIO_SND_PCM_RATE_88200, 88200),
+        (VIRTIO_SND_PCM_RATE_96000, 96000),
+        (VIRTIO_SND_PCM_RATE_176400, 176400),
+        (VIRTIO_SND_PCM_RATE_192000, 192000),
+        (VIRTIO_SND_PCM_RATE_384000, 384000),
+    ];
+    let mut mask = 0u64;
+    for (bit, rate) in RATES {
+        if rate <= hz && (SUPPORTED_FRAME_RATES & (1u64 << bit)) != 0 {
+            mask |= 1u64 << bit;
+        }
+    }
+    // An empty mask is a stream the guest cannot configure at all, which is worse than a wide one.
+    if mask == 0 {
+        SUPPORTED_FRAME_RATES
+    } else {
+        mask
+    }
+}
+
+/// The formats in the same family as `format`, out of the ones this device can carry.
+///
+/// By family rather than down to the single native format: within a family the conversion is a
+/// widening or narrowing of the same representation, and crossing between integer and float is
+/// the expensive one -- a guest that wants 16-bit should not have to go through float to get it.
+///
+/// Not narrowed, though the other two axes are, and not for want of trying.
+///
+/// Ranking does not decide the format: offered float and 32-bit integer at the same width,
+/// Windows takes the integer one, measured on an endpoint built from scratch with float first in
+/// the range list. So the only way to choose float is to offer nothing else.
+///
+/// Offering nothing else does not work. A device advertising only float leaves the audio endpoint
+/// builder with no endpoints at all -- the PCI device starts, the driver registers every
+/// subdevice, and not one endpoint is created, on a subdevice name Windows had never seen and so
+/// with nothing cached to blame. An earlier attempt broke only the pre-existing endpoints and the
+/// cached format looked like the explanation; a slot that had never existed failing the same way
+/// says the format set itself is what Windows will not take.
+///
+/// So the format the guest should prefer is expressed as an order instead, which steers nothing
+/// today but costs nothing either, and the samples are converted on the way to the endpoint.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn device_caps(
+    devices: &[PCMDeviceParameters],
+    device_table: &str,
+    index: u32,
+    input: bool,
+    fallback_channels: u8,
+) -> DeviceCaps {
+    let wide = DeviceCaps {
+        formats: SUPPORTED_FORMATS,
+        rates: SUPPORTED_FRAME_RATES,
+        channels_max: fallback_channels,
+    };
+    match endpoint_native(device_table, devices.get(index as usize), input) {
+        Some(native) => DeviceCaps {
+            formats: SUPPORTED_FORMATS,
+            rates: rates_up_to(native.frame_rate),
+            channels_max: native.num_channels.max(1),
+        },
+        None => wide,
+    }
+}
+
+/// Nothing to ask on a platform with no endpoint table, so nothing is narrowed.
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn device_caps(
+    _devices: &[PCMDeviceParameters],
+    _device_table: &str,
+    _index: u32,
+    _input: bool,
+    fallback_channels: u8,
+) -> DeviceCaps {
+    DeviceCaps {
+        formats: SUPPORTED_FORMATS,
+        rates: SUPPORTED_FRAME_RATES,
+        channels_max: fallback_channels,
+    }
+}
+
 pub fn hardcoded_snd_data(params: &Parameters) -> SndData {
     let jack_info: Vec<virtio_snd_jack_info> = Vec::new();
     let mut pcm_info: Vec<virtio_snd_pcm_info> = Vec::new();
     let mut chmap_info: Vec<virtio_snd_chmap_info> = Vec::new();
+
+    let output_caps: Vec<DeviceCaps> = (0..params.num_output_devices)
+        .map(|dev| device_caps(&params.output_device_config, &params.device_table, dev, false, 6))
+        .collect();
+    let input_caps: Vec<DeviceCaps> = (0..params.num_input_devices)
+        .map(|dev| device_caps(&params.input_device_config, &params.device_table, dev, true, 2))
+        .collect();
 
     for dev in 0..params.num_output_devices {
         for _ in 0..params.num_output_streams {
@@ -316,11 +700,13 @@ pub fn hardcoded_snd_data(params: &Parameters) -> SndData {
                     hda_fn_nid: dev.into(),
                 },
                 features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
-                formats: SUPPORTED_FORMATS.into(),
-                rates: SUPPORTED_FRAME_RATES.into(),
+                formats: output_caps[dev as usize].formats.into(),
+                rates: output_caps[dev as usize].rates.into(),
                 direction: VIRTIO_SND_D_OUTPUT,
+                // Never zero: the Linux driver rejects a stream whose minimum is zero or whose
+                // minimum exceeds its maximum, and a rejected stream is a device with no audio.
                 channels_min: 1,
-                channels_max: 6,
+                channels_max: output_caps[dev as usize].channels_max.max(1),
                 padding: [0; 5],
             });
         }
@@ -332,64 +718,78 @@ pub fn hardcoded_snd_data(params: &Parameters) -> SndData {
                     hda_fn_nid: dev.into(),
                 },
                 features: 0.into(), /* 1 << VIRTIO_SND_PCM_F_XXX */
-                formats: SUPPORTED_FORMATS.into(),
-                rates: SUPPORTED_FRAME_RATES.into(),
+                formats: input_caps[dev as usize].formats.into(),
+                rates: input_caps[dev as usize].rates.into(),
                 direction: VIRTIO_SND_D_INPUT,
                 channels_min: 1,
-                channels_max: 2,
+                channels_max: input_caps[dev as usize].channels_max.max(1),
                 padding: [0; 5],
             });
         }
     }
-    // Use stereo channel map.
-    let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
-    positions[0] = VIRTIO_SND_CHMAP_FL;
-    positions[1] = VIRTIO_SND_CHMAP_FR;
+    // A channel map says how a given channel count is laid out, so only the counts a device can
+    // actually carry get one. Publishing a six-channel map for a stereo endpoint would describe
+    // a layout its stream cannot be configured for -- Linux hands the widest map it finds to
+    // ALSA, so the inconsistency is visible in the guest rather than harmless.
+    const LAYOUTS: [(u8, [u8; 6]); 3] = [
+        (
+            2,
+            [
+                VIRTIO_SND_CHMAP_FL,
+                VIRTIO_SND_CHMAP_FR,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+            ],
+        ),
+        (
+            4,
+            [
+                VIRTIO_SND_CHMAP_FL,
+                VIRTIO_SND_CHMAP_FR,
+                VIRTIO_SND_CHMAP_RL,
+                VIRTIO_SND_CHMAP_RR,
+                VIRTIO_SND_CHMAP_NONE,
+                VIRTIO_SND_CHMAP_NONE,
+            ],
+        ),
+        (
+            6,
+            [
+                VIRTIO_SND_CHMAP_FL,
+                VIRTIO_SND_CHMAP_FR,
+                VIRTIO_SND_CHMAP_FC,
+                VIRTIO_SND_CHMAP_LFE,
+                VIRTIO_SND_CHMAP_RL,
+                VIRTIO_SND_CHMAP_RR,
+            ],
+        ),
+    ];
+
+    let mut push_chmaps = |dev: u32, direction: u8, max_channels: u8| {
+        for (channels, layout) in LAYOUTS {
+            if channels > max_channels {
+                continue;
+            }
+            let mut positions = [VIRTIO_SND_CHMAP_NONE; VIRTIO_SND_CHMAP_MAX_SIZE];
+            positions[..layout.len()].copy_from_slice(&layout);
+            chmap_info.push(virtio_snd_chmap_info {
+                hdr: virtio_snd_info {
+                    hda_fn_nid: dev.into(),
+                },
+                direction,
+                channels,
+                positions,
+            });
+        }
+    };
+
     for dev in 0..params.num_output_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_OUTPUT,
-            channels: 2,
-            positions,
-        });
+        push_chmaps(dev, VIRTIO_SND_D_OUTPUT, output_caps[dev as usize].channels_max.max(1));
     }
     for dev in 0..params.num_input_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_INPUT,
-            channels: 2,
-            positions,
-        });
-    }
-    positions[2] = VIRTIO_SND_CHMAP_RL;
-    positions[3] = VIRTIO_SND_CHMAP_RR;
-    for dev in 0..params.num_output_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_OUTPUT,
-            channels: 4,
-            positions,
-        });
-    }
-    positions[2] = VIRTIO_SND_CHMAP_FC;
-    positions[3] = VIRTIO_SND_CHMAP_LFE;
-    positions[4] = VIRTIO_SND_CHMAP_RL;
-    positions[5] = VIRTIO_SND_CHMAP_RR;
-    for dev in 0..params.num_output_devices {
-        chmap_info.push(virtio_snd_chmap_info {
-            hdr: virtio_snd_info {
-                hda_fn_nid: dev.into(),
-            },
-            direction: VIRTIO_SND_D_OUTPUT,
-            channels: 6,
-            positions,
-        });
+        push_chmaps(dev, VIRTIO_SND_D_INPUT, input_caps[dev as usize].channels_max.max(1));
     }
 
     SndData {
@@ -975,9 +1375,19 @@ mod tests {
         assert_eq!(res.worker_thread.is_none(), true);
 
         assert_eq!(res.avail_features, 123); // avail_features must be equal to the input
-        assert_eq!(res.cfg.jacks.to_native(), 0);
-        assert_eq!(res.cfg.streams.to_native(), 13); // (Output = 3*3) + (Input = 2*2)
-        assert_eq!(res.cfg.chmaps.to_native(), 11); // (Output = 3*3) + (Input = 2*1)
+        assert_eq!(res.cfg.spec.jacks.to_native(), 0);
+        assert_eq!(res.cfg.spec.streams.to_native(), 13); // (Output = 3*3) + (Input = 2*2)
+        // No device_table here, so every device keeps its fallback width: outputs 6 channels,
+        // which fits all three layouts, inputs 2, which fits only the stereo one. That the old
+        // hardcoded formula (three per output, one per input) also landed on 11 is what let it
+        // survive -- it only agrees when the outputs are six-channel.
+        assert_eq!(res.cfg.spec.chmaps.to_native(), 3 * 3 + 2 * 1);
+        // The count the guest is told is the count it will ask for, so it has to be the count
+        // the backend can answer with.
+        assert_eq!(
+            res.cfg.spec.chmaps.to_native() as usize,
+            res.snd_data.chmap_info.len()
+        );
 
         // Check snd_data.pcm_info
         assert_eq!(res.snd_data.pcm_info.len(), 13);

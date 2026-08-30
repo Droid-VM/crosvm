@@ -2352,6 +2352,11 @@ pub struct RunCommand {
     ///        in case the when the host not allowing write to
     ///        /proc/<pid>/attr/fscreate, or guest directory does
     ///        not care about the security context.
+    ///     supp_gids=GIDS - Supplementary groups for the device
+    ///         process, comma- or space-separated. Empty (default)
+    ///         drops all of them. Honoured only with sandboxing
+    ///         off: the sandboxed path runs in a user namespace
+    ///         that forbids setgroups(2).
     ///     Options uid and gid are useful when the crosvm process
     ///     has no CAP_SETGID/CAP_SETUID but an identity mapping of
     ///     the current user/group between the VM and the host is
@@ -2767,8 +2772,10 @@ pub struct RunCommand {
     /// Possible key values:
     ///     capture=(false,true) - Disable/enable audio capture.
     ///         Default is false.
-    ///     backend=(null,file,[cras]) - Which backend to use for
-    ///         virtio-snd.
+    ///     backend=(null,file,[cras],[aaudio]) - Which backend to
+    ///         use for virtio-snd. Note that the default is null,
+    ///         i.e. silence: an aaudio build still needs
+    ///         backend=aaudio spelled out.
     ///     client_type=(crosvm,arcvm,borealis) - Set specific
     ///         client type for cras backend. Default is crosvm.
     ///     socket_type=(legacy,unified) Set specific socket type
@@ -2784,6 +2791,35 @@ pub struct RunCommand {
     ///         streams per device.
     ///     num_input_streams=INT - Set number of input PCM streams
     ///         per device.
+    ///     output_device_config=[[KEY=VAL,..],..] - Per output PCM
+    ///         device settings, one [] per device.
+    ///     input_device_config=[[KEY=VAL,..],..] - Same for input
+    ///         PCM devices.
+    ///         Keys: effects=[..] (cras), device_id=INT (aaudio:
+    ///         the AudioDeviceInfo id to pin that PCM device to,
+    ///         0 = let the platform route it).
+    ///     underrun=(silence,hold) - What to play when the guest
+    ///         has not queued a period in time. silence is the
+    ///         upstream behaviour and the default; hold continues
+    ///         the previous audio instead, which hides short holes
+    ///         at the cost of inventing samples.
+    ///     guest_outstanding_packets=INT - Hint to the guest for
+    ///         how many periods to keep in flight. 0 (default)
+    ///         leaves it to the driver. Fewer means less latency
+    ///         and more underruns.
+    ///     guest_period_bytes=INT - Hint to the guest for the
+    ///         preferred period size. 0 (default) = no preference.
+    ///     uid=INT - Run this device's backend in its own
+    ///         process under this uid, as --shared-dir and
+    ///         --pmem-ext2 already do for theirs. On Android a
+    ///         stream opened by uid 0 is silenced by the platform,
+    ///         so a crosvm running as root has to put its audio
+    ///         somewhere else. Unlike the sandbox's uid this is a
+    ///         real host uid and applies whether or not sandboxing
+    ///         is on. Unset (default) keeps the device in-process.
+    ///     gid=INT - Group for that process. Defaults to uid.
+    ///     supp_gids=[INT,..] - Supplementary groups for it.
+    ///         Empty (default) drops all of them.
     pub virtio_snd: Vec<SndParameters>,
 
     #[cfg(feature = "vnc")]

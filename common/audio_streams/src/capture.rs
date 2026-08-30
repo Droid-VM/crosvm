@@ -78,6 +78,11 @@ pub trait AsyncCaptureBufferStream: Send {
         &'a mut self,
         _ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncCaptureBuffer<'a>, BoxError>;
+
+    /// Lets go of whatever the host holds for this stream while nobody is reading it, without
+    /// ending the stream itself: the next buffer takes it again. See the playback trait; on the
+    /// capture side what it costs to hold is the recording indicator.
+    fn set_idle(&mut self, _idle: bool) {}
 }
 
 #[async_trait(?Send)]
@@ -87,6 +92,10 @@ impl<S: AsyncCaptureBufferStream + ?Sized> AsyncCaptureBufferStream for &mut S {
         ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncCaptureBuffer<'a>, BoxError> {
         (**self).next_capture_buffer(ex).await
+    }
+
+    fn set_idle(&mut self, idle: bool) {
+        (**self).set_idle(idle)
     }
 }
 

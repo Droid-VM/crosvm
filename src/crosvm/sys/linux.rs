@@ -18,6 +18,8 @@ pub(crate) mod pci_hotplug_helpers;
 pub(crate) mod pci_hotplug_manager;
 #[cfg(feature = "vnc")]
 mod simplefb_display;
+#[cfg(feature = "audio")]
+pub(crate) mod snd_helper;
 mod vcpu;
 
 #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
@@ -819,7 +821,12 @@ fn create_virtio_devices(
         for (card_index, virtio_snd) in cfg.virtio_snds.iter().enumerate() {
             let (snd_host_tube, snd_device_tube) =
                 Tube::pair().context("failed to create tube for snd")?;
-            add_control_tube(DeviceControlTube::Snd(snd_host_tube).into());
+            // A backend in another process does not service this tube, so registering it would
+            // leave `crosvm snd` commands waiting on a device that is never going to answer. The
+            // same gap exists for any vhost-user snd backend.
+            if virtio_snd.uid.is_none() {
+                add_control_tube(DeviceControlTube::Snd(snd_host_tube).into());
+            }
             let mut snd_params = virtio_snd.clone();
             snd_params.card_index = card_index;
             devs.push(create_virtio_snd_device(
@@ -827,6 +834,7 @@ fn create_virtio_devices(
                 cfg.jail_config.as_ref(),
                 snd_params,
                 snd_device_tube,
+                worker_process_pids,
             )?);
         }
     }
@@ -916,6 +924,7 @@ fn create_virtio_devices(
             ugid,
             uid_map,
             gid_map,
+            supp_gids,
             fs_cfg,
             p9_cfg,
         } = shared_dir;
@@ -931,6 +940,7 @@ fn create_virtio_devices(
                     *ugid,
                     uid_map,
                     gid_map,
+                    supp_gids,
                     src,
                     tag,
                     fs_cfg.clone(),
