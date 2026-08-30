@@ -85,7 +85,15 @@ pub fn launch(mut params: SndParameters) -> Result<(UnixStream, Pid)> {
             if libc::setgid(gid) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::setuid(uid) != 0 {
+            // setresuid, not setuid: setuid()'s kernel path only calls set_user() -- which
+            // updates cred->user, the field commit_creds() gates the per-uid RLIMIT_NPROC
+            // charge on -- inside its CAP_SETUID branch. A drop that reaches the saved-uid
+            // path instead updates cred->ucounts but not cred->user, so the app uid's NPROC
+            // counter is never incremented for this process yet is decremented when it exits;
+            // it drifts until fork() for that uid fails and the app "won't open" until reboot.
+            // setresuid() calls set_user() unconditionally on a real-uid change, keeping the
+            // accounting consistent. All three ids go to uid, exactly as setuid did.
+            if libc::setresuid(uid, uid, uid) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             // Only now: changing credentials clears the parent-death signal (`commit_creds()`

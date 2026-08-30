@@ -116,10 +116,17 @@ fn parse_args() -> Result<Args, String> {
 /// Drop to `uid` before the first NDK call. Nothing here needs the capabilities we give up, and
 /// `cameraserver` reads the real uid, not the effective one.
 fn drop_to_uid(uid: u32) -> Result<(), String> {
-    // SAFETY: setuid on the current process with no borrowed state; the result is checked.
-    if unsafe { libc::setuid(uid) } != 0 {
+    // setresuid, not setuid: setuid()'s set_user() -- which updates cred->user, the field
+    // commit_creds() gates the per-uid RLIMIT_NPROC charge on -- is cap-gated, so a drop that
+    // reaches the saved-uid path updates cred->ucounts but not cred->user, leaving the app
+    // uid's NPROC counter un-incremented here yet decremented at exit; it drifts until the app
+    // can no longer fork ("won't open" until reboot). setresuid() calls set_user()
+    // unconditionally on a real-uid change. All three ids go to uid -- the same real-uid drop
+    // cameraserver needs.
+    // SAFETY: setresuid on the current process with no borrowed state; the result is checked.
+    if unsafe { libc::setresuid(uid, uid, uid) } != 0 {
         return Err(format!(
-            "setuid({}) failed: {}",
+            "setresuid({}) failed: {}",
             uid,
             std::io::Error::last_os_error()
         ));
@@ -127,7 +134,7 @@ fn drop_to_uid(uid: u32) -> Result<(), String> {
     // SAFETY: getuid cannot fail and takes no arguments.
     let now = unsafe { libc::getuid() };
     if now != uid {
-        return Err(format!("setuid({}) left uid at {}", uid, now));
+        return Err(format!("setresuid({}) left uid at {}", uid, now));
     }
     Ok(())
 }
