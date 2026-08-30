@@ -96,11 +96,20 @@ const IRQ_TYPE_LEVEL_LOW: u32 = 0x00000008;
 fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     let mut mem_reg_prop = Vec::new();
     let mut previous_memory_region_end = None;
+    // A growable pool is declared to the guest whole but backed only up to its floor, so it must
+    // not appear here: a guest that took the window for ordinary RAM would allocate in the part
+    // nothing has granted yet, where a read silently returns zeros and a write kills the VM. The
+    // floor is described by the pool's own reserved-memory node instead, and everything above it
+    // is address space the guest only reaches through a grant.
+    //
+    // Non-growable pools stay in `/memory` exactly as before, marked no-map by their node -- the
+    // arrangement every existing pool boots with.
     // A pseudo-unprotected VM's window is left out for the same reason and one more: nothing has
     // been handed to the hypervisor for it yet, and the guest is not told it exists until the
     // shim has accepted it and pointed `/memory` here itself. The handoff page is not the guest's
     // RAM either -- it is the one place the host can still write once the boot region is lent.
     let hidden: HashSet<u64> = guest_mem
+        .regions()
         .filter(|r| {
             r.options.step_size != 0
                 || matches!(
@@ -108,6 +117,8 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
                     MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::ShimHandoff
                 )
         })
+        .map(|r| r.guest_addr.offset())
+        .collect();
     let mut regions = guest_mem.guest_memory_regions();
     regions.sort();
     for region in regions {
@@ -115,6 +126,8 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
             continue;
         }
         if hidden.contains(&region.0.offset()) {
+            continue;
+        }
         // Merge with the previous region if possible.
         if let Some(previous_end) = previous_memory_region_end {
             if region.0 == previous_end {
@@ -216,6 +229,21 @@ struct GrowablePool {
 ///   memparcel registered before VM start (`vm_creation.c
 ///   find_memparcel_for_resmem_node_by_address`). It walks every `/reserved-memory` child and
 ///   never looks at `compatible`.
+///
+/// # `reg` is the FLOOR, not the window
+///
+/// For a growable pool the two are different, and which one goes in `reg` decides whether the VM
+/// starts at all. The RM's match is exact -- same base, same size, one mapping -- so a `reg` that
+/// covers the whole declared window while only its floor is really shared matches nothing, and
+/// android14-6.1's RM refuses the VM outright (`GH_VM_START` -> ENODEV). Measured on sm8650: the
+/// same pool boots with the node removed and is refused with it present.
+///
+/// So `reg` describes exactly what was SHARE'd before boot, and the window's real size travels in
+/// `droidvm,pool-size`. The rest of the window is address space the guest is never told about
+/// through `reg` at all; a grant lands there as a runtime memparcel the guest accepts itself,
+/// which is a shape the RM does not police (measured on the same device). A pool that is fully
+/// pre-shared emits exactly the node it always did -- no `pool-size`, `reg` covering everything --
+/// because for it the floor IS the window.
 /// * edk2's `GunyahPoolAcpiDxe` walks every `droidvm,pool` node and emits one ACPI device per pool
 ///   under `\_SB`, so a guest that cannot read a device tree -- Windows -- still finds its pool.
 ///   `pool-name` becomes the ACPI `_UID`, so a pool shows up as e.g. `ACPI\DRVM0001\gpu_guest`.
@@ -259,6 +287,13 @@ fn create_pool_node(
         node.set_prop("compatible", &["droidvm,dynamic-pool", "droidvm,pool"][..])?;
     } else {
         node.set_prop("compatible", "droidvm,pool")?;
+    }
+    // See "`reg` is the FLOOR" above: the node describes the pre-shared floor, and the window's
+    // size rides along beside it when the two differ.
+    let floor = growable.as_ref().map_or(size, |g| g.pre_alloc_size.min(size));
+    node.set_prop("reg", &[gpa, floor])?;
+    if floor != size {
+        node.set_prop("droidvm,pool-size", size)?;
     }
     node.set_prop("no-map", ())?;
     // The name again, as a property: a consumer that reaches the node by phandle or by scanning
@@ -951,6 +986,7 @@ pub fn create_fdt(
     swiotlb: Option<(Option<GuestAddress>, u64)>,
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
+    test_pool_resv: Vec<(u64, u64, u64, u64)>,
     shim_handoff_resv: Option<(u64, u64)>,
     bat_mmio_base_and_irq: Option<(u64, u32)>,
     vmwdt_cfg: VmWdtConfig,
@@ -1068,6 +1104,7 @@ pub fn create_fdt(
 
     // The growable test pool: exists so the grow/shrink path can be exercised end to end without
     // disturbing the production pools, which are all fully pre-shared and must stay that way.
+    for (idx, (gpa, size, prealloc, step)) in test_pool_resv.into_iter().enumerate() {
         let growable = if step != 0 {
             let pool_id = next_growable_pool_id;
             next_growable_pool_id += 1;
@@ -1079,6 +1116,9 @@ pub fn create_fdt(
         } else {
             None
         };
+        // First pool keeps the historical node name; a second gets a distinct one so both
+        // droidvm,dynamic-pool nodes are present and the guest can drive each by pool-id.
+        let name = if idx == 0 { "test_guest".to_string() } else { format!("test_guest{}", idx + 1) };
         // DROIDVM_POOL_HIDE=dt|shm|both (diagnostic): omit the reserved-memory node for the test
         // pools. The sm8650-era RM refuses a `/reserved-memory` child whose `reg` does not match
         // an accepted memparcel exactly, which is one of three tangled explanations for why a
@@ -1092,6 +1132,9 @@ pub fn create_fdt(
             );
             continue;
         }
+        create_pool_node(&mut fdt, &name, gpa, size, None, growable)?;
+    }
+
     // drm2kgsl's native-context arena: the guest allocates nothing from it -- it holds the host's
     // own msm shmem rings -- so nothing in the guest matches this name. It is announced anyway so
     // the RM blesses the range.

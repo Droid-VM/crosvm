@@ -531,6 +531,24 @@ pub struct PreAllocConfig {
     /// leaves the host-side cap unset; the actual RM quota is shared by the whole VM.
     pub gpu_guest_max_grants: Option<u32>,
     /// the round trip this route exists to avoid. Its own Drm2KgslPool region + `drm2kgsl_host` DT
+
+    /// Growable TEST pool: total window size (MB). Declared to the guest whole but backed only up
+    /// to `test-pool-prealloc-mb`; the rest is granted at runtime as the guest asks, a
+    /// `test-pool-step-mb` multiple at a time.
+    ///
+    /// Exists to exercise the growable-pool path end to end -- the three pools above are all
+    /// fully pre-shared (step 0) and cannot. Nothing in the guest uses it except the test driver.
+    pub test_pool_mb: Option<u64>,
+    /// Bytes of the test pool SHARE'd before boot. Defaults to the whole window, i.e. an ordinary
+    /// non-growable pool, so setting only `test-pool-mb` changes nothing about how it behaves.
+    pub test_pool_prealloc_mb: Option<u64>,
+    /// Grant granularity for the test pool (MB). Must be >= 2 and a power of two. 0, or absent,
+    /// means the pool does not grow.
+    ///
+    /// One grant is one RM memparcel however many steps it spans, and MAX_MEMPARCEL_PER_VM is
+    /// 1024 for the whole VM -- so this is not "how much to allocate at once", it is the smallest
+    /// piece the guest can ever release. Small steps buy fine-grained release and spend quota.
+    pub test_pool_step_mb: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]

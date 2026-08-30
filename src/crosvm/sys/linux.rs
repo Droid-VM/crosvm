@@ -464,6 +464,83 @@ fn create_virtio_devices(
         )?);
     }
 
+    // EXPERIMENT (DROIDVM_POOL_GROW_TEST=<hex gpa>[,<mb>]): after the guest has booted, run
+    // exactly one runtime SHARE + guest MEM_ACCEPT at the given guest physical address.
+    //
+    // The address to pass is inside a pool window that was only PARTIALLY shared at boot
+    // (see DROIDVM_POOL_PREALLOC_MB in hypervisor/src/gunyah/mod.rs) -- i.e. an IPA the guest
+    // was told about in its reserved-memory node but which has never been backed by any
+    // memparcel. Whether the RM permits that is the load-bearing assumption under a
+    // guest-managed growable pool, and nothing has ever tested it on this device: the shipping
+    // RM is a Qualcomm internal build whose platform_memparcel_* hooks are no-ops in the
+    // public tree we can read.
+    //
+    // Deliberately reuses RegisterMemory rather than calling share_blob directly, so what is
+    // measured is the same path a real grow would take: allocate host memory, runtime_share,
+    // then drive_guest_accept over virtio-gunyah-accept. The only thing that differs from a
+    // VkDeviceMemory mapping is the destination address.
+    if let Ok(spec) = std::env::var("DROIDVM_POOL_GROW_TEST") {
+        let (test_host_tube, test_device_tube) =
+            Tube::pair().context("failed to create pool-grow test tube")?;
+        add_control_tube(
+            VmMemoryTube {
+                tube: test_host_tube,
+                expose_with_viommu: false,
+            }
+            .into(),
+        );
+        std::thread::Builder::new()
+            .name("pool_grow_test".into())
+            .spawn(move || {
+                let mut it = spec.split(',');
+                let gpa = it
+                    .next()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0);
+                let mb: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(2);
+                let size = mb << 20;
+                // The guest module has to be probed and have posted its request buffers before
+                // an accept can be delivered; it comes up a second or two into userspace, and
+                // 90s is chosen to be far past that without needing to poll for it.
+                std::thread::sleep(std::time::Duration::from_secs(90));
+                let shm = match base::SharedMemory::new("pool_grow_test", size) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        base::error!("GH-POOL-EXP: SharedMemory::new failed: {}", e);
+                        return;
+                    }
+                };
+                base::warn!(
+                    "GH-POOL-EXP: TEST2 requesting runtime share gpa={:#x} size={:#x} \
+                     (into the unbacked remainder of a pool window)",
+                    gpa,
+                    size
+                );
+                let req = VmMemoryRequest::RegisterMemory {
+                    source: VmMemorySource::SharedMemory(shm),
+                    dest: VmMemoryDestination::GuestPhysicalAddress(gpa),
+                    prot: Protection::read_write(),
+                    cache: MemCacheType::CacheCoherent,
+                    vm_accept: hypervisor::VmAccept::Sync,
+                };
+                if let Err(e) = test_device_tube.send(&req) {
+                    base::error!("GH-POOL-EXP: TEST2 send failed: {}", e);
+                    return;
+                }
+                match test_device_tube.recv::<VmMemoryResponse>() {
+                    Ok(VmMemoryResponse::RegisterMemory { .. }) => base::warn!(
+                        "GH-POOL-EXP: TEST2 PASS -- runtime share + guest accept succeeded at \
+                         gpa={:#x}",
+                        gpa
+                    ),
+                    Ok(other) => base::error!("GH-POOL-EXP: TEST2 FAIL -- {:?}", other),
+                    Err(e) => base::error!("GH-POOL-EXP: TEST2 FAIL -- recv: {}", e),
+                }
+            })
+            .context("failed to spawn pool-grow test thread")?;
+    }
+
+
     for (index, pmem_ext2) in cfg.pmem_ext2.iter().enumerate() {
         // Prepare a `VmMemoryClient` for pmem-ext2 device to send a request for mmap() and memory
         // registeration.
@@ -988,10 +1065,23 @@ fn create_virtio_devices(
         let (accept_host_tube, accept_device_tube) =
             Tube::pair().context("failed to create tube")?;
         add_control_tube(DeviceControlTube::GunyahAccept(accept_host_tube).into());
+        // A second tube, to the vm_memory handler rather than to drive_guest_accept: the pool
+        // worker uses it for RegisterMemory. It has to be its own tube served by its own thread,
+        // or a grow deadlocks against the accept it is waiting on.
+        let (pool_host_tube, pool_device_tube) =
+            Tube::pair().context("failed to create pool tube")?;
+        add_control_tube(
+            VmMemoryTube {
+                tube: pool_host_tube,
+                expose_with_viommu: false,
+            }
+            .into(),
+        );
         devs.push(create_gunyah_accept_device(
             cfg.protection_type,
             cfg.jail_config.as_ref(),
             accept_device_tube,
+            pool_device_tube,
         )?);
     }
 
@@ -2073,6 +2163,15 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         }
         if let Some(n) = pa.gpu_guest_max_grants {
             std::env::set_var("NCTX_GFX_GUEST_POOL_MAX_GRANTS", n.to_string());
+        }
+        if let Some(mb) = pa.test_pool_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_prealloc_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_PREALLOC_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_step_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_STEP_MB", mb.to_string());
         }
     }
 

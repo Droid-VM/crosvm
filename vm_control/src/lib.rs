@@ -707,6 +707,12 @@ pub enum VmMemoryRequest {
     UnregisterMemory(VmMemoryRegionId),
     /// Register an eventfd with raw guest memory address.
     IoEventRaw(IoEventUpdateRequest),
+    /// Fold `[offset, offset+size)` of `descriptor` into 2 MiB folios, leaving the rest of the
+    PrepareBlobRange {
+        descriptor: SafeDescriptor,
+        offset: u64,
+        size: u64,
+    },
 }
 
 /// Struct for managing `VmMemoryRequest`s IOMMU related state.
@@ -1337,6 +1343,14 @@ impl VmMemoryRequest {
                     Err(e) => VmMemoryResponse::Err(e),
                 }
             }
+            PrepareBlobRange {
+                descriptor,
+                offset,
+                size,
+            } => match vm.prepare_blob_range(&descriptor, offset, size) {
+                Ok(()) => VmMemoryResponse::Ok,
+                Err(e) => VmMemoryResponse::Err(e),
+            },
         }
     }
 }
@@ -1345,6 +1359,15 @@ impl VmMemoryRequest {
 /// Identifer for registered memory regions. Globally unique.
 // The current implementation uses guest physical address as the unique identifier.
 pub struct VmMemoryRegionId(GuestAddress);
+
+impl VmMemoryRegionId {
+    /// The id of the region registered at `addr`. The identifier IS the guest physical address, so
+    /// a caller that knows where it registered something can name it again without having kept the
+    /// response -- which is what the growable-pool worker does when it releases a step.
+    pub fn from_guest_addr(addr: GuestAddress) -> Self {
+        VmMemoryRegionId(addr)
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum VmMemoryResponse {

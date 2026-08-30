@@ -528,11 +528,16 @@ pub fn create_rng_device(
 }
 
 /// virtio-gunyah-accept: transport for VmAccept::Sync runtime attaches on protected Gunyah.
+/// `tube` is the device end for accept notifications; `pool_tube` is a second device end used
+/// only by the pool worker for its RegisterMemory round trips. Two tubes and two worker threads,
+/// because a grow makes the pool worker wait on a share whose completion needs the accept worker.
 pub fn create_gunyah_accept_device(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,
     tube: Tube,
+    pool_tube: Tube,
 ) -> DeviceResult {
+    let dev = virtio::GunyahAccept::new(virtio::base_features(protection_type), tube, pool_tube);
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),

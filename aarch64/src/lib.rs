@@ -1748,6 +1748,24 @@ impl arch::LinuxArch for AArch64 {
         // NCTX_GFX_POOL_MB they ride the transparent runtime_share/guest-accept path instead (no
         // pool region emitted).
         let mut gpu_guest_resv: Option<(u64, u64, u64, u64)> = None;
+        // (base, size, pre_alloc, step) for the growable test pool, read back off the region so
+        // the DT node and the region cannot disagree about what the guest was promised.
+        let test_pool_resv: Vec<(u64, u64, u64, u64)> = {
+            let mut found = Vec::new();
+            for region in vm.get_memory().regions() {
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::DynamicTestPool {
+                    let size = region.size as u64;
+                    found.push((
+                        region.guest_addr.offset(),
+                        size,
+                        region.options.boot_share_len(size),
+                        region.options.step_size,
+                    ));
+                }
+            }
+            found
+        };
         // The handoff page, read back off the layout like every other region the tree describes.
         let shim_handoff_resv: Option<(u64, u64)> = mem
             .regions()
@@ -1844,6 +1862,7 @@ impl arch::LinuxArch for AArch64 {
             }),
             gpu_resv,
             gpu_guest_resv,
+            test_pool_resv,
             shim_handoff_resv,
             bat_mmio_base_and_irq,
             vmwdt_cfg,

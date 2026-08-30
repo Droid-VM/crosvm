@@ -355,6 +355,26 @@ fn map_cma_region(
     }
 }
 
+/// Best-available proxy for the Gunyah RM generation: no RM version reaches the
+/// host (the DT compatible is identical across generations), but the host kernel
+/// tracks the SoC line. Pre-6.6 hosts (sm8650 era) carry the older RM.
+pub(crate) fn host_kernel_pre_6_6() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .and_then(|r| {
+            let mut it = r.trim().split('.');
+            let major: u32 = it.next()?.parse().ok()?;
+            let minor: u32 = it
+                .next()?
+                .split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()?;
+            Some((major, minor) < (6, 6))
+        })
+        .unwrap_or(false)
+}
+
 #[derive(PartialEq, Eq, Hash)]
 pub struct GunyahIrqRoute {
     irq: u32,
@@ -419,6 +439,10 @@ impl GunyahVm {
                     // mem-entries into it), never lent.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::GpuPoolGuest => false,
+                    // Growable test pool: SHARE'd like the others. Only its pre_alloc prefix is
+                    // shared at boot; the remainder is granted at runtime.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::DynamicTestPool => false,
                     // The window: neither lent nor shared before boot. It is handed over after
                     // GH_VM_START as a memparcel the guest accepts, which is the whole point.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -693,6 +717,19 @@ impl GunyahVm {
                     guest_mem.set_framebuffer_prep(prep);
                 }
 
+                // A growable pool is declared to the guest whole but SHARE'd only in part: the
+                // remainder is filled in at runtime as the guest asks for it. `boot_share_len`
+                // is that prefix, and it is the region's full size for everything that is not a
+                // growable pool -- including all three of the pre-existing pools, which set
+                // step_size == 0 and pre_alloc_size == size and therefore take exactly the code
+                // path they took before this existed.
+                //
+                // Measured on device (plans/DYNAMIC_POOL_PLAN.md): the RM accepts a partially
+                // shared pool region, the guest sees the whole window, and a later runtime SHARE
+                // plus MEM_ACCEPT lands in the unbacked remainder and is genuinely usable. It
+                // works because the region is still created at full size -- a sparse memfd, so
+                // host VA rather than host RAM -- so `region.size` still feeds ram_top and hence
+                // the RM's size-max, and the whole window gets untagged either way.
                 // A zero-prefix pool is a valid demand-backed window. It must remain entirely
                 // absent from stage-2 until the first runtime grant; mapping the whole region
                 // here would both consume the backing and collide with the first SHARE at offset
@@ -705,6 +742,7 @@ impl GunyahVm {
                         region.options.purpose,
                         region.guest_addr.offset(),
                         full_size,
+                    );
                     continue;
                 }
 
@@ -715,6 +753,7 @@ impl GunyahVm {
                 // shares only its boot_share_len prefix (the growable remainder is granted at
                 // runtime over the accept transport); a non-pool shares its whole size, and its
                 // boot_share_len already equals the full size, so the same expression covers both.
+                //
                 // The old per-2MB chunked SHARE emitted one parcel per 2 MiB. The sm8650-era RM
                 // rejects that outright (it accepts exactly one parcel per region -- RM message
                 // 51000013 error 3 at the first chunk); newer RMs accepted either shape. Validated
@@ -723,6 +762,7 @@ impl GunyahVm {
                 // gate that selected it, are gone. (The belief that a whole-region pool SHARE
                 // "hard-resets sm8650" was a separate misdiagnosis: that reset was a kernel-CFI
                 // fault in the udmabuf module's memfd_fcntl call, since fixed.)
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 let share_len = boot_share_len;
                 #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
                 let share_len: u64 = region.size.try_into().unwrap();
@@ -733,10 +773,17 @@ impl GunyahVm {
                 // follows, this line pins which region caused it and by how much it was sparse.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 if is_pool && share_len != full_size {
+                    base::info!(
                         "GH-POOL: SPARSE {:?} gpa={:#x} window={:#x} -- SHARE {:#x} at boot, \
                          {:#x} demand-grown (step={:#x}); older RMs reject this at VM_START",
+                        region.options.purpose,
+                        region.guest_addr.offset(),
                         full_size,
+                        share_len,
                         full_size - share_len,
+                        region.options.step_size,
+                    );
+                }
                 // Same pin probe as the LEND path above: a SHARE'd pool whose pages cannot be
                 // pinned takes the host down inside the ioctl, so find out here instead.
                 let _pin = if share_len != 0 {
@@ -1579,7 +1626,24 @@ impl Vm for GunyahVm {
         self.unshare_blob(label)
     }
 
+    fn prepare_blob_range(
+        &mut self,
+        fd: &dyn base::AsRawDescriptor,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        // A grant that ends up 4 KiB-backed still works, but its parcel carries 512x the
+        // mem_entries and the host share module builds that array with a high-order kcalloc --
+        // which starts failing as uptime fragments memory. Report the failure rather than
+        // silently degrading, and let the caller decide.
+        //
+        // SAFETY: fd is the pool region's shmem descriptor, alive for the VM's lifetime, and
+        // folio_back_range only fallocates and collapses within [offset, offset+size).
+        unsafe { mthp::folio_back_range(fd.as_raw_descriptor(), offset, size) }
             .map(|_coverage| ())
+            .map_err(|e| Error::new(e.raw_os_error().unwrap_or(EINVAL)))
+    }
+
     fn add_memory_region(
         &mut self,
         guest_addr: GuestAddress,

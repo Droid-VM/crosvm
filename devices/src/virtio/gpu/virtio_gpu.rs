@@ -117,6 +117,11 @@ struct VirtioGpuResource {
     // host addresses.
     backing_iovecs: Option<Vec<(GuestAddress, usize)>>,
 
+    // Ranges of a growable pool this resource holds a reference on, so unref_resource can release
+    // exactly what create took. Kept separately from backing_iovecs, which a blob does not
+    // necessarily set and which detach_backing clears independently.
+    pool_refs: Option<Vec<(GuestAddress, usize)>>,
+
     // For a scanout blob backed by the guest/pre-alloc pool: host (ptr, len) segments into the
     // pool memory. virgl cannot read a guest-memory blob back for display, so `flush` reads the
     // composited frame directly from these segments into the display framebuffer.
@@ -155,6 +160,7 @@ impl VirtioGpuResource {
             rutabaga_external_mapping: false,
             pool_offset: None,
             backing_iovecs: None,
+            pool_refs: None,
             pool_scanout_iovecs: None,
             scanout_blob_map: None,
         }
@@ -1210,8 +1216,10 @@ impl VirtioGpu {
     }
 
     /// Releases guest kernel reference on the resource.
-    pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
-        let resource = self
+    /// `mem` is only for releasing growable-pool grants this resource was holding. It is a
+    /// parameter rather than a field because VirtioGpu does not otherwise keep GuestMemory, and
+    /// the caller has it.
+    pub fn unref_resource(&mut self, mem: &GuestMemory, resource_id: u32) -> VirtioGpuResult {
             .resources
             .remove(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
@@ -1293,6 +1301,7 @@ impl VirtioGpu {
         let mut descriptor = None;
         let mut rutabaga_iovecs = None;
         let mut pool_iovecs: Option<Vec<(usize, usize)>> = None;
+        let mut pool_refs: Option<Vec<(GuestAddress, usize)>> = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
                 "GUEST-ALLOC: create_blob CREATE_GUEST_HANDLE res={} mem={} nvecs={} first={:#x} len={} udmabuf={}",
@@ -1303,8 +1312,22 @@ impl VirtioGpu {
                 vecs.first().map(|v| v.1).unwrap_or(0),
                 self.udmabuf_driver.is_some(),
             );
+            // Refuse an import over unbacked pool memory, and hold the grants until this
+            // resource is gone. The udmabuf path resolves addresses through find_region, which
+            // check_host_access does not gate, so nothing else would catch a guest handing over
+            // an address inside the declared window that has never been granted -- and reading a
+            // hole in the sparse pool memfd allocates host memory rather than failing.
+            if let Err(e) = mem.pool_ref_iovecs(&vecs[..]) {
+                base::error!(
+                    "GUEST-ALLOC: refusing blob res={}: iovecs are not backed by a live grant ({:?})",
+                    resource_id, e
+                );
+                return Err(ErrUnspec);
+            }
+            pool_refs = Some(vecs.clone());
             descriptor = match self.udmabuf_driver {
                 Some(ref driver) => Some(driver.create_udmabuf(mem, &vecs[..]).map_err(|e| {
+                    mem.pool_unref_iovecs(&vecs[..]);
                     base::error!("GUEST-ALLOC: create_udmabuf failed res={}: {:?}", resource_id, e);
                     ErrUnspec
                 })?),

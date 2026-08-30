@@ -387,10 +387,76 @@ fn clean_dcache_to_poc(host_addr: *mut u8, size: usize) {
 #[cfg(not(target_arch = "aarch64"))]
 fn clean_dcache_to_poc(_host_addr: *mut u8, _size: usize) {}
 
+/// Fold `[offset, offset+len)` of an already-sized fd into 2 MiB folios, leaving the rest of the
+/// file untouched.
+///
+/// The alignment dance is the same and for the same reason: MADV_COLLAPSE on a file mapping only
+/// forms a PMD when the virtual address and the file offset are congruent mod 2 MiB, so the fd is
+/// mapped at a 2 MiB-aligned VA with the window's own offset, rather than wherever mmap happens to
+/// land it. `offset` and `len` must both be 2 MiB multiples; anything else is rejected rather than
+/// silently degraded, because a degraded grant is a parcel with 512x the mem_entries and that
+/// failure shows up much later as an order-5 kcalloc failing under fragmentation.
+///
+/// Returns Ok even when individual collapses fail -- the caller gets 4 KiB backing, which works
 /// but is expensive. How much of the range really came back as 2 MiB folios is in the returned
 /// [`FolioCoverage`], which a caller who cannot live with a degraded range checks and a caller who
 /// only wanted the cheap shape ignores.
+///
+/// # Safety
+/// `fd` must be a live shmem descriptor at least `offset + len` bytes long.
 pub unsafe fn folio_back_range(fd: i32, offset: u64, len: u64) -> std::io::Result<FolioCoverage> {
+    let err = || std::io::Error::last_os_error();
+    if offset % THP_SIZE != 0 || len % THP_SIZE != 0 || len == 0 {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // NO fallocate here, deliberately. Punching the range in first allocates it as ordinary 4 KiB
+    // shmem, and on these phones the free memory a 4 KiB allocation can reach is whatever the
+    // gh_hugepage reserve pool did not park (measured on 8gen3: MemAvailable ~1 GiB against a
+    // 5.5 GiB reservoir). So a 1 GiB grant failed with ENOMEM inside fallocate while 5.5 GiB of
+    // 2 MiB folios sat unused, and the collapse below would then have had to allocate the folio
+    // *and* migrate into it -- twice the peak for a worse result.
+    //
+    // MADV_POPULATE_WRITE through the mapping, with MADV_HUGEPAGE already set, faults the file
+    // pages in as order-9 folios straight from the reserve pool's supply hook: the same path the
+    // multi-GiB LEND of guest RAM has always taken (prepare_lend_region).
+    let l = len as usize;
+    let thp = THP_SIZE as usize;
+    let base = libc::mmap(
+        std::ptr::null_mut(),
+        l + thp,
+        libc::PROT_NONE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        -1,
+        0,
+    );
+    if base == libc::MAP_FAILED {
+        return Err(err());
+    }
+    let base_u = base as usize;
+    let aligned = (base_u + thp - 1) & !(thp - 1);
+    // The file offset is a 2 MiB multiple and the VA is 2 MiB-aligned, so they are congruent.
+    let mapped = libc::mmap(
+        aligned as *mut libc::c_void,
+        l,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_SHARED | libc::MAP_FIXED,
+        fd,
+        offset as libc::off_t,
+    );
+    if mapped == libc::MAP_FAILED {
+        let e = err();
+        libc::munmap(base, l + thp);
+        return Err(e);
+    }
+    if aligned > base_u {
+        libc::munmap(base, aligned - base_u);
+    }
+    let tail_start = aligned + l;
+    let tail_end = base_u + l + thp;
+    if tail_end > tail_start {
+        libc::munmap(tail_start as *mut libc::c_void, tail_end - tail_start);
+    }
+
     let coverage = fold_mapped_range(mapped as *mut u8, len);
     libc::munmap(mapped, l);
     coverage
@@ -419,9 +485,28 @@ pub unsafe fn fold_mapped_range(base: *mut u8, len: u64) -> std::io::Result<Foli
     let mut collapsed = 0u64;
     for w in 0..windows {
         let ptr = base.add((w * THP_SIZE) as usize) as *mut libc::c_void;
+        if libc::madvise(ptr, THP_SIZE as usize, MADV_POPULATE_WRITE) != 0 {
+            let e = err();
+            match e.raw_os_error() {
+                // Older kernels lack MADV_POPULATE_WRITE; fault each page in by hand so the
+                // collapse has something to work with.
+                Some(libc::EINVAL) | Some(libc::ENOSYS) => {
+                    let npages = THP_SIZE / 4096;
+                    for pg in 0..npages {
+                        let p = (ptr as *mut u8).add((pg * 4096) as usize);
+                        std::ptr::write_volatile(p, std::ptr::read_volatile(p));
+                    }
+                }
+                // Out of memory is the caller's business, and it must not be answered by the
+                // hand-fault loop: a write fault that cannot allocate raises SIGBUS, which kills
+                // the VMM instead of failing one grant.
                 _ => return Err(e),
+            }
+        }
         if libc::madvise(ptr, THP_SIZE as usize, MADV_COLLAPSE) == 0 {
             collapsed += 1;
+        }
+    }
     Ok(FolioCoverage { windows, collapsed })
 }
 

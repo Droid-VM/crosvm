@@ -200,6 +200,9 @@ impl VmAArch64 for GunyahVm {
                 // Guest-alloc pool: same — needs the shm vdevice + stage-2 mapping so the
                 // guest driver can allocate from it and the host resolves its mem-entries.
                 MemoryRegionPurpose::GpuPoolGuest => true,
+                // Growable test pool: needs the shm vdevice for its pre-shared floor, exactly
+                // like the pools above. Runtime grants do not use it -- they go through
+                // runtime_share and the guest's own MEM_ACCEPT.
                 //
                 // DROIDVM_POOL_HIDE=shm|both (diagnostic) drops it. On android14-6.1 this node is
                 // how the RM ties a SHARE'd memparcel to the guest -- it is the reason the shm

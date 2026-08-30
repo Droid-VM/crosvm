@@ -442,7 +442,8 @@ impl Frontend {
                     .resource_create_3d(resource_id, resource_create_3d)
             }
             GpuCommand::ResourceUnref(info) => {
-                self.virtio_gpu.unref_resource(info.resource_id.to_native())
+                self.virtio_gpu
+                    .unref_resource(mem, info.resource_id.to_native())
             }
             GpuCommand::SetScanout(info) => self.virtio_gpu.set_scanout(
                 info.r,
