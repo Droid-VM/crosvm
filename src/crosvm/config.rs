@@ -157,6 +157,7 @@ pub struct VncConfig {
     pub port: Option<u32>,
     #[serde(default)]
     pub password: Option<String>,
+    #[serde(default)]
 }
 
 #[derive(Debug, Default, Serialize, Deserialize, FromKeyValues)]
@@ -293,6 +294,14 @@ pub fn parse_vhost_user_fs_option(param: &str) -> Result<VhostUserFsOption, Stri
 pub const DEFAULT_TOUCH_DEVICE_HEIGHT: u32 = 1024;
 pub const DEFAULT_TOUCH_DEVICE_WIDTH: u32 = 1280;
 
+/// Fixed ABS_X/ABS_Y max for a "normalized" absolute-pointer / touch device -- used when an
+/// `--input absolute-mouse`/`multi-touch` is given with no explicit width/height. The feeder
+/// scales its coordinates to this range against the live display size, so the mapping is
+/// resolution-independent and survives guest auto-resize (same scheme the VNC pointer path uses;
+/// MUST equal `VNC_ABS_MAX` in gpu_display/src/gpu_display_vnc.rs). An explicit width/height keeps
+/// the legacy pixel-sized range for backward compatibility.
+pub const NORMALIZED_ABS_MAX: u32 = 0x7FFF;
+
 #[derive(Serialize, Deserialize, Debug, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct TouchDeviceOption {
@@ -362,6 +371,15 @@ pub enum InputDeviceOption {
     },
     Mouse {
         path: PathBuf,
+    },
+    // Absolute-pointing mouse (qemu usb-tablet profile): ABS_X/ABS_Y + buttons + wheel. Unlike
+    // SingleTouch (a BTN_TOUCH touchscreen) it reports a position continuously, so the guest gets
+    // pointer hover, right-click and scroll -- what the app's "tablet" input mode maps a host
+    // mouse/stylus onto.
+    AbsoluteMouse {
+        path: PathBuf,
+        width: Option<u32>,
+        height: Option<u32>,
     },
     MultiTouch {
         path: PathBuf,

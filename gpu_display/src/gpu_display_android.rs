@@ -55,6 +55,14 @@ pub(crate) struct ANativeWindow_Buffer {
 
 pub(crate) type ErrorCallback = unsafe extern "C" fn(message: *const c_char);
 
+/// virtio-gpu's cursor plane is fixed at 64x64 (drivers/gpu/drm/virtio registers it with that
+/// single size), and a smaller cursor image arrives in the top-left of it.
+const CURSOR_PLANE_SIZE: u32 = 64;
+
+/// Sentinel position meaning "the guest hid its pointer". A real cursor position is a framebuffer
+/// coordinate, so u32::MAX can never collide with one.
+const CURSOR_HIDDEN_POS: u32 = u32::MAX;
+
 extern "C" {
     /// Constructs an AndroidDisplayContext for this backend. This awlays returns a valid (ex:
     /// non-null) handle to the context. The `name` parameter is from crosvm commandline and the
@@ -189,9 +197,29 @@ impl GpuDisplaySurface for AndroidSurface {
         unsafe { post_android_surface_buffer(self.context.0.as_ptr(), self.surface.as_ptr()) }
     }
 
-    fn set_position(&mut self, x: u32, y: u32) {
+    fn set_position(&mut self, x: i32, y: i32) {
+        // The image origin goes negative when the pointer is within the hotspot of the left or top
+        // edge, but the app owns this FFI and it takes u32 -- and u32::MAX is the hide sentinel,
+        // which -1 would land on exactly, making the pointer vanish near the edge. Clamp instead:
+        // the cursor stops up to a hotspot short of the corner rather than disappearing into it.
+        // Drawing it properly clipped would mean re-rendering the plane, which is the app's side.
         // SAFETY: context is an opaque handle.
-        unsafe { set_android_surface_position(self.context.0.as_ptr(), x, y) };
+        unsafe {
+            set_android_surface_position(self.context.0.as_ptr(), x.max(0) as u32, y.max(0) as u32)
+        };
+    /// Hiding rides the existing position pipe rather than a new FFI entry point: the native side
+    /// forwards whatever it is given straight to the app, so a coordinate the guest can never
+    /// produce carries the message with no change to the C bridge or the AIDL.
+    fn set_cursor_visible(&mut self, visible: bool) {
+        if visible {
+            return; // the next real position makes it visible again
+        }
+        // SAFETY: context is an opaque handle.
+        unsafe {
+            set_android_surface_position(self.context.0.as_ptr(), CURSOR_HIDDEN_POS, CURSOR_HIDDEN_POS)
+        };
+    }
+
     }
 }
 
@@ -227,7 +255,15 @@ impl DisplayT for DisplayAndroid {
         display_params: &DisplayParameters,
         _surf_type: SurfaceType,
     ) -> GpuDisplayResult<Box<dyn GpuDisplaySurface>> {
-        let (requested_width, requested_height) = display_params.get_virtual_display_size();
+        // A parented surface is virtio-gpu's cursor. Its scanout carries no display_params of its
+        // own, so crosvm passes DisplayParameters::default() -- sizing the cursor surface from
+        // that would configure it at the default DISPLAY resolution instead of the cursor plane's
+        // 64x64, and the Android side would allocate a full-screen buffer per pointer image.
+        let (requested_width, requested_height) = if parent_surface_id.is_some() {
+            (CURSOR_PLANE_SIZE, CURSOR_PLANE_SIZE)
+        } else {
+            display_params.get_virtual_display_size()
+        };
         // SAFETY: context is an opaque handle.
         let surface = NonNull::new(unsafe {
             create_android_surface(

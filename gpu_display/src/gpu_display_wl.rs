@@ -185,7 +185,7 @@ impl GpuDisplaySurface for WaylandSurface {
         Ok(())
     }
 
-    fn set_position(&mut self, x: u32, y: u32) {
+    fn set_position(&mut self, x: i32, y: i32) {
         // SAFETY:
         // Safe because only a valid surface is used.
         unsafe {

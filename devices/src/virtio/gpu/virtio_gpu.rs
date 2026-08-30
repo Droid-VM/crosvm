@@ -17,6 +17,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use base::debug;
 use base::error;
+use base::info;
 use base::FromRawDescriptor;
 use base::IntoRawDescriptor;
 use base::Protection;
@@ -29,6 +30,7 @@ use rutabaga_gfx::ResourceCreate3D;
 use rutabaga_gfx::ResourceCreateBlob;
 use rutabaga_gfx::Rutabaga;
 use rutabaga_gfx::RutabagaDescriptor;
+#[cfg(windows)]
 use rutabaga_gfx::RutabagaError;
 use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFromRawDescriptor;
@@ -171,7 +173,9 @@ struct VirtioGpuScanout {
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
+    // Reused packed staging buffer for flushes into padded-stride window buffers.
+    flush_staging: Vec<u8>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,7 +193,7 @@ struct VirtioGpuScanoutSnapshot {
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
 }
 
 impl VirtioGpuScanout {
@@ -206,6 +210,7 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_staging: Vec::new(),
         }
     }
 
@@ -223,6 +228,7 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_staging: Vec::new(),
         }
     }
 
@@ -359,8 +365,8 @@ impl VirtioGpuScanout {
     fn set_position(
         &mut self,
         display: &Rc<RefCell<GpuDisplay>>,
-        x: u32,
-        y: u32,
+        x: i32,
+        y: i32,
     ) -> VirtioGpuResult {
         if let Some(surface_id) = self.surface_id {
             display.borrow_mut().set_position(surface_id, x, y)?;
@@ -381,7 +387,6 @@ impl VirtioGpuScanout {
         display: &Rc<RefCell<GpuDisplay>>,
         resource: &mut VirtioGpuResource,
         rutabaga: &mut Rutabaga,
-        mem: &GuestMemory,
     ) -> VirtioGpuResult {
         let surface_id = match self.surface_id {
             Some(id) => id,
@@ -413,6 +418,9 @@ impl VirtioGpuScanout {
             .framebuffer_region(surface_id, 0, 0, self.width, self.height)
             .ok_or(ErrUnspec)?;
 
+            let packed_stride = self.width as usize * 4;
+            let fb_stride = fb.stride() as usize;
+                rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
         let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
         transfer.stride = fb.stride();
         let fb_slice = fb.as_volatile_slice();
@@ -515,11 +523,15 @@ impl VirtioGpuScanout {
                     );
                 }
             } else {
+                let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
+                transfer.stride = packed_stride as u32;
+                let size = packed_stride * self.height as usize;
+                if self.flush_staging.len() < size {
+                    self.flush_staging.resize(size, 0);
                 if !transfer_ok {
                     return Err(ErrUnspec);
                 }
-                // transfer_read succeeded but data was all zeros and no backing.
-                // Still flip the (empty) data.
+                let staging = &mut self.flush_staging[..size];
             }
         }
 
@@ -866,16 +878,14 @@ impl VirtioGpu {
     }
 
     /// If the resource is the scanout resource, flush it to the display.
-    pub fn flush_resource(&mut self, resource_id: u32, mem: &GuestMemory) -> VirtioGpuResult {
+    pub fn flush_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
         if resource_id == 0 {
             return Ok(OkNoData);
         }
 
+        #[cfg(windows)]
         match self.rutabaga.resource_flush(resource_id) {
-            Ok(_) => {
-                #[cfg(windows)]
-                return Ok(OkNoData);
-            }
+            Ok(_) => return Ok(OkNoData),
             Err(RutabagaError::Unsupported) => {}
             Err(e) => return Err(ErrRutabaga(e)),
         }
@@ -891,22 +901,14 @@ impl VirtioGpu {
             None => return Ok(OkNoData),
         };
 
-        let mut flushed = false;
         for scanout in self.scanouts.values_mut() {
             if scanout.resource_id == resource_id {
-                scanout.flush(&self.display, resource, &mut self.rutabaga, mem)?;
-                flushed = true;
+                scanout.flush(&self.display, resource, &mut self.rutabaga)?;
             }
-        }
-        if !flushed {
-            debug!(
-                "flush_resource: resource {:?} did not match any scanout",
-                resource_id,
-            );
         }
         if self.cursor_scanout.resource_id == resource_id {
             self.cursor_scanout
-                .flush(&self.display, resource, &mut self.rutabaga, mem)?;
+                .flush(&self.display, resource, &mut self.rutabaga)?;
         }
 
         Ok(OkNoData)
@@ -918,17 +920,30 @@ impl VirtioGpu {
         &mut self,
         resource_id: u32,
         scanout_id: u32,
-        x: u32,
-        y: u32,
-        mem: &GuestMemory,
+        x: i32,
+        y: i32,
     ) -> VirtioGpuResult {
         self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
+        // What the guest actually asked for. Two cursor complaints need this and neither can be
+        // settled by reading the code: a VNC client's own pointer drifting up-left from the one
+        // crosvm composites, worst on the double-headed resize cursor, and the native path
+        // freezing the position once the pointer nears the left edge. Both would follow from a
+        // hotspot applied on one path and not the other, or a position clamped after subtracting
+        // it -- so print the four numbers and compare them with what lands on screen.
+        if gpu_diag_enabled() {
+            base::warn!(
+                "CURSOR: res={} pos=({},{}) hot=({},{})",
+                resource_id, x, y, hot_x, hot_y
+            );
+        }
 
         self.cursor_scanout.set_position(&self.display, x, y)?;
 
-        self.flush_resource(resource_id, mem)
+        self.flush_resource(resource_id)
     }
 
+        if gpu_diag_enabled() {
+        }
     /// Moves the cursor's position to the given coordinates.
     pub fn move_cursor(&mut self, _scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
         self.cursor_scanout.set_position(&self.display, x, y)?;
@@ -1206,13 +1221,8 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = match self.rutabaga.map_info(resource_id) {
-            Ok(info) => info,
-            Err(e) => {
-                error!("resource_map_blob: map_info failed for resource {}: {}", resource_id, e);
-                return Err(ErrUnspec);
-            }
-        };
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+
 
         let mut source: Option<VmMemorySource> = None;
         match self.rutabaga.export_blob(resource_id) {
@@ -1264,6 +1274,7 @@ impl VirtioGpu {
                         "resource_map_blob: ExternalMapping fallback, ptr={:?} size={}",
                         mapping.ptr, mapping.size
                     );
+                    // resources mapped via rutabaga must also be marked for unmap via rutabaga.
                     resource.rutabaga_external_mapping = true;
                     source = Some(VmMemorySource::ExternalMapping {
                         ptr: mapping.ptr,
@@ -1281,10 +1292,7 @@ impl VirtioGpu {
             RUTABAGA_MAP_ACCESS_READ => Protection::read(),
             RUTABAGA_MAP_ACCESS_WRITE => Protection::write(),
             RUTABAGA_MAP_ACCESS_RW => Protection::read_write(),
-            _ => {
-                error!("resource_map_blob: invalid access mask 0x{:x}", map_info);
-                return Err(ErrUnspec);
-            }
+            _ => return Err(ErrUnspec),
         };
 
         let cache = if cfg!(feature = "noncoherent-dma")
@@ -1463,18 +1471,11 @@ impl VirtioGpu {
         match scanout_type {
             SurfaceType::Cursor => {
                 if let Some(scanout_parent_surface_id) = scanout_parent_surface_id {
-                    match scanout.create_surface(
+                    scanout.create_surface(
                         &self.display,
                         Some(scanout_parent_surface_id),
                         scanout_rect,
-                    ) {
-                        Ok(_) => {}
-                        Err(ErrDisplay(GpuDisplayError::Unsupported)) => {
-                            // Display doesn't support cursor subsurfaces (e.g. VNC).
-                            return Ok(OkNoData);
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    )?;
                 }
             }
             SurfaceType::Scanout => {
@@ -1500,22 +1501,41 @@ impl VirtioGpu {
             .context("failed to suspend rutabaga")
     }
 
-    /// Clears all GPU resources and scanout bindings.
-    /// Called on device reset so the next driver starts with a clean state.
-    pub fn reset_state(&mut self) {
-        let resource_ids: Vec<u32> = self.resources.keys().copied().collect();
-        for id in resource_ids {
-            if let Some(resource) = self.resources.remove(&id) {
-                if resource.rutabaga_external_mapping {
-                    let _ = self.rutabaga.unmap(id);
-                }
-                let _ = self.rutabaga.unref_resource(id);
-            }
-        }
+    /// Reset the device to a clean state on a guest-initiated device reset: forget each scanout's
+    /// resource association and drop every resource/context (ours and rutabaga's), while keeping
+    /// the rutabaga render server alive so re-init is instant. Lets a guest that takes the device
+    /// over from another one (UEFI firmware -> OS) recreate resource ids from scratch -- rutabaga
+    /// rejects a duplicate resource id otherwise.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
         for scanout in self.scanouts.values_mut() {
             scanout.resource_id = None;
+            // Drop the previous guest's surface: update_scanout_resource() only recreates a
+            // surface when the modeset size differs from scanout.width/height, so after the
+            // restore below, an OS modeset to the configured size would otherwise keep using a
+            // stale firmware-geometry surface (its content posted top-left into a larger frame).
+            scanout.release_surface(&self.display);
+            // Also restore the configured boot resolution. set_scanout() tracks the guest's
+            // modesets in scanout.width/height, which GET_DISPLAY_INFO then reports; a device
+            // reset means a NEW guest is taking over, and the previous guest's last modeset
+            // (e.g. the UEFI firmware console at 800x600) must not leak into it. The guest
+            // virtio-gpu driver prunes any EDID *preferred* mode that mismatches display info
+            // by >16px, so a leaked firmware resolution permanently locks the OS out of the
+            // configured mode and it falls back to an arbitrary (wrong-aspect) one.
+            if let Some(params) = &scanout.display_params {
+                let (width, height) = params.get_virtual_display_size();
+                info!(
+                    "gpu reset: scanout {:?} restored {}x{} -> {}x{}, surface dropped",
+                    scanout.scanout_id, scanout.width, scanout.height, width, height
+                );
+                scanout.width = width;
+                scanout.height = height;
+            }
         }
         self.cursor_scanout.resource_id = None;
+        self.cursor_scanout.release_surface(&self.display);
+        self.resources.clear();
+        self.rutabaga.reset().context("failed to reset rutabaga")?;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> anyhow::Result<VirtioGpuSnapshot> {

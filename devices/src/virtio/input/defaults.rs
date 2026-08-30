@@ -65,6 +65,19 @@ pub fn new_mouse_config(idx: u32) -> VirtioInputConfig {
     )
 }
 
+/// Instantiates a VirtioInputConfig object for an absolute-pointing mouse (the qemu usb-tablet
+/// profile): ABS_X/ABS_Y positioning plus mouse buttons and a scroll wheel. Remote displays
+/// (VNC) need absolute coordinates so the client cursor maps 1:1 onto the guest with no drift,
+/// while the button/wheel set keeps full mouse semantics (hover, right-click, scroll).
+    VirtioInputConfig::new(
+        virtio_input_device_ids::new(0, 0, 0, 0),
+        format!("virtio-abs-mouse-{idx}"),
+        virtio_input_bitmap::new([0u8; 128]),
+        default_absolute_mouse_events(),
+        default_trackpad_absinfo(width, height),
+    )
+}
+
 /// Instantiates a VirtioInputConfig object with the default configuration for a keyboard.
 /// It supports the same keys as a en-us keyboard and the CAPSLOCK, NUMLOCK and SCROLLLOCK leds.
 pub fn new_keyboard_config(idx: u32) -> VirtioInputConfig {
@@ -308,15 +321,32 @@ fn default_trackpad_events() -> BTreeMap<u16, virtio_input_bitmap> {
     supported_events
 }
 
+fn default_absolute_mouse_events() -> BTreeMap<u16, virtio_input_bitmap> {
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(
+        EV_KEY,
+        virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]),
+    );
+    supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y]));
+    // Advertise the horizontal wheel too so the guest keeps our REL_HWHEEL events (2D scrolling).
+    supported_events.insert(
+        EV_REL,
+        virtio_input_bitmap::from_bits(&[REL_WHEEL, REL_HWHEEL]),
+    );
+    supported_events
+}
+
 fn default_mouse_events() -> BTreeMap<u16, virtio_input_bitmap> {
     let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
     supported_events.insert(
         EV_KEY,
         virtio_input_bitmap::from_bits(&[BTN_LEFT, BTN_RIGHT, BTN_MIDDLE]),
     );
+    // REL_HWHEEL: without it the guest drops horizontal-scroll events, so 2D/side scrolling
+    // (two-finger pan sideways, tilt wheel) never reaches apps.
     supported_events.insert(
         EV_REL,
-        virtio_input_bitmap::from_bits(&[REL_X, REL_Y, REL_WHEEL]),
+        virtio_input_bitmap::from_bits(&[REL_X, REL_Y, REL_WHEEL, REL_HWHEEL]),
     );
     supported_events
 }

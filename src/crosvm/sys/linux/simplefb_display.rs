@@ -31,6 +31,15 @@ pub struct SimplefbDisplayParams {
     pub size: u64,
 }
 
+pub enum SimplefbDisplayTarget {
+    Vnc {
+        addr: String,
+        password: Option<String>,
+    },
+    /// The Android Surface the app hands over through the display service binder. Input does
+    /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
+    /// the virtio-gpu native-display path.
+    Android { service_name: String },
 pub struct VncDisplayTarget {
     pub addr: String,
     pub password: Option<String>,
@@ -41,12 +50,19 @@ const DEFAULT_FPS: u32 = 30;
 pub fn start_simplefb_display_thread(
     guest_mem: GuestMemory,
     params: SimplefbDisplayParams,
-    target: VncDisplayTarget,
-    event_devices: Vec<EventDevice>,
+    target: SimplefbDisplayTarget,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("simplefb_display".into())
         .spawn(move || {
+                SimplefbDisplayTarget::Vnc {
+                    addr,
+                    password,
+                } => GpuDisplay::open_vnc_tcp(
+                ),
+                SimplefbDisplayTarget::Android { service_name } => {
+                }
+            };
             let display_result = GpuDisplay::open_vnc_tcp(
                 &target.addr,
                 params.width,
@@ -56,7 +72,7 @@ pub fn start_simplefb_display_thread(
             let mut display = match display_result {
                 Ok(d) => d,
                 Err(e) => {
-                    error!("simplefb: failed to open VNC display: {:?}", e);
+                    error!("simplefb: failed to open display: {:?}", e);
                     return;
                 }
             };

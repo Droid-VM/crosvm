@@ -497,6 +497,31 @@ impl Rutabaga {
         component.suspend()
     }
 
+    /// Drops all resources and contexts, releasing them against the still-live components (and
+    /// their render server), which are kept intact. Used on a guest-initiated virtio-gpu device
+    /// reset (e.g. UEFI firmware hands the device off to the OS): the next guest must be able to
+    /// recreate resource ids from scratch, and `resource_create_*` rejects a duplicate id
+    /// (`RutabagaError::InvalidResourceId`), so leftover resources would otherwise break it.
+    /// Keeping the components avoids paying to re-initialize the renderer.
+    pub fn reset(&mut self) -> RutabagaResult<()> {
+        // Destroy contexts first: dropping each runs its Drop (for gfxstream,
+        // stream_renderer_context_destroy), which detaches the context's resources host-side so
+        // the resource refcounts can reach zero when we unref below.
+        self.contexts.clear();
+        // Release every resource THROUGH the component (e.g. stream_renderer_resource_unref).
+        // Merely dropping the RutabagaResource does NOT release the backend's colorbuffer -- the
+        // backend keeps it and aborts (createColorBufferWithResourceHandle) when the next guest
+        // re-creates the same resource id.
+        let resource_ids: Vec<u32> = self.resources.keys().copied().collect();
+        if let Some(component) = self.components.get_mut(&self.default_component) {
+            for resource_id in resource_ids {
+                component.unref_resource(resource_id);
+            }
+        }
+        self.resources.clear();
+        Ok(())
+    }
+
     /// Take a snapshot of Rutabaga's current state. The snapshot is serialized into an opaque byte
     /// stream and written to `w`.
     pub fn snapshot(&self, directory: &Path) -> RutabagaResult<()> {

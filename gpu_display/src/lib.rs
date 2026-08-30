@@ -265,7 +265,34 @@ trait GpuDisplaySurface {
     }
 
     /// Sets the position of the identified subsurface relative to its parent.
-    fn set_position(&mut self, _x: u32, _y: u32) {
+    ///
+    /// For a cursor surface this is the TOP-LEFT CORNER of the cursor image, not where the pointer
+    /// points: virtio-gpu carries the guest's `crtc_x/crtc_y`, and the guest has already subtracted
+    /// the hotspot. A backend that treats it as the pointer position and subtracts the hotspot
+    /// again draws the cursor up and left of the truth by exactly the hotspot -- barely visible on
+    /// an arrow (5,5), a very visible 22px on a resize arrow.
+    ///
+    /// Signed because `crtc_x` is: a pointer within `hot_x` of the left edge puts the image origin
+    /// off-screen, and the wire carries that as a negative number in a `__le32` field.
+    fn set_position(&mut self, _x: i32, _y: i32) {
+        // no-op
+    }
+
+    /// Sets the cursor hotspot: where inside the cursor image the pointer actually points.
+    ///
+    /// virtio-gpu carries this on every UPDATE_CURSOR and it is not optional dressing -- get it
+    /// wrong and an I-beam or a resize arrow clicks somewhere other than where it looks like it
+    /// points. Only backends that draw a real cursor need it, so the default ignores it.
+    fn set_cursor_hotspot(&mut self, _hot_x: u32, _hot_y: u32) {
+        // no-op
+    }
+
+    /// Show or hide the cursor this surface carries.
+    ///
+    /// The guest hides its pointer with UPDATE_CURSOR resource_id=0 -- switching to a text console
+    /// does exactly that. Without a signal the backend keeps presenting the last cursor image it
+    /// was given, so the pointer lingers on a console that should have none.
+    fn set_cursor_visible(&mut self, _visible: bool) {
         // no-op
     }
 
@@ -775,7 +802,7 @@ impl GpuDisplay {
     /// Sets the position of the identified subsurface relative to its parent.
     ///
     /// The change in position will not be visible until `commit` is called for the parent surface.
-    pub fn set_position(&mut self, surface_id: u32, x: u32, y: u32) -> GpuDisplayResult<()> {
+    pub fn set_position(&mut self, surface_id: u32, x: i32, y: i32) -> GpuDisplayResult<()> {
         let surface = self
             .surfaces
             .get_mut(&surface_id)
@@ -784,4 +811,33 @@ impl GpuDisplay {
         surface.set_position(x, y);
         Ok(())
     }
+
+    /// Sets the cursor hotspot on the identified surface. See
+    /// `GpuDisplaySurface::set_cursor_hotspot`.
+    pub fn set_cursor_hotspot(
+        &mut self,
+        surface_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> GpuDisplayResult<()> {
+        let surface = self
+            .surfaces
+            .get_mut(&surface_id)
+            .ok_or(GpuDisplayError::InvalidSurfaceId)?;
+
+        surface.set_cursor_hotspot(hot_x, hot_y);
+        Ok(())
+    }
+
+    /// See `GpuDisplaySurface::set_cursor_visible`.
+    pub fn set_cursor_visible(&mut self, surface_id: u32, visible: bool) -> GpuDisplayResult<()> {
+        let surface = self
+            .surfaces
+            .get_mut(&surface_id)
+            .ok_or(GpuDisplayError::InvalidSurfaceId)?;
+
+        surface.set_cursor_visible(visible);
+        Ok(())
+    }
+}
 }

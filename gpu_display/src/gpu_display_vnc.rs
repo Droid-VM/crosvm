@@ -65,6 +65,27 @@ extern "C" {
         server: *mut std::ffi::c_void,
         out: *mut VncInputEvent,
     ) -> c_int;
+    fn vnc_server_set_cursor(
+        server: *mut std::ffi::c_void,
+        argb: *const u8,
+        width: c_int,
+        height: c_int,
+        hot_x: c_int,
+        hot_y: c_int,
+    );
+    fn vnc_server_set_cursor_pos(server: *mut std::ffi::c_void, x: c_int, y: c_int);
+    #[allow(clippy::too_many_arguments)]
+        server: *mut std::ffi::c_void,
+        clean: *const u8,
+        clean_size: u32,
+        cursor_argb: *const u8,
+        cw: c_int,
+        ch: c_int,
+        cx: c_int,
+        cy: c_int,
+        visible: c_int,
+        full: c_int,
+    );
 }
 
 struct VncServerHandle {
@@ -85,8 +106,45 @@ impl Drop for VncServerHandle {
 struct SharedFramebuffer {
     width: u32,
     height: u32,
+    /// The guest scanout with NO cursor composited into it. Kept pristine: it is the source the
+    /// bridge restores from when the pointer moves off a pixel, which is why this design needs no
+    /// save-under-cursor buffer at all.
     data: Vec<u8>,
     server: Arc<VncServerHandle>,
+    cursor: CursorState,
+}
+
+/// The guest's hardware cursor, as last reported by virtio-gpu.
+#[derive(Default)]
+struct CursorState {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// Top-left corner of the cursor image, as the guest reported it. Signed: it goes negative
+    /// when the pointer is within the hotspot of the left or top edge. No hotspot is kept beside
+    /// it: the bridge draws the image at this corner, and the hotspot is the guest's business.
+    x: i32,
+    y: i32,
+    visible: bool,
+}
+
+impl SharedFramebuffer {
+        let c = &self.cursor;
+        let has_img = !c.pixels.is_empty() && c.width > 0 && c.height > 0;
+        unsafe {
+                self.server.ptr,
+                if has_img { c.pixels.as_ptr() } else { std::ptr::null() },
+                c.width as c_int,
+                c.height as c_int,
+                c.x as c_int,
+                c.y as c_int,
+                (c.visible && has_img) as c_int,
+                full as c_int,
+            )
+        }
+    }
+}
+
 }
 
 struct VncSurface {
@@ -137,7 +195,95 @@ impl GpuDisplaySurface for VncSurface {
                 );
             }
             fb.data[..copy_len].copy_from_slice(&self.local_buffer[..copy_len]);
+            // fb.data stays cursor-free; the bridge blends the pointer on its way out.
+        }
+    }
 
+}
+
+/// The guest's hardware cursor, published to VNC clients two ways at once.
+///
+/// It is composited into the outgoing frame by our own bridge, AND handed to LibVNCServer as an
+/// RFB cursor. The composited one is the one that has to be right: the DroidVM app drives the
+/// pointer over its own channel, so a VNC client can be a passive viewer whose idea of where the
+/// pointer is has nothing to do with the guest's. The RFB cursor is what lets a client that
+/// speaks the Cursor pseudo-encoding move the pointer for free, and it doubles as an independent
+/// rendering of the same data -- differencing a frame grabbed with the encoding against one
+/// grabbed without it is how the hotspot bug in the composited path was caught.
+///
+/// that to the two rectangles the pointer left and entered rather than a whole frame.
+struct VncCursorSurface {
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+    server: Arc<VncServerHandle>,
+    shared_fb: Arc<Mutex<SharedFramebuffer>>,
+    pixels: Vec<u8>,
+}
+
+impl GpuDisplaySurface for VncCursorSurface {
+    fn framebuffer(&mut self) -> Option<GpuDisplayFramebuffer> {
+        Some(GpuDisplayFramebuffer::new(
+            VolatileSlice::new(self.pixels.as_mut_slice()),
+            self.width * 4,
+            4,
+        ))
+    }
+
+    fn flip(&mut self) {
+        // Publish to our own compositor: this is the one that works when the DroidVM app drives
+        // the pointer in RELATIVE mode, where a client drawing at its own pointer position would
+        // put the cursor somewhere unrelated to where the guest thinks it is.
+        if let Ok(mut fb) = self.shared_fb.lock() {
+            fb.cursor.pixels.clear();
+            fb.cursor.pixels.extend_from_slice(&self.pixels);
+            fb.cursor.width = self.width;
+            fb.cursor.height = self.height;
+            fb.cursor.visible = true;
+        }
+        // And as an RFB cursor, which is what a client with the Cursor pseudo-encoding draws
+        // itself. Unlike the composited copy this one carries the hotspot, because LibVNCServer
+        // positions by the pointer and subtracts it.
+        // SAFETY: `pixels` is width*height*4 bytes and outlives the call.
+        unsafe {
+            vnc_server_set_cursor(
+                self.server.ptr,
+                self.pixels.as_ptr(),
+                self.width as c_int,
+                self.height as c_int,
+                self.hot_x as c_int,
+                self.hot_y as c_int,
+            )
+        }
+    }
+
+    fn set_cursor_hotspot(&mut self, hot_x: u32, hot_y: u32) {
+        self.hot_x = hot_x;
+        self.hot_y = hot_y;
+    }
+
+    /// Tell LibVNCServer where the pointer is.
+    ///
+    /// Not redundant with the pointer events it already sees: the DroidVM app drives input over
+    /// its own channel, so a VNC client can be a passive VIEWER that never sends a PointerEvent.
+    /// Its cursorX/cursorY would then stay at the origin and the composited pointer would sit in
+    /// the top-left corner no matter where the guest actually put it.
+    fn set_position(&mut self, x: i32, y: i32) {
+        if let Ok(mut fb) = self.shared_fb.lock() {
+            fb.cursor.x = x;
+            fb.cursor.y = y;
+            // Partial: only the rectangles the pointer left and entered. Without this the pointer
+            // would only move when the guest happened to send a frame.
+        // LibVNCServer wants the POINTER, not the image: it draws the cursor at
+        // cursorX - hot_x. (x,y) is the image origin, so the hotspot goes back on here.
+        // SAFETY: server handle is valid for this surface's lifetime.
+        unsafe {
+            vnc_server_set_cursor_pos(
+                self.server.ptr,
+                x + self.hot_x as c_int,
+                y + self.hot_y as c_int,
+            )
             unsafe {
                 vnc_server_update_framebuffer(
                     fb.server.ptr,
@@ -147,6 +293,16 @@ impl GpuDisplaySurface for VncSurface {
             }
         }
     }
+
+    fn set_cursor_visible(&mut self, visible: bool) {
+        if let Ok(mut fb) = self.shared_fb.lock() {
+            fb.cursor.visible = visible;
+        if !visible {
+            // SAFETY: null pixels is the bridge's hide request.
+            unsafe { vnc_server_set_cursor(self.server.ptr, std::ptr::null(), 0, 0, 0, 0) }
+        }
+    }
+
 }
 
 pub struct DisplayVnc {
@@ -158,6 +314,13 @@ pub struct DisplayVnc {
     input_queue: VecDeque<VncInputEvent>,
     next_tracking_id: i32,
     prev_button_mask: u8,
+const VNC_ABS_MAX: i32 = 0x7FFF;
+
+/// Scale a VNC framebuffer coordinate in `0..extent` (where `extent` is the live framebuffer
+/// width/height, updated on guest resize) to `0..=VNC_ABS_MAX`.
+fn vnc_norm_abs(v: i32, extent: u32) -> i32 {
+    let extent = extent.max(1) as i64;
+    (((v.max(0) as i64) * (VNC_ABS_MAX as i64)) / extent).clamp(0, VNC_ABS_MAX as i64) as i32
 }
 
 impl DisplayVnc {
@@ -226,14 +389,33 @@ impl DisplayVnc {
         let _ = self.event.wait_timeout(std::time::Duration::ZERO);
     }
 
-    fn next_touch_tracking_id(&mut self) -> i32 {
-        let id = self.next_tracking_id;
-        self.next_tracking_id = self.next_tracking_id.wrapping_add(1);
-        id
-    }
+    /// Mouse mode (qemu usb-tablet equivalent): absolute position on every event (hover
+    /// works), button transitions from the RFB mask, wheel as REL_WHEEL.
+    /// RFB button mask: bit0=left, bit1=middle, bit2=right, bit3/4=wheel up/down.
+        let cur_mask = ev.button_mask;
+        let prev_mask = self.prev_button_mask;
+        self.prev_button_mask = cur_mask;
+        let changed = cur_mask ^ prev_mask;
 
-    fn current_tracking_id(&self) -> i32 {
-        self.next_tracking_id.wrapping_sub(1)
+        let mut events = vec![
+            virtio_input_event::absolute_x(vnc_norm_abs(ev.x, self.width)),
+            virtio_input_event::absolute_y(vnc_norm_abs(ev.y, self.height)),
+        ];
+        if changed & 0x01 != 0 {
+            events.push(virtio_input_event::left_click(cur_mask & 0x01 != 0));
+        }
+        if changed & 0x02 != 0 {
+            events.push(virtio_input_event::middle_click(cur_mask & 0x02 != 0));
+        }
+        if changed & 0x04 != 0 {
+            events.push(virtio_input_event::right_click(cur_mask & 0x04 != 0));
+        }
+        if changed & 0x08 != 0 && cur_mask & 0x08 != 0 {
+            events.push(virtio_input_event::wheel(1));
+        }
+        if changed & 0x10 != 0 && cur_mask & 0x10 != 0 {
+            events.push(virtio_input_event::wheel(-1));
+        }
     }
 
     fn convert_next_event(&mut self) -> Option<GpuDisplayEvents> {
@@ -333,10 +515,34 @@ impl DisplayT for DisplayVnc {
         _surface_id: u32,
         _scanout_id: Option<u32>,
         display_params: &DisplayParameters,
-        _surf_type: SurfaceType,
+        surf_type: SurfaceType,
     ) -> GpuDisplayResult<Box<dyn GpuDisplaySurface>> {
+        // A parented surface is virtio-gpu's cursor (see VirtioGpu::update_cursor). It must be
+        // handled BEFORE the sizing below: the cursor scanout carries no display_params of its
+        // own, so crosvm passes DisplayParameters::default() -- taking the size from there would
+        // resize the whole VNC screen to the default resolution the moment a pointer appeared.
         if parent_surface_id.is_some() {
-            return Err(GpuDisplayError::Unsupported);
+            if !matches!(surf_type, SurfaceType::Cursor) {
+                return Err(GpuDisplayError::Unsupported);
+            }
+            // virtio-gpu's cursor plane is fixed at 64x64 and the guest's cursor resource is
+            // allocated to match.
+            let (width, height) = (64u32, 64u32);
+            base::info!("VNC: created cursor surface {}x{}", width, height);
+            let shared_fb = self
+                .shared_fb
+                .clone()
+                .ok_or(GpuDisplayError::Unsupported)?;
+            return Ok(Box::new(VncCursorSurface {
+                width,
+                height,
+                // Replaced by the first set_cursor_hotspot, which virtio-gpu sends with the image.
+                hot_x: 0,
+                hot_y: 0,
+                server: self.server.clone(),
+                shared_fb,
+                pixels: vec![0u8; (width as usize) * (height as usize) * 4],
+            }));
         }
 
         let (req_w, req_h) = display_params.get_virtual_display_size();
@@ -369,6 +575,7 @@ impl DisplayT for DisplayVnc {
             height,
             data: vec![0u8; buf_size],
             server: self.server.clone(),
+            cursor: CursorState::default(),
         }));
 
         self.shared_fb = Some(shared_fb.clone());

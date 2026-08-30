@@ -200,6 +200,7 @@ use crate::crosvm::config::InputDeviceOption;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_HEIGHT;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_WIDTH;
+use crate::crosvm::config::NORMALIZED_ABS_MAX;
 #[cfg(feature = "gdb")]
 use crate::crosvm::gdb::gdb_thread;
 #[cfg(feature = "gdb")]
@@ -217,6 +218,56 @@ const KVM_PATH: &str = "/dev/kvm";
 const GENIEZONE_PATH: &str = "/dev/gzvm";
 #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
 static GUNYAH_PATH: &str = "/dev/gunyah";
+
+#[cfg(feature = "vnc")]
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+fn create_display_window_input_devices(
+    cfg: &Config,
+    default_width: u32,
+    default_height: u32,
+    devs: &mut Vec<VirtioDeviceStub>,
+) -> DeviceResult<Vec<EventDevice>> {
+    let mut event_devices = Vec::new();
+    if cfg.display_window_mouse {
+        let (event_device_socket, virtio_dev_socket) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .context("failed to create socket")?;
+        let mut multi_touch_width = default_width;
+        let mut multi_touch_height = default_height;
+        for input in &cfg.virtio_input {
+        .context("failed to set up multi-touch device")?;
+        devs.push(VirtioDeviceStub {
+            dev: Box::new(dev),
+            jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+        });
+        event_devices.push(EventDevice::touchscreen(event_device_socket));
+
+        {
+            let (event_device_socket, virtio_dev_socket) =
+                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                    .context("failed to create socket")?;
+            let dev = virtio::input::new_mouse(
+                u32::MAX,
+                virtio_dev_socket,
+                virtio::base_features(cfg.protection_type),
+            )
+            .context("failed to set up relative mouse device")?;
+            devs.push(VirtioDeviceStub {
+                dev: Box::new(dev),
+                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+            });
+            event_devices.push(EventDevice::mouse(event_device_socket));
+        }
+    }
+    if cfg.display_window_keyboard {
+        let (event_device_socket, virtio_dev_socket) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .context("failed to create socket")?;
+        let dev = virtio::input::new_keyboard(
+            u32::MAX,
+            virtio_dev_socket,
+    Ok(event_devices)
+}
 
 fn create_virtio_devices(
     cfg: &Config,
@@ -296,85 +347,15 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")]
     {
         if let Some(gpu_parameters) = &cfg.gpu_parameters {
-            let mut event_devices = Vec::new();
-            if cfg.display_window_mouse {
-                let display_param = if gpu_parameters.display_params.is_empty() {
-                    Default::default()
-                } else {
-                    gpu_parameters.display_params[0].clone()
-                };
-                let (gpu_display_w, gpu_display_h) = display_param.get_virtual_display_size();
-
-                let (event_device_socket, virtio_dev_socket) =
-                    StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                        .context("failed to create socket")?;
-                let mut multi_touch_width = gpu_display_w;
-                let mut multi_touch_height = gpu_display_h;
-                let mut multi_touch_name = None;
-                for input in &cfg.virtio_input {
-                    if let InputDeviceOption::MultiTouch {
-                        width,
-                        height,
-                        name,
-                        ..
-                    } = input
-                    {
-                        if let Some(width) = width {
-                            multi_touch_width = *width;
-                        }
-                        if let Some(height) = height {
-                            multi_touch_height = *height;
-                        }
-                        if let Some(name) = name {
-                            multi_touch_name = Some(name.as_str());
-                        }
-                        break;
-                    }
-                }
-                let dev = virtio::input::new_multi_touch(
-                    // u32::MAX is the least likely to collide with the indices generated above for
-                    // the multi_touch options, which begin at 0.
-                    u32::MAX,
-                    virtio_dev_socket,
-                    multi_touch_width,
-                    multi_touch_height,
-                    multi_touch_name,
-                    virtio::base_features(cfg.protection_type),
-                )
-                .context("failed to set up mouse device")?;
-                devs.push(VirtioDeviceStub {
-                    dev: Box::new(dev),
-                    jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                });
-                event_devices.push(EventDevice::touchscreen(event_device_socket));
-            }
-            if cfg.display_window_keyboard {
-                let (event_device_socket, virtio_dev_socket) =
-                    StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                        .context("failed to create socket")?;
-                let dev = virtio::input::new_keyboard(
-                    // u32::MAX is the least likely to collide with the indices generated above for
-                    // the multi_touch options, which begin at 0.
-                    u32::MAX,
-                    virtio_dev_socket,
-                    virtio::base_features(cfg.protection_type),
-                )
-                .context("failed to set up keyboard device")?;
-                devs.push(VirtioDeviceStub {
-                    dev: Box::new(dev),
-                    jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                });
-                event_devices.push(EventDevice::keyboard(event_device_socket));
-            }
-
-            #[cfg(feature = "vnc")]
-            let event_devices = if cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
-                log::info!("GPU: simplefb+VNC mode — event_devices go to simplefb bridge");
-                *simplefb_event_devices_out = event_devices;
-                Vec::new()
+            let display_param = if gpu_parameters.display_params.is_empty() {
+                Default::default()
             } else {
-                event_devices
+                gpu_parameters.display_params[0].clone()
             };
+            let (gpu_display_w, gpu_display_h) = display_param.get_virtual_display_size();
+            let event_devices =
+                create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
+
 
             let (gpu_control_host_tube, gpu_control_device_tube) =
                 Tube::pair().context("failed to create gpu tube")?;
@@ -576,6 +557,7 @@ fn create_virtio_devices(
 
     let mut keyboard_idx = 0;
     let mut mouse_idx = 0;
+    let mut absolute_mouse_idx = 0;
     let mut rotary_idx = 0;
     let mut switches_idx = 0;
     let mut multi_touch_idx = 0;
@@ -610,28 +592,46 @@ fn create_virtio_devices(
                 mouse_idx += 1;
                 dev
             }
+            InputDeviceOption::AbsoluteMouse {
+                path,
+                width,
+                height,
+            } => {
+                let width = *width;
+                let height = *height;
+                // Omitted width/height => resolution-independent normalized mode: advertise a
+                // fixed ABS range (NORMALIZED_ABS_MAX) and let the feeder scale coordinates to it
+                // against the live display size, so the mapping stays 1:1 across guest auto-resize
+                // (matches the VNC pointer path). An explicit width/height keeps the legacy
+                // pixel-sized range for backward compatibility.
+                let dev = create_absolute_mouse_device(
+                    cfg.protection_type,
+                    cfg.jail_config.as_ref(),
+                    path.as_path(),
+                    width.unwrap_or(NORMALIZED_ABS_MAX),
+                    height.unwrap_or(NORMALIZED_ABS_MAX),
+                    absolute_mouse_idx,
+                )?;
+                absolute_mouse_idx += 1;
+                dev
+            }
             InputDeviceOption::MultiTouch {
                 path,
                 width,
                 height,
                 name,
             } => {
-                let mut width = *width;
-                let mut height = *height;
-                if multi_touch_idx == 0 {
-                    if width.is_none() {
-                        width = cfg.display_input_width;
-                    }
-                    if height.is_none() {
-                        height = cfg.display_input_height;
-                    }
-                }
+                let width = *width;
+                let height = *height;
+                // Omitted width/height => resolution-independent normalized mode (see AbsoluteMouse
+                // above): fixed ABS range + feeder-side scaling to the live display size, correct
+                // across guest auto-resize. Explicit width/height keeps the legacy pixel range.
                 let dev = create_multi_touch_device(
                     cfg.protection_type,
                     cfg.jail_config.as_ref(),
                     path.as_path(),
-                    width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
-                    height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
+                    width.unwrap_or(NORMALIZED_ABS_MAX),
+                    height.unwrap_or(NORMALIZED_ABS_MAX),
                     name.as_deref(),
                     multi_touch_idx,
                 )?;
@@ -1938,6 +1938,9 @@ fn run_gunyah(
     use hypervisor::gunyah::GunyahVcpu;
     use hypervisor::gunyah::GunyahVm;
 
+    // The Gunyah RingBlob-pin workaround (GFXSTREAM_GUNYAH_PIN_RINGBLOB) is now driven by the
+    // `--gpu gunyah-pvm=true` sub-option, plumbed in create_gpu_device(), so it can be turned
+    // off on non-Gunyah SoCs.
     let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
     let gunyah = Gunyah::new_with_path(device_path)
         .with_context(|| format!("failed to open Gunyah device {}", device_path.display()))?;
@@ -3746,12 +3749,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         }
     };
 
-    // If simplefb and a VNC display backend are both configured, spawn a bridge
-    // thread that polls guest memory and pushes frames to the VNC display.
-    // In protected VM mode, the simplefb region is backed by a DMA-BUF from
-    // the DMA heap and shared via map_cma_region (same as MMIO devices).
-    // The display bridge reads from the host mmap of the same DMA-BUF.
-    #[cfg(feature = "vnc")]
+    // If simplefb and a display backend are configured, spawn a bridge thread that polls guest
+    // memory and pushes frames to that display -- VNC, or the Android Surface from the display
+    // service when one is configured (the bridge itself is backend-agnostic).
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
         let vnc_cfg = cfg.vnc_server.as_ref()?;
@@ -3788,6 +3789,19 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             size: fb_size,
         };
 
+        #[cfg(feature = "android_display")]
+        #[cfg(not(feature = "android_display"))]
+
+            None => {
+                #[cfg(feature = "vnc")]
+                {
+                        simplefb_display::SimplefbDisplayTarget::Vnc {
+                            addr: format!("{}:{}", host, port),
+                            password: vnc_cfg.password.clone(),
+                }
+                #[cfg(not(feature = "vnc"))]
+                return None;
+            }
         let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
         let port = vnc_cfg.port.unwrap_or(5900);
         let addr = format!("{}:{}", host, port);
@@ -3796,7 +3810,11 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             password: vnc_cfg.password.clone(),
         };
 
-        match simplefb_display::start_simplefb_display_thread(guest_mem, params, target, simplefb_event_devices) {
+        match simplefb_display::start_simplefb_display_thread(
+            guest_mem,
+            params,
+            target,
+        ) {
             Ok(handle) => {
                 info!("simplefb display bridge started");
                 Some(handle)

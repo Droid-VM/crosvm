@@ -451,7 +451,7 @@ impl Frontend {
                 None,
             ),
             GpuCommand::ResourceFlush(info) => {
-                self.virtio_gpu.flush_resource(info.resource_id.to_native(), mem)
+                self.virtio_gpu.flush_resource(info.resource_id.to_native())
             }
             GpuCommand::TransferToHost2d(info) => {
                 let resource_id = info.resource_id.to_native();
@@ -489,17 +489,21 @@ impl Frontend {
             GpuCommand::ResourceDetachBacking(info) => {
                 self.virtio_gpu.detach_backing(info.resource_id.to_native())
             }
+            // pos is the guest's crtc_x/crtc_y for the cursor plane -- the image's top-left corner,
+            // already hotspot-compensated, and SIGNED. Reading it unsigned turns a pointer against
+            // the left edge into a position near 4.29e9.
             GpuCommand::UpdateCursor(info) => self.virtio_gpu.update_cursor(
                 info.resource_id.to_native(),
                 info.pos.scanout_id.to_native(),
-                info.pos.x.into(),
-                info.pos.y.into(),
-                mem,
+                info.pos.x.to_native() as i32,
+                info.pos.y.to_native() as i32,
+                info.hot_x.into(),
+                info.hot_y.into(),
             ),
             GpuCommand::MoveCursor(info) => self.virtio_gpu.move_cursor(
                 info.pos.scanout_id.to_native(),
-                info.pos.x.into(),
-                info.pos.y.into(),
+                info.pos.x.to_native() as i32,
+                info.pos.y.to_native() as i32,
             ),
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id.to_native();
@@ -1110,7 +1114,19 @@ impl Worker {
     }
 
     fn on_reset(&mut self) -> anyhow::Result<()> {
-        self.state.virtio_gpu.reset_state();
+        // Deactivate without tearing down: release the virtqueues/interrupt and the fence
+        // handler's activation resources, but keep the worker thread + rutabaga/render server
+        // alive so the next activate() succeeds. (rutabaga is intentionally NOT suspended here --
+        // on_activate() resumes unconditionally, which already happens on the very first activate,
+        // so an unpaired resume is safe.)
+        self.fence_handler_resources.lock().take();
+        self.activation_resources = None;
+        // Drop all guest resources/contexts so the next guest (e.g. the OS after UEFI firmware
+        // used then reset the device) can recreate resource ids from a clean slate.
+        self.state
+            .virtio_gpu
+            .reset()
+            .context("failed to reset VirtioGpu")?;
         Ok(())
     }
 
@@ -2140,38 +2156,45 @@ impl VirtioDevice for Gpu {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        match self.worker_state {
-            WorkerState::Active => {
-                // Suspend the worker instead of destroying it so it can be re-activated
-                // (e.g. when the guest driver resets the device during UEFI→Linux transition).
-                if let (
-                    Some(worker_request_sender),
-                    Some(worker_response_receiver),
-                    Some(worker_suspend_evt),
-                ) = (
-                    &self.worker_request_sender,
-                    &self.worker_response_receiver,
-                    &self.worker_suspend_evt,
-                ) {
-                    let _ = worker_request_sender.send(WorkerRequest::Suspend);
-                    let _ = worker_suspend_evt.signal();
-                    let _ = worker_response_receiver.recv();
-                    let _ = worker_suspend_evt.reset();
-                    // Clear all GPU state (resources, scanouts) so the next driver
-                    // starts with a clean slate.
-                    let _ = worker_request_sender.send(WorkerRequest::Reset);
-                    let _ = worker_response_receiver.recv();
-                }
-                self.worker_state = WorkerState::Inactive;
-            }
-            WorkerState::Inactive => {
-                // Worker is already idle, nothing to do.
-            }
-            WorkerState::Error => {
-                // Worker is broken, fully tear it down.
-                self.stop_worker_thread();
+        // Do NOT tear the worker down here. on_device_sandboxed() starts it exactly once, so a
+        // stopped worker is never restarted (start_worker_thread() consumes one-shot inputs it
+        // can't reacquire), and the next activate() then fails with "worker thread missing on
+        // activate?". That fires on every UEFI boot: the EDK2 virtio-gpu driver activates the
+        // device for its boot display, then resets it on ExitBootServices, and the guest OS
+        // re-activates it. Instead, deactivate the worker and drop the guest's resources while
+        // keeping the thread + render server alive, so the OS's activate() succeeds and it starts
+        // from a clean resource-id space. (Full teardown happens in Drop instead.)
+        if self.worker_thread.is_none() {
+            return Ok(());
+        }
+        let was_active = matches!(self.worker_state, WorkerState::Active);
+        // If the worker is mid-processing, break it out of run_until_sleep_or_exit() without
+        // killing it (the same signal virtio_sleep() uses to park it).
+        if was_active {
+            if let Some(suspend_evt) = &self.worker_suspend_evt {
+                suspend_evt
+                    .signal()
+                    .context("failed to signal gpu worker suspend event for reset")?;
             }
         }
+        if let (Some(sender), Some(receiver)) =
+            (&self.worker_request_sender, &self.worker_response_receiver)
+        {
+            sender
+                .send(WorkerRequest::Reset)
+                .map_err(|e| anyhow!("failed to send gpu worker reset request: {:?}", e))?;
+            receiver
+                .recv()
+                .context("failed to receive gpu worker reset response")??;
+        }
+        if was_active {
+            if let Some(suspend_evt) = &self.worker_suspend_evt {
+                suspend_evt
+                    .reset()
+                    .context("failed to reset gpu worker suspend event after reset")?;
+            }
+        }
+        self.worker_state = WorkerState::Inactive;
         Ok(())
     }
 }
