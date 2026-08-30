@@ -27,6 +27,7 @@ use cros_async::Executor;
 use cros_async::IoSource;
 
 use crate::AsyncDisk;
+use crate::zstd_ffi as zstd;
 use crate::DiskFile;
 use crate::DiskGetLen;
 use crate::Error as DiskError;
