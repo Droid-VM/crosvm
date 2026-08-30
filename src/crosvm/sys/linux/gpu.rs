@@ -18,6 +18,12 @@ use serde_keyvalue::FromKeyValues;
 
 use super::*;
 use crate::crosvm::config::Config;
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+use crate::crosvm::config::DisplayScreen;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_HOST;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_PORT;
 
 pub struct GpuCacheInfo<'a> {
     directory: Option<&'a str>,
@@ -82,6 +88,10 @@ pub fn get_gpu_cache_info<'a>(
     }
 }
 
+/// `vnc_input` carries what a VNC exporter bound to `gpu-0` injects into: this screen's own
+/// absolute pointer and keyboard. Built by the caller, because the virtio-input devices behind them
+/// go into the same device list as this one and only the caller holds it. Empty on every other
+/// configuration -- no VNC binding on this screen, a `view-only=true` one, or a native exporter.
 pub fn create_gpu_device(
     cfg: &Config,
     exit_evt_wrtube: &SendTube,
@@ -90,6 +100,7 @@ pub fn create_gpu_device(
     render_server_fd: Option<SafeDescriptor>,
     has_vfio_gfx_device: bool,
     event_devices: Vec<EventDevice>,
+    #[cfg(feature = "vnc")] vnc_input: gpu_display::VncBindingInput,
 ) -> DeviceResult {
     let is_sandboxed = cfg.jail_config.is_some();
     let mut gpu_params = cfg.gpu_parameters.clone().unwrap();
@@ -137,26 +148,51 @@ pub fn create_gpu_device(
         virtio::DisplayBackend::Stub,
     ];
 
+    // This device provides one screen, `gpu-0`, so it takes the one exporter bound to that screen
+    // and nothing else. An exporter bound to `simplefb` belongs to the simplefb device's screen,
+    // which presents on its own display and is no part of this.
+    //
+    // `display_backends` remains an ordered try-in-turn list, but the two entries that used to
+    // race for the front of it can no longer both be here: config rejects two exporters on one
+    // screen, so at most one of the two inserts below runs. The list is a fallback chain again
+    // (Wayland/X/Stub), not a silent winner-takes-all -- which is what it was when
+    // `insert(0, Android)` followed by `insert(0, VncTcp)` put VNC in front and left
+    // `AServiceManager_addService` uncalled, so the app's native display waited on a binder that
+    // was never registered.
+    //
+    // The exporter also carries this binding's transport ceiling, collected alongside the backend
+    // it belongs to. At most one of the two arms below runs (config rejects two exporters on one
+    // screen), so there is exactly one answer here, and no binding at all means the default: take
+    // whatever gets negotiated.
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    let mut transport_cap = crate::crosvm::config::TransportCap::Auto;
+
     #[cfg(feature = "android_display")]
-    if let Some(service_name) = &cfg.android_display_service {
-        display_backends.insert(0, virtio::DisplayBackend::Android(service_name.to_string()));
+    if let Some(service) = cfg.android_display_service_for(DisplayScreen::Gpu0) {
+        display_backends.insert(0, virtio::DisplayBackend::Android(service.name.clone()));
+        transport_cap = service.transport_cap;
     }
 
     #[cfg(feature = "vnc")]
-    if let Some(ref vnc_cfg) = cfg.vnc_server {
-        if cfg.simplefb.is_none() {
-            let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
-            let port = vnc_cfg.port.unwrap_or(5900);
-            let addr = format!("{}:{}", host, port);
-            let (w, h) = cfg
-                .display_input_width
-                .zip(cfg.display_input_height)
-                .unwrap_or((1280, 720));
-            display_backends.insert(
-                0,
-                virtio::DisplayBackend::VncTcp(addr, w, h, vnc_cfg.password.clone()),
-            );
-        }
+    if let Some(vnc_cfg) = cfg.vnc_server_for(DisplayScreen::Gpu0) {
+        let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+        let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+        let addr = format!("{}:{}", host, port);
+        let (w, h) = cfg
+            .display_input_width
+            .zip(cfg.display_input_height)
+            .unwrap_or((1280, 720));
+        display_backends.insert(
+            0,
+                // Resolved from the ceiling here rather than inside the sink, because the ceiling
+                // belongs to the binding and one sink serves several of them. A binding capped
+                // below `gpu-hw` builds no broker at all, so a client that asks for encoding 50
+                // there is served pixels and told nothing -- which is what an old server looks
+                // like, and what the app is written to fall back from.
+                hw_encode: vnc_cfg.h264_enabled(),
+                // This screen's own devices, parked for whichever `build` call opens the sink.
+                vnc_input: std::sync::Arc::new(sync::Mutex::new(vnc_input)),
+        transport_cap = vnc_cfg.transport_cap;
     }
 
     // Use the unnamed socket for GPU display screens.
@@ -167,7 +203,8 @@ pub fn create_gpu_device(
         );
     }
 
-    let dev = virtio::Gpu::new(
+    #[allow(unused_mut)]
+    let mut dev = virtio::Gpu::new(
         exit_evt_wrtube
             .try_clone()
             .context("failed to clone tube")?,
@@ -181,6 +218,9 @@ pub fn create_gpu_device(
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
     );
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
+        dev.cap_transport_to_cpu();
+    }
 
     let jail = if let Some(jail_config) = cfg.jail_config.as_ref() {
         let mut config = SandboxConfig::new(jail_config, "gpu_device");

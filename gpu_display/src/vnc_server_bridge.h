@@ -34,6 +34,11 @@ int vnc_server_resize(vnc_server_t* server, int width, int height);
 void vnc_server_update_framebuffer(vnc_server_t* server, const uint8_t* data, uint32_t size);
 void vnc_server_destroy(vnc_server_t* server);
 
+/* Whether any RFB client is connected. Non-zero means a frame pushed now will actually be
+ * encoded and sent; zero means every copy on the way there is wasted. Cheap enough to ask per
+ * frame -- it is a NULL check on the client list head. */
+int vnc_server_has_clients(vnc_server_t* server);
+
 /* Publish the guest's hardware cursor.
  *
  * `argb` is width*height pixels of the guest's cursor resource in the same BGRX byte order as the
@@ -55,12 +60,20 @@ void vnc_server_set_cursor(vnc_server_t* server, const uint8_t* argb,
  * ignore this; clients that do not get it composited here. */
 void vnc_server_set_cursor_pos(vnc_server_t* server, int x, int y);
 
+/* Offer the guest frame and the guest's cursor to whoever is consuming frames.
+ *
+ * This is the sink's ingest point. It works out what changed since the last offer and then hands
+ * the frame to each registered consumer; compositing the cursor into an outgoing framebuffer is
  *
  * `clean` is the guest scanout with NO cursor in it, and stays that way -- keeping a pristine
  * copy is what removes the need for LibVNCServer's save-under-cursor bookkeeping entirely: the
  * area the cursor used to cover is restored by copying from `clean`, never by remembering what
  * was underneath.
  *
+ * full=1 for a new guest frame. full=0 for a cursor move, where not one guest pixel changed and
+ * only the pointer's old and new rectangles are in play -- that is what lets the pointer keep
+ * moving over a completely static desktop without pushing a whole frame. */
+void vnc_server_offer_frame(vnc_server_t* server, const uint8_t* clean, uint32_t clean_size,
                             const uint8_t* cursor_argb, int cw, int ch,
 void vnc_server_set_input_event_fd(vnc_server_t* server, int fd);
 int vnc_server_poll_input_event(vnc_server_t* server, struct vnc_input_event* out);

@@ -299,8 +299,16 @@ fn build(
     udmabuf: bool,
     #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
     snapshot_scratch_directory: Option<PathBuf>,
+    dmabuf_import_capped: bool,
 ) -> Option<VirtioGpu> {
+    // `display_backends` is a try-in-turn chain, so a backend declining is how it is meant to
+    // work, not a fault: `--gpu` on an Android host carries an X entry that no Android host has
+    // ever been able to open. Reporting each refusal at error level as it happened made the
+    // ordinary case read as a failure -- "failed to open display: unsupported by the
+    // implementation" on every single boot -- while saying nothing about what did open. Collect
+    // them instead and report once, below, where the outcome is known.
     let mut display_opt = None;
+    let mut declined: Vec<String> = Vec::new();
     for display_backend in display_backends {
         match display_backend.build(
             #[cfg(windows)]
@@ -311,20 +319,49 @@ fn build(
                 .expect("failed to clone wait context ctrl channel"),
         ) {
             Ok(c) => {
-                display_opt = Some(c);
+                display_opt = Some((display_backend, c));
                 break;
             }
-            Err(e) => error!("failed to open display: {}", e),
+            Err(e) => declined.push(format!("{}: {}", display_backend.name(), e)),
         };
     }
 
-    let display = match display_opt {
+    let (chosen, mut display) = match display_opt {
         Some(d) => d,
         None => {
-            error!("failed to open any displays");
+            error!("failed to open any display backend ({})", declined.join("; "));
             return None;
         }
     };
+
+    // The ceiling the exporter bound to this device's screen was configured with. Applied before
+    // anything asks the display what it can do, so `try_import_resource_to_display`'s probe sees a
+    // display that refuses dmabufs and caches `CpuFallback` on the first resource, exactly as it
+    // does against a sink that genuinely has no GPU half.
+    if dmabuf_import_capped {
+        info!("gpu: transport capped to cpu copy on this screen (transport-cap=cpu)");
+        display.cap_transport_to_cpu();
+    }
+
+    // One line, and it names the outcome rather than the attempts. Landing on the stub is the
+    // case worth spelling out: it is what a GPU device does when no exporter is bound to its
+    // screen, which is a legitimate configuration -- the picture is somebody else's, the simplefb
+    // screen's or nobody's -- and it used to be indistinguishable from a broken display. Whatever
+    // was declined on the way is carried in the same line so a bound exporter that failed to open
+    // still reports its reason here.
+    let declined = if declined.is_empty() {
+        String::new()
+    } else {
+        format!(" (after {})", declined.join("; "))
+    };
+    match chosen {
+        DisplayBackend::Stub => info!(
+            "gpu: no exporter opened this device's screen; rendering to the stub display, where \
+             frames are discarded{}",
+            declined
+        ),
+        _ => info!("gpu: display backend {} opened{}", chosen.name(), declined),
+    }
 
     VirtioGpu::new(
         display,
@@ -907,10 +944,32 @@ impl Frontend {
                             GpuResponse::ErrRutabaga(RutabagaError::InvalidContextId)
                         )
                     );
+                    // A display with nowhere to put pixels refuses the cursor plane, and a guest
+                    // moving its pointer asks again for every motion sample. The stub backend --
+                    // where a GPU device lands when no exporter is bound to its screen -- returns
+                    // `Unsupported` from `create_surface` for any parented surface, so a VM whose
+                    // picture is somebody else's (the simplefb screen's, or nobody's) printed one
+                    // ERROR per pointer sample for as long as it ran. The response the guest gets
+                    // is unchanged, and the guest does not read it: cursor commands ride the
+                    // cursor queue, which the driver posts to without inspecting the reply. What
+                    // changes is that the log stops describing a working configuration as broken;
+                    // the one INFO line at display-open already said there is no screen here.
+                    let cursor_on_a_screenless_display = matches!(
+                        (&gpu_cmd, &gpu_response),
+                        (
+                            GpuCommand::UpdateCursor(_) | GpuCommand::MoveCursor(_),
+                            GpuResponse::ErrDisplay(GpuDisplayError::Unsupported)
+                        )
+                    );
                     if expected_during_teardown {
                         debug!(
                             "gpu command {:?} arrived after its context went away: {:?}",
                             gpu_cmd, gpu_response
+                        );
+                    } else if cursor_on_a_screenless_display {
+                        debug!(
+                            "gpu command {:?}: this display has no plane to put a cursor on",
+                            gpu_cmd
                         );
                     } else {
                         error!(
@@ -1183,6 +1242,7 @@ impl Worker {
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_rd: RecvTube,
         #[cfg(windows)] gpu_display_wait_descriptor_ctrl_wr: SendTube,
         snapshot_scratch_directory: Option<PathBuf>,
+        dmabuf_import_capped: bool,
     ) -> anyhow::Result<Worker> {
         let fence_state = Arc::new(Mutex::new(Default::default()));
         let fence_handler_resources = Arc::new(Mutex::new(None));
@@ -1203,6 +1263,7 @@ impl Worker {
             #[cfg(windows)]
             gpu_display_wait_descriptor_ctrl_wr,
             snapshot_scratch_directory,
+            dmabuf_import_capped,
         )
         .ok_or_else(|| anyhow!("failed to build virtio gpu"))?;
 
@@ -1234,6 +1295,13 @@ impl Worker {
         // This loop effectively only runs while the worker is inactive. Once activated via
         // a `WorkerRequest::Activate`, the worker will remain in `run_until_sleep_or_exit()`
         // until suspended via `kill_evt` or `suspend_evt` being signaled.
+        //
+        // A guest with no virtio-gpu driver resets the device on its way out of the firmware and
+        // never activates it again -- Windows, whose Basic Display Driver only knows the linear
+        // framebuffer the firmware left behind. This thread then parks here for the rest of the
+        // VM's life, which is correct: that guest is painting the simplefb screen, and the
+        // simplefb screen has its own exporter to paint it on. This device's screen keeps the
+        // last frame the firmware put there, and nothing about that is this thread's to fix.
         loop {
             let request = match self.request_receiver.recv() {
                 Ok(r) => r,
@@ -1264,17 +1332,17 @@ impl Worker {
                         .send(response)
                         .expect("failed to send gpu worker response for suspend");
                 }
-                WorkerRequest::Snapshot => {
-                    let response = self.on_snapshot().map(WorkerResponse::Snapshot);
-                    self.response_sender
-                        .send(response)
-                        .expect("failed to send gpu worker response for snapshot");
-                }
                 WorkerRequest::Reset => {
                     let response = self.on_reset().map(|_| WorkerResponse::Ok);
                     self.response_sender
                         .send(response)
                         .expect("failed to send gpu worker response for reset");
+                }
+                WorkerRequest::Snapshot => {
+                    let response = self.on_snapshot().map(WorkerResponse::Snapshot);
+                    self.response_sender
+                        .send(response)
+                        .expect("failed to send gpu worker response for snapshot");
                 }
                 WorkerRequest::Restore(snapshot) => {
                     let response = self.on_restore(snapshot).map(|_| WorkerResponse::Ok);
@@ -1629,12 +1697,51 @@ pub enum DisplayBackend {
     /// via this name, and pass the surface to it.
     Android(String),
     #[cfg(feature = "vnc")]
+    /// Named fields rather than a tuple: the list is long enough that "which of these is which" at
+    /// the call site is exactly the kind of question a struct answers for free.
+        /// Whether this binding may run the hardware H.264 encoder and serve the stream to RFB
+        /// clients that ask for encoding 50. Resolved by the caller from the transport ceiling
+        /// (see `VncConfig::h264_enabled`); there is no port, the stream rides `addr`.
+        hw_encode: bool,
+        /// This binding's own absolute pointer and keyboard, parked until the sink is built.
+        ///
+        /// Behind an `Arc<Mutex<..>>` because of what this enum is: a CLONEABLE entry in a
+        /// try-in-turn chain whose `build` takes `&self`. An `EventDevice` owns a socket and can be
+        /// neither cloned nor moved out of a `&self`, so the devices are parked here and taken by
+        /// whichever `build` call succeeds. The chain stops at the first success, so they are taken
+        /// at most once; if this entry declines, the next backend leaves them alone and they are
+        /// dropped with the config.
+        ///
+        /// Empty inside means `view-only=true` -- a binding that was given no input devices -- which
+        /// is a different thing from devices already taken, but neither can reach a second `build`.
+        /// The lock is an artifact of `&self`, not of sharing: after `build`, one thread owns them.
+        vnc_input: Arc<Mutex<VncBindingInput>>,
     /// Start a VNC server for remote display access.
     /// VncTcp(addr, width, height, password) listens on a TCP address.
     VncTcp(String, u32, u32, Option<String>),
 }
 
 impl DisplayBackend {
+    /// What this entry is called when the chain reports which of them opened and which declined.
+    ///
+    /// Deliberately not the `Debug` derive: the Android and VNC variants carry a service name and
+    /// a listen address, and a log line about which backend opened is not the place to repeat
+    /// either. What a reader needs is which kind it was.
+    fn name(&self) -> &'static str {
+        match self {
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            DisplayBackend::Wayland(_) => "wayland",
+            #[cfg(any(target_os = "android", target_os = "linux"))]
+            DisplayBackend::X(_) => "x",
+            DisplayBackend::Stub => "stub",
+            #[cfg(windows)]
+            DisplayBackend::WinApi => "winapi",
+            #[cfg(feature = "android_display")]
+            DisplayBackend::Android(_) => "android",
+            #[cfg(feature = "vnc")]
+        }
+    }
+
     fn build(
         &self,
         #[cfg(windows)] wndproc_thread: &mut Option<WindowProcedureThread>,
@@ -1662,6 +1769,15 @@ impl DisplayBackend {
             #[cfg(feature = "android_display")]
             DisplayBackend::Android(service_name) => GpuDisplay::open_android(service_name),
             #[cfg(feature = "vnc")]
+                hw_encode,
+                vnc_input,
+            } => {
+                let input = std::mem::take(&mut *vnc_input.lock());
+                GpuDisplay::open_vnc_tcp(
+                    *hw_encode,
+                    input.tablet,
+                    input.keyboard,
+                )
             DisplayBackend::VncTcp(addr, width, height, password) => {
                 GpuDisplay::open_vnc_tcp(addr, *width, *height, password.clone())
             }
@@ -1682,6 +1798,8 @@ pub struct Gpu {
     worker_thread: Option<WorkerThread<()>>,
     display_backends: Vec<DisplayBackend>,
     display_params: Vec<GpuDisplayParameters>,
+    /// What the guest is told in `virtio_gpu_config.num_scanouts`. Zero means render-only.
+    num_scanouts: u32,
     display_event: Arc<AtomicBool>,
     rutabaga_builder: RutabagaBuilder,
     pci_address: Option<PciAddress>,
@@ -1707,6 +1825,16 @@ pub struct Gpu {
     #[cfg(any(target_os = "android", target_os = "linux"))]
     gpu_cgroup_path: Option<PathBuf>,
     snapshot_scratch_directory: Option<PathBuf>,
+    /// Whether the exporter bound to this device's screen capped its transport to a CPU copy.
+    ///
+    /// Not a `GpuParameters` field, and that is the point: the ceiling belongs to the *binding*
+    /// between one exporter and one screen (`--vnc-server ...,transport-cap=`, `
+    /// --android-display-service ...,transport-cap=`), not to the GPU device, which has no opinion
+    /// about how its frames leave. Set after construction because that is where a caller can read
+    /// the binding -- `Gpu::new` takes the display backends but not the config they came from.
+    dmabuf_import_capped: bool,
+}
+
 }
 
 impl Gpu {
@@ -1724,6 +1852,15 @@ impl Gpu {
         #[cfg(any(target_os = "android", target_os = "linux"))] gpu_cgroup_path: Option<&PathBuf>,
     ) -> Gpu {
         let mut display_params = gpu_parameters.display_params.clone();
+        // Zero configured displays is a real configuration, not an oversight: the picture comes
+        // from somewhere else (crosvm's simplefb bridge) and this device is here to render. Keep
+        // a nominal size for the internal bookkeeping below, but report no scanouts to the guest
+        // (`num_scanouts` in build_config) so it never picks this device to display on.
+        let num_scanouts = if display_params.is_empty() {
+            0
+        } else {
+            VIRTIO_GPU_MAX_SCANOUTS as u32
+        };
         if display_params.is_empty() {
             display_params.push(Default::default());
         }
@@ -1797,6 +1934,7 @@ impl Gpu {
             worker_thread: None,
             display_backends,
             display_params,
+            num_scanouts,
             display_event: Arc::new(AtomicBool::new(false)),
             rutabaga_builder,
             pci_address: gpu_parameters.pci_address,
@@ -1817,7 +1955,19 @@ impl Gpu {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             gpu_cgroup_path: gpu_cgroup_path.cloned(),
             snapshot_scratch_directory: gpu_parameters.snapshot_scratch_path.clone(),
+            dmabuf_import_capped: false,
         }
+    }
+
+    /// Caps this device's screen to the CPU transport, for a binding configured
+    /// `transport-cap=cpu`.
+    ///
+    /// Must be called before the device is activated, which is when the display is opened and the
+    /// cap applied; there is no way to change it afterwards, deliberately (see
+    /// `GpuDisplay::cap_transport_to_cpu`). Ceilings only remove options from a negotiation whose
+    /// floor is a CPU copy, so this cannot fail and there is nothing to report.
+    pub fn cap_transport_to_cpu(&mut self) {
+        self.dmabuf_import_capped = true;
     }
 
     /// Initializes the internal device state so that it can begin processing virtqueues.
@@ -1855,6 +2005,7 @@ impl Gpu {
                 .try_clone()
                 .expect("failed to clone wait context control channel"),
             self.snapshot_scratch_directory.clone(),
+            self.dmabuf_import_capped,
         )?;
 
         for event_device in self.event_devices.take().expect("missing event_devices") {
@@ -1901,6 +2052,7 @@ impl Gpu {
         let fixed_blob_mapping = self.fixed_blob_mapping;
         let udmabuf = self.udmabuf;
         let snapshot_scratch_directory = self.snapshot_scratch_directory.clone();
+        let dmabuf_import_capped = self.dmabuf_import_capped;
 
         #[cfg(windows)]
         let mut wndproc_thread = self.wndproc_thread.take();
@@ -1964,6 +2116,7 @@ impl Gpu {
                 #[cfg(windows)]
                 gpu_display_wait_descriptor_ctrl_wr,
                 snapshot_scratch_directory,
+                dmabuf_import_capped,
             )
             .expect("Failed to create virtio gpu worker thread");
 
@@ -2031,7 +2184,7 @@ impl Gpu {
         virtio_gpu_config {
             events_read: Le32::from(events_read),
             events_clear: Le32::from(0),
-            num_scanouts: Le32::from(VIRTIO_GPU_MAX_SCANOUTS as u32),
+            num_scanouts: Le32::from(self.num_scanouts),
             num_capsets: Le32::from(num_capsets),
         }
     }
