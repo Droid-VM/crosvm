@@ -20,7 +20,9 @@ use std::panic::catch_unwind;
 use std::process::abort;
 use std::ptr::null;
 use std::ptr::null_mut;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -68,6 +70,9 @@ pub struct stream_renderer_param {
 pub struct stream_renderer_handle {
     pub os_handle: i64,
     pub handle_type: u32,
+    // DroidVM gfxstream pre-alloc: pool byte offset when handle_type == MEM_POOL.
+    pub _pad_pool: u32,
+    pub pool_offset: u64,
 }
 
 #[repr(C)]
@@ -236,9 +241,16 @@ extern "C" {
 }
 
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
+/// gfxstream MEM_POOL export handle type (matches STREAM_HANDLE_TYPE_MEM_POOL in the C header):
+/// the exported os_handle is a dup of the GpuPool memfd and `pool_offset` is valid.
+const STREAM_HANDLE_TYPE_MEM_POOL: u32 = 0x7;
+
 pub struct Gfxstream {
     /// Cookie used by Gfxstream, should be held as long as the renderer is alive.
     _cookie: Box<RutabagaCookie>,
+    /// DroidVM gfxstream pre-alloc: resource_id -> GpuPool byte offset for blobs whose
+    /// host-visible memory was sub-allocated from the pool (recorded at export time).
+    pool_offsets: Arc<Mutex<BTreeMap<u32, u64>>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -472,7 +484,15 @@ impl Gfxstream {
             ))?;
         }
 
-        Ok(Box::new(Gfxstream { _cookie: cookie }))
+        Ok(Box::new(Gfxstream {
+            _cookie: cookie,
+            pool_offsets: Arc::new(Mutex::new(BTreeMap::new())),
+        }))
+    }
+
+    /// DroidVM: GpuPool byte offset for a pool-resident blob, or None.
+    fn pool_offset(&self, resource_id: u32) -> Option<u64> {
+        self.pool_offsets.lock().unwrap().get(&resource_id).copied()
     }
 
     fn map_info(&self, resource_id: u32) -> RutabagaResult<u32> {
@@ -507,6 +527,20 @@ impl Gfxstream {
         #[allow(clippy::undocumented_unsafe_blocks)]
         let ret = unsafe { stream_renderer_export_blob(resource_id, &mut stream_handle) };
         ret_to_res(ret)?;
+
+        // DroidVM gfxstream pre-alloc: remember the pool offset for a MEM_POOL blob so
+        // resource_map_blob can map the pool GPA directly (no runtime SHARE). Resource ids are
+        // recycled by the guest, so this must also *clear* the entry for anything that is not
+        // pool-resident: inheriting the previous tenant's offset makes crosvm map the wrong pool
+        // GPA into the guest.
+        {
+            let mut offsets = self.pool_offsets.lock().unwrap();
+            if stream_handle.handle_type == STREAM_HANDLE_TYPE_MEM_POOL {
+                offsets.insert(resource_id, stream_handle.pool_offset);
+            } else {
+                offsets.remove(&resource_id);
+            }
+        }
 
         let raw_descriptor = stream_handle.os_handle as RawDescriptor;
         // gfxstream can report success but hand back -1 when the host allocation
@@ -608,6 +642,7 @@ impl RutabagaComponent for Gfxstream {
             component_mask: 1 << (RutabagaComponentType::Gfxstream as u8),
             size: 0,
             mapping: None,
+            pool_offset: None,
         })
     }
 
@@ -621,6 +656,8 @@ impl RutabagaComponent for Gfxstream {
         let stream_handle = stream_renderer_handle {
             os_handle: import_handle.os_handle.into_raw_descriptor() as i64,
             handle_type: import_handle.handle_type,
+            _pad_pool: 0,
+            pool_offset: 0,
         };
 
         // VULKAN_INFO not currently supported in Rutabaga -> gfxstream translation
@@ -667,6 +704,7 @@ impl RutabagaComponent for Gfxstream {
                 component_mask: 1 << (RutabagaComponentType::Gfxstream as u8),
                 size: 0,
                 mapping: None,
+                pool_offset: None,
             }))
         }
     }
@@ -701,6 +739,10 @@ impl RutabagaComponent for Gfxstream {
     }
 
     fn unref_resource(&self, resource_id: u32) {
+        // The id becomes available for reuse here, so drop its pool offset with it -- a later
+        // resource that lands on the same id must not look pool-resident because this one was.
+        self.pool_offsets.lock().unwrap().remove(&resource_id);
+
         // SAFETY:
         // The resource is safe to unreference destroy because no user of these bindings can still
         // be holding a reference.
@@ -845,9 +887,12 @@ impl RutabagaComponent for Gfxstream {
 
         ret_to_res(ret)?;
 
+        let handle = self.export_blob(resource_id).ok();
+        // export_blob populated pool_offsets if this blob is GpuPool-resident.
+        let pool_offset = self.pool_offset(resource_id);
         Ok(RutabagaResource {
             resource_id,
-            handle: self.export_blob(resource_id).ok(),
+            handle,
             blob: true,
             blob_mem: resource_create_blob.blob_mem,
             blob_flags: resource_create_blob.blob_flags,
@@ -859,6 +904,7 @@ impl RutabagaComponent for Gfxstream {
             component_mask: 1 << (RutabagaComponentType::Gfxstream as u8),
             size: resource_create_blob.size,
             mapping: None,
+            pool_offset,
         })
     }
 
