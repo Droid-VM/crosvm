@@ -109,6 +109,73 @@ pub fn create_gpu_device(
         gpu_params.snapshot_scratch_path = Some(Path::new("/tmpfs-gpu-snapshot").to_path_buf());
     }
 
+    // DroidVM: plumb gfxstream's host-allocation knobs to the in-process renderer before the
+    // GPU/jail process forks. They describe how gfxstream backs the fresh shmem it allocates and
+    // hands to the host Vulkan driver; generic VM memory registration never reads them.
+    //
+    // Only when gfxstream is the renderer. One binary carries both backends and the drm2kgsl
+    // native context runs through virglrenderer, where every name below is dead weight -- and
+    // an inherited GFXSTREAM_* in a drm2kgsl process environment reads like a misconfiguration to
+    // anyone debugging one.
+    #[cfg(feature = "gfxstream")]
+    if gpu_params.mode == devices::virtio::GpuMode::ModeGfxstream {
+        // Presence is the dynamic-VRAM switch. A value of 0 is an unmetered configuration, not
+        // "off"; absence is what keeps this renderer allocation policy disabled.
+        let host_dynamic = !gpu_params.udmabuf && gpu_params.vram_limit.is_some();
+        // All of these have a consumer only for gfxstream host-alloc with dynamic VRAM enabled.
+        if host_dynamic {
+            env::set_var(
+                "GFXSTREAM_POOL_BLOB_MAX_KB",
+                gpu_params.pool_blob_max_kb.unwrap_or(4096).to_string(),
+            );
+            let limit_mb = match gpu_params.vram_limit {
+                Some(n) if n > 0 => n.to_string(),
+                // Explicitly unlimited: use a sentinel above any emulated heap. gfxstream still
+                // clamps the value it reports to the guest heap size.
+                _ => "1048576".to_string(), // 1 TiB
+            };
+            env::set_var("GFXSTREAM_VRAM_LIMIT_MB", &limit_mb);
+            env::set_var("GFXSTREAM_VRAM_BUDGET_MB", limit_mb);
+            env::set_var(
+                "GFXSTREAM_VRAM_FOLIO_THRESHOLD_KB",
+                gpu_params.vram_folio_threshold_kb.unwrap_or(1024).to_string(),
+            );
+            env::set_var(
+                "GFXSTREAM_VRAM_EXCEED_POLICY",
+                match gpu_params.vram_exceed_policy {
+                    Some(devices::virtio::gpu::VramExceedPolicy::Oom) => "oom",
+                    _ => "fallback",
+                },
+            );
+        } else {
+            // Do not let a launcher environment opt guest-alloc or static host-alloc into a
+            // renderer policy that belongs exclusively to dynamic host-alloc.
+            for name in [
+                "GFXSTREAM_POOL_BLOB_MAX_KB",
+                "GFXSTREAM_VRAM_LIMIT_MB",
+                "GFXSTREAM_VRAM_BUDGET_MB",
+                "GFXSTREAM_VRAM_FOLIO_THRESHOLD_KB",
+                "GFXSTREAM_VRAM_EXCEED_POLICY",
+            ] {
+                env::remove_var(name);
+            }
+        }
+        // Guest-alloc pool partition: the host-owned slice serving all gfx host-alloc requests
+        // (ASG rings etc.). Only meaningful with udmabuf=true; consumed by gfxstream in the
+        // pVM guest-alloc mode (stage 2).
+        if gpu_params.udmabuf {
+            env::set_var(
+                "GFXSTREAM_POOL_HOST_MB",
+                gpu_params.gfx_host_pre_alloc_mb.unwrap_or(64).to_string(),
+            );
+        }
+        if gpu_params.gunyah_pvm == Some(true) {
+            // Gunyah SHARE mappings are permanent and cannot be re-pointed, so the RingBlob
+            // backing must be pinned (never freed/recycled). Only Qualcomm/Gunyah needs this.
+            env::set_var("GFXSTREAM_GUNYAH_PIN_RINGBLOB", "1");
+        }
+    }
+
     if gpu_params.fixed_blob_mapping {
         if has_vfio_gfx_device {
             // TODO(b/323368701): make fixed_blob_mapping compatible with vfio dma_buf mapping for

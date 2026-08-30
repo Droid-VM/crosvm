@@ -8,6 +8,7 @@ use std::convert::TryInto;
 use std::io::IoSliceMut;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -458,6 +459,14 @@ pub fn calculate_capset_names(capset_mask: u64) -> Vec<String> {
         .collect()
 }
 
+/// Whether the gfxstream route keeps a Rutabaga2D component for classic 2D resources.
+/// `GPU_GFXSTREAM_NO_2D_FALLBACK=1` sends them back to gfxstream, restoring the previous
+/// behaviour (an un-provisioned guest with no display at all) for a one-build comparison.
+fn gfxstream_2d_fallback() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("GPU_GFXSTREAM_NO_2D_FALLBACK").as_deref() != Ok("1"))
+}
+
 fn calculate_component(component_mask: u8) -> RutabagaResult<RutabagaComponentType> {
     if component_mask.count_ones() != 1 {
         return Err(RutabagaError::SpecViolation("can't infer single component"));
@@ -741,15 +750,50 @@ impl Rutabaga {
         component.poll_descriptor()
     }
 
+    /// The component that owns `resource_id`.
+    ///
+    /// Resources are normally created by the default component, but the gfxstream route also
+    /// keeps a Rutabaga2D component for classic 2D resources (see `classic_component`), so every
+    /// operation on a resource has to follow the component that created it rather than the
+    /// default one. Falls back to the default component whenever the resource does not name
+    /// exactly one live component, which is the pre-existing behaviour.
+    fn component_of(&self, resource_id: u32) -> RutabagaComponentType {
+        self.resources
+            .get(&resource_id)
+            .and_then(|resource| calculate_component(resource.component_mask).ok())
+            .filter(|component| self.components.contains_key(component))
+            .unwrap_or(self.default_component)
+    }
+
+    /// The component that should own a newly created classic (non-blob) resource.
+    ///
+    /// gfxstream implements these only far enough to create them: the readback the display path
+    /// needs fails with EINVAL, so a guest that draws on the CPU -- fbcon, plymouth, or a whole
+    /// llvmpipe desktop on an un-provisioned image -- has no picture at all. Rutabaga2D keeps
+    /// such a resource's pixels in host memory and serves transfer_read from there. Provisioned
+    /// guests are unaffected: their scanout buffers are blobs, which still go to gfxstream.
+    fn classic_component(&self) -> RutabagaComponentType {
+        if self.default_component == RutabagaComponentType::Gfxstream
+            && self
+                .components
+                .contains_key(&RutabagaComponentType::Rutabaga2D)
+        {
+            RutabagaComponentType::Rutabaga2D
+        } else {
+            self.default_component
+        }
+    }
+
     /// Creates a resource with the `resource_create_3d` metadata.
     pub fn resource_create_3d(
         &mut self,
         resource_id: u32,
         resource_create_3d: ResourceCreate3D,
     ) -> RutabagaResult<()> {
+        let component_type = self.classic_component();
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         if self.resources.contains_key(&resource_id) {
@@ -794,9 +838,10 @@ impl Rutabaga {
         resource_id: u32,
         mut vecs: Vec<RutabagaIovec>,
     ) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -811,9 +856,10 @@ impl Rutabaga {
 
     /// Detaches any previously attached iovecs from the resource.
     pub fn detach_backing(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -828,9 +874,10 @@ impl Rutabaga {
 
     /// Releases guest kernel reference on the resource.
     pub fn unref_resource(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get_mut(&self.default_component)
+            .get_mut(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         self.resources
@@ -849,9 +896,10 @@ impl Rutabaga {
         resource_id: u32,
         transfer: Transfer3D,
     ) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -873,9 +921,10 @@ impl Rutabaga {
         transfer: Transfer3D,
         buf: Option<IoSliceMut>,
     ) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::InvalidComponent)?;
 
         let resource = self
@@ -887,9 +936,10 @@ impl Rutabaga {
     }
 
     pub fn resource_flush(&mut self, resource_id: u32) -> RutabagaResult<()> {
+        let component_type = self.component_of(resource_id);
         let component = self
             .components
-            .get(&self.default_component)
+            .get(&component_type)
             .ok_or(RutabagaError::Unsupported)?;
 
         let resource = self
@@ -1412,7 +1462,16 @@ impl RutabagaBuilder {
 
             self.virglrenderer_flags = self
                 .virglrenderer_flags
-                .use_virgl(capset_enabled(RUTABAGA_CAPSET_VIRGL2))
+                // Keep vrend (the classic renderer) initialised for every virglrenderer
+                // configuration, not only when the VIRGL2 capset is advertised: vrend is also
+                // what implements classic 2D resources and their transfers (fbcon, dumb
+                // buffers, llvmpipe scanout). With NO_VIRGL the very first RESOURCE_CREATE_2D
+                // fails with EINVAL and the guest has no display at all. Advertising VIRGL2 to
+                // the guest is a separate decision (the capset list above): a stock guest that
+                // sees VIRGL2 picks host-GL virgl and our CPU-copy scanout cannot read those
+                // frames back (black screen); without it stock Mesa falls back to llvmpipe,
+                // which the 2D path displays fine.
+                .use_virgl(supports_virglrenderer)
                 .use_venus(capset_enabled(RUTABAGA_CAPSET_VENUS))
                 .use_drm(capset_enabled(RUTABAGA_CAPSET_DRM));
 
@@ -1480,7 +1539,14 @@ impl RutabagaBuilder {
             push_capset(RUTABAGA_CAPSET_CROSS_DOMAIN);
         }
 
-        if self.default_component == RutabagaComponentType::Rutabaga2D {
+        // The gfxstream route gets a Rutabaga2D component too, as the owner of classic 2D
+        // resources (see `Rutabaga::classic_component`). virglrenderer routes need no equivalent:
+        // vrend implements the classic 2D path itself, which is why an un-provisioned guest has a
+        // (llvmpipe) desktop there and a frozen boot console under gfxstream.
+        if self.default_component == RutabagaComponentType::Rutabaga2D
+            || (self.default_component == RutabagaComponentType::Gfxstream
+                && gfxstream_2d_fallback())
+        {
             let rutabaga_2d = Rutabaga2D::init(fence_handler.clone())?;
             rutabaga_components.insert(RutabagaComponentType::Rutabaga2D, rutabaga_2d);
         }
