@@ -108,6 +108,7 @@ struct WaylandSurface {
     buffer_size: usize,
     buffer_index: Cell<usize>,
     buffer_mem: MemoryMapping,
+    fourcc: u32,
 }
 
 impl WaylandSurface {
@@ -135,6 +136,7 @@ impl GpuDisplaySurface for WaylandSurface {
             framebuffer,
             self.row_size,
             BYTES_PER_PIXEL,
+            self.fourcc,
         ))
     }
 
@@ -434,6 +436,10 @@ impl DisplayT for DisplayWl {
             buffer_size: fb_size as usize,
             buffer_index: Cell::new(0),
             buffer_mem,
+            fourcc: match surf_type {
+                SurfaceType::Cursor => crate::DRM_FORMAT_ARGB8888,
+                SurfaceType::Scanout => crate::DRM_FORMAT_XRGB8888,
+            },
         }))
     }
 

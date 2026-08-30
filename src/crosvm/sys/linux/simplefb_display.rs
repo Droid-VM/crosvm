@@ -56,10 +56,8 @@ const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
 ///
 /// The DT string is the only statement anyone makes about this framebuffer's byte order, and the
 /// host has been acting on it implicitly: the default `a8r8g8b8` is ARGB8888, which in memory is
-/// B,G,R,A -- the CPU pipeline's canonical order -- which is precisely why the bridge's plain copy
-/// has always produced the right colours without a swizzle anywhere on this route. Naming it turns
-/// that from a coincidence nobody wrote down into a field a sink can read, which is what the GPU
-/// path will need when it picks a VkFormat from the fourcc instead of assuming BGRX.
+/// B,G,R,A. Naming it lets the CPU edge compare the source with each sink's real layout, and lets
+/// the GPU path pick its VkFormat from the same fact instead of assuming one byte order.
 ///
 /// The fallback matches the one the bpp lookup uses on an unrecognised string, for the same reason:
 /// `a8r8g8b8` is what the device tree defaults to when nobody says otherwise.
@@ -341,12 +339,10 @@ fn build_gpu_transport(
         .create_udmabuf(guest_mem, &[(GuestAddress(params.addr), window)])
         .map_err(|e| format!("udmabuf create failed: {e}"))?;
 
-    // THE CROSSING (plan §4.4). Until now this framebuffer travelled the CPU path, where colour is
-    // kept right by an unwritten invariant: the producer is assumed to emit BGRX and the sink
-    // swaps red and blue unconditionally. From here the sink stops assuming and reads the fourcc
-    // instead, picking a VkFormat from it (`vkFormatFromDrmFourcc`). The device tree's default
-    // `a8r8g8b8` is AR24, which in memory IS the pipeline's canonical BGRX, so declaring it lands
-    // on B8G8R8A8_UNORM and the picture is identical to the CPU path's. Declare it wrong and every
+    // THE CROSSING (plan §4.4). Both transports now carry this source fourcc explicitly: the CPU
+    // edge compares it with the sink framebuffer, while the GPU sink picks a VkFormat from it
+    // (`vkFormatFromDrmFourcc`). The device tree's default `a8r8g8b8` is AR24, so declaring it lands
+    // on B8G8R8A8_UNORM. Declare it wrong and every
     // pixel comes out with red and blue exchanged, on both paths' behalf, with no error anywhere
     // and nothing in the logs -- the failure looks like a picture. `params.fourcc` is the DT
     // string resolved once at config time (`simplefb_format_fourcc`) precisely so that this is one

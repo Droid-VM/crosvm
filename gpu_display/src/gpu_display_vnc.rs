@@ -285,10 +285,10 @@ impl VncSurface {
     /// The GPU transport: blit the guest's dmabuf into a CPU-readable buffer and offer THAT to the
     /// bridge, instead of a frame the producer copied for us.
     ///
-    /// What this replaces is not one copy but a chain of them. On the virtio-gpu route the producer
-    /// was mapping the resource, swizzling red and blue by hand to keep the CPU pipeline's BGRX
-    /// invariant, and copying it into `local_buffer` for `flip` to copy again into `data`. Here the
-    /// GPU reads the guest pages directly, the channel exchange rides along inside the blit
+    /// What this replaces is not one copy but a chain of them. On the CPU route the producer's
+    /// actual layout is converted into this VNC sink's BGRX framebuffer at the copy boundary, then
+    /// `flip` copies it into `data`. Here the GPU reads the guest pages directly, the same channel
+    /// exchange rides along inside the blit
     /// (`blitSourceFourcc`, C++ side), and what the CPU touches afterwards is ordinary cached host
     /// memory instead of a write-combining guest mapping.
     ///
@@ -407,6 +407,7 @@ impl GpuDisplaySurface for VncSurface {
             VolatileSlice::new(self.local_buffer.as_mut_slice()),
             stride,
             4,
+            crate::DRM_FORMAT_XRGB8888,
         ))
     }
 
@@ -506,6 +507,7 @@ impl GpuDisplaySurface for VncCursorSurface {
             VolatileSlice::new(self.pixels.as_mut_slice()),
             self.width * 4,
             4,
+            crate::DRM_FORMAT_ARGB8888,
         ))
     }
 

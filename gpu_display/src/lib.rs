@@ -69,6 +69,99 @@ pub use sys::SysGpuDisplayExt;
 #[cfg(feature = "vulkan_display")]
 const VK_UUID_BYTES: usize = 16;
 
+pub const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
+    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
+}
+
+pub const DRM_FORMAT_XRGB8888: u32 = drm_fourcc(b'X', b'R', b'2', b'4');
+pub const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
+pub const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
+pub const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+pub const DRM_FORMAT_RGB888: u32 = drm_fourcc(b'R', b'G', b'2', b'4');
+pub const DRM_FORMAT_RGB565: u32 = drm_fourcc(b'R', b'G', b'1', b'6');
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PixelLayout {
+    /// B, G, R, X/A in memory on a little-endian host.
+    BlueFirst8888,
+    /// R, G, B, X/A in memory on a little-endian host.
+    RedFirst8888,
+    /// B, G, R in memory on a little-endian host.
+    BlueFirst888,
+    Rgb565,
+}
+
+impl PixelLayout {
+    fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::BlueFirst8888 | Self::RedFirst8888 => 4,
+            Self::BlueFirst888 => 3,
+            Self::Rgb565 => 2,
+        }
+    }
+}
+
+fn pixel_layout(fourcc: u32) -> Option<PixelLayout> {
+    match fourcc {
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 => Some(PixelLayout::BlueFirst8888),
+        DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888 => Some(PixelLayout::RedFirst8888),
+        DRM_FORMAT_RGB888 => Some(PixelLayout::BlueFirst888),
+        DRM_FORMAT_RGB565 => Some(PixelLayout::Rgb565),
+        _ => None,
+    }
+}
+
+fn convert_scanout_row(
+    source_fourcc: u32,
+    target_fourcc: u32,
+    width: usize,
+    source: &[u8],
+    target: &mut [u8],
+) -> bool {
+    let Some(source_layout) = pixel_layout(source_fourcc) else {
+        return false;
+    };
+    let Some(target_layout) = pixel_layout(target_fourcc) else {
+        return false;
+    };
+    if !matches!(
+        target_layout,
+        PixelLayout::BlueFirst8888 | PixelLayout::RedFirst8888
+    ) {
+        return false;
+    }
+
+    let source_bpp = source_layout.bytes_per_pixel();
+    if source.len() < width.saturating_mul(source_bpp)
+        || target.len() < width.saturating_mul(4)
+    {
+        return false;
+    }
+
+    for pixel in 0..width {
+        let source = &source[pixel * source_bpp..];
+        let (r, g, b, a) = match source_layout {
+            PixelLayout::BlueFirst8888 => (source[2], source[1], source[0], source[3]),
+            PixelLayout::RedFirst8888 => (source[0], source[1], source[2], source[3]),
+            PixelLayout::BlueFirst888 => (source[2], source[1], source[0], 0xff),
+            PixelLayout::Rgb565 => {
+                let packed = u16::from_le_bytes([source[0], source[1]]);
+                let r = (((packed >> 11) & 0x1f) * 255 / 31) as u8;
+                let g = (((packed >> 5) & 0x3f) * 255 / 63) as u8;
+                let b = ((packed & 0x1f) * 255 / 31) as u8;
+                (r, g, b, 0xff)
+            }
+        };
+        let target = &mut target[pixel * 4..];
+        match target_layout {
+            PixelLayout::BlueFirst8888 => target[..4].copy_from_slice(&[b, g, r, a]),
+            PixelLayout::RedFirst8888 => target[..4].copy_from_slice(&[r, g, b, a]),
+            PixelLayout::BlueFirst888 | PixelLayout::Rgb565 => unreachable!(),
+        }
+    }
+    true
+}
+
 #[derive(Clone)]
 pub struct VulkanCreateParams {
     #[cfg(feature = "vulkan_display")]
@@ -168,6 +261,7 @@ pub struct GpuDisplayFramebuffer<'a> {
     slice: VolatileSlice<'a>,
     stride: u32,
     bytes_per_pixel: u32,
+    fourcc: u32,
 }
 
 impl<'a> GpuDisplayFramebuffer<'a> {
@@ -175,12 +269,14 @@ impl<'a> GpuDisplayFramebuffer<'a> {
         framebuffer: VolatileSlice<'a>,
         stride: u32,
         bytes_per_pixel: u32,
+        fourcc: u32,
     ) -> GpuDisplayFramebuffer<'a> {
         GpuDisplayFramebuffer {
             framebuffer,
             slice: framebuffer,
             stride,
             bytes_per_pixel,
+            fourcc,
         }
     }
 
@@ -219,6 +315,98 @@ impl<'a> GpuDisplayFramebuffer<'a> {
     pub fn stride(&self) -> u32 {
         self.stride
     }
+
+    pub fn fourcc(&self) -> u32 {
+        self.fourcc
+    }
+
+    /// Whether a producer can write this framebuffer without changing pixel layout.
+    ///
+    /// X-versus-alpha does not require a conversion: both variants put their fourth byte in the
+    /// same place. Only the red/blue order matters for the 32-bit CPU fast path.
+    pub fn can_copy_direct_from(&self, source_fourcc: u32) -> bool {
+        self.bytes_per_pixel == 4
+            && matches!(
+                (pixel_layout(source_fourcc), pixel_layout(self.fourcc)),
+                (Some(PixelLayout::BlueFirst8888), Some(PixelLayout::BlueFirst8888))
+                    | (Some(PixelLayout::RedFirst8888), Some(PixelLayout::RedFirst8888))
+            )
+    }
+
+    /// Copies one CPU-produced frame into this sink framebuffer.
+    ///
+    /// The frame and framebuffer each describe their real layout. Conversion, when needed, is an
+    /// edge operation: producers do not normalize into a global byte order and sinks do not apply
+    /// an unconditional post-process after receiving the frame.
+    pub fn copy_from_frame(&self, frame: &ScanoutFrame) {
+        let dst_stride = self.stride as usize;
+        let dst_bpp = self.bytes_per_pixel as usize;
+        let dst = self.as_volatile_slice();
+        let dst_rows = if dst_stride == 0 || dst.size() == 0 {
+            0
+        } else {
+            (dst.size() - 1) / dst_stride + 1
+        };
+        let src_stride = frame.stride as usize;
+        let source_layout = pixel_layout(frame.fourcc);
+        let target_layout = pixel_layout(self.fourcc);
+        let source_bpp = source_layout
+            .map(PixelLayout::bytes_per_pixel)
+            .unwrap_or(dst_bpp);
+        let convertible = source_layout.is_some()
+            && matches!(
+                target_layout,
+                Some(PixelLayout::BlueFirst8888 | PixelLayout::RedFirst8888)
+            )
+            && dst_bpp == 4;
+        let direct = self.can_copy_direct_from(frame.fourcc);
+        let pixels = (frame.width as usize)
+            .min(src_stride.checked_div(source_bpp).unwrap_or(0))
+            .min(dst_stride.checked_div(dst_bpp).unwrap_or(0));
+        let source_row_bytes = pixels.saturating_mul(source_bpp);
+        let target_row_bytes = pixels.saturating_mul(dst_bpp);
+        let rows = (frame.height as usize).min(dst_rows);
+        let mut converted = if convertible && !direct {
+            vec![0; target_row_bytes]
+        } else {
+            Vec::new()
+        };
+
+        let Damage::Full = frame.damage;
+        for row in 0..rows {
+            let source_offset = row.saturating_mul(src_stride);
+            let Some(source_end) = source_offset.checked_add(source_row_bytes) else {
+                break;
+            };
+            if source_end > frame.bytes.len() {
+                break;
+            }
+            let source = &frame.bytes[source_offset..source_end];
+
+            let (bytes, bytes_to_write) = if direct {
+                (source, target_row_bytes)
+            } else if convertible
+                && convert_scanout_row(
+                    frame.fourcc,
+                    self.fourcc,
+                    pixels,
+                    source,
+                    &mut converted,
+                )
+            {
+                (converted.as_slice(), target_row_bytes)
+            } else {
+                // Preserve the historical raw-copy fallback for formats this CPU edge does not
+                // understand yet. The declared format is still retained, so adding a converter
+                // later does not require changing either producer or sink.
+                (source, source_row_bytes.min(target_row_bytes))
+            };
+            match dst.sub_slice(row * dst_stride, bytes_to_write) {
+                Ok(target) => target.copy_from(&bytes[..bytes_to_write]),
+                Err(_) => break,
+            }
+        }
+    }
 }
 
 /// How much of a `ScanoutFrame` is new since the sink last saw one.
@@ -250,11 +438,9 @@ pub struct ScanoutFrame<'a> {
     pub stride: u32,
     pub width: u32,
     pub height: u32,
-    /// DRM fourcc of `bytes`. The CPU pipeline's canonical byte order is BGRX (XR24/AR24): every
-    /// producer maintains that on its own side and every sink converts from it, so carrying the
-    /// fourcc changes nothing about what happens to these bytes. It is here because the convention
-    /// is otherwise a promise kept in comments, and the GPU path -- which picks a VkFormat from a
-    /// fourcc rather than assuming one -- is the one that will need it stated as data.
+    /// DRM fourcc of `bytes`. This is the producer's actual layout, not a pipeline-wide canonical
+    /// format. The CPU edge compares it with the sink framebuffer's fourcc and performs at most one
+    /// conversion while copying the frame.
     pub fourcc: u32,
     pub damage: Damage,
 }
@@ -868,10 +1054,10 @@ impl GpuDisplay {
     /// Copies a produced frame into the identified surface's framebuffer and flips it.
     ///
     /// The one place the CPU pipeline turns a produced frame into pixels a sink can post. It does
-    /// exactly what each producer used to do inline and nothing more: fetch the surface's
-    /// framebuffer, copy the rows in, flip. In particular it never touches channel order -- the
-    /// frame arrives in the pipeline's canonical BGRX and the sink is what converts (see
-    /// `ScanoutFrame::fourcc`), so there is no swizzle on this path to move, add or lose.
+    /// fetches the surface's framebuffer, copies the rows in, and flips. The framebuffer declares
+    /// the sink's real pixel layout; when it differs from `ScanoutFrame::fourcc`, the copy and
+    /// conversion happen at this one boundary instead of as producer normalization plus a second
+    /// sink-side full-frame pass.
     ///
     /// The copy honours both strides and stops at the smaller rectangle in each axis, row by row.
     /// That is what makes a gralloc-padded destination and a packed source line up instead of
@@ -887,31 +1073,7 @@ impl GpuDisplay {
                 Some(fb) => fb,
                 None => return PresentOutcome::NoFramebuffer,
             };
-            let dst_stride = fb.stride() as usize;
-            let bytes_per_pixel = fb.bytes_per_pixel as usize;
-            let dst = fb.as_volatile_slice();
-            let dst_rows = if dst_stride == 0 {
-                0
-            } else {
-                dst.size() / dst_stride
-            };
-            let src_stride = frame.stride as usize;
-            let visible_bytes = (frame.width as usize).saturating_mul(bytes_per_pixel);
-            let row_bytes = src_stride.min(dst_stride).min(visible_bytes);
-            let rows = (frame.height as usize).min(dst_rows);
-            // Full damage is the only kind there is; when rectangles arrive they narrow this loop,
-            // which is the whole reason the loop is in one place now.
-            let Damage::Full = frame.damage;
-            for row in 0..rows {
-                let src = row * src_stride;
-                if src + row_bytes > frame.bytes.len() {
-                    break;
-                }
-                match dst.sub_slice(row * dst_stride, row_bytes) {
-                    Ok(d) => d.copy_from(&frame.bytes[src..src + row_bytes]),
-                    Err(_) => break,
-                }
-            }
+            fb.copy_from_frame(frame);
         }
         self.flip(surface_id);
         PresentOutcome::Flipped
@@ -1092,5 +1254,97 @@ impl GpuDisplay {
 
         surface.set_cursor_visible(visible);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_between_red_first_and_blue_first_8888() {
+        let rgba = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let mut bgra = [0; 8];
+        assert!(convert_scanout_row(
+            DRM_FORMAT_ABGR8888,
+            DRM_FORMAT_XRGB8888,
+            2,
+            &rgba,
+            &mut bgra,
+        ));
+        assert_eq!(bgra, [0x33, 0x22, 0x11, 0x44, 0x77, 0x66, 0x55, 0x88]);
+
+        let mut round_trip = [0; 8];
+        assert!(convert_scanout_row(
+            DRM_FORMAT_ARGB8888,
+            DRM_FORMAT_ABGR8888,
+            2,
+            &bgra,
+            &mut round_trip,
+        ));
+        assert_eq!(round_trip, rgba);
+    }
+
+    #[test]
+    fn preserves_rows_when_8888_orders_match() {
+        let source = [0x33, 0x22, 0x11, 0x44];
+        let mut target = [0; 4];
+        assert!(convert_scanout_row(
+            DRM_FORMAT_ARGB8888,
+            DRM_FORMAT_XRGB8888,
+            1,
+            &source,
+            &mut target,
+        ));
+        assert_eq!(target, source);
+    }
+
+    #[test]
+    fn expands_rgb565_into_sink_layout() {
+        let source = [0x00, 0xf8, 0xe0, 0x07, 0x1f, 0x00];
+        let mut target = [0; 12];
+        assert!(convert_scanout_row(
+            DRM_FORMAT_RGB565,
+            DRM_FORMAT_ABGR8888,
+            3,
+            &source,
+            &mut target,
+        ));
+        assert_eq!(
+            target,
+            [0xff, 0x00, 0x00, 0xff, 0x00, 0xff, 0x00, 0xff, 0x00, 0x00, 0xff, 0xff]
+        );
+    }
+
+    #[test]
+    fn framebuffer_copy_converts_once_and_honors_both_strides() {
+        let source = [
+            1, 2, 3, 4, 5, 6, 7, 8, 0xaa, 0xaa, 0xaa, 0xaa, 9, 10, 11, 12, 13, 14, 15,
+            16, 0xbb, 0xbb, 0xbb, 0xbb,
+        ];
+        let mut target = [0xee; 24];
+        {
+            let framebuffer = GpuDisplayFramebuffer::new(
+                VolatileSlice::new(&mut target),
+                12,
+                4,
+                DRM_FORMAT_XRGB8888,
+            );
+            framebuffer.copy_from_frame(&ScanoutFrame {
+                bytes: &source,
+                stride: 12,
+                width: 2,
+                height: 2,
+                fourcc: DRM_FORMAT_ABGR8888,
+                damage: Damage::Full,
+            });
+        }
+        assert_eq!(
+            target,
+            [
+                3, 2, 1, 4, 7, 6, 5, 8, 0xee, 0xee, 0xee, 0xee, 11, 10, 9, 12, 15, 14,
+                13, 16, 0xee, 0xee, 0xee, 0xee,
+            ]
+        );
     }
 }

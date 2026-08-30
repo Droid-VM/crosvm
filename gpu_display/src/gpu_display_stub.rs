@@ -77,6 +77,7 @@ impl GpuDisplaySurface for StubSurface {
             framebuffer.as_volatile_slice(),
             framebuffer_stride,
             framebuffer_bytes_per_pixel,
+            crate::DRM_FORMAT_XRGB8888,
         ))
     }
 }

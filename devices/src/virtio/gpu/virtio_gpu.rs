@@ -91,15 +91,6 @@ use crate::virtio::SharedMemoryMapper;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
-const fn drm_fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
-    (a as u32) | ((b as u32) << 8) | ((c as u32) << 16) | ((d as u32) << 24)
-}
-
-const DRM_FORMAT_XRGB8888: u32 = drm_fourcc(b'X', b'R', b'2', b'4');
-const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
-const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
-const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
-
 // A guest-pool blob must be at least this large to be retained as a possible scanout source (its
 // udmabuf duped for direct display import in `try_import_resource_to_display`). Real scanouts are
 // multi-MiB; gating on size keeps us from holding an extra fd for every small guest BO (which can
@@ -115,23 +106,6 @@ fn is_single_plane_8888_rgb(format: u32) -> bool {
         format,
         DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888
     )
-}
-
-/// CPU display consumers take BGRX bytes. R-first scanouts therefore need one R/B exchange before
-/// they enter that pipeline; the Android sink performs the inverse exchange when it posts its
-/// fixed RGBA_8888 window buffer. A legacy SET_SCANOUT has no fourcc and keeps the historical
-/// desktop assumption that an exchange is required.
-fn cpu_scanout_needs_red_blue_swap(format: Option<u32>) -> bool {
-    match format {
-        Some(fourcc) => fourcc == DRM_FORMAT_ABGR8888 || fourcc == DRM_FORMAT_XBGR8888,
-        None => true,
-    }
-}
-
-fn swap_red_blue_in_place(bytes: &mut [u8]) {
-    for pixel in bytes.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
 }
 
 /// Falling back to the CPU copy path costs a full-frame copy on every present, and every way
@@ -168,6 +142,36 @@ fn note_flush_route(outcome: &str) {
     let set = seen.get_or_insert_with(Default::default);
     if set.insert(outcome.to_string()) {
         base::warn!("FLUSH-ROUTE: {outcome}");
+    }
+}
+
+fn probe_transfer_read(resource_id: u32, counter: &mut u64, bytes: &[u8]) {
+    *counter = counter.wrapping_add(1);
+    if *counter % 64 != 1 {
+        return;
+    }
+    let probe = &bytes[..4096.min(bytes.len())];
+    // Count only color channels: XRGB frames commonly carry 0xff in every fourth byte, which
+    // would make an all-black frame look non-zero.
+    let rgb_nz = probe
+        .chunks_exact(4)
+        .flat_map(|pixel| &pixel[..3])
+        .filter(|byte| **byte != 0)
+        .count();
+    let head: Vec<String> = probe[..16.min(probe.len())]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    scanout_trace_write(format_args!(
+        "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
+        resource_id,
+        rgb_nz,
+        head.join(" ")
+    ));
+    if rgb_nz == 0 {
+        note_flush_route("transfer_read: readback is black");
+    } else {
+        note_flush_route("transfer_read: readback has color");
     }
 }
 
@@ -624,8 +628,9 @@ impl VirtioGpuScanout {
         // SurfaceFlinger RenderEngine (Skia-GL) cannot import our guest-blob dmabuf, the import
         // "succeeds" at the crosvm boundary but the frame never composites -- and crosvm, which
         // no longer owns the bytes, cannot correct it. The CPU-copy path below produces a plain
-        // RGBA_8888 window buffer that every RenderEngine accepts and whose bytes crosvm fully
-        // controls (swizzle, format). The app selects this per device via GPU_DISPLAY_COPY_MODE;
+        // RGBA_8888 window buffer that every RenderEngine accepts and whose layout crosvm fully
+        // controls at the producer-to-sink edge. The app selects this per device via
+        // GPU_DISPLAY_COPY_MODE;
         // `zero`/`auto` keep the fast path. See display_copy_mode().
         if matches!(self.scanout_type, SurfaceType::Scanout)
             && display_copy_mode() != DisplayCopyMode::ForceCpu
@@ -727,7 +732,8 @@ impl VirtioGpuScanout {
             if gpu_diag_enabled()
                 && (self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0)
             {
-                // Read the RAW guest bytes (RGBX) before the R<->B swizzle below.
+                // Read the raw guest bytes before the display edge performs any required
+                // conversion.
                 let staging = &self.flush_staging[..total];
                 let probe = &staging[src_offset.min(staging.len())..];
                 let probe = &probe[..4096.min(probe.len())];
@@ -757,33 +763,10 @@ impl VirtioGpuScanout {
                     head.join(" "),
                 );
             }
-            // Match the byte order to what every one-copy consumer downstream assumes: BGRX (the
-            // VNC surface reads XR24, and the Android backend's swapRedBlueInPlace converts BGRX ->
-            // RGBA_8888). Whether a swap is needed depends on the guest's declared scanout fourcc,
-            // NOT a fixed assumption -- the desktop plane declares ABGR8888 (R-first, RGBX byte
-            // order) so it needs the swap, while fbcon declares XRGB8888 (B-first, already BGRX) so
-            // it must NOT be swapped or its colours invert. This mirrors the zero-copy path, which
-            // is fourcc-correct by construction (the fd's fourcc picks the VkFormat). No
-            // scanout_data means the legacy SET_SCANOUT desktop path: default to swapping, the
-            // pre-fourcc behaviour. gfxstream DOES reach this branch -- a host-visible colorbuffer
-            // whose export returns EINVAL falls through to the pool copy like any other, and it
-            // arrives carrying whatever fourcc the guest compositor picked. So the swap stays
-            // keyed on the fourcc here too: a guest whose declared fourcc disagrees with the byte
-            // order it actually wrote is a bug to fix where the two diverge, not to special-case
-            // here. Kill-switch: GPU_POOL_SCANOUT_NO_SWIZZLE=1.
-            let needs_swizzle =
-                cpu_scanout_needs_red_blue_swap(resource.scanout_data.map(|d| d.drm_format.0));
-            if pool_scanout_swizzle() && needs_swizzle {
-                swap_red_blue_in_place(&mut self.flush_staging[..total]);
-            }
-            // The swizzle above stays where it is: keeping the CPU pipeline in BGRX is the
-            // producer's job, and the frame is built out of bytes that already satisfy it. The
-            // fourcc travelling with the frame is the guest's declared one, which is the same
-            // fourcc that just decided the swap -- XR24 for the legacy SET_SCANOUT path, where a
-            // guest that never declared anything is taken at its pre-fourcc word.
-            //
-            // `bytes` starts at the guest's scanout offset rather than carrying it separately, so
-            // the row walk downstream is the same walk it was here.
+            // Preserve the bytes exactly as the guest produced them. The source fourcc and the
+            // sink framebuffer's fourcc meet in present_frame, which either copies directly or
+            // exchanges red and blue once while copying. A legacy pool resource has no
+            // SET_SCANOUT_BLOB metadata; retain its historical R-first desktop interpretation.
             let frame = ScanoutFrame {
                 bytes: &self.flush_staging[src_offset.min(total)..total],
                 stride: src_stride as u32,
@@ -792,7 +775,7 @@ impl VirtioGpuScanout {
                 fourcc: resource
                     .scanout_data
                     .map(|d| d.drm_format.0)
-                    .unwrap_or(DRM_FORMAT_XRGB8888),
+                    .unwrap_or(DRM_FORMAT_ABGR8888),
                 damage: Damage::Full,
             };
             if matches!(
@@ -875,71 +858,51 @@ impl VirtioGpuScanout {
                 let data = resource.scanout_data.unwrap();
                 let src_stride = data.strides[0] as usize;
                 let src_offset = data.offsets[0] as usize;
-                let packed_stride = self.width as usize * 4;
-                // Unlike transfer_read, this mapping exposes the colorbuffer's declared byte
-                // order directly. AB24/XB24 are R-first, while the CPU display pipeline is BGRX:
-                // apply the same fourcc-aware normalization as the guest-alloc pool path before
-                // Android's fixed RGBA sink performs its final R/B exchange.
-                let needs_swizzle =
-                    cpu_scanout_needs_red_blue_swap(Some(data.drm_format.0));
-                if needs_swizzle {
-                    note_flush_route("blob: normalizing R-first scanout to CPU BGRX");
-                    if self.flush_staging.len() < packed_stride {
-                        self.flush_staging.resize(packed_stride, 0);
-                    }
-                }
                 let mut display = display.borrow_mut();
                 if display.next_buffer_in_use(surface_id) {
                     return Ok(OkNoData);
                 }
-                let fb = display
-                    .framebuffer_region(surface_id, 0, 0, self.width, self.height)
-                    .ok_or(ErrUnspec)?;
-                let fb_stride = fb.stride() as usize;
-                let fb_slice = fb.as_volatile_slice();
                 // SAFETY: `m` maps at least `map_size` bytes of the exported dmabuf; we read within.
                 let src = unsafe {
                     std::slice::from_raw_parts(m.as_ptr() as *const u8, m.size())
                 };
                 strace!(
-                    "flush.blob.copy.begin src_len={} src_stride={} src_off={} fb_stride={} rows={}",
+                    "flush.blob.copy.begin src_len={} src_stride={} src_off={} rows={}",
                     src.len(),
                     src_stride,
                     src_offset,
-                    fb_stride,
                     self.height,
                 );
-                let mut copy_result: VirtioGpuResult = Ok(OkNoData);
-                for row in 0..self.height as usize {
-                    let s = src_offset + row * src_stride;
-                    if s + packed_stride > src.len() {
-                        break;
-                    }
-                    match fb_slice.sub_slice(row * fb_stride, packed_stride) {
-                        Ok(dst) if needs_swizzle => {
-                            let staging = &mut self.flush_staging[..packed_stride];
-                            staging.copy_from_slice(&src[s..s + packed_stride]);
-                            swap_red_blue_in_place(staging);
-                            dst.copy_from(staging);
-                        }
-                        Ok(dst) => dst.copy_from(&src[s..s + packed_stride]),
-                        Err(_) => {
-                            copy_result = Err(ErrUnspec);
-                            break;
-                        }
-                    }
-                }
+                let frame = ScanoutFrame {
+                    bytes: &src[src_offset.min(src.len())..],
+                    stride: src_stride as u32,
+                    width: self.width,
+                    height: self.height,
+                    fourcc: data.drm_format.0,
+                    damage: Damage::Full,
+                };
+                let outcome = display.present_frame(surface_id, &frame);
                 strace!("flush.blob.copy.end");
-                // Always release the locked window buffer, even when the copy failed above.
-                display.flip(surface_id);
                 strace!("flush.blob.flip.end");
-                return copy_result;
+                return match outcome {
+                    PresentOutcome::Flipped => Ok(OkNoData),
+                    PresentOutcome::NoFramebuffer => Err(ErrUnspec),
+                };
             }
         }
 
         // Import failed, fall back to a copy.
         strace!("flush.transfer_read.branch res={}", resource.resource_id);
         note_flush_route("transfer_read: rutabaga readback into the framebuffer");
+        // transfer_read returns the resource's own format. Prefer the renderer's Resource3DInfo,
+        // because SET_SCANOUT_BLOB describes the scanout view while the resource creation format
+        // is what selected gfxstream's readColorBuffer output layout.
+        let transfer_fourcc = rutabaga
+            .query(resource.resource_id)
+            .ok()
+            .map(|query| query.drm_fourcc)
+            .or_else(|| resource.scanout_data.map(|data| data.drm_format.0))
+            .unwrap_or(DRM_FORMAT_XRGB8888);
         let mut display = display.borrow_mut();
 
         // Prevent overwriting a buffer that is currently being used by the compositor.
@@ -960,7 +923,7 @@ impl VirtioGpuScanout {
         let readback: VirtioGpuResult = (|| {
             let packed_stride = self.width as usize * 4;
             let fb_stride = fb.stride() as usize;
-            if fb_stride == packed_stride {
+            if fb_stride == packed_stride && fb.can_copy_direct_from(transfer_fourcc) {
                 let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
                 transfer.stride = fb.stride();
                 let fb_slice = fb.as_volatile_slice();
@@ -969,43 +932,16 @@ impl VirtioGpuScanout {
                     unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
                 );
                 rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
-                // Whether the readback produced anything, every 64th frame: a black display can mean
-                // the copy went to the wrong place or that these bytes were zero to begin with, and
-                // nothing else distinguishes the two.
-                self.flush_probe_counter = self.flush_probe_counter.wrapping_add(1);
-                if self.flush_probe_counter % 64 == 1 {
-                    let probe = unsafe {
-                        std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, 4096.min(fb_slice.size()))
-                    };
-                    // Count only the color channels: XRGB frames carry 0xff in every fourth byte,
-                    // which made an all-black frame read as "25% nonzero" and pass for content.
-                    let rgb_nz = probe
-                        .chunks_exact(4)
-                        .flat_map(|px| &px[..3])
-                        .filter(|b| **b != 0)
-                        .count();
-                    let head: Vec<String> = probe[..16.min(probe.len())]
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    strace!(
-                        "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
-                        resource.resource_id,
-                        rgb_nz,
-                        head.join(" ")
-                    );
-                    if rgb_nz == 0 {
-                        note_flush_route("transfer_read: readback is black");
-                    } else {
-                        note_flush_route("transfer_read: readback has color");
-                    }
-                }
+                // SAFETY: transfer_read just initialized this locked framebuffer memory.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, fb_slice.size())
+                };
+                probe_transfer_read(resource.resource_id, &mut self.flush_probe_counter, bytes);
             } else {
-                // The window buffer rows are padded (gralloc stride alignment), and the readback
-                // backend writes tightly-packed rows no matter what Transfer3D::stride says (observed
-                // with gfxstream at widths whose row size isn't aligned, e.g. 1440x900) -- every row
-                // lands progressively shifted and the image smears. Read into a packed staging buffer
-                // and re-stride into the window buffer by row.
+                // Staging is needed when gralloc pads rows (gfxstream writes packed rows despite
+                // Transfer3D::stride) or when producer and sink have different channel order. In
+                // the latter case copy_from_frame combines the re-stride and R/B exchange instead
+                // of following the copy with a second full-frame pass in the Android backend.
                 let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
                 transfer.stride = packed_stride as u32;
                 let size = packed_stride * self.height as usize;
@@ -1019,13 +955,15 @@ impl VirtioGpuScanout {
                     transfer,
                     Some(IoSliceMut::new(staging)),
                 )?;
-                let fb_slice = fb.as_volatile_slice();
-                for row in 0..self.height as usize {
-                    fb_slice
-                        .sub_slice(row * fb_stride, packed_stride)
-                        .map_err(|_| ErrUnspec)?
-                        .copy_from(&staging[row * packed_stride..][..packed_stride]);
-                }
+                probe_transfer_read(resource.resource_id, &mut self.flush_probe_counter, staging);
+                fb.copy_from_frame(&ScanoutFrame {
+                    bytes: staging,
+                    stride: packed_stride as u32,
+                    width: self.width,
+                    height: self.height,
+                    fourcc: transfer_fourcc,
+                    damage: Damage::Full,
+                });
             }
 
             Ok(OkNoData)
@@ -1356,18 +1294,6 @@ fn gpu_diag_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("GFXSTREAM_DIAG").map_or(false, |v| !v.is_empty() && v != "0")
-    })
-}
-
-/// Master kill-switch for the pool-direct-read R<->B swap. The swap itself is applied per-frame
-/// only when the scanout's declared fourcc is R-first (see the call site) -- a drm2kgsl desktop
-/// scanout arrives RGBX (ABGR8888) and must land BGRX for the one-copy consumers, while fbcon's
-/// XRGB8888 is already BGRX and is left alone. This returns whether the swap is permitted at all;
-/// GPU_POOL_SCANOUT_NO_SWIZZLE=1 disables it globally for regression bisects.
-fn pool_scanout_swizzle() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("GPU_POOL_SCANOUT_NO_SWIZZLE").map_or(true, |v| v.is_empty() || v == "0")
     })
 }
 

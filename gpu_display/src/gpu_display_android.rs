@@ -24,6 +24,7 @@ use base::VolatileSlice;
 use vm_control::gpu::DisplayParameters;
 
 use crate::DisplayT;
+use crate::DRM_FORMAT_ABGR8888;
 use crate::GpuDisplayError;
 use crate::GpuDisplayFramebuffer;
 use crate::GpuDisplayResult;
@@ -211,7 +212,14 @@ impl From<ANativeWindow_Buffer> for GpuDisplayFramebuffer<'_> {
             // SAFETY: get_android_surface_buffer guarantees that bits points to a valid buffer and
             // the buffer remains available until post_android_surface_buffer is called.
             unsafe { slice::from_raw_parts_mut(anb.bits, buffer_size.try_into().unwrap()) };
-        Self::new(VolatileSlice::new(buffer), stride_bytes, BYTES_PER_PIXEL)
+        // HAL_PIXEL_FORMAT_RGBA_8888 is R, G, B, A in memory, i.e. DRM AB24 on a
+        // little-endian host.
+        Self::new(
+            VolatileSlice::new(buffer),
+            stride_bytes,
+            BYTES_PER_PIXEL,
+            DRM_FORMAT_ABGR8888,
+        )
     }
 }
 
