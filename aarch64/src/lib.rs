@@ -45,6 +45,7 @@ use devices::PciConfigMmio;
 use devices::PciDevice;
 use devices::PciRootCommand;
 use devices::Pflash;
+use devices::SbsaUart;
 use devices::Serial;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use devices::VirtCpufreq;
@@ -157,6 +158,21 @@ const AARCH64_VMWDT_SIZE: u64 = 0x1000;
 
 // Place the PL061 GPIO controller (power/sleep button) at page 4
 const AARCH64_GPIO_ADDR: u64 = 0x4000;
+// ARM SBSA UART: a standalone PL011-subset device, independent of the four fixed
+// 16550 COM ports. It occupies a free 4k page in the low MMIO map; its SPI is drawn
+// from the dynamic pool (allocate_irq) at wire-up time. Windows-on-ARM binds it via
+// ACPI SPCR (SBSA subtype) + SerPL011.sys.
+// NB: page 0x5000 is reserved by the ACPI FADT for the DroidVM PmReset controller
+// (SleepControlReg 0x5000 / ResetReg 0x5008, see edk2 ArmFadtGenerator); the UART
+// must not squat on it, so it lives at page 0x6000.
+const AARCH64_SBSA_UART_BASE: u64 = 0x6000;
+const AARCH64_SBSA_UART_SIZE: u64 = 0x1000;
+// DroidVM PmReset: ACPI reduced-hardware power controller backing the FADT's
+// SLEEP_CONTROL_REG (0x5000) / SLEEP_STATUS_REG (0x5004) / RESET_REG (0x5008).
+// Windows-on-ARM has no PSCI, so power-off/reboot come through these registers.
+// One 4k page keeps the whole FADT-declared block inside a single mapping.
+const AARCH64_PMRESET_ADDR: u64 = 0x5000;
+const AARCH64_PMRESET_SIZE: u64 = 0x1000;
 // The GPIO controller gets one 4k page
 const AARCH64_GPIO_SIZE: u64 = 0x1000;
 // The GPIO controller uses a fixed high SPI (like the vmwdt) so it does not
@@ -941,6 +957,50 @@ impl arch::LinuxArch for AArch64 {
             .register_edge_irq_event(AARCH64_SERIAL_2_4_IRQ, &com_evt_2_4, source)
             .map_err(Error::RegisterIrqfd)?;
 
+        // ARM SBSA UART (optional): added only when the guest config asked for
+        // `--serial hardware=sbsa,num=1`. It is a standalone device, separate from
+        // the four 16550 COM ports above, with its own MMIO page and a
+        // dynamically-allocated SPI. Returns (base, irq, is_console) for the FDT.
+        let sbsa_uart_cfg = if let Some(param) =
+            serial_parameters.get(&(SerialHardware::Sbsa, 1))
+        {
+            let sbsa_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
+            let sbsa_irq = system_allocator.allocate_irq().ok_or(
+                Error::CreateSerialDevices(arch::DeviceRegistrationError::AllocateIrq),
+            )?;
+            let mut sbsa_keep_rds = Vec::new();
+            let sbsa = param
+                .create_serial_device::<SbsaUart>(
+                    components.hv_cfg.protection_type,
+                    sbsa_evt.get_trigger(),
+                    &mut sbsa_keep_rds,
+                )
+                .map_err(|e| {
+                    Error::CreateSerialDevices(arch::DeviceRegistrationError::CreateSerialDevice(e))
+                })?;
+            mmio_bus
+                .insert(
+                    Arc::new(Mutex::new(sbsa)),
+                    AARCH64_SBSA_UART_BASE,
+                    AARCH64_SBSA_UART_SIZE,
+                )
+                .expect("failed to add SBSA UART to MMIO bus");
+            irq_chip
+                .register_edge_irq_event(
+                    sbsa_irq,
+                    &sbsa_evt,
+                    IrqEventSource {
+                        device_id: SbsaUart::device_id(),
+                        queue_id: 0,
+                        device_name: SbsaUart::debug_label(),
+                    },
+                )
+                .map_err(Error::RegisterIrqfd)?;
+            Some((AARCH64_SBSA_UART_BASE, sbsa_irq, param.console))
+        } else {
+            None
+        };
+
         mmio_bus
             .insert(
                 pci_bus,
@@ -1186,6 +1246,7 @@ impl arch::LinuxArch for AArch64 {
             matches!(vm.hypervisor_kind(), HypervisorKind::Kvm),
             &components.smbios,
             pflash_cfg,
+            sbsa_uart_cfg,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -1593,6 +1654,18 @@ impl AArch64 {
             AARCH64_VMWDT_SIZE,
         )
         .expect("failed to add vmwdt device");
+
+        // PmReset: ACPI reduced-hardware power controller (power-off + reset).
+        // Purely MMIO-triggered, so it needs no IRQ. Backs the FADT registers
+        // the edk2 ArmFadtGenerator advertises; without it Windows-on-ARM (no
+        // PSCI) cannot shut down or reboot the guest.
+        let pmreset = devices::PmReset::new(vm_evt_wrtube.try_clone().unwrap());
+        bus.insert(
+            Arc::new(Mutex::new(pmreset)),
+            AARCH64_PMRESET_ADDR,
+            AARCH64_PMRESET_SIZE,
+        )
+        .expect("failed to add pmreset device");
 
         // PL061 GPIO controller, used to deliver power/sleep button events to the
         // guest's gpio-keys driver (aarch64 has no ACPI power management block).

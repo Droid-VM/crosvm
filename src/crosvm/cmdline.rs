@@ -2233,11 +2233,16 @@ pub struct RunCommand {
     ///     type=(stdout,syslog,sink,file) - Where to route the
     ///        serial device.
     ///        Platform-specific options:
-    ///        On Unix: 'unix' (datagram) and 'unix-stream' (stream)
+    ///        On Unix: 'unix' (datagram), 'unix-stream' (stream),
+    ///        'pty' (allocate a pseudo-terminal; crosvm keeps the
+    ///        master and path= optionally becomes a symlink to the
+    ///        slave), and 'dev' (open the existing character device
+    ///        at path=, e.g. a USB gadget serial port /dev/ttyGSn,
+    ///        raw and non-blocking)
     ///        On Windows: 'namedpipe'
-    ///     hardware=(serial,virtio-console,debugcon) - Which type of
-    ///        serial hardware to emulate. Defaults to 8250 UART
-    ///        (serial).
+    ///     hardware=(serial,virtio-console,debugcon,sbsa) - Which
+    ///        type of serial hardware to emulate. Defaults to 8250
+    ///        UART (serial); sbsa is an ARM SBSA/PL011-subset UART.
     ///     name=NAME - Console Port Name, used for virtio-console
     ///        as a tag for identification within the guest.
     ///     num=(1,2,3,4) - Serial Device Number. If not provided,
@@ -3043,9 +3048,10 @@ impl TryFrom<RunCommand> for super::config::Config {
             }
 
             if serial_params.earlycon {
-                // Only SerialHardware::Serial supports earlycon= currently.
+                // Serial (uart8250) and Sbsa (pl011) may carry earlycon. For Sbsa the
+                // Linux earlycon= string is skipped in get_serial_cmdline; Windows uses ACPI.
                 match serial_params.hardware {
-                    SerialHardware::Serial => {}
+                    SerialHardware::Serial | SerialHardware::Sbsa => {}
                     _ => {
                         return Err(super::config::invalid_value_err(
                             serial_params.hardware.to_string(),
