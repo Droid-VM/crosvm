@@ -15,6 +15,7 @@ use arch::CpuSet;
 use arch::DtbOverlay;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use arch::PlatformBusResources;
+use arch::SmbiosOptions;
 use base::open_file_or_duplicate;
 use cros_fdt::Error;
 use cros_fdt::Fdt;
@@ -362,6 +363,7 @@ fn create_chosen_node(
     cmdline: &str,
     initrd: Option<(GuestAddress, usize)>,
     stdout_path: Option<&str>,
+    smbios: &SmbiosOptions,
 ) -> Result<()> {
     let chosen_node = fdt.root_mut().subnode_mut("chosen")?;
     chosen_node.set_prop("linux,pci-probe-only", 1u32)?;
@@ -369,6 +371,19 @@ fn create_chosen_node(
     if let Some(stdout_path) = stdout_path {
         // Used by android bootloader for boot console output
         chosen_node.set_prop("stdout-path", stdout_path)?;
+    }
+
+    // DroidVM: forward SMBIOS identity strings (from `--smbios`) to the guest firmware. EDK2's
+    // SmbiosPlatformDxe reads these /chosen properties and publishes them in its SMBIOS tables
+    // (Type 4 processor version = the CPU name Windows displays). Linux kernels ignore them.
+    if let Some(v) = &smbios.processor_version {
+        chosen_node.set_prop("droidvm,smbios-processor-version", v.as_str())?;
+    }
+    if let Some(v) = &smbios.product_name {
+        chosen_node.set_prop("droidvm,smbios-product-name", v.as_str())?;
+    }
+    if let Some(v) = &smbios.manufacturer {
+        chosen_node.set_prop("droidvm,smbios-manufacturer", v.as_str())?;
     }
 
     let mut kaslr_seed_bytes = [0u8; 8];
@@ -584,7 +599,9 @@ fn create_rtc_node(fdt: &mut Fdt) -> Result<()> {
 
     let rtc_name = format!("rtc@{:x}", AARCH64_RTC_ADDR);
     let reg = [AARCH64_RTC_ADDR, AARCH64_RTC_SIZE];
-    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_RTC_IRQ, IRQ_TYPE_LEVEL_HIGH];
+    // Same as the PL061 below: the PL030 alarm is an IrqEdgeEvent, so declare the line edge-
+    // triggered instead of level (a level declaration on an edge doorbell storms after EOI).
+    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_RTC_IRQ, IRQ_TYPE_EDGE_RISING];
 
     let rtc_node = fdt.root_mut().subnode_mut(&rtc_name)?;
     rtc_node.set_prop("compatible", "arm,primecell")?;
@@ -609,7 +626,13 @@ fn create_gpio_node(fdt: &mut Fdt) -> Result<()> {
 
     let gpio_name = format!("gpio@{:x}", AARCH64_GPIO_ADDR);
     let reg = [AARCH64_GPIO_ADDR, AARCH64_GPIO_SIZE];
-    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_GPIO_IRQ, IRQ_TYPE_LEVEL_HIGH];
+    // The PL061 model injects its aggregate interrupt through an IrqEdgeEvent (one edge per
+    // rising transition of MIS -- the Gunyah irqchip only supports edge irqfds, and the doorbell
+    // vdevice behind it is declared IRQ_TYPE_EDGE_RISING in the hypervisor DT). Declaring it
+    // LEVEL_HIGH here made the guest GIC treat the doorbell as a level line that nobody ever
+    // deasserts: the first power-button press left vCPU0 spinning in the interrupt handler
+    // (RCU stalls, soft lockups, hung tasks -- a hard guest hang on every "Power" press).
+    let irq = [GIC_FDT_IRQ_TYPE_SPI, AARCH64_GPIO_IRQ, IRQ_TYPE_EDGE_RISING];
 
     let gpio_node = fdt.root_mut().subnode_mut(&gpio_name)?;
     gpio_node.set_prop("compatible", &["arm,pl061", "arm,primecell"])?;
@@ -802,6 +825,7 @@ pub fn create_fdt(
     serial_devices: &[SerialDeviceInfo],
     virt_cpufreq_v2: bool,
     is_kvm: bool,
+    smbios: &SmbiosOptions,
     pflash_cfg: Option<PflashDtConfig>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
@@ -818,6 +842,7 @@ pub fn create_fdt(
     if let Some(android_fstab) = android_fstab {
         arch::android::create_android_fdt(&mut fdt, android_fstab)?;
     }
+    create_chosen_node(&mut fdt, cmdline, initrd, stdout_path.as_deref(), smbios)?;
     let stdout_path = serial_devices
         .first()
         .map(|first_serial| format!("/U6_16550A@{:x}", first_serial.address));

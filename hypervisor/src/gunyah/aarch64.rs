@@ -102,6 +102,7 @@ impl VmAArch64 for GunyahVm {
             }
         }
 
+        base::info!("GH: layout base={:#x} ram_top={:#x} size-max={:#x}", base_address, ram_top, size_max);
         let interrupts_node = top_node.subnode_mut("interrupts")?;
         interrupts_node.set_prop("config", *phandles.get("intc").unwrap())?;
 
@@ -150,6 +151,28 @@ impl VmAArch64 for GunyahVm {
             }
         }
 
+        // The sm8650-era RM (observed on 6.1 host kernels, OPPO 6.1.118) REJECTS a
+        // guest DTB that carries this reserved-memory node: VM init fails with
+        // ENODEV at GH_VM_START. Newer RMs (6.6/6.12 hosts) accept it, and there
+        // the fence is required (the RM's low-IPA donation is silently
+        // non-executable; without the fence the guest faults on code placed
+        // there -- see the commit that introduced it). No RM version is exposed
+        // to the host, so the host kernel release is the best available proxy
+        // for the RM generation. GUNYAH_LOWMEM_FENCE=0/1 forces either way.
+        let fence_enabled = match std::env::var("GUNYAH_LOWMEM_FENCE").ok().as_deref() {
+            Some("0") => false,
+            Some(_) => true,
+            None => {
+                let pre_6_6 = super::host_kernel_pre_6_6();
+                if pre_6_6 {
+                    base::info!(
+                        "GH: pre-6.6 host kernel: omitting the RM-lowmem fence node                          (this RM generation rejects DTBs that carry it)"
+                    );
+                }
+                !pre_6_6
+            }
+        };
+        if fence_enabled && resv_top > GUNYAH_RM_LOWMEM_FLOOR {
         Ok(())
     }
 
@@ -203,7 +226,9 @@ impl VmAArch64 for GunyahVm {
         }
 
         if let Err(e) = self.set_boot_pc(payload_entry_address.offset()) {
-            if e.errno() == ENOTTY {
+            // Kernels without GH_VM_SET_BOOT_CONTEXT answer ENOTTY (mainline ioctl
+            // dispatch) or ENODEV (OPPO sm8650 6.1 downstream dispatch).
+            if e.errno() == ENOTTY || e.errno() == libc::ENODEV {
                 // GH_VM_SET_BOOT_CONTEXT ioctl is not supported, but returning success
                 // for backward compatibility when the offset is zero.
                 if payload_offset != 0 {

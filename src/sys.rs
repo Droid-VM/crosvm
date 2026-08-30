@@ -7,6 +7,8 @@ cfg_if::cfg_if! {
         pub(crate) mod linux;
         use linux as platform;
         pub(crate) use crate::crosvm::sys::linux::{run_config, ExitState};
+        #[cfg(not(feature = "crash-report"))]
+        pub(crate) use platform::install_crash_handler;
     } else if #[cfg(windows)] {
         pub(crate) mod windows;
         use windows as platform;

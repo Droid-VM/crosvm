@@ -1595,7 +1595,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         delay_rt: cfg.delay_rt,
         no_i8042: cfg.no_i8042,
         no_rtc: cfg.no_rtc,
-        #[cfg(target_arch = "x86_64")]
         smbios: cfg.smbios.clone(),
         simplefb: cfg.simplefb.as_ref().map(|s| arch::SimplefbParams {
             width: s.width,
@@ -4293,11 +4292,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         // child processes that exit cleanly which should not be considered a
                         // crash. When running with sandboxing, this should be handled by the
                         // device's process handler.
+                        // Some vendor GPU driver builds (observed: OPPO sm8650 / Android 14
+                        // Adreno stack) fork helpers that exit with a NON-zero status during
+                        // normal operation; only crosvm's own (tracked) children are evidence
+                        // of a crash. Accept any exit code from untracked children.
                         if cfg.jail_config.is_none()
                             && !linux.pid_debug_label_map.contains_key(&pid)
                             && siginfo.ssi_signo == libc::SIGCHLD as u32
                             && siginfo.ssi_code == libc::CLD_EXITED
-                            && siginfo.ssi_status == 0
                         {
                             continue;
                         }

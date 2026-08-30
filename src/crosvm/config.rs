@@ -16,7 +16,6 @@ use arch::CpuSet;
 use arch::FdtPosition;
 use arch::PciConfig;
 use arch::Pstore;
-#[cfg(target_arch = "x86_64")]
 use arch::SmbiosOptions;
 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
 use arch::SveConfig;
@@ -835,7 +834,6 @@ pub struct Config {
     pub simplefb: Option<SimplefbConfig>,
     #[cfg(any(feature = "slirp-ring-capture", feature = "slirp-debug"))]
     pub slirp_capture_file: Option<String>,
-    #[cfg(target_arch = "x86_64")]
     pub smbios: SmbiosOptions,
     #[cfg(all(windows, feature = "audio"))]
     pub snd_split_configs: Vec<SndSplitConfig>,
@@ -1075,7 +1073,6 @@ impl Default for Config {
             simplefb: None,
             #[cfg(any(feature = "slirp-ring-capture", feature = "slirp-debug"))]
             slirp_capture_file: None,
-            #[cfg(target_arch = "x86_64")]
             smbios: SmbiosOptions::default(),
             #[cfg(all(windows, feature = "audio"))]
             snd_split_configs: Vec::new(),
