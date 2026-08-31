@@ -131,8 +131,8 @@ const AARCH64_PFLASH_MAX_SIZE: u64 = AARCH64_PLATFORM_MMIO_SIZE;
 ///
 /// Everything above this is the window -- the guest's real RAM -- which is why this comes out of
 /// `--mem` rather than being added to it: the pools and the MMIO windows are placed relative to
-/// the top of `--mem`, so a VM in this mode has exactly the layout it would have had, with its
-/// RAM starting a few megabytes higher.
+/// the top of the block `--mem` describes, so a VM in this mode has exactly the layout it would
+/// have had, with its RAM starting a few megabytes higher.
 const AARCH64_SHIM_BOOT_REGION_SIZE: u64 = AARCH64_FDT_ALIGN + AARCH64_FDT_MAX_SIZE;
 
 /// Where the device tree goes inside the boot region, and how much room it has there. Both are
@@ -142,6 +142,15 @@ const AARCH64_SHIM_FDT_MAX_SIZE: u64 = AARCH64_FDT_MAX_SIZE;
 
 /// The page the host and the shim talk through. One folio, immediately above the boot region.
 const AARCH64_SHIM_HANDOFF_SIZE: u64 = 0x200000;
+
+/// The least guest RAM the Gunyah resource manager will start a VM with.
+///
+/// Checked because `--mem` is not the guest's RAM: the swiotlb, the framebuffer and every pool
+/// tagged `consume_system_mem` come out of it first, and each of those is configured somewhere
+/// else -- so it is entirely possible to ask for a VM whose parts add up to more than it has.
+/// Without this the subtraction is what notices, either by panicking on the overflow check or, if
+/// that is off, by wrapping into a region tens of exabytes long.
+const AARCH64_MIN_GUEST_RAM: u64 = 4 << 20;
 
 const AARCH64_PROTECTED_VM_FW_MAX_SIZE: u64 = 0x400000;
 const AARCH64_PROTECTED_VM_FW_START: u64 =
@@ -423,6 +432,19 @@ pub enum Error {
     GetPsciVersion(base::Error),
     #[error("failed to get serial cmdline: {0}")]
     GetSerialCmdline(GetSerialCmdlineError),
+    #[error(
+        "--mem {mem:#x} leaves {ram:#x} for the guest, below the {floor:#x} the resource manager \
+         will start a VM with: {swiotlb:#x} swiotlb, {simplefb:#x} framebuffer and {pools:#x} of \
+         pools all come out of it"
+    )]
+    GuestRamTooSmall {
+        mem: u64,
+        ram: u64,
+        floor: u64,
+        swiotlb: u64,
+        simplefb: u64,
+        pools: u64,
+    },
     #[error("failed to initialize arm pvtime: {0}")]
     InitPvtimeError(base::Error),
     #[error("initrd could not be loaded: {0}")]
@@ -804,16 +826,11 @@ fn sys_ram_pool_bytes() -> u64 {
 /// up to `--mem` exactly when every pool comes out of it, and grows past `--mem` only when a
 /// growable pool is actually granted more.
 fn vm_block_size(components: &VmComponents) -> u64 {
-    let pools = sys_ram_pool_bytes();
-    if pools >= components.memory_size {
-        base::error!(
-            "GH-POOL: pools want {:#x} of a {:#x} VM; not taking them out of its RAM",
-            pools,
-            components.memory_size,
-        );
-        return components.memory_size;
-    }
-    components.memory_size - pools
+    // Saturating, and deliberately not the place that complains: this is called from eight places
+    // that have no way to refuse, and they all have to agree on one number. `guest_memory_layout`
+    // makes the judgement once, before anything is laid out at all -- so by the time the rest of
+    // these run, a block this arithmetic could not produce honestly has already been rejected.
+    components.memory_size.saturating_sub(sys_ram_pool_bytes())
 }
 
 fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?Sized)) -> u64 {
@@ -824,10 +841,11 @@ fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?
     let mut main_memory_size = block;
     if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
         if let Some(size) = components.swiotlb {
-            main_memory_size -= size;
+            main_memory_size = main_memory_size.saturating_sub(size);
         }
         if let Some(ref sfb) = components.simplefb {
-            main_memory_size -= get_simplefb_size(sfb, block, components.swiotlb, hypervisor);
+            main_memory_size = main_memory_size
+                .saturating_sub(get_simplefb_size(sfb, block, components.swiotlb, hypervisor));
         }
     }
     main_memory_size
@@ -904,6 +922,25 @@ impl arch::LinuxArch for AArch64 {
         hypervisor: &impl Hypervisor,
     ) -> std::result::Result<Vec<(GuestAddress, u64, MemoryRegionOptions)>, Self::Error> {
         let main_memory_size = main_memory_size(components, hypervisor);
+        // Everything below reads this, and several things subtract from it again, so it is checked
+        // here rather than where each of them would notice. A VM whose swiotlb, framebuffer and
+        // pools add up to more than `--mem` is a configuration mistake in whichever of those was
+        // set last, and saying which one it was costs nothing here.
+        if main_memory_size < AARCH64_MIN_GUEST_RAM {
+            let block = vm_block_size(components);
+            return Err(Error::GuestRamTooSmall {
+                mem: components.memory_size,
+                ram: main_memory_size,
+                floor: AARCH64_MIN_GUEST_RAM,
+                swiotlb: components.swiotlb.unwrap_or(0),
+                simplefb: components
+                    .simplefb
+                    .as_ref()
+                    .map(|sfb| get_simplefb_size(sfb, block, components.swiotlb, hypervisor))
+                    .unwrap_or(0),
+                pools: sys_ram_pool_bytes(),
+            });
+        }
 
         // In a pseudo-unprotected VM the guest's RAM is not lent to it: the region at the bottom
         // holds only the shim and the device tree, and everything above it is a window the host
