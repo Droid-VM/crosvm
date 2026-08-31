@@ -92,6 +92,21 @@ mod tests {
         ex.run_until(this_test(&ex)).unwrap();
     }
 
+    /// A zero-length sleep used to arm a timerfd with an all-zero itimerspec, which disarms it:
+    /// the wait never returned and whatever task was pacing itself against a clock stopped for
+    /// good. Guest audio capture reached that state after a few minutes every time.
+    #[test]
+    fn sleep_zero_returns() {
+        async fn this_test(ex: &Executor) {
+            TimerAsync::sleep(ex, Duration::ZERO)
+                .await
+                .expect("a zero sleep must return");
+        }
+
+        let ex = Executor::new().unwrap();
+        ex.run_until(this_test(&ex)).unwrap();
+    }
+
     #[test]
     fn one_shot_fd() {
         async fn this_test(ex: &Arc<RawExecutor<EpollReactor>>) {

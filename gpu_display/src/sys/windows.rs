@@ -91,6 +91,7 @@ impl WinGpuDisplayExt for GpuDisplay {
             next_id: 1,
             event_devices: Default::default(),
             surfaces: Default::default(),
+            dmabuf_import_capped: false,
             wait_ctx,
         })
     }

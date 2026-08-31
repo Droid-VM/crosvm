@@ -144,6 +144,8 @@ pub enum CrosvmDeviceId {
     VirtCpufreq = 22,
     FwCfg = 23,
     Pl061 = 24,
+    SbsaUart = 25,
+    PmReset = 26,
 }
 
 impl TryFrom<u16> for CrosvmDeviceId {
@@ -172,6 +174,8 @@ impl TryFrom<u16> for CrosvmDeviceId {
             20 => Ok(CrosvmDeviceId::AcAdapter),
             21 => Ok(CrosvmDeviceId::VirtualPmc),
             24 => Ok(CrosvmDeviceId::Pl061),
+            25 => Ok(CrosvmDeviceId::SbsaUart),
+            26 => Ok(CrosvmDeviceId::PmReset),
             _ => Err(base::Error::new(EINVAL)),
         }
     }

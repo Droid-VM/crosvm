@@ -14,7 +14,9 @@ use std::marker::Sync;
 use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::bail;
 use anyhow::Context;
@@ -44,6 +46,8 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 
 use crate::guest_address::GuestAddress;
+use crate::pool_grants::GrantError;
+use crate::pool_grants::PoolGrants;
 
 mod sys;
 pub use sys::MemoryPolicy;
@@ -75,6 +79,8 @@ pub enum Error {
     MemoryRegionOverlap,
     #[error("memory region size {0} is too large")]
     MemoryRegionTooLarge(u128),
+    #[error("growable pool at {0}: {1}")]
+    PoolParams(GuestAddress, String),
     #[error("host access to lent memory region at {0} (purpose={1:?}) in protected VM")]
     ProtectedMemoryAccess(GuestAddress, MemoryRegionPurpose),
     #[error("incomplete read of {completed} instead of {expected} bytes")]
@@ -83,6 +89,8 @@ pub enum Error {
     ShortWrite { expected: usize, completed: usize },
     #[error("DescriptorChain split is out of bounds: {0}")]
     SplitOutOfBounds(usize),
+    #[error("host access to an ungranted address {0} in a growable pool")]
+    UngrantedPoolAccess(GuestAddress),
     #[error("{0}")]
     VolatileMemoryAccess(#[source] VolatileMemoryError),
 }
@@ -114,6 +122,34 @@ impl AsRef<dyn AsRawDescriptor + Sync + Send> for BackingObject {
     }
 }
 
+/// What the hypervisor backend was able to promise about the pages behind the `SharedFramebuffer`
+/// region, recorded at VM creation and read much later by whoever wants to hand those pages to
+/// someone who will hold a reference on them.
+///
+/// The one consumer is the simplefb bridge's GPU transport. A udmabuf over this region takes a
+/// plain page reference on every page (`shmem_read_mapping_page` on GKI 6.6 -- a reference, not a
+/// pin), and a referenced page cannot be migrated. If the page is sitting in a CMA pageblock when
+/// the guest first touches it, gunyah's fault-time `FOLL_LONGTERM` pin has to migrate it out and
+/// cannot, and the guest takes `page fault at <gpa>, attempt: -12` -- a vcpu OOM seconds after the
+/// bridge announces `transport=gpu-blit`. So the question the GPU path has to ask first is not
+/// "can I make a dmabuf" but "is this memory somewhere the host can leave it", and only the
+/// backend that laid the region out knows the answer.
+///
+/// `Unclaimed` is not "probably fine": it is "nobody has said", and the GPU path treats it exactly
+/// like a refusal. A backend that wants the fast path has to earn it by recording `PoolBacked`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum FramebufferPrep {
+    /// No hypervisor backend has spoken for this region.
+    #[default]
+    Unclaimed,
+    /// Every 2 MiB of the region is a present, non-movable folio, and will still be one when the
+    /// guest faults on it.
+    PoolBacked,
+    /// It is not, and this is why. Carried as prose because the only thing done with it is to put
+    /// it in the line that explains why the bridge is on the CPU path.
+    NotPoolBacked(String),
+}
+
 /// For MemoryRegion::regions
 pub struct MemoryRegionInformation<'a> {
     pub index: usize,
@@ -131,6 +167,35 @@ pub enum MemoryRegionPurpose {
     /// BIOS/firmware ROM
     Bios,
 
+    /// DroidVM: drm2kgsl native-context arena. A third SHARE-blessed pool, treated exactly like
+    /// GpuPool for access/bless/hugepage, that virglrenderer's drm2kgsl backend sub-allocates every
+    /// GPU BO from. Distinct from GpuPool so a build carrying both renderers cannot hand the
+    /// drm2kgsl arena to gfxstream's HostVisiblePool (which is handed any GpuPool region), so the
+    /// two can be sized independently, and so it gets its own `drm2kgsl_host` DT node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    Drm2KgslPool,
+
+
+    /// DroidVM: a GROWABLE test pool. Declared to the guest at its full size but SHARE'd only up
+    /// to `pre_alloc_size` at boot; the rest is granted at runtime over virtio-gunyah-accept's
+    /// pool queue. Exists so the growable path can be exercised end to end without disturbing the
+    /// three production pools, which are all fully pre-shared and must stay that way.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    DynamicTestPool,
+
+    /// DroidVM: GPU pre-alloc pool (gfxstream HOST-visible pool). Appended after
+    /// guest RAM, SHARE'd (not lent) at boot on protected Gunyah so the host renderer and the guest
+    /// reach the same pages, hugepage-prepared, and announced as a no-map reserved-memory node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    GpuPool,
+
+    /// DroidVM: gfxstream GUEST-alloc pool. A second SHARE-blessed region (treated exactly like
+    /// GpuPool for access/bless/hugepage) that the guest virtio-gpu driver owns and sub-allocates
+    /// BLOB_MEM_GUEST from in guest-alloc mode. Distinct so it gets its own `gpu_guest`
+    /// DT node and is NOT handed to the host gfxstream HostVisiblePool (which sees only GpuPool).
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    GpuPoolGuest,
+
     /// General purpose guest memory
     #[default]
     GuestMemoryRegion,
@@ -146,8 +211,35 @@ pub enum MemoryRegionPurpose {
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     SharedFramebuffer,
 
+    /// DroidVM: the guest's RAM in a pseudo-unprotected VM.
+    ///
+    /// Declared to crosvm like any region -- it is a memfd the host writes the payload into
+    /// before the VM starts -- but never handed to the hypervisor at boot. It appears in no
+    /// device tree node, so the resource manager has nothing to object to, and arrives in the
+    /// guest as a runtime memparcel the boot shim accepts. From then on it is ordinary memory
+    /// that both sides can reach, which is the point: no bounce pool, and a stock kernel with no
+    /// CONFIG_RESTRICTED_DMA_POOL boots.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    SharedGuestRam,
+
+    /// DroidVM: the page a pseudo-unprotected VM's host and shim talk through.
+    ///
+    /// SHARE'd at boot like a pool, because the memparcel handles it carries do not exist until
+    /// after GH_VM_START -- by which time the boot region is lent and the host can no longer
+    /// write to it. It is also the shim's only way to report: a failure written here is a log
+    /// line, and a failure with nowhere to go is a VM that hangs.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    ShimHandoff,
+
     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
     StaticSwiotlbRegion,
+
+    /// DroidVM: venus (vkr) host-alloc transport pool. The region vkr's blob_id==0 shmems
+    /// (per-instance ring, CS/reply chunks) are sub-allocated from (pool merge landed), so the
+    /// guest maps them pool-relative with no runtime SHARE; blessed and access-checked exactly
+    /// like GpuPool. Its own `venus_host` DT node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    VenusPool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues, PartialEq, Eq, PartialOrd, Ord)]
@@ -187,6 +279,37 @@ pub struct MemoryRegionOptions {
     /// Gunyah protected VMs where mixing lend/share operations on the same
     /// memfd causes conflicts.
     pub isolate_backing: bool,
+
+    /// How much of this region is SHARE'd to a protected guest at boot. `None` means all of it,
+    /// which is what every region that is not a growable pool wants.
+    ///
+    /// A growable pool is declared to the guest at its FULL size but backed only in part, with the
+    /// remainder filled in at runtime as the guest asks for it. That works because the region is
+    /// still created whole -- a sparse memfd, so host VA rather than host RAM -- and `size` is
+    /// what feeds `ram_top` and hence the RM's `size-max`, so the RM untags the entire window
+    /// whether or not it is backed. Measured on device: see plans/DYNAMIC_POOL_PLAN.md.
+    ///
+    /// Build the region full and share part of it. Building it small and extending it later is the
+    /// version that fails, with RM_ERROR_MEM_INVALID (0xa) on the first runtime accept.
+    pub pre_alloc_size: Option<u64>,
+
+    /// Granularity of a runtime grant into the unbacked remainder, in bytes.
+    ///
+    /// `0` means this pool does not grow at all: everything is shared before boot, which is what
+    /// the three existing pools do and must keep doing. Non-zero must be a multiple of 2 MiB --
+    /// the folio the share path is built around, and the granularity the reserve pool serves.
+    ///
+    /// Each grant costs one RM memparcel, and MAX_MEMPARCEL_PER_VM is 1024 across the whole VM --
+    /// shared with Android's own parcels, and never released until the phone reboots for anything
+    /// a killed VMM left behind. A 2 MiB step therefore exhausts the quota at 2 GiB and takes the
+    /// phone with it; 32-64 MiB is the range that leaves room.
+    pub step_size: u64,
+
+    /// Cap on this pool's simultaneously live grants. Zero means "as many as the window holds",
+    /// which is only safe for a small window: the real limit is MAX_MEMPARCEL_PER_VM = 1024 for
+    /// the entire VM, and it is shared with Android's own parcels, so several pools each sizing
+    /// themselves against the window can add up past it. Budget it across pools, not per pool.
+    pub max_grants: u32,
 }
 
 impl MemoryRegionOptions {
@@ -212,6 +335,98 @@ impl MemoryRegionOptions {
     pub fn isolate_backing(mut self) -> Self {
         self.isolate_backing = true;
         self
+    }
+
+    /// Declare this region as a growable pool: `pre_alloc` bytes shared at boot, the remainder
+    /// left for runtime grants of `step` bytes each. `step == 0` means the pool never grows and
+    /// `pre_alloc` must be the whole region.
+    pub fn growable_pool(mut self, pre_alloc: u64, step: u64) -> Self {
+        self.pre_alloc_size = Some(pre_alloc);
+        self.step_size = step;
+        self
+    }
+
+    /// Cap on simultaneously live grants for this pool. See `max_grants`.
+    pub fn max_grants(mut self, n: u32) -> Self {
+        self.max_grants = n;
+        self
+    }
+
+    /// Bytes SHARE'd at boot. Regions that never set `pre_alloc_size` get all of `size`, which
+    /// keeps every non-pool region and the three pre-existing pools on exactly the path they are
+    /// on today.
+    pub fn boot_share_len(&self, size: u64) -> u64 {
+        self.pre_alloc_size.map_or(size, |p| p.min(size))
+    }
+
+    /// Validate the pool parameters against a region size. Returns the reason it is not usable, so
+    /// the caller can refuse at configuration time rather than at first grant -- an invalid step
+    /// otherwise surfaces as drm_buddy returning -EINVAL inside the guest, which reads as a guest
+    /// driver bug rather than a command line mistake.
+    pub fn pool_param_error(&self, size: u64) -> Option<String> {
+        const MIN_STEP: u64 = 2 << 20;
+        let pre_alloc = self.pre_alloc_size.unwrap_or(size);
+        if pre_alloc > size {
+            return Some(format!(
+                "pre_alloc_size {:#x} exceeds the region size {:#x}",
+                pre_alloc, size
+            ));
+        }
+        if self.step_size == 0 {
+            // A pool that cannot grow must be fully backed, or the remainder is memory the guest
+            // has been told about and can never obtain -- a read there silently returns zeros.
+            return (pre_alloc != size).then(|| {
+                format!(
+                    "step_size is 0 (pool does not grow) but pre_alloc_size {:#x} != size {:#x}; \
+                     the difference could never be granted",
+                    pre_alloc, size
+                )
+            });
+        }
+        if self.step_size < MIN_STEP {
+            return Some(format!(
+                "step_size {:#x} is below the {:#x} minimum (a grant is shared as 2 MiB folios)",
+                self.step_size, MIN_STEP
+            ));
+        }
+        // A multiple of a folio, not a power of two. The power-of-two rule was written down as
+        // "drm_buddy rejects anything else", and that turned out to be about a different number:
+        // the guest's allocator is initialised with PAGE_SIZE as its chunk (virtgpu_vram.c
+        // `drm_buddy_init(..., PAGE_SIZE)`), and never sees the step at all. What the step really
+        // has to satisfy is the share path -- grants are made of 2 MiB folios -- and the
+        // bookkeeping below, which wants the window and the floor to be whole numbers of steps.
+        if self.step_size % MIN_STEP != 0 {
+            return Some(format!(
+                "step_size {:#x} is not a multiple of {:#x} (a grant is shared as 2 MiB folios)",
+                self.step_size, MIN_STEP
+            ));
+        }
+        if size % self.step_size != 0 || pre_alloc % self.step_size != 0 {
+            return Some(format!(
+                "size {:#x} and pre_alloc_size {:#x} must both be multiples of step_size {:#x}",
+                size, pre_alloc, self.step_size
+            ));
+        }
+        // A growable pool must have SOMETHING shared before boot, and at least a folio of it.
+        //
+        // The pool's `/reserved-memory` node declares the pre-shared floor, and the Gunyah
+        // resource manager on android14-6.1 requires every such node's `reg` to match an accepted
+        // memparcel exactly -- base, size, and a single mapping. A zero floor leaves nothing for
+        // it to match and the VM does not start at all: GH_VM_START answers ENODEV, which reads
+        // as a broken VMM rather than as the one line of configuration it is. (Measured on
+        // sm8650: with the node the VM is refused, without it the same VM boots -- see
+        // plans/PSEUDO_UNPROTECTED_SHIM_PLAN.md.)
+        //
+        // The floor is also where the pool's identity lives: it is the range a driver may touch
+        // without asking, and the node that carries the pool's name, id, step and total size.
+        const MIN_FLOOR: u64 = 2 << 20;
+        if pre_alloc < MIN_FLOOR {
+            return Some(format!(
+                "pre_alloc_size {:#x} is below the {:#x} minimum for a growable pool; the                  reserved-memory node has to describe a memparcel that really exists",
+                pre_alloc, MIN_FLOOR
+            ));
+        }
+        None
     }
 }
 
@@ -297,6 +512,14 @@ pub struct GuestMemory {
     /// When true, host access to lent (non-shared) memory regions is forbidden.
     /// Set after memory is donated to a protected VM (e.g. Gunyah).
     protected: Arc<AtomicBool>,
+    /// Which parts of each growable pool are currently backed, keyed by the pool's base address.
+    /// Empty unless a region declared a non-zero `step_size`, so nothing that exists today pays
+    /// for it. See pool_grants.rs for why the host has to keep this rather than deriving it.
+    grants: Arc<Mutex<BTreeMap<u64, PoolGrants>>>,
+    /// What the hypervisor backend promised about the `SharedFramebuffer` region's pages. Written
+    /// once while the VM is being built, read by the simplefb bridge long afterwards; it lives
+    /// here rather than in a process global because it is a fact about one VM's memory.
+    fb_prep: Arc<Mutex<FramebufferPrep>>,
 }
 
 impl AsRawDescriptors for GuestMemory {
@@ -344,6 +567,17 @@ impl GuestMemory {
     pub fn new_with_options(
         ranges: &[(GuestAddress, u64, MemoryRegionOptions)],
     ) -> Result<GuestMemory> {
+        // Refuse bad pool parameters here, before a single page is mapped. Left to run, a step
+        // the share path cannot honour surfaces as an error deep inside the guest driver, and
+        // a pre_alloc short of the size on a non-growable pool surfaces as reads of the shortfall
+        // silently returning zeros -- both of which read as guest driver bugs rather than as the
+        // command line mistake they are.
+        for (addr, size, options) in ranges {
+            if let Some(why) = options.pool_param_error(*size) {
+                return Err(Error::PoolParams(*addr, why));
+            }
+        }
+
         // Create shm
         let shm = Arc::new(GuestMemory::create_shm(ranges)?);
 
@@ -422,10 +656,32 @@ impl GuestMemory {
             }
         }
 
+        // One entry per growable pool; regions with step_size == 0 -- which is every region that
+        // exists today -- contribute nothing, so this map stays empty on the existing paths.
+        let grants = regions
+            .iter()
+            .filter(|r| r.options.step_size != 0)
+            .map(|r| {
+                let size = r.mapping.size() as u64;
+                (
+                    r.guest_base.offset(),
+                    PoolGrants::new(
+                        r.guest_base,
+                        size,
+                        r.options.boot_share_len(size),
+                        r.options.step_size,
+                        r.options.max_grants,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
         Ok(GuestMemory {
             regions: Arc::from(regions),
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
+            grants: Arc::new(Mutex::new(grants)),
+            fb_prep: Arc::new(Mutex::new(FramebufferPrep::Unclaimed)),
         })
     }
 
@@ -464,10 +720,32 @@ impl GuestMemory {
             }
         }
 
+        // One entry per growable pool; regions with step_size == 0 -- which is every region that
+        // exists today -- contribute nothing, so this map stays empty on the existing paths.
+        let grants = regions
+            .iter()
+            .filter(|r| r.options.step_size != 0)
+            .map(|r| {
+                let size = r.mapping.size() as u64;
+                (
+                    r.guest_base.offset(),
+                    PoolGrants::new(
+                        r.guest_base,
+                        size,
+                        r.options.boot_share_len(size),
+                        r.options.step_size,
+                        r.options.max_grants,
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
         Ok(GuestMemory {
             regions: Arc::from(regions),
             locked: false,
             protected: Arc::new(AtomicBool::new(false)),
+            grants: Arc::new(Mutex::new(grants)),
+            fb_prep: Arc::new(Mutex::new(FramebufferPrep::Unclaimed)),
         })
     }
 
@@ -484,6 +762,260 @@ impl GuestMemory {
         self.protected.store(true, Ordering::Release);
     }
 
+    /// Record what the hypervisor backend managed to promise about the `SharedFramebuffer`
+    /// region's pages. Called once, while the VM is being built.
+    pub fn set_framebuffer_prep(&self, prep: FramebufferPrep) {
+        *self.fb_prep.lock().expect("framebuffer prep record poisoned") = prep;
+    }
+
+    /// What was recorded. `Unclaimed` when no backend said anything, which is the answer the
+    /// framebuffer's GPU transport must refuse on -- see [`FramebufferPrep`].
+    pub fn framebuffer_prep(&self) -> FramebufferPrep {
+        self.fb_prep
+            .lock()
+            .expect("framebuffer prep record poisoned")
+            .clone()
+    }
+
+    /// Base address of the `pool_id`-th growable pool, ordered by address.
+    ///
+    /// The id is an index rather than a name because it has to survive a wire round trip in 32
+    /// bits and be trivially checkable; the guest learns which is which from the device tree node
+    /// order, which is the same ordering.
+    pub fn pool_base(&self, pool_id: u32) -> Option<GuestAddress> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants.keys().nth(pool_id as usize).copied().map(GuestAddress)
+    }
+
+    /// Take a host-side reference on every growable pool the iovecs touch, after checking that
+    /// all of them are backed.
+    ///
+    /// Two jobs in one pass, because they need the same lookup:
+    ///
+    ///   * REFUSE an import over unbacked pool memory. The udmabuf path resolves guest addresses
+    ///     through `find_region`/`shm_region`, which are not gated by `check_host_access`, so
+    ///     without this a guest could have a dma-buf built over a HOLE in the sparse pool memfd.
+    ///     Reading such a buffer allocates host memory on the spot -- a guest-triggerable,
+    ///     unaccounted, never-reclaimed host allocation.
+    ///
+    ///   * Hold the grant until the import is gone, so a shrink cannot pull memory out from under
+    ///     a live dma-buf. The guest cannot get this right by itself: its RESOURCE_UNREF is
+    ///     fire-and-forget, so it returns a buffer to its own allocator while the host still has
+    ///     it mapped.
+    ///
+    /// All or nothing: if any iovec is unbacked, nothing is referenced. Addresses outside every
+    /// growable pool are ignored, so callers do not have to know which is which.
+    pub fn pool_ref_iovecs(&self, iovecs: &[(GuestAddress, usize)]) -> std::result::Result<(), GrantError> {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        if grants.is_empty() {
+            return Ok(());
+        }
+        // Check everything before touching anything, so a refusal leaves no counts raised.
+        for (addr, len) in iovecs {
+            let start = addr.offset();
+            let end = start
+                .checked_add(*len as u64)
+                .ok_or(GrantError::NotBacked)?;
+            for (base, pool) in grants.iter() {
+                let pool_end = base
+                    .checked_add(pool.size())
+                    .ok_or(GrantError::NotBacked)?;
+                if start < pool_end && *base < end {
+                    // An iovec that crosses a pool boundary cannot be safely represented by a
+                    // single pool grant lookup. Reject it even when it starts outside the pool;
+                    // otherwise a guest could smuggle an unbacked suffix into an otherwise valid
+                    // dma-buf by choosing a start address in ordinary RAM.
+                    if start < *base || end > pool_end {
+                        return Err(GrantError::NotBacked);
+                    }
+                    if !pool.range_backed(start - *base, *len as u64) {
+                        return Err(GrantError::NotBacked);
+                    }
+                    pool.ref_range_available(start - *base, *len as u64)?;
+                }
+            }
+        }
+        for (addr, len) in iovecs {
+            for (base, pool) in grants.iter_mut() {
+                let a = addr.offset();
+                if a >= *base && a < *base + pool.size() {
+                    pool.ref_range(a - *base, *len as u64)
+                        .expect("pool iovec was validated immediately above");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Drop references taken by [`Self::pool_ref_iovecs`]. Must be handed the same iovecs.
+    pub fn pool_unref_iovecs(&self, iovecs: &[(GuestAddress, usize)]) {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        if grants.is_empty() {
+            return;
+        }
+        for (addr, len) in iovecs {
+            for (base, pool) in grants.iter_mut() {
+                let a = addr.offset();
+                if a >= *base && a < *base + pool.size() {
+                    pool.unref_range(a - *base, *len as u64);
+                }
+            }
+        }
+    }
+
+    /// Grant granularity of a pool, or `None` if there is no such pool.
+    pub fn pool_step(&self, pool_id: u32) -> Option<u64> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants.values().nth(pool_id as usize).map(|p| p.step())
+    }
+
+    /// Live grants in a pool, for the guest's reconciliation query.
+    pub fn pool_live_grants(&self, pool_id: u32) -> Option<usize> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants.values().nth(pool_id as usize).map(|p| p.live_grants())
+    }
+
+    /// Query whether a specific range in a growable pool is backed. This is used to reconcile a
+    /// request whose guest-side wait timed out: the host may have completed the SHARE/UNSHARE even
+    /// though the response was lost, and a count alone cannot identify that range.
+    pub fn pool_range_backed(&self, pool_id: u32, offset: u64, len: u64) -> Option<bool> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values()
+            .nth(pool_id as usize)
+            .map(|p| p.range_backed(offset, len))
+    }
+
+    /// Check a guest-originated grow request. Does not modify anything.
+    pub fn pool_validate_share(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> std::result::Result<(), GrantError> {
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .validate_share(offset, len)
+    }
+
+    /// Reserve a guest-originated shrink request while the host unregisters the mapping. This
+    /// blocks new dma-buf references until [`Self::pool_finish_unshare`] or
+    /// [`Self::pool_cancel_unshare`] is called.
+    pub fn pool_begin_unshare(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> std::result::Result<(), GrantError> {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values_mut()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .begin_unshare(offset, len)
+    }
+
+    /// Undo a failed guest-originated shrink reservation.
+    pub fn pool_cancel_unshare(&self, pool_id: u32, offset: u64, len: u64) {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        if let Some(pool) = grants.values_mut().nth(pool_id as usize) {
+            pool.cancel_unshare(offset, len);
+        }
+    }
+
+    /// Record a completed grant. One grant is one memparcel, whatever its length.
+    pub fn pool_mark_granted(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+        handle: u32,
+    ) -> std::result::Result<(), GrantError> {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values_mut()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .mark_granted(offset, len, handle)
+    }
+
+    /// Complete a previously reserved guest-originated shrink and return the RM handle recorded
+    /// for it. The range must name a grant exactly: the RM reclaims a parcel whole.
+    pub fn pool_finish_unshare(
+        &self,
+        pool_id: u32,
+        offset: u64,
+        len: u64,
+    ) -> std::result::Result<u32, GrantError> {
+        let mut grants = self.grants.lock().expect("pool grant table poisoned");
+        grants
+            .values_mut()
+            .nth(pool_id as usize)
+            .ok_or(GrantError::NotGrowable)?
+            .finish_unshare(offset, len)
+    }
+
+    /// A pool region is host-accessible, but a GROWABLE one is only accessible where it is
+    /// actually backed.
+    ///
+    /// This is not belt-and-braces. Measured on device: reading an ungranted address inside a
+    /// declared window returns zeros -- no fault, no error, no log, and the VM keeps running --
+    /// while writing it kills the vcpu. The silent-zero direction is the one that matters here,
+    /// because it turns a host-side accounting bug into wrong data with nothing to show for it.
+    /// A region with step_size == 0 is fully pre-shared and answers yes everywhere, which is every
+    /// pool that exists today.
+    fn check_pool_backed_range(
+        &self,
+        region: &MemoryRegion,
+        guest_addr: GuestAddress,
+        len: u64,
+    ) -> Result<()> {
+        if region.options.step_size == 0 {
+            return Ok(());
+        }
+        let grants = self.grants.lock().expect("pool grant table poisoned");
+        let offset = guest_addr
+            .offset()
+            .checked_sub(region.guest_base.offset())
+            .ok_or(Error::InvalidGuestAddress(guest_addr))?;
+        match grants.get(&region.guest_base.offset()) {
+            Some(p) if p.range_backed(offset, len) => Ok(()),
+            // Untracked or ungranted both mean "do not touch it".
+            _ => Err(Error::UngrantedPoolAccess(guest_addr)),
+        }
+    }
+
+    /// Check a complete host-access range, including the part after the first byte. The mapping
+    /// APIs otherwise only identify the region from their start address, which would let an
+    /// access beginning in a backed prefix run into an unbacked suffix of a growable pool.
+    fn check_host_access_range(&self, guest_addr: GuestAddress, len: usize) -> Result<()> {
+        self.check_host_access(guest_addr)?;
+        if len == 0 || !self.protected.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        let end = guest_addr
+            .offset()
+            .checked_add(len as u64)
+            .ok_or(Error::InvalidGuestAddress(guest_addr))?;
+        let region = self
+            .regions
+            .iter()
+            .find(|r| r.contains(guest_addr))
+            .ok_or(Error::InvalidGuestAddress(guest_addr))?;
+        if end > region.end().offset() {
+            return Err(Error::InvalidGuestAddress(guest_addr));
+        }
+
+        if region.options.step_size != 0 {
+            self.check_pool_backed_range(region, guest_addr, len as u64)?;
+        }
+        Ok(())
+    }
+
     /// Check whether `guest_addr` falls in a host-accessible region.
     /// Returns `Ok(())` when the access is safe, or an error describing why
     /// the host must not touch that address.
@@ -497,6 +1029,44 @@ impl GuestMemory {
             .find(|r| r.contains(guest_addr))
             .ok_or(Error::InvalidGuestAddress(guest_addr))?;
         match region.options.purpose {
+            // The GPU pool is SHARE'd (never lent), so the host keeps access — same as the
+            // framebuffer/swiotlb regions (crosvm reads scanout data straight from the pool).
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::GpuPool => self.check_pool_backed_range(region, guest_addr, 1),
+            // Guest-alloc pool: SHARE'd like GpuPool; the host resolves guest-blob mem-entries
+            // that point into it via get_slice_at_addr (the whole point of guest-alloc).
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::GpuPoolGuest => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // drm2kgsl arena: SHARE'd like the gfx pools. that backend lives in this
+            // process and sub-allocates BOs out of it, so the host needs access.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::Drm2KgslPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // venus transport pool: SHARE'd like the gfx pools; vkr lives in this process and
+            // sub-allocates ring shmems out of it, so the host needs access.  Fully
+            // pre-shared (step 0), so the range check is a formality with the same answer.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::VenusPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // The one region where this actually gates anything today: everything else has
+            // step_size == 0 and answers yes everywhere.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::DynamicTestPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // The window of a pseudo-unprotected VM, and the page the shim is told about it
+            // through. Both are SHARE'd rather than lent -- that is the whole of the mode -- so
+            // the host keeps its access, and needs it: the window IS the guest's RAM, and every
+            // virtqueue the guest publishes lives in it. Gating them here is what a protected VM
+            // needs and what this one exists to avoid.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::SharedGuestRam => Ok(()),
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::ShimHandoff => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::SharedFramebuffer => Ok(()),
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -627,7 +1197,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn write_at_addr(&self, buf: &[u8], guest_addr: GuestAddress) -> Result<usize> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, buf.len())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .write_slice(buf, offset)
@@ -686,7 +1256,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn read_at_addr(&self, buf: &mut [u8], guest_addr: GuestAddress) -> Result<usize> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, buf.len())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .read_slice(buf, offset)
@@ -742,7 +1312,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn read_obj_from_addr<T: FromBytes>(&self, guest_addr: GuestAddress) -> Result<T> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .read_obj(offset)
@@ -774,7 +1344,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn read_obj_from_addr_volatile<T: FromBytes>(&self, guest_addr: GuestAddress) -> Result<T> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .read_obj_volatile(offset)
@@ -801,7 +1371,7 @@ impl GuestMemory {
         val: T,
         guest_addr: GuestAddress,
     ) -> Result<()> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .write_obj(val, offset)
@@ -831,7 +1401,7 @@ impl GuestMemory {
         val: T,
         guest_addr: GuestAddress,
     ) -> Result<()> {
-        self.check_host_access(guest_addr)?;
+        self.check_host_access_range(guest_addr, std::mem::size_of::<T>())?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         mapping
             .write_obj_volatile(val, offset)
@@ -856,7 +1426,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn get_slice_at_addr(&self, addr: GuestAddress, len: usize) -> Result<VolatileSlice> {
-        self.check_host_access(addr)?;
+        self.check_host_access_range(addr, len)?;
         self.regions
             .iter()
             .find(|region| region.contains(addr))
@@ -891,6 +1461,7 @@ impl GuestMemory {
     /// # }
     /// ```
     pub fn get_host_address(&self, guest_addr: GuestAddress) -> Result<*const u8> {
+        self.check_host_access(guest_addr)?;
         let (mapping, offset, _) = self.find_region(guest_addr)?;
         Ok(
             // SAFETY:
@@ -929,6 +1500,8 @@ impl GuestMemory {
         if size == 0 {
             return Err(Error::InvalidSize(size));
         }
+
+        self.check_host_access_range(guest_addr, size)?;
 
         // Assume no overlap among regions
         let (mapping, offset, _) = self.find_region(guest_addr)?;

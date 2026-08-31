@@ -27,6 +27,10 @@ const EVENT_BUFFER_LEN_MAX: usize = 64 * EVENT_SIZE;
 pub enum EventDeviceKind {
     /// Produces relative mouse motions, wheel, and button clicks while the real mouse is captured.
     Mouse,
+    /// Produces absolute pointer motion (qemu usb-tablet equivalent): a 1:1 cursor with hover,
+    /// buttons and wheel. Kept distinct from `Mouse` so a relative mouse and an absolute tablet
+    /// can be two independent, separately-routed devices at once (the dispatch is by-kind).
+    Tablet,
     /// Produces absolute motion and touch events from the display window's events.
     Touchscreen,
     /// Produces key events while the display window has focus.
@@ -54,6 +58,11 @@ impl EventDevice {
     #[inline]
     pub fn mouse(event_socket: StreamChannel) -> EventDevice {
         Self::new(EventDeviceKind::Mouse, event_socket)
+    }
+
+    #[inline]
+    pub fn tablet(event_socket: StreamChannel) -> EventDevice {
+        Self::new(EventDeviceKind::Tablet, event_socket)
     }
 
     #[inline]
@@ -179,4 +188,23 @@ impl fmt::Debug for EventDevice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Event device ({:?})", self.kind)
     }
+}
+
+/// The input devices belonging to one display binding, on their way to that binding's sink.
+///
+/// A VNC binding gets an absolute pointer and a keyboard of its own, created with the guest device
+/// and handed to the sink that injects into them. Both `None` is a view-only binding: no devices
+/// were made and the sink drops RFB input.
+///
+/// They travel as a pair because they are created together, taken together, and named after the
+/// same screen -- and because "which of these two `Option<EventDevice>`s went where" is exactly the
+/// question a named pair answers for free. It lives here, next to `EventDevice` rather than beside
+/// either consumer, because the two consumers (the virtio-gpu display chain and the simplefb
+/// bridge) are in different crates and neither is upstream of the other.
+#[derive(Default)]
+pub struct VncBindingInput {
+    /// Absolute pointer, named for the screen this binding serves.
+    pub tablet: Option<EventDevice>,
+    /// Keyboard, named for the same screen.
+    pub keyboard: Option<EventDevice>,
 }

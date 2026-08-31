@@ -29,6 +29,7 @@ pub mod x86_64;
 pub mod geniezone;
 
 use base::AsRawDescriptor;
+use base::RawDescriptor;
 use base::Event;
 use base::MappedRegion;
 use base::Protection;
@@ -50,11 +51,37 @@ pub use crate::x86_64::*;
 /// An index in the list of guest-mapped memory regions.
 pub type MemSlot = u32;
 
+/// Per-operation policy for how a runtime-attached host region is accepted into a *protected*
+/// guest's stage-2 (Gunyah). Ignored (a plain no-op) by hypervisors whose runtime attach is a
+/// normal memslot (KVM / geniezone / Gunyah unprotected).
+///
+/// Chosen per call site, NOT from the command line. This used to document a
+/// `vm_accept=sync|false|async` CLI value; nothing parses one, and the launcher scripts that
+/// appear to pass it only mention it in comments. virtio-gpu hard-codes `Sync`
+/// (devices/src/virtio/gpu/virtio_gpu.rs), and the accept device itself is created for every
+/// protected VM (src/crosvm/sys/linux.rs), gated only by the debug escape
+/// `GUNYAH_ACCEPT_DEVICE_OFF=1`. Believing the old wording leads to thinking a change to the
+/// accept transport only affects an opt-in configuration, when it affects all of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum VmAccept {
+    /// Transparent: notify the in-VM accept module over the transport and WAIT for it to
+    /// `gh_rm_mem_accept` before returning. Any component uses add/remove exactly like upstream;
+    /// the RM handle is delivered to the generic guest-accept module (not the caller).
+    #[default]
+    Sync,
+    /// No transport: return the RM handle to the caller (e.g. virtio-gpu) so it drives the guest
+    /// accept itself and owns the handle for the symmetric release. Low-latency.
+    Off,
+    /// Notify the transport but return without waiting for the accept to complete. (Future.)
+    Async,
+}
+
 /// Range of GPA space. Starting from `guest_address` up to `size`.
 pub struct MemRegion {
     pub guest_address: GuestAddress,
     pub size: u64,
 }
+
 
 /// Signal to the hypervisor on kernels that support the KVM_CAP_USER_CONFIGURE_NONCOHERENT_DMA (or
 /// equivalent) that during user memory region (memslot) configuration, a guest page's memtype
@@ -177,6 +204,70 @@ pub trait Vm: Send {
         log_dirty_pages: bool,
         cache: MemCacheType,
     ) -> Result<MemSlot>;
+
+    /// Runtime (post-boot) attach of a host-backed region at `guest_addr` into the running guest.
+    /// This is the universal dynamic-memory op the transparent `VmMemoryRequest::RegisterMemory`
+    /// path routes through, so gfxstream (and any component) calls add/remove exactly like upstream.
+    ///
+    /// Default (KVM / geniezone / Gunyah unprotected): a plain removable memslot via
+    /// [`Vm::add_memory_region`]; `accept` is ignored and it returns `None` (no guest-side accept
+    /// needed). Gunyah protected overrides this to SHARE the region and return the RM memparcel
+    /// handle. `Some(handle)` means a guest-side `gh_rm_mem_accept` is still required; who performs
+    /// it depends on `accept` (see [`VmAccept`]): `Off` hands the handle to the caller, `Sync`/`Async`
+    /// route it to the in-VM accept module over the transport.
+    fn runtime_share(
+        &mut self,
+        guest_addr: GuestAddress,
+        mem_region: Box<dyn MappedRegion>,
+        // Original mapping fd and byte offset when the region came from a descriptor.
+        // The fd remains valid for this synchronous call.
+        source_descriptor: Option<RawDescriptor>,
+        source_offset: u64,
+        read_only: bool,
+        cache: MemCacheType,
+        accept: VmAccept,
+    ) -> Result<(MemSlot, Option<u32>)> {
+        let _ = (source_descriptor, source_offset, accept);
+        let slot = self.add_memory_region(guest_addr, mem_region, read_only, false, cache)?;
+        Ok((slot, None))
+    }
+
+    /// Runtime detach of a region attached with [`Vm::runtime_share`]. Default: remove the memslot.
+    /// Gunyah protected overrides to reclaim the SHARE by label (`gpa >> 12`). The guest-side release
+    /// must already have happened, driven per `accept` symmetrically with the attach.
+    fn runtime_unshare(
+        &mut self,
+        guest_addr: GuestAddress,
+        slot: MemSlot,
+        accept: VmAccept,
+    ) -> Result<()> {
+        let _ = (guest_addr, accept);
+        self.remove_memory_region(slot).map(|_| ())
+    }
+
+    /// Releases the long-term pin the VMM took over a runtime-shared region while handing it to
+    /// the hypervisor, once the guest has accepted it -- or failed to.
+    ///
+    /// The pin exists only to prove the pages are pinnable (and to migrate them out of CMA)
+    /// before the hypervisor tries the same thing somewhere we cannot recover from; see
+    /// `gunyah::pin`. Migration is not undone by unpinning, so there is nothing to keep. On
+    /// hypervisors that take no such pin this is a no-op.
+    fn release_share_pin(&self, guest_addr: GuestAddress) {
+        let _ = guest_addr;
+    }
+
+    /// Fold a sub-range of `fd` into 2 MiB folios. Default no-op; only Gunyah protected acts.
+    /// The file is a growable VMM-owned pool, so only the granted range is populated and the rest
+    /// remains sparse.
+    fn prepare_blob_range(
+        &mut self,
+        fd: &dyn AsRawDescriptor,
+        offset: u64,
+        size: u64,
+    ) -> Result<()> {
+        let _ = (fd, offset, size);
+        Ok(())
+    }
 
     /// Does a synchronous msync of the memory mapped at `slot`, syncing `size` bytes starting at
     /// `offset` from the start of the region.  `offset` must be page aligned.
@@ -598,6 +689,21 @@ pub enum ProtectionType {
     /// mode, protected VM firmware loaded, and simulating protected mode as much as possible.
     /// This is useful for debugging the protected VM firmware and other protected mode issues.
     UnprotectedWithFirmware,
+    /// Protected as far as the hypervisor is concerned, but with the guest's memory shared back to
+    /// it at run time instead of lent before boot, so the host can still reach it.
+    ///
+    /// Qualcomm's own unprotected VM mode is disabled on consumer parts, and a protected VM's
+    /// memory is lent: the host cannot see it, so every virtio buffer has to go through a bounce
+    /// pool, and a guest kernel without CONFIG_RESTRICTED_DMA_POOL -- which is to say every stock
+    /// distribution kernel -- cannot boot at all.
+    ///
+    /// A memparcel carries whatever rights its ACL asks for, though, and the platform's SCM
+    /// assign leaves the host its own access. So the VM is given a small lent region to boot in,
+    /// its real memory is SHARE'd afterwards, and a shim inside the VM accepts it before anything
+    /// else runs -- the host cannot accept on the guest's behalf, the resource manager refuses.
+    /// From the payload's point of view it is an ordinary machine whose RAM happens to start a
+    /// few megabytes above the bottom.
+    ProtectedPseudoUnprotected,
 }
 
 impl ProtectionType {
@@ -605,8 +711,20 @@ impl ProtectionType {
     pub fn isolates_memory(&self) -> bool {
         matches!(
             self,
-            Self::Protected | Self::ProtectedWithCustomFirmware | Self::ProtectedWithoutFirmware
+            Self::Protected
+                | Self::ProtectedWithCustomFirmware
+                | Self::ProtectedWithoutFirmware
+                // The boot region really is lent, and everything that decides how a region is
+                // handed over keys off this. The window is the exception, and it says so for
+                // itself through its own purpose rather than by weakening this answer.
+                | Self::ProtectedPseudoUnprotected
         )
+    }
+
+    /// Returns whether the guest's RAM is a window the guest accepts at run time rather than
+    /// memory lent to it before boot.
+    pub fn shares_guest_ram(&self) -> bool {
+        matches!(self, Self::ProtectedPseudoUnprotected)
     }
 
     /// Returns whether the VMM needs to load the pVM firmware.
@@ -622,6 +740,11 @@ impl ProtectionType {
         self.needs_firmware_loaded() || matches!(self, Self::Protected)
     }
 }
+
+/// The boot shim's ABI, re-exported so the arch code that loads the shim and the shim itself
+/// cannot disagree about it.
+#[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+pub use crate::gunyah::shim_abi as gunyah_shim_abi;
 
 /// How an mTHP-prepared lend region is handed to Gunyah at VM start.
 ///

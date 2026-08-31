@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use audio_streams::capture::AsyncCaptureBuffer;
@@ -17,6 +18,7 @@ use audio_streams::AsyncPlaybackBuffer;
 use audio_streams::BoxError;
 use base::debug;
 use base::error;
+use base::warn;
 use base::info;
 use cros_async::sync::Condvar;
 use cros_async::sync::RwLock as AsyncRwLock;
@@ -44,6 +46,7 @@ use crate::virtio::snd::common_backend::stream_info::SetParams;
 use crate::virtio::snd::common_backend::stream_info::StreamInfo;
 use crate::virtio::snd::common_backend::DirectionalStream;
 use crate::virtio::snd::common_backend::PcmResponse;
+use crate::virtio::snd::common_backend::underrun::UnderrunConcealer;
 use crate::virtio::snd::constants::*;
 use crate::virtio::snd::layout::*;
 use crate::virtio::DescriptorChain;
@@ -58,6 +61,11 @@ pub trait CaptureBufferReader {
         &mut self,
         ex: &Executor,
     ) -> Result<AsyncCaptureBuffer, BoxError>;
+
+    /// Passed through to the stream underneath: let go of the host endpoint while nobody is
+    /// reading, take it again when somebody is. Readers with nothing to let go of need not
+    /// implement it.
+    fn set_idle(&mut self, _idle: bool) {}
 }
 
 /// Trait to wrap system specific helpers for writing to endpoint playback buffers.
@@ -217,15 +225,114 @@ async fn process_pcm_ctrl(
     }
 }
 
+
+/// How long a started stream has gone unfed, and what to say about it.
+///
+/// A stream the guest has started but has nothing queued for is ordinary -- at the start of
+/// playback, in any gap the guest leaves, and for as long as a driver takes to come back after
+/// being replaced. Reported once per period it is about a hundred lines a second, which buries
+/// everything else in the log and says less than two lines would: how long it lasted is what
+/// matters, and counting log lines is a poor way to learn it.
+///
+/// So it is reported as a state change. Once when it starts, once when it ends, with the length.
+///
+/// Past `PARK_AFTER` the host stream is let go as well. Nothing is feeding it, and an endpoint
+/// held open costs power on the way out and keeps the recording indicator lit on the way in --
+/// for a guest that has stopped recording, or is no longer there at all.
+struct Starvation {
+    periods: u64,
+    since: Option<Instant>,
+    parked: bool,
+    /// Whether the endpoint wants taking or letting go, to be acted on at the top of the next
+    /// period: the buffer in hand borrows the stream for the rest of this one.
+    pending: Option<bool>,
+}
+
+impl Starvation {
+    /// Long enough that an ordinary gap between periods never reaches it, short enough that a
+    /// driver that has gone away does not hold the microphone for the rest of the session.
+    const PARK_AFTER: Duration = Duration::from_secs(2);
+
+    fn new() -> Self {
+        Starvation {
+            periods: 0,
+            since: None,
+            parked: false,
+            pending: None,
+        }
+    }
+
+    fn take_pending(&mut self) -> Option<bool> {
+        self.pending.take()
+    }
+
+    /// A period went by with nothing from the guest.
+    fn starved(&mut self, card_index: usize, direction: &str) {
+        let now = Instant::now();
+        let since = *self.since.get_or_insert_with(|| {
+            warn!(
+                "[Card {}] {} stream is running with nothing queued",
+                card_index, direction
+            );
+            now
+        });
+        self.periods += 1;
+        if !self.parked && now.duration_since(since) >= Self::PARK_AFTER {
+            self.parked = true;
+            warn!(
+                "[Card {}] {} stream unfed for {:?}; releasing the host endpoint until it resumes",
+                card_index, direction, Self::PARK_AFTER
+            );
+            self.pending = Some(true);
+        }
+    }
+
+    /// The guest queued something.
+    fn fed(&mut self, card_index: usize, direction: &str) {
+        let Some(since) = self.since.take() else {
+            return;
+        };
+        warn!(
+            "[Card {}] {} stream resumed after {:?} with nothing queued ({} periods)",
+            card_index,
+            direction,
+            Instant::now().duration_since(since),
+            self.periods
+        );
+        self.periods = 0;
+        if self.parked {
+            self.parked = false;
+            self.pending = Some(false);
+        }
+    }
+}
+
 async fn write_data(
     mut dst_buf: AsyncPlaybackBuffer<'_>,
     reader: Option<&mut Reader>,
     buffer_writer: &mut Box<dyn PlaybackBufferWriter>,
+    concealer: Option<&mut UnderrunConcealer>,
 ) -> Result<u32, Error> {
-    let transferred = match reader {
-        Some(reader) => buffer_writer.copy_to_buffer(&mut dst_buf, reader)?,
-        None => dst_buf
-            .copy_from(&mut io::repeat(0).take(buffer_writer.endpoint_period_bytes() as u64))
+    let period = buffer_writer.endpoint_period_bytes();
+    let transferred = match (reader, concealer) {
+        // Concealment needs a copy of what went to the endpoint, and the descriptor is
+        // consumed by the copy, so the period lands in the concealer's own buffer first. That
+        // buffer is reused and becomes the history by a swap, so the steady state costs one
+        // extra memcpy per period and no allocation at all.
+        (Some(reader), Some(concealer)) => {
+            let n = reader.read(concealer.scratch_mut()).map_err(Error::Io)?;
+            let pcm = concealer.commit_good_period(n);
+            dst_buf.copy_from(&mut &pcm[..]).map_err(Error::Io)?
+        }
+        (Some(reader), None) => buffer_writer.copy_to_buffer(&mut dst_buf, reader)?,
+        (None, Some(concealer)) => match concealer.conceal() {
+            Some(pcm) => dst_buf.copy_from(&mut &pcm[..]).map_err(Error::Io)?,
+            None => dst_buf
+                .copy_from(&mut io::repeat(0).take(period as u64))
+                .map_err(Error::Io)?,
+        },
+        (None, None) => dst_buf
+            .copy_from(&mut io::repeat(0).take(period as u64))
             .map_err(Error::Io)?,
     };
 
@@ -380,6 +487,9 @@ async fn pcm_worker_loop(
     .fuse();
     pin_mut!(on_release);
 
+    // One per stream, outside the loop: it is the history of the gap, not a fact about a period.
+    let mut starvation = Starvation::new();
+
     match dstream {
         DirectionalStream::Output(mut sys_direction_output) => loop {
             #[cfg(windows)]
@@ -393,10 +503,19 @@ async fn pcm_worker_loop(
             #[cfg(windows)]
             let buffer_writer = &mut buffer_writer_lock;
             #[cfg(any(target_os = "android", target_os = "linux"))]
-            let (stream, buffer_writer) = (
+            let (stream, buffer_writer, concealer) = (
                 &mut sys_direction_output.async_playback_buffer_stream,
                 &mut sys_direction_output.buffer_writer,
+                sys_direction_output.concealer.as_mut(),
             );
+            // Windows has no concealer; the parameter exists for both so write_data stays one
+            // function.
+            #[cfg(windows)]
+            let concealer: Option<&mut UnderrunConcealer> = None;
+
+            if let Some(idle) = starvation.take_pending() {
+                stream.set_idle(idle);
+            }
 
             let next_buf = stream.next_playback_buffer(&ex).fuse();
             pin_mut!(next_buf);
@@ -412,7 +531,7 @@ async fn pcm_worker_loop(
             match *worker_status {
                 WorkerStatus::Quit => {
                     drain_desc_receiver(desc_receiver, sender).await?;
-                    if let Err(e) = write_data(dst_buf, None, buffer_writer).await {
+                    if let Err(e) = write_data(dst_buf, None, buffer_writer, concealer).await {
                         error!(
                             "[Card {}] Error on write_data after worker quit: {}",
                             card_index, e
@@ -421,29 +540,27 @@ async fn pcm_worker_loop(
                     break Ok(());
                 }
                 WorkerStatus::Pause => {
-                    write_data(dst_buf, None, buffer_writer).await?;
+                    write_data(dst_buf, None, buffer_writer, concealer).await?;
                 }
                 WorkerStatus::Running => match desc_receiver.try_next() {
-                    Err(e) => {
-                        error!(
-                            "[Card {}] Underrun. No new DescriptorChain while running: {}",
-                            card_index, e
-                        );
-                        write_data(dst_buf, None, buffer_writer).await?;
+                    Err(_) => {
+                        starvation.starved(card_index, "playback");
+                        write_data(dst_buf, None, buffer_writer, concealer).await?;
                     }
                     Ok(None) => {
                         error!("[Card {}] Unreachable. status should be Quit when the channel is closed", card_index);
-                        write_data(dst_buf, None, buffer_writer).await?;
+                        write_data(dst_buf, None, buffer_writer, concealer).await?;
                         return Err(Error::InvalidPCMWorkerState);
                     }
                     Ok(Some(mut desc_chain)) => {
+                        starvation.fed(card_index, "playback");
                         let reader = if muted.load(Ordering::Relaxed) {
                             None
                         } else {
                             // stream_id was already read in handle_pcm_queue
                             Some(&mut desc_chain.reader)
                         };
-                        let status = write_data(dst_buf, reader, buffer_writer).await.into();
+                        let status = write_data(dst_buf, reader, buffer_writer, concealer).await.into();
                         sender
                             .send(PcmResponse {
                                 desc_chain,
@@ -457,6 +574,10 @@ async fn pcm_worker_loop(
             }
         },
         DirectionalStream::Input(period_bytes, mut buffer_reader) => loop {
+            if let Some(idle) = starvation.take_pending() {
+                buffer_reader.set_idle(idle);
+            }
+
             let next_buf = buffer_reader.get_next_capture_period(&ex).fuse();
             pin_mut!(next_buf);
 
@@ -484,11 +605,8 @@ async fn pcm_worker_loop(
                     read_data(src_buf, None, period_bytes).await?;
                 }
                 WorkerStatus::Running => match desc_receiver.try_next() {
-                    Err(e) => {
-                        error!(
-                            "[Card {}] Overrun. No new DescriptorChain while running: {}",
-                            card_index, e
-                        );
+                    Err(_) => {
+                        starvation.starved(card_index, "capture");
                         read_data(src_buf, None, period_bytes).await?;
                     }
                     Ok(None) => {
@@ -497,6 +615,7 @@ async fn pcm_worker_loop(
                         return Err(Error::InvalidPCMWorkerState);
                     }
                     Ok(Some(mut desc_chain)) => {
+                        starvation.fed(card_index, "capture");
                         let writer = if muted.load(Ordering::Relaxed) {
                             None
                         } else {

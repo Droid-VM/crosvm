@@ -18,6 +18,8 @@ pub(crate) mod pci_hotplug_helpers;
 pub(crate) mod pci_hotplug_manager;
 #[cfg(feature = "vnc")]
 mod simplefb_display;
+#[cfg(feature = "audio")]
+pub(crate) mod snd_helper;
 mod vcpu;
 
 #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
@@ -90,7 +92,9 @@ use devices::vfio::VfioContainerManager;
 use devices::virtio;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoDeviceType;
-#[cfg(feature = "gpu")]
+// `vnc` implies `devices/gpu`, so this type is reachable on a VNC-only build too -- and needed
+// there, since that is the build where the simplefb bridge is the only display.
+#[cfg(any(feature = "gpu", feature = "vnc"))]
 use devices::virtio::gpu::EventDevice;
 #[cfg(target_arch = "x86_64")]
 use devices::virtio::memory_mapper::MemoryMapper;
@@ -149,6 +153,8 @@ use devices::VirtioPciDevice;
 use devices::XhciController;
 #[cfg(feature = "gpu")]
 use gpu::*;
+#[cfg(feature = "vnc")]
+use gpu_display::VncBindingInput;
 #[cfg(target_arch = "riscv64")]
 use hypervisor::CpuConfigRiscv64;
 #[cfg(target_arch = "x86_64")]
@@ -194,12 +200,19 @@ use vm_memory::MemoryRegionOptions;
 use x86_64::X8664arch as Arch;
 
 use crate::crosvm::config::Config;
+#[cfg(any(feature = "vnc", feature = "android_display"))]
+use crate::crosvm::config::DisplayScreen;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_HOST;
+#[cfg(feature = "vnc")]
+use crate::crosvm::config::DEFAULT_VNC_PORT;
 use crate::crosvm::config::Executable;
 use crate::crosvm::config::HypervisorKind;
 use crate::crosvm::config::InputDeviceOption;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_HEIGHT;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_WIDTH;
+use crate::crosvm::config::NORMALIZED_ABS_MAX;
 #[cfg(feature = "gdb")]
 use crate::crosvm::gdb::gdb_thread;
 #[cfg(feature = "gdb")]
@@ -218,6 +231,261 @@ const GENIEZONE_PATH: &str = "/dev/gzvm";
 #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
 static GUNYAH_PATH: &str = "/dev/gunyah";
 
+/// The evdev names this screen's built-in VNC input devices carry.
+///
+/// CROSS-REPO SEAM. The tablet string is the one
+/// `NativeDisplay.tabletDeviceName(screenId)` produces in the DroidVM app repo
+/// (app/src/main/java/cn/classfun/droidvm/lib/store/vm/NativeDisplay.java), and the keyboard is that
+/// file's keyboard variant of the same format. On a NATIVELY exported screen those devices are
+/// `--input absolute-mouse[...,name=]` fed over a daemon socket; here they are built in-process and
+/// fed by this screen's VNC server. The guest must not be able to tell the two apart: a user maps an
+/// absolute pointer to an output BY NAME (kwin stores it by name, `xinput map-to-output` takes one,
+/// Windows' Tablet PC setup remembers the one it was pointed at), so moving a screen from one
+/// exporter to the other has to leave the name its mapping is keyed on untouched. Change the format
+/// on one side only and a mapping silently stops matching, with nothing anywhere to notice.
+#[cfg(feature = "vnc")]
+fn vnc_tablet_device_name(screen: DisplayScreen) -> String {
+    format!("DroidVM Tablet ({})", screen.as_str())
+}
+
+/// See `vnc_tablet_device_name` -- same seam, same file on the other side, same format with the
+/// kind swapped. `NativeDisplay.tabletDeviceName`'s javadoc names this string explicitly as the
+/// keyboard sibling, and the DroidVM daemon emits the identical format itself for a NATIVELY
+/// exported screen (`--input keyboard[path=…,name=DroidVM Keyboard (<screenId>)]`). One format, two
+/// producers: a screen keeps its keyboard's name when it moves between exporters.
+///
+/// A keyboard is not an output-mapped device the way a pointer is -- it reports no coordinates, so
+/// no guest-side mapping is keyed on this and nothing breaks silently if it changes. It is
+/// per-screen because the DEVICE is: a keyboard belongs to a scanout, so the guest sees one per
+/// screen with input enabled, and a name is the difference between a device list that explains
+/// itself and several identical rows.
+#[cfg(feature = "vnc")]
+fn vnc_keyboard_device_name(screen: DisplayScreen) -> String {
+    format!("DroidVM Keyboard ({})", screen.as_str())
+}
+
+/// The `idx` a built-in device is created with.
+///
+/// Fixed per screen, and a function of the screen and nothing else. It reaches the guest only as
+/// the device's unique-id string (`virtio-absolute-mouse-<idx>`, `virtio-keyboard-<idx>`) -- the
+/// names are set explicitly above -- but a number that moved when some other screen's input was
+/// switched off would still be a per-screen identity that is not derived from the screen.
+///
+/// Counted DOWN from just under `u32::MAX`, which keeps it clear of both neighbours at once: the
+/// `--input` devices count UP from 0 in emission order, and the display-window set uses `u32::MAX`
+/// itself. That last one matters even though nothing in this project passes
+/// `--display-window-keyboard`: its keyboard and a VNC binding's keyboard are the same device type,
+/// so sharing an index would give two live devices one unique-id string.
+#[cfg(feature = "vnc")]
+fn vnc_device_idx(screen: DisplayScreen) -> u32 {
+    match screen {
+        DisplayScreen::Gpu0 => u32::MAX - 1,
+        DisplayScreen::Simplefb => u32::MAX - 2,
+    }
+}
+
+/// Builds the tablet and keyboard belonging to one VNC binding.
+///
+/// Returns an empty pair for a screen with no VNC exporter and for one whose binding says
+/// `view-only=true` -- the same answer for two different reasons, and the sink treats them the same
+/// way because there is nothing to tell apart: no device, so nowhere to inject, so RFB input is
+/// dropped.
+///
+/// The tablet's width and height are `NORMALIZED_ABS_MAX` rather than a pixel size, which is exactly
+/// what `--input absolute-mouse` declares when it omits them: the sink scales every coordinate to
+/// that fixed range against the framebuffer size it has at the time (`VNC_ABS_MAX` in
+/// gpu_display_vnc.rs, required to be the same number), so the mapping stays 1:1 across a guest
+/// auto-resize without anything having to be told the new size.
+///
+/// Both devices are created here, in device creation, because the guest-facing half of each has to
+/// land in the same device list as everything else the VM gets, and this is the only code path
+/// holding that list. The sink-facing halves travel to whichever display path serves this screen.
+#[cfg(feature = "vnc")]
+fn create_vnc_binding_input(
+    cfg: &Config,
+    screen: DisplayScreen,
+    devs: &mut Vec<VirtioDeviceStub>,
+) -> DeviceResult<VncBindingInput> {
+    let Some(vnc_cfg) = cfg.vnc_server_for(screen) else {
+        return Ok(VncBindingInput::default());
+    };
+    if !vnc_cfg.wants_input_devices() {
+        info!(
+            "vnc: screen {} is view-only; no tablet or keyboard, RFB input dropped",
+            screen.as_str()
+        );
+        return Ok(VncBindingInput::default());
+    }
+    let idx = vnc_device_idx(screen);
+
+    let (tablet_sink, tablet_dev_socket) =
+        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+            .context("failed to create socket")?;
+    let tablet_name = vnc_tablet_device_name(screen);
+    let tablet = virtio::input::new_absolute_mouse(
+        idx,
+        tablet_dev_socket,
+        NORMALIZED_ABS_MAX,
+        NORMALIZED_ABS_MAX,
+        Some(&tablet_name),
+        virtio::base_features(cfg.protection_type),
+    )
+    .context("failed to set up the VNC binding's absolute mouse device")?;
+    devs.push(VirtioDeviceStub {
+        dev: Box::new(tablet),
+        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+    });
+
+    let (keyboard_sink, keyboard_dev_socket) =
+        StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+            .context("failed to create socket")?;
+    let keyboard_name = vnc_keyboard_device_name(screen);
+    let keyboard = virtio::input::new_keyboard(
+        idx,
+        keyboard_dev_socket,
+        Some(&keyboard_name),
+        virtio::base_features(cfg.protection_type),
+    )
+    .context("failed to set up the VNC binding's keyboard device")?;
+    devs.push(VirtioDeviceStub {
+        dev: Box::new(keyboard),
+        jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+    });
+
+    info!(
+        "vnc: screen {} gets \"{}\" + \"{}\"",
+        screen.as_str(),
+        tablet_name,
+        keyboard_name
+    );
+    Ok(VncBindingInput {
+        tablet: Some(EventDevice::tablet(tablet_sink)),
+        keyboard: Some(EventDevice::keyboard(keyboard_sink)),
+    })
+}
+
+/// Names for the display-window device set. They are constants and not derived from anything,
+/// which is the point: these devices belong to the VM's display window, not to any one screen, so
+/// nothing about a screen may leak into them. Sharing a name with a `--input` device would hand the
+/// guest two devices claiming one identity -- and since a guest maps an absolute device to an output
+/// *by name*, the mapping the user set for one of them would silently start matching the other.
+/// Fixed strings also mean they come back identical across reboots, which is what makes them
+/// mappable at all.
+///
+/// They still say "VNC" and no VNC configuration can reach them any more -- the name is history, not
+/// a claim. This set is the X11 display window's, built only when `--display-window-mouse` /
+/// `--display-window-keyboard` are passed explicitly; VNC stopped turning those on and stopped
+/// injecting into these (see `create_vnc_binding_input`). Renaming them would move a device
+/// identity that somebody's guest-side mapping is keyed on, in exchange for tidier strings.
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+const DISPLAY_WINDOW_TOUCH_NAME: &str = "DroidVM VNC Touch";
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+const DISPLAY_WINDOW_MOUSE_NAME: &str = "DroidVM VNC Mouse";
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+const DISPLAY_WINDOW_KEYBOARD_NAME: &str = "DroidVM VNC Keyboard";
+
+/// Creates the display-window input devices and returns their event-device ends: a multi-touch
+/// touchscreen, a relative mouse and a keyboard, spanning `default_width` x `default_height` unless
+/// a `--input multi-touch` option overrides the dimensions.
+///
+/// The X11 display window's, and only its: a VNC session's devices belong to the BINDING that serves
+/// one screen, not to the VM (`create_vnc_binding_input`). What used to be here was the same set
+/// with a VNC-shaped absolute range bolted on and an extra tablet, handed to whichever display
+/// happened to ask -- which is how two VNC screens ended up injecting into one tablet, and how a
+/// simplefb screen alongside a GPU device ended up injecting into nothing at all.
+#[cfg(any(feature = "gpu", feature = "vnc"))]
+fn create_display_window_input_devices(
+    cfg: &Config,
+    default_width: u32,
+    default_height: u32,
+    devs: &mut Vec<VirtioDeviceStub>,
+) -> DeviceResult<Vec<EventDevice>> {
+    let mut event_devices = Vec::new();
+    if cfg.display_window_mouse {
+        let (event_device_socket, virtio_dev_socket) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .context("failed to create socket")?;
+        // Dimensions only: the first `--input multi-touch`'s width/height stand in for the display
+        // size when one was given, because both devices are measuring the same window. Its *name*
+        // is deliberately not taken. A name identifies a device, and with one `--input multi-touch`
+        // per guest output the first one's name is one screen's identity, not a spare label -- copy
+        // it here and the guest sees two touchscreens called e.g. "DroidVM Touch (gpu-0)", one of
+        // which has nothing to do with gpu-0. This device gets its own fixed name below.
+        let mut multi_touch_width = default_width;
+        let mut multi_touch_height = default_height;
+        for input in &cfg.virtio_input {
+            if let InputDeviceOption::MultiTouch { width, height, .. } = input {
+                if let Some(width) = width {
+                    multi_touch_width = *width;
+                }
+                if let Some(height) = height {
+                    multi_touch_height = *height;
+                }
+                break;
+            }
+        }
+        // Pixel dimensions, unconditionally. This used to be overridden to the VNC sink's
+        // normalized range whenever ANY vnc binding existed -- a VM-global device measured against
+        // whichever screen a client happened to be looking at, which is the coordinate half of the
+        // same mistake the per-binding devices fix. Nothing normalized reaches this device now.
+        let dev = virtio::input::new_multi_touch(
+            // u32::MAX is the least likely to collide with the indices generated above for
+            // the multi_touch options, which begin at 0.
+            u32::MAX,
+            virtio_dev_socket,
+            multi_touch_width,
+            multi_touch_height,
+            Some(DISPLAY_WINDOW_TOUCH_NAME),
+            virtio::base_features(cfg.protection_type),
+        )
+        .context("failed to set up multi-touch device")?;
+        devs.push(VirtioDeviceStub {
+            dev: Box::new(dev),
+            jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+        });
+        event_devices.push(EventDevice::touchscreen(event_device_socket));
+
+        // Relative-motion mouse (EventDeviceKind::Mouse) for the display window. There used to be
+        // an absolute Tablet beside it, created when the VNC server asked for one; it is gone with
+        // the rest of VNC's claim on this set.
+        {
+            let (event_device_socket, virtio_dev_socket) =
+                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                    .context("failed to create socket")?;
+            let dev = virtio::input::new_mouse(
+                u32::MAX,
+                virtio_dev_socket,
+                Some(DISPLAY_WINDOW_MOUSE_NAME),
+                virtio::base_features(cfg.protection_type),
+            )
+            .context("failed to set up relative mouse device")?;
+            devs.push(VirtioDeviceStub {
+                dev: Box::new(dev),
+                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+            });
+            event_devices.push(EventDevice::mouse(event_device_socket));
+        }
+    }
+    if cfg.display_window_keyboard {
+        let (event_device_socket, virtio_dev_socket) =
+            StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
+                .context("failed to create socket")?;
+        let dev = virtio::input::new_keyboard(
+            u32::MAX,
+            virtio_dev_socket,
+            Some(DISPLAY_WINDOW_KEYBOARD_NAME),
+            virtio::base_features(cfg.protection_type),
+        )
+        .context("failed to set up keyboard device")?;
+        devs.push(VirtioDeviceStub {
+            dev: Box::new(dev),
+            jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
+        });
+        event_devices.push(EventDevice::keyboard(event_device_socket));
+    }
+    Ok(event_devices)
+}
+
 fn create_virtio_devices(
     cfg: &Config,
     vm: &mut impl VmArch,
@@ -229,7 +497,7 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
-    #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "vnc")] simplefb_vnc_input_out: &mut VncBindingInput,
 ) -> DeviceResult<Vec<VirtioDeviceStub>> {
     let mut devs = Vec::new();
 
@@ -296,90 +564,29 @@ fn create_virtio_devices(
     #[cfg(feature = "gpu")]
     {
         if let Some(gpu_parameters) = &cfg.gpu_parameters {
-            let mut event_devices = Vec::new();
-            if cfg.display_window_mouse {
-                let display_param = if gpu_parameters.display_params.is_empty() {
-                    Default::default()
-                } else {
-                    gpu_parameters.display_params[0].clone()
-                };
-                let (gpu_display_w, gpu_display_h) = display_param.get_virtual_display_size();
-
-                let (event_device_socket, virtio_dev_socket) =
-                    StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                        .context("failed to create socket")?;
-                let mut multi_touch_width = gpu_display_w;
-                let mut multi_touch_height = gpu_display_h;
-                let mut multi_touch_name = None;
-                for input in &cfg.virtio_input {
-                    if let InputDeviceOption::MultiTouch {
-                        width,
-                        height,
-                        name,
-                        ..
-                    } = input
-                    {
-                        if let Some(width) = width {
-                            multi_touch_width = *width;
-                        }
-                        if let Some(height) = height {
-                            multi_touch_height = *height;
-                        }
-                        if let Some(name) = name {
-                            multi_touch_name = Some(name.as_str());
-                        }
-                        break;
-                    }
-                }
-                let dev = virtio::input::new_multi_touch(
-                    // u32::MAX is the least likely to collide with the indices generated above for
-                    // the multi_touch options, which begin at 0.
-                    u32::MAX,
-                    virtio_dev_socket,
-                    multi_touch_width,
-                    multi_touch_height,
-                    multi_touch_name,
-                    virtio::base_features(cfg.protection_type),
-                )
-                .context("failed to set up mouse device")?;
-                devs.push(VirtioDeviceStub {
-                    dev: Box::new(dev),
-                    jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                });
-                event_devices.push(EventDevice::touchscreen(event_device_socket));
-            }
-            if cfg.display_window_keyboard {
-                let (event_device_socket, virtio_dev_socket) =
-                    StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                        .context("failed to create socket")?;
-                let dev = virtio::input::new_keyboard(
-                    // u32::MAX is the least likely to collide with the indices generated above for
-                    // the multi_touch options, which begin at 0.
-                    u32::MAX,
-                    virtio_dev_socket,
-                    virtio::base_features(cfg.protection_type),
-                )
-                .context("failed to set up keyboard device")?;
-                devs.push(VirtioDeviceStub {
-                    dev: Box::new(dev),
-                    jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-                });
-                event_devices.push(EventDevice::keyboard(event_device_socket));
-            }
-
-            #[cfg(feature = "vnc")]
-            let event_devices = if cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
-                log::info!("GPU: simplefb+VNC mode — event_devices go to simplefb bridge");
-                *simplefb_event_devices_out = event_devices;
-                Vec::new()
+            let display_param = if gpu_parameters.display_params.is_empty() {
+                Default::default()
             } else {
-                event_devices
+                gpu_parameters.display_params[0].clone()
             };
+            let (gpu_display_w, gpu_display_h) = display_param.get_virtual_display_size();
+            let event_devices =
+                create_display_window_input_devices(cfg, gpu_display_w, gpu_display_h, &mut devs)?;
+
+            // `event_devices` above is the X11 display window's, if any were asked for, and nothing
+            // else. A VNC exporter bound to this screen gets its own pair instead, built here and
+            // carried to whichever backend in the chain opens.
+            //
+            // Bound to a local rather than written inline in the call below: both it and the
+            // `devs.push` around the call want `&mut devs`, and the argument is evaluated inside
+            // the push's borrow.
+            #[cfg(feature = "vnc")]
+            let vnc_input = create_vnc_binding_input(cfg, DisplayScreen::Gpu0, &mut devs)?;
 
             let (gpu_control_host_tube, gpu_control_device_tube) =
                 Tube::pair().context("failed to create gpu tube")?;
             add_control_tube(DeviceControlTube::Gpu(gpu_control_host_tube).into());
-            devs.push(create_gpu_device(
+            let gpu_dev = create_gpu_device(
                 cfg,
                 vm_evt_wrtube,
                 gpu_control_device_tube,
@@ -387,56 +594,21 @@ fn create_virtio_devices(
                 render_server_fd,
                 has_vfio_gfx_device,
                 event_devices,
-            )?);
+                #[cfg(feature = "vnc")]
+                vnc_input,
+            )?;
+            devs.push(gpu_dev);
         }
     }
 
+    // The simplefb screen's, on the same terms as the GPU screen's above -- and unconditionally,
+    // which is the fix. This used to be gated on `cfg.gpu_parameters.is_none()`, so a simplefb
+    // screen exported over VNC alongside a GPU device got no input devices at all: the bridge was
+    // handed an empty list, and every RFB event it received was dispatched to nobody. Whether some
+    // other device exists says nothing about whether THIS screen's exporter needs a pointer.
     #[cfg(feature = "vnc")]
-    if cfg.gpu_parameters.is_none() && cfg.simplefb.is_some() && cfg.vnc_server.is_some() {
-        let simplefb_cfg = cfg.simplefb.as_ref().unwrap();
-        let mut event_devices = Vec::new();
-
-        if cfg.display_window_mouse {
-            let (event_device_socket, virtio_dev_socket) =
-                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                    .context("failed to create socket")?;
-            let dev = virtio::input::new_multi_touch(
-                u32::MAX,
-                virtio_dev_socket,
-                simplefb_cfg.width,
-                simplefb_cfg.height,
-                None,
-                virtio::base_features(cfg.protection_type),
-            )
-            .context("failed to set up multi-touch device for simplefb")?;
-            devs.push(VirtioDeviceStub {
-                dev: Box::new(dev),
-                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-            });
-            event_devices.push(EventDevice::touchscreen(event_device_socket));
-            log::info!("simplefb: created multi-touch event device ({}x{})", simplefb_cfg.width, simplefb_cfg.height);
-        }
-
-        if cfg.display_window_keyboard {
-            let (event_device_socket, virtio_dev_socket) =
-                StreamChannel::pair(BlockingMode::Nonblocking, FramingMode::Byte)
-                    .context("failed to create socket")?;
-            let dev = virtio::input::new_keyboard(
-                u32::MAX,
-                virtio_dev_socket,
-                virtio::base_features(cfg.protection_type),
-            )
-            .context("failed to set up keyboard device for simplefb")?;
-            devs.push(VirtioDeviceStub {
-                dev: Box::new(dev),
-                jail: simple_jail(cfg.jail_config.as_ref(), "input_device")?,
-            });
-            event_devices.push(EventDevice::keyboard(event_device_socket));
-            log::info!("simplefb: created keyboard event device");
-        }
-
-        log::info!("simplefb: total event_devices={}", event_devices.len());
-        *simplefb_event_devices_out = event_devices;
+    if cfg.simplefb.is_some() {
+        *simplefb_vnc_input_out = create_vnc_binding_input(cfg, DisplayScreen::Simplefb, &mut devs)?;
     }
 
     for (_, param) in cfg
@@ -480,6 +652,83 @@ fn create_virtio_devices(
             pmem_device_tube,
         )?);
     }
+
+    // EXPERIMENT (DROIDVM_POOL_GROW_TEST=<hex gpa>[,<mb>]): after the guest has booted, run
+    // exactly one runtime SHARE + guest MEM_ACCEPT at the given guest physical address.
+    //
+    // The address to pass is inside a pool window that was only PARTIALLY shared at boot
+    // (see DROIDVM_POOL_PREALLOC_MB in hypervisor/src/gunyah/mod.rs) -- i.e. an IPA the guest
+    // was told about in its reserved-memory node but which has never been backed by any
+    // memparcel. Whether the RM permits that is the load-bearing assumption under a
+    // guest-managed growable pool, and nothing has ever tested it on this device: the shipping
+    // RM is a Qualcomm internal build whose platform_memparcel_* hooks are no-ops in the
+    // public tree we can read.
+    //
+    // Deliberately reuses RegisterMemory rather than calling share_blob directly, so what is
+    // measured is the same path a real grow would take: allocate host memory, runtime_share,
+    // then drive_guest_accept over virtio-gunyah-accept. The only thing that differs from a
+    // VkDeviceMemory mapping is the destination address.
+    if let Ok(spec) = std::env::var("DROIDVM_POOL_GROW_TEST") {
+        let (test_host_tube, test_device_tube) =
+            Tube::pair().context("failed to create pool-grow test tube")?;
+        add_control_tube(
+            VmMemoryTube {
+                tube: test_host_tube,
+                expose_with_viommu: false,
+            }
+            .into(),
+        );
+        std::thread::Builder::new()
+            .name("pool_grow_test".into())
+            .spawn(move || {
+                let mut it = spec.split(',');
+                let gpa = it
+                    .next()
+                    .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or(0);
+                let mb: u64 = it.next().and_then(|s| s.parse().ok()).unwrap_or(2);
+                let size = mb << 20;
+                // The guest module has to be probed and have posted its request buffers before
+                // an accept can be delivered; it comes up a second or two into userspace, and
+                // 90s is chosen to be far past that without needing to poll for it.
+                std::thread::sleep(std::time::Duration::from_secs(90));
+                let shm = match base::SharedMemory::new("pool_grow_test", size) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        base::error!("GH-POOL-EXP: SharedMemory::new failed: {}", e);
+                        return;
+                    }
+                };
+                base::warn!(
+                    "GH-POOL-EXP: TEST2 requesting runtime share gpa={:#x} size={:#x} \
+                     (into the unbacked remainder of a pool window)",
+                    gpa,
+                    size
+                );
+                let req = VmMemoryRequest::RegisterMemory {
+                    source: VmMemorySource::SharedMemory(shm),
+                    dest: VmMemoryDestination::GuestPhysicalAddress(gpa),
+                    prot: Protection::read_write(),
+                    cache: MemCacheType::CacheCoherent,
+                    vm_accept: hypervisor::VmAccept::Sync,
+                };
+                if let Err(e) = test_device_tube.send(&req) {
+                    base::error!("GH-POOL-EXP: TEST2 send failed: {}", e);
+                    return;
+                }
+                match test_device_tube.recv::<VmMemoryResponse>() {
+                    Ok(VmMemoryResponse::RegisterMemory { .. }) => base::warn!(
+                        "GH-POOL-EXP: TEST2 PASS -- runtime share + guest accept succeeded at \
+                         gpa={:#x}",
+                        gpa
+                    ),
+                    Ok(other) => base::error!("GH-POOL-EXP: TEST2 FAIL -- {:?}", other),
+                    Err(e) => base::error!("GH-POOL-EXP: TEST2 FAIL -- recv: {}", e),
+                }
+            })
+            .context("failed to spawn pool-grow test thread")?;
+    }
+
 
     for (index, pmem_ext2) in cfg.pmem_ext2.iter().enumerate() {
         // Prepare a `VmMemoryClient` for pmem-ext2 device to send a request for mmap() and memory
@@ -576,6 +825,7 @@ fn create_virtio_devices(
 
     let mut keyboard_idx = 0;
     let mut mouse_idx = 0;
+    let mut absolute_mouse_idx = 0;
     let mut rotary_idx = 0;
     let mut switches_idx = 0;
     let mut multi_touch_idx = 0;
@@ -590,11 +840,18 @@ fn create_virtio_devices(
                 cfg.jail_config.as_ref(),
                 path.as_path(),
             )?,
-            InputDeviceOption::Keyboard { path } => {
+            InputDeviceOption::Keyboard { path, name } => {
+                // One of these per screen with input enabled, not one per VM: `keyboard_idx`
+                // counts them the same way the touch devices' index counts theirs, which is what
+                // keeps their unique-id strings (`virtio-keyboard-<idx>`) distinct. The NAME is
+                // what a reader tells them apart by, and it comes from the caller precisely
+                // because an emission-order index does not survive another screen's input being
+                // switched off.
                 let dev = create_keyboard_device(
                     cfg.protection_type,
                     cfg.jail_config.as_ref(),
                     path.as_path(),
+                    name.as_deref(),
                     keyboard_idx,
                 )?;
                 keyboard_idx += 1;
@@ -610,28 +867,48 @@ fn create_virtio_devices(
                 mouse_idx += 1;
                 dev
             }
+            InputDeviceOption::AbsoluteMouse {
+                path,
+                width,
+                height,
+                name,
+            } => {
+                let width = *width;
+                let height = *height;
+                // Omitted width/height => resolution-independent normalized mode: advertise a
+                // fixed ABS range (NORMALIZED_ABS_MAX) and let the feeder scale coordinates to it
+                // against the live display size, so the mapping stays 1:1 across guest auto-resize
+                // (matches the VNC pointer path). An explicit width/height keeps the legacy
+                // pixel-sized range for backward compatibility.
+                let dev = create_absolute_mouse_device(
+                    cfg.protection_type,
+                    cfg.jail_config.as_ref(),
+                    path.as_path(),
+                    width.unwrap_or(NORMALIZED_ABS_MAX),
+                    height.unwrap_or(NORMALIZED_ABS_MAX),
+                    name.as_deref(),
+                    absolute_mouse_idx,
+                )?;
+                absolute_mouse_idx += 1;
+                dev
+            }
             InputDeviceOption::MultiTouch {
                 path,
                 width,
                 height,
                 name,
             } => {
-                let mut width = *width;
-                let mut height = *height;
-                if multi_touch_idx == 0 {
-                    if width.is_none() {
-                        width = cfg.display_input_width;
-                    }
-                    if height.is_none() {
-                        height = cfg.display_input_height;
-                    }
-                }
+                let width = *width;
+                let height = *height;
+                // Omitted width/height => resolution-independent normalized mode (see AbsoluteMouse
+                // above): fixed ABS range + feeder-side scaling to the live display size, correct
+                // across guest auto-resize. Explicit width/height keeps the legacy pixel range.
                 let dev = create_multi_touch_device(
                     cfg.protection_type,
                     cfg.jail_config.as_ref(),
                     path.as_path(),
-                    width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
-                    height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
+                    width.unwrap_or(NORMALIZED_ABS_MAX),
+                    height.unwrap_or(NORMALIZED_ABS_MAX),
                     name.as_deref(),
                     multi_touch_idx,
                 )?;
@@ -819,7 +1096,12 @@ fn create_virtio_devices(
         for (card_index, virtio_snd) in cfg.virtio_snds.iter().enumerate() {
             let (snd_host_tube, snd_device_tube) =
                 Tube::pair().context("failed to create tube for snd")?;
-            add_control_tube(DeviceControlTube::Snd(snd_host_tube).into());
+            // A backend in another process does not service this tube, so registering it would
+            // leave `crosvm snd` commands waiting on a device that is never going to answer. The
+            // same gap exists for any vhost-user snd backend.
+            if virtio_snd.uid.is_none() {
+                add_control_tube(DeviceControlTube::Snd(snd_host_tube).into());
+            }
             let mut snd_params = virtio_snd.clone();
             snd_params.card_index = card_index;
             devs.push(create_virtio_snd_device(
@@ -827,6 +1109,7 @@ fn create_virtio_devices(
                 cfg.jail_config.as_ref(),
                 snd_params,
                 snd_device_tube,
+                worker_process_pids,
             )?);
         }
     }
@@ -916,6 +1199,7 @@ fn create_virtio_devices(
             ugid,
             uid_map,
             gid_map,
+            supp_gids,
             fs_cfg,
             p9_cfg,
         } = shared_dir;
@@ -931,6 +1215,7 @@ fn create_virtio_devices(
                     *ugid,
                     uid_map,
                     gid_map,
+                    supp_gids,
                     src,
                     tag,
                     fs_cfg.clone(),
@@ -968,6 +1253,36 @@ fn create_virtio_devices(
         )?);
     }
 
+    // virtio-gunyah-accept: transport for VmAccept::Sync runtime attaches. Only meaningful when
+    // the guest must accept memparcels itself (protected VMs); harmless if the guest lacks the
+    // driver — Sync attaches then just time out. Pushed LAST so existing devices keep their PCI
+    // slots (guest /dev/vdX names, BAR layout). GUNYAH_ACCEPT_DEVICE_OFF=1 skips it (debug).
+    if cfg.protection_type.isolates_memory()
+        && std::env::var_os("GUNYAH_ACCEPT_DEVICE_OFF").is_none()
+    {
+        let (accept_host_tube, accept_device_tube) =
+            Tube::pair().context("failed to create tube")?;
+        add_control_tube(DeviceControlTube::GunyahAccept(accept_host_tube).into());
+        // A second tube, to the vm_memory handler rather than to drive_guest_accept: the pool
+        // worker uses it for RegisterMemory. It has to be its own tube served by its own thread,
+        // or a grow deadlocks against the accept it is waiting on.
+        let (pool_host_tube, pool_device_tube) =
+            Tube::pair().context("failed to create pool tube")?;
+        add_control_tube(
+            VmMemoryTube {
+                tube: pool_host_tube,
+                expose_with_viommu: false,
+            }
+            .into(),
+        );
+        devs.push(create_gunyah_accept_device(
+            cfg.protection_type,
+            cfg.jail_config.as_ref(),
+            accept_device_tube,
+            pool_device_tube,
+        )?);
+    }
+
     Ok(devs)
 }
 
@@ -985,7 +1300,7 @@ fn create_devices(
     vfio_container_manager: &mut VfioContainerManager,
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
-    #[cfg(feature = "vnc")] simplefb_event_devices_out: &mut Vec<EventDevice>,
+    #[cfg(feature = "vnc")] simplefb_vnc_input_out: &mut VncBindingInput,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
     #[cfg(feature = "balloon")]
@@ -1124,7 +1439,7 @@ fn create_devices(
         #[cfg(feature = "registered_events")]
         registered_evt_q,
         #[cfg(feature = "vnc")]
-        simplefb_event_devices_out,
+        simplefb_vnc_input_out,
     )?;
 
     for stub in stubs {
@@ -1386,7 +1701,15 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             size.checked_mul(1024 * 1024)
                 .ok_or_else(|| anyhow!("requested swiotlb size too large"))?,
         )
-    } else if matches!(cfg.protection_type, ProtectionType::Unprotected) {
+    } else if matches!(
+        cfg.protection_type,
+        // A pseudo-unprotected VM has no use for a bounce pool: its RAM is shared to it rather
+        // than lent, so the host can already reach every buffer the guest hands a device. Worse
+        // than useless, in fact -- crosvm defaults protected VMs to 64 MiB of it, and that puts a
+        // `restricted-dma-pool` node in the tree for a guest kernel that was never built to
+        // honour one, which is the whole reason this mode exists.
+        ProtectionType::Unprotected | ProtectionType::ProtectedPseudoUnprotected
+    ) {
         None
     } else {
         Some(64 * 1024 * 1024)
@@ -1595,7 +1918,6 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         delay_rt: cfg.delay_rt,
         no_i8042: cfg.no_i8042,
         no_rtc: cfg.no_rtc,
-        #[cfg(target_arch = "x86_64")]
         smbios: cfg.smbios.clone(),
         simplefb: cfg.simplefb.as_ref().map(|s| arch::SimplefbParams {
             width: s.width,
@@ -1938,6 +2260,10 @@ fn run_gunyah(
     use hypervisor::gunyah::GunyahVcpu;
     use hypervisor::gunyah::GunyahVm;
 
+    // The Gunyah RingBlob-pin workaround (GFXSTREAM_GUNYAH_PIN_RINGBLOB) is now driven by the
+    // `--gpu gunyah-pvm=true` sub-option, plumbed in create_gpu_device(), so it can be turned
+    // off on non-Gunyah SoCs.
+
     let device_path = device_path.unwrap_or(Path::new(GUNYAH_PATH));
     let gunyah = Gunyah::new_with_path(device_path)
         .with_context(|| format!("failed to open Gunyah device {}", device_path.display()))?;
@@ -2017,6 +2343,43 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
+    // Bridge the `--pre-alloc` GPU pool sizes to the env the in-process renderer + early memory
+    // setup expect (NCTX_GFX_POOL_MB), BEFORE any of guest_memory_layout, the gpu device, or the
+    // gunyah size-max reads them. The user sets `--pre-alloc`; crosvm no longer requires a
+    // hand-exported NCTX_*. Absent keys keep the renderer's built-in defaults.
+    if let Some(pa) = &cfg.pre_alloc {
+        if let Some(mb) = pa.gfx_host_mb {
+            std::env::set_var("NCTX_GFX_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.gpu_guest_mb {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.gpu_guest_prealloc_mb {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_PREALLOC_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.gpu_guest_step_mb {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_STEP_MB", mb.to_string());
+        }
+        if let Some(n) = pa.gpu_guest_max_grants {
+            std::env::set_var("NCTX_GFX_GUEST_POOL_MAX_GRANTS", n.to_string());
+        }
+        if let Some(mb) = pa.drm_host_mb {
+            std::env::set_var("NCTX_DRM2KGSL_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.venus_host_mb {
+            std::env::set_var("NCTX_VENUS_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_prealloc_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_PREALLOC_MB", mb.to_string());
+        }
+        if let Some(mb) = pa.test_pool_step_mb {
+            std::env::set_var("DROIDVM_TEST_POOL_STEP_MB", mb.to_string());
+        }
+    }
+
     let components = setup_vm_components(&cfg)?;
 
     let hypervisor = cfg
@@ -2039,7 +2402,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         ))]
         HypervisorKind::Gunyah { device,
                                  qcom_trusted_vm_id,
-                                 qcom_trusted_vm_pas_id
+                                 qcom_trusted_vm_pas_id,
                                } => run_gunyah(
                                         device.as_deref(),
                                         qcom_trusted_vm_id,
@@ -2197,7 +2560,7 @@ where
     let mut worker_process_pids = BTreeSet::new();
 
     #[cfg(feature = "vnc")]
-    let mut simplefb_event_devices: Vec<EventDevice> = Vec::new();
+    let mut simplefb_vnc_input = VncBindingInput::default();
 
     let mut devices = create_devices(
         &cfg,
@@ -2216,7 +2579,7 @@ where
         &mut vfio_container_manager,
         &mut worker_process_pids,
         #[cfg(feature = "vnc")]
-        &mut simplefb_event_devices,
+        &mut simplefb_vnc_input,
     )?;
 
     #[cfg(feature = "pci-hotplug")]
@@ -2501,7 +2864,7 @@ where
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         vcpu_domain_paths,
         #[cfg(feature = "vnc")]
-        simplefb_event_devices,
+        simplefb_vnc_input,
     )
 }
 
@@ -2542,6 +2905,7 @@ fn start_pci_root_worker(
                     dest: VmMemoryDestination::GuestPhysicalAddress(addr.0),
                     prot: Protection::read(),
                     cache: MemCacheType::CacheCoherent,
+                    vm_accept: hypervisor::VmAccept::default(),
                 })
                 .context("failed to send request")?;
             match self.vm_control_tube.recv::<VmMemoryResponse>() {
@@ -3613,7 +3977,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         usize,
         PathBuf,
     >,
-    #[cfg(feature = "vnc")] simplefb_event_devices: Vec<EventDevice>,
+    #[cfg(feature = "vnc")] simplefb_vnc_input: VncBindingInput,
 ) -> Result<ExitState> {
     // Split up `all_control_tubes`.
     #[cfg(feature = "balloon")]
@@ -3625,6 +3989,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let mut pvclock_host_tube = None;
     #[cfg(feature = "audio")]
     let mut snd_host_tubes = Vec::new();
+    let mut gunyah_accept_host_tube = None;
     let mut irq_control_tubes = Vec::new();
     let mut vm_memory_control_tubes = Vec::new();
     let mut control_tubes = Vec::new();
@@ -3651,6 +4016,10 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             #[cfg(feature = "audio")]
             AnyControlTube::DeviceControlTube(DeviceControlTube::Snd(t)) => {
                 snd_host_tubes.push(t);
+            }
+            AnyControlTube::DeviceControlTube(DeviceControlTube::GunyahAccept(t)) => {
+                assert!(gunyah_accept_host_tube.is_none());
+                gunyah_accept_host_tube = Some(t)
             }
             AnyControlTube::IrqTube(t) => irq_control_tubes.push(t),
             AnyControlTube::TaggedControlTube(t) => control_tubes.push(t),
@@ -3746,15 +4115,27 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         }
     };
 
-    // If simplefb and a VNC display backend are both configured, spawn a bridge
-    // thread that polls guest memory and pushes frames to the VNC display.
-    // In protected VM mode, the simplefb region is backed by a DMA-BUF from
-    // the DMA heap and shared via map_cma_region (same as MMIO devices).
-    // The display bridge reads from the host mmap of the same DMA-BUF.
-    #[cfg(feature = "vnc")]
+    // If simplefb and a display backend are configured, spawn a bridge thread that polls guest
+    // memory and pushes frames to that display -- VNC, or the Android Surface from the display
+    // service when one is configured (the bridge itself is backend-agnostic).
+    // The region is a slice of the guest's own memfd, not a separate buffer. On Gunyah it takes
+    // the swiotlb sharing path -- lend=false, so set_user_memory_region leaves the host with read
+    // access, and create_shm_node=true has RM build a memparcel so the guest gets its stage-2
+    // mapping (see aarch64/src/lib.rs, `SharedFramebuffer`). The bridge therefore reads it
+    // straight out of the host mmap of guest memory at the region's offset.
+    //
+    // Measured on device under --protected-vm-without-firmware: crosvm holds zero dmabuf fds and
+    // one `memfd:crosvm_guest`, with no separate mapping the size of the framebuffer. An earlier
+    // version of this comment claimed a DMA-heap DMA-BUF shared via map_cma_region; that is not
+    // what happens, and it matters because it makes a GPU import look free. Anything wanting an
+    // importable fd for this region has to build a udmabuf over the memfd first, the way
+    // `resource_create_blob` already does for the guest pool.
+    //
+    // The guest maps it with ioremap_wc(), so it is write-combining: visibility of guest writes to
+    // a GPU reader is a real question here, not a formality.
+    #[cfg(any(feature = "vnc", feature = "android_display"))]
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
-        let vnc_cfg = cfg.vnc_server.as_ref()?;
         let guest_mem = linux.vm.get_memory().clone();
         let bpp: u32 = match sfb_cfg.format.as_str() {
             "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
@@ -3763,6 +4144,9 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             _ => 4,
         };
         let stride = sfb_cfg.width * bpp;
+        // The same DT string the guest reads, resolved once here rather than assumed downstream:
+        // the bridge hands it to the sink as part of every frame it produces.
+        let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
 
         #[cfg(target_arch = "aarch64")]
         let (fb_size, guest_addr) = {
@@ -3786,17 +4170,70 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
             stride,
             bpp,
             size: fb_size,
+            fourcc,
+            // A host-side property: it says how often we look, not anything about the device the
+            // guest was handed, which is why it goes here and not into the device tree.
+            poll_hz: sfb_cfg.poll_hz,
         };
 
-        let host = vnc_cfg.host.as_deref().unwrap_or("0.0.0.0");
-        let port = vnc_cfg.port.unwrap_or(5900);
-        let addr = format!("{}:{}", host, port);
-        let target = simplefb_display::VncDisplayTarget {
-            addr,
-            password: vnc_cfg.password.clone(),
+        // This device provides the `simplefb` screen, so it takes the exporter bound to that
+        // screen -- and opens it, whether or not this VM also has a GPU device. Which of the two
+        // screens the user is looking at is the user's answer to give, not something the VMM
+        // decides by merging them into one display and guessing which source is live.
+        //
+        // The app display path still takes precedence over VNC below when both are somehow
+        // present, but config rejects that pairing outright (one exporter per screen), so the
+        // ordering is a leftover tie-break rather than a decision anyone can reach.
+        #[cfg(feature = "android_display")]
+        let android_service = cfg
+            .android_display_service_for(DisplayScreen::Simplefb)
+            .map(|s| (s.name.clone(), s.transport_cap));
+        #[cfg(not(feature = "android_display"))]
+        let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
+
+        // No binding, no thread. A framebuffer nobody asked to see costs nothing to not look at,
+        // and there is no longer anywhere for its frames to go by default: they used to be handed
+        // to the GPU device's display, which is what the exporter bindings replace. (The step-5
+        // liveness rate is for a screen that is bound but unwatched -- a sink attached with no
+        // client -- not for one nothing has bound at all.)
+        // The transport ceiling travels with the binding, not with the screen: it says how far this
+        // one exporter may go, so it is read off whichever entry bound to `simplefb` and handed to
+        // the bridge alongside the target it describes.
+        let (target, transport_cap) = match android_service {
+            Some((service_name, transport_cap)) => (
+                simplefb_display::SimplefbDisplayTarget::Android { service_name },
+                transport_cap,
+            ),
+            None => {
+                #[cfg(feature = "vnc")]
+                {
+                    let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
+                    let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+                    let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+                    (
+                        simplefb_display::SimplefbDisplayTarget::Vnc {
+                            addr: format!("{}:{}", host, port),
+                            password: vnc_cfg.password.clone(),
+                            hw_encode: vnc_cfg.h264_enabled(),
+                            // This screen's own tablet and keyboard, built during device creation
+                            // beside the guest halves they are paired with. Empty on a
+                            // `view-only=true` binding.
+                            input: simplefb_vnc_input,
+                        },
+                        vnc_cfg.transport_cap,
+                    )
+                }
+                #[cfg(not(feature = "vnc"))]
+                return None;
+            }
         };
 
-        match simplefb_display::start_simplefb_display_thread(guest_mem, params, target, simplefb_event_devices) {
+        match simplefb_display::start_simplefb_display_thread(
+            guest_mem,
+            params,
+            target,
+            transport_cap,
+        ) {
             Ok(handle) => {
                 info!("simplefb display bridge started");
                 Some(handle)
@@ -4079,6 +4516,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                     gralloc,
                     iommu_client,
                     vm_memory_handler_control_for_thread,
+                    gunyah_accept_host_tube,
                 )
             }
         })
@@ -4275,11 +4713,14 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                         // child processes that exit cleanly which should not be considered a
                         // crash. When running with sandboxing, this should be handled by the
                         // device's process handler.
+                        // Some vendor GPU driver builds (observed: OPPO sm8650 / Android 14
+                        // Adreno stack) fork helpers that exit with a NON-zero status during
+                        // normal operation; only crosvm's own (tracked) children are evidence
+                        // of a crash. Accept any exit code from untracked children.
                         if cfg.jail_config.is_none()
                             && !linux.pid_debug_label_map.contains_key(&pid)
                             && siginfo.ssi_signo == libc::SIGCHLD as u32
                             && siginfo.ssi_code == libc::CLD_EXITED
-                            && siginfo.ssi_status == 0
                         {
                             continue;
                         }
@@ -4771,6 +5212,7 @@ fn vm_memory_handler_thread(
     mut gralloc: RutabagaGralloc,
     mut iommu_client: Option<VmMemoryRequestIommuClient>,
     handler_control: Tube,
+    gunyah_accept_tube: Option<Tube>,
 ) -> anyhow::Result<()> {
     #[derive(EventToken)]
     enum Token {
@@ -4848,6 +5290,7 @@ fn vm_memory_handler_thread(
                                         None
                                     },
                                     &mut region_state,
+                                    gunyah_accept_tube.as_ref(),
                                 );
                                 if let Err(e) = tube.send(&response) {
                                     error!("failed to send VmMemoryControlResponse: {}", e);

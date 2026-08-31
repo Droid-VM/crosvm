@@ -51,6 +51,7 @@ pub fn from_virtio_sample_format(virtio_pcm_format: u8) -> Result<SampleFormat> 
         VIRTIO_SND_PCM_FMT_S16 => SampleFormat::S16LE,
         VIRTIO_SND_PCM_FMT_S24 => SampleFormat::S24LE,
         VIRTIO_SND_PCM_FMT_S32 => SampleFormat::S32LE,
+        VIRTIO_SND_PCM_FMT_FLOAT => SampleFormat::F32LE,
         _ => {
             return Err(Error::UnsupportedVirtioPcmFormat(virtio_pcm_format));
         }
@@ -64,6 +65,7 @@ pub fn from_sample_format(format: SampleFormat) -> u8 {
         SampleFormat::S16LE => VIRTIO_SND_PCM_FMT_S16,
         SampleFormat::S24LE => VIRTIO_SND_PCM_FMT_S24,
         SampleFormat::S32LE => VIRTIO_SND_PCM_FMT_S32,
+        SampleFormat::F32LE => VIRTIO_SND_PCM_FMT_FLOAT,
     }
 }
 

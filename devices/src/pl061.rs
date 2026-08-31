@@ -1,6 +1,10 @@
-// Copyright 2024 The ChromiumOS Authors
-// Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE file.
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright DroidVM contributors
+// Derived from QEMU (GPL-2.0-or-later): hw/gpio/pl061.c, non-Luminary variant.
+// The additional permissions do not extend to QEMU copyright in this file.
+//
+// This file previously carried a "Copyright 2024 The ChromiumOS Authors" BSD notice.
+// That was boilerplate copied from a sibling file; ChromiumOS did not write this one.
 
 //! ARM PrimeCell PL061 General Purpose IO controller.
 //!

@@ -22,8 +22,10 @@ use base::SharedMemory;
 use base::Tube;
 use base::WorkerThread;
 use data_model::Le32;
+use base::SafeDescriptor;
 use hypervisor::Datamatch;
 use hypervisor::MemCacheType;
+use hypervisor::VmAccept;
 use libc::ERANGE;
 #[cfg(target_arch = "x86_64")]
 use metrics::MetricEventType;
@@ -467,6 +469,10 @@ impl VirtioPciDevice {
                 &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
             ),
             DeviceType::Pvclock => (
+                PciClassCode::BaseSystemPeripheral,
+                &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
+            ),
+            DeviceType::GunyahAccept => (
                 PciClassCode::BaseSystemPeripheral,
                 &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
             ),
@@ -1519,6 +1525,43 @@ impl SharedMemoryMapper for VmRequester {
 
         self.mappings.insert(offset, id);
         Ok(())
+    }
+
+    fn add_mapping_blob(
+        &mut self,
+        source: VmMemorySource,
+        offset: u64,
+        prot: Protection,
+        cache: MemCacheType,
+        vm_accept: VmAccept,
+    ) -> anyhow::Result<Option<u32>> {
+        if !self.prepared {
+            if let SharedMemoryPrepareType::SingleMappingOnFirst(prepare_cache_type) =
+                self.prepare_type
+            {
+                self.vm_memory_client
+                    .prepare_shared_memory_region(self.alloc, prepare_cache_type)
+                    .context("lazy prepare_shared_memory_region failed")?;
+            }
+            self.prepared = true;
+        }
+
+        let (id, gunyah_handle) = self
+            .vm_memory_client
+            .register_memory_for_blob(
+                source,
+                VmMemoryDestination::ExistingAllocation {
+                    allocation: self.alloc,
+                    offset,
+                },
+                prot,
+                cache,
+                vm_accept,
+            )
+            .context("register_memory_for_blob failed")?;
+
+        self.mappings.insert(offset, id);
+        Ok(gunyah_handle)
     }
 
     fn remove_mapping(&mut self, offset: u64) -> anyhow::Result<()> {

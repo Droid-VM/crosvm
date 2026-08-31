@@ -8,6 +8,7 @@
 #![cfg_attr(feature = "document-features", doc = document_features::document_features!())]
 
 #[cfg(any(feature = "composite-disk", feature = "qcow"))]
+use std::ffi::c_int;
 use std::fs::OpenOptions;
 use std::path::Path;
 
@@ -760,6 +761,14 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
     #[cfg(not(feature = "crash-report"))]
     sys::set_panic_hook();
 
+    // DroidVM: also catch raw fatal signals (SIGSEGV/SIGBUS/... e.g. a null deref in the native
+    // display glue or gfxstream backend, or during device teardown on VM stop) with an in-process
+    // handler that prints a backtrace to stderr. Android debuggerd's tombstone path forks a helper
+    // via clone() which fails ("second clone failed") under teardown pressure, so without this a
+    // shutdown-time SIGSEGV leaves no diagnostic at all.
+    #[cfg(all(not(feature = "crash-report"), any(target_os = "android", target_os = "linux")))]
+    sys::install_crash_handler();
+
     // Ensure all processes detach from metrics on exit.
     #[cfg(windows)]
     let _metrics_destructor = metrics::get_destructor();
@@ -926,8 +935,48 @@ fn crosvm_main<I: IntoIterator<Item = String>>(args: I) -> Result<CommandStatus>
     })
 }
 
+/// Turn a fatal signal into an immediate `_exit`, skipping the platform crash handler.
+///
+/// On this platform, HOW crosvm dies decides whether the user's phone survives it. Measured, same
+/// VM state both times -- Minecraft in a world, 763 descriptors held:
+///
+///   SIGKILL  host survives, memparcels reclaimed within the reaper's window
+///   SIGABRT  the phone reboots, ~100ms after the abort, boot reason "reboot", no panic, no pstore
+///
+/// The difference is that SIGKILL runs no userspace at all, while a fatal signal goes through
+/// bionic's crash path -- debuggerd is signalled and crash_dump64 attaches to a process that is
+/// still holding a running protected VM, its lent guest memory, and in-flight GPU work. Whatever
+/// resets the device lives past that boundary, in the RM or TZ, and is not visible from here.
+///
+/// So this does not diagnose it; it removes the difference. `_exit` is async-signal-safe, runs no
+/// destructors, and produces exactly the kernel-side teardown SIGKILL produces -- which is the case
+/// that was measured to be survivable. The cost is no tombstone, and that cost is already being
+/// paid: in the abort that prompted this, crash_dump64 logged "failed to open /proc/22801: No such
+/// file or directory" and wrote nothing.
+///
+/// The alternative -- fix every abort -- is not a policy. One was fixed today (a FORTIFY FD_SET
+/// past FD_SETSIZE, inside libvncserver); the next one should cost a VM, not somebody's phone.
+extern "C" fn exit_without_crash_dump(sig: c_int) {
+    // Async-signal-safe only. No allocation, no formatting, no logging.
+    unsafe { libc::_exit(128 + sig) };
+}
+
+fn install_fatal_signal_handlers() {
+    // SIGABRT covers Rust panics (panic = 'abort') and every C assert/FORTIFY check in the
+    // libraries linked in here. SIGSEGV/SIGBUS/SIGILL/SIGFPE take the same crash path and hold the
+    // same VM state, so they get the same treatment.
+    for sig in [libc::SIGABRT, libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {
+        // SAFETY: the handler is async-signal-safe -- it calls only _exit.
+        if let Err(e) = unsafe { base::linux::register_signal_handler(sig, exit_without_crash_dump) } {
+            // Not fatal: without this crosvm still runs, it just takes the host with it if it dies.
+            error!("could not install the fatal-signal handler for {sig}: {e}");
+        }
+    }
+}
+
 fn main() {
     syslog::early_init();
+    install_fatal_signal_handlers();
     debug!("crosvm started.");
     let res = crosvm_main(std::env::args());
 

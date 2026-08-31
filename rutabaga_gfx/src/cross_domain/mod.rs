@@ -830,6 +830,7 @@ impl RutabagaContext for CrossDomainContext {
                         component_mask: 1 << (RutabagaComponentType::CrossDomain as u8),
                         size: resource_create_blob.size,
                         mapping: None,
+                        pool_offset: None,
                     })
                 }
                 _ => Err(RutabagaError::InvalidCrossDomainItemType),
@@ -864,6 +865,7 @@ impl RutabagaContext for CrossDomainContext {
                         component_mask: 1 << (RutabagaComponentType::CrossDomain as u8),
                         size: resource_create_blob.size,
                         mapping: None,
+                        pool_offset: None,
                     })
                 }
                 _ => Err(RutabagaError::InvalidCrossDomainItemType),
@@ -1061,6 +1063,7 @@ impl RutabagaComponent for CrossDomain {
             component_mask: 1 << (RutabagaComponentType::CrossDomain as u8),
             size: resource_create_blob.size,
             mapping: None,
+            pool_offset: None,
         })
     }
 

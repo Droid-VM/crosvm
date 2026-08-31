@@ -371,10 +371,18 @@ impl VhostUserFrontend {
                 backend_req_handler,
                 backend_client,
             };
-            worker
+            // A vhost-user backend going away must not take the VM with it. Upstream
+            // unwrapped here, so a sound helper that exits -- which it does on any guest-side
+            // device restart, because the snd backend cannot restart a queue -- panicked the
+            // 'vu-<device>' thread and aborted crosvm mid-flight. Log it and let the worker
+            // wind down instead: the device stops responding, which the guest driver sees as
+            // a dead device, and everything else in the VM keeps running.
+            if let Err(e) = worker
                 .run(interrupt)
                 .with_context(|| format!("{label}: vhost_user_frontend worker failed"))
-                .unwrap();
+            {
+                error!("{:#}", e);
+            }
             worker.backend_req_handler
         }));
     }

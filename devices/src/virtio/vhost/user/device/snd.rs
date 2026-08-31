@@ -23,6 +23,7 @@ use serde::Serialize;
 use snapshot::AnySnapshot;
 pub use sys::run_snd_device;
 pub use sys::Options;
+use virtio_sys::virtio_config::VIRTIO_F_ACCESS_PLATFORM;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::VhostUserProtocolFeatures;
 use vmm_vhost::VHOST_USER_F_PROTOCOL_FEATURES;
@@ -30,13 +31,13 @@ use zerocopy::IntoBytes;
 
 use crate::virtio;
 use crate::virtio::copy_config;
-use crate::virtio::device_constants::snd::virtio_snd_config;
 use crate::virtio::snd::common_backend::async_funcs::handle_ctrl_queue;
 use crate::virtio::snd::common_backend::async_funcs::handle_pcm_queue;
 use crate::virtio::snd::common_backend::async_funcs::send_pcm_response_worker;
 use crate::virtio::snd::common_backend::create_stream_info_builders;
 use crate::virtio::snd::common_backend::hardcoded_snd_data;
-use crate::virtio::snd::common_backend::hardcoded_virtio_snd_config;
+use crate::virtio::snd::common_backend::droidvm_snd_config;
+use crate::virtio::snd::common_backend::DroidVmSndConfig;
 use crate::virtio::snd::common_backend::stream_info::StreamInfo;
 use crate::virtio::snd::common_backend::stream_info::StreamInfoBuilder;
 use crate::virtio::snd::common_backend::stream_info::StreamInfoSnapshot;
@@ -62,7 +63,7 @@ use crate::virtio::Queue;
 const PCM_RESPONSE_WORKER_IDX_OFFSET: usize = 2;
 struct SndBackend {
     ex: Executor,
-    cfg: virtio_snd_config,
+    cfg: DroidVmSndConfig,
     avail_features: u64,
     workers: [Option<WorkerState<Rc<AsyncRwLock<Queue>>, Result<(), Error>>>; MAX_QUEUE_NUM],
     // tx and rx
@@ -91,11 +92,19 @@ impl SndBackend {
         #[cfg(windows)] audio_client_guid: Option<String>,
         card_index: usize,
     ) -> anyhow::Result<Self> {
-        let cfg = hardcoded_virtio_snd_config(&params);
-        let avail_features = virtio::base_features(ProtectionType::Unprotected)
-            | 1 << VHOST_USER_F_PROTOCOL_FEATURES;
-
+        // Descriptors first: the config declares how many of them there are.
         let snd_data = hardcoded_snd_data(&params);
+        let cfg = droidvm_snd_config(&params, &snd_data);
+        // Unprotected unconditionally, because this process does not know what kind of VM it is
+        // serving and cannot ask. The one protection-dependent bit is passed in instead: without
+        // it the guest skips the DMA API for this device, puts its vrings at guest-physical
+        // addresses, and the frontend fails to translate them at activate -- before any audio.
+        let mut avail_features = virtio::base_features(ProtectionType::Unprotected)
+            | 1 << VHOST_USER_F_PROTOCOL_FEATURES;
+        if params.access_platform {
+            avail_features |= 1 << VIRTIO_F_ACCESS_PLATFORM;
+        }
+
         let mut keep_rds = Vec::new();
         let builders = create_stream_info_builders(&params, &snd_data, &mut keep_rds, card_index)?;
 
@@ -170,6 +179,18 @@ impl VhostUserDevice for SndBackend {
         for worker in self.workers.iter_mut().filter_map(Option::take) {
             let _ = self.ex.run_until(worker.queue_task.cancel());
         }
+        // The response workers hold the PCM response receivers; leaving them running would
+        // keep the old channel alive across a reset. See stop_queue for why the channels are
+        // re-created rather than reclaimed.
+        for worker in self.response_workers.iter_mut().filter_map(Option::take) {
+            let _ = self.ex.run_until(worker.queue_task.cancel());
+        }
+        let (tx_send, tx_recv) = mpsc::unbounded();
+        let (rx_send, rx_recv) = mpsc::unbounded();
+        self.tx_send = tx_send;
+        self.rx_send = rx_send;
+        self.tx_recv = Some(tx_recv);
+        self.rx_recv = Some(rx_recv);
     }
 
     fn start_queue(
@@ -288,6 +309,27 @@ impl VhostUserDevice for SndBackend {
             {
                 // Wait for queue_task to be aborted.
                 let _ = self.ex.run_until(worker.queue_task.cancel());
+            }
+
+            // start_queue moves the PCM response receiver into the worker above, so once that
+            // worker is cancelled the receiver is gone and a later start_queue for the same
+            // index fails with "queue restart is not supported". In-process that never showed,
+            // because a device reset rebuilds the whole VirtioSnd; a vhost-user backend is a
+            // separate process that outlives the guest's reset, so the second initialisation --
+            // a driver reinstall, a device disable/enable, a guest reboot -- killed the backend,
+            // and with it the VM. Re-create the channel here.
+            //
+            // Safe against stale senders because stops arrive as a batch before any start: the
+            // frontend's reset() deactivates every vring it has sent, and only then are the
+            // queues started again, so the control worker and the streams clone the senders
+            // installed here rather than the ones just dropped.
+            let (send, recv) = mpsc::unbounded();
+            if idx == 2 {
+                self.tx_send = send;
+                self.tx_recv = Some(recv);
+            } else {
+                self.rx_send = send;
+                self.rx_recv = Some(recv);
             }
         }
 

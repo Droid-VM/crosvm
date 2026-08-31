@@ -163,7 +163,7 @@ extern "C" {
     pub fn dwl_surface_close_requested(self_: *const dwl_surface) -> bool;
 }
 extern "C" {
-    pub fn dwl_surface_set_position(self_: *mut dwl_surface, x: u32, y: u32);
+    pub fn dwl_surface_set_position(self_: *mut dwl_surface, x: i32, y: i32);
 }
 extern "C" {
     pub fn dwl_surface_descriptor(self_: *const dwl_surface) -> *const ::std::ffi::c_void;

@@ -4,6 +4,8 @@
 
 #[cfg(feature = "audio_aaudio")]
 use android_audio::AndroidAudioStreamSourceGenerator;
+#[cfg(feature = "audio_aaudio")]
+use android_audio::AAUDIO_DEVICE_UNSPECIFIED;
 use async_trait::async_trait;
 use audio_streams::capture::AsyncCaptureBuffer;
 use audio_streams::capture::AsyncCaptureBufferStream;
@@ -15,6 +17,7 @@ use audio_streams::StreamSourceGenerator;
 use base::error;
 use base::set_rt_prio_limit;
 use base::set_rt_round_robin;
+use base::warn;
 use cros_async::Executor;
 use futures::channel::mpsc::UnboundedSender;
 #[cfg(feature = "audio_cras")]
@@ -24,9 +27,11 @@ use libcras::CrasStreamType;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::virtio::snd::constants::VIRTIO_SND_D_INPUT;
 use crate::virtio::snd::common_backend::async_funcs::CaptureBufferReader;
 use crate::virtio::snd::common_backend::async_funcs::PlaybackBufferWriter;
 use crate::virtio::snd::common_backend::stream_info::StreamInfo;
+use crate::virtio::snd::common_backend::underrun::UnderrunConcealer;
 use crate::virtio::snd::common_backend::DirectionalStream;
 use crate::virtio::snd::common_backend::Error;
 use crate::virtio::snd::common_backend::PcmResponse;
@@ -43,6 +48,8 @@ pub(crate) type SysBufferReader = UnixBufferReader;
 pub struct SysDirectionOutput {
     pub async_playback_buffer_stream: Box<dyn audio_streams::AsyncPlaybackBufferStream>,
     pub buffer_writer: Box<dyn PlaybackBufferWriter>,
+    /// Present only when this stream conceals underruns; see [`UnderrunConcealer`].
+    pub concealer: Option<UnderrunConcealer>,
 }
 
 pub(crate) struct SysAsyncStreamObjects {
@@ -86,13 +93,48 @@ impl TryFrom<&str> for StreamSourceBackend {
 
 #[cfg(feature = "audio_aaudio")]
 pub(crate) fn create_aaudio_stream_source_generators(
+    params: &Parameters,
     snd_data: &SndData,
 ) -> Vec<SysAudioStreamSourceGenerator> {
     let mut generators: Vec<Box<dyn StreamSourceGenerator>> =
         Vec::with_capacity(snd_data.pcm_info_len());
     for pcm_info in snd_data.pcm_info_iter() {
         assert_eq!(pcm_info.features, 0); // Should be 0. Android audio backend does not support any features.
-        generators.push(Box::new(AndroidAudioStreamSourceGenerator::new()));
+        // Per-PCM-device host routing: output_device_config[i]/input_device_config[i] may pin
+        // device i to one AAudio endpoint. Anything unset stays on the platform's own routing.
+        //
+        // Say so when the config is shorter than the device count. Falling back is right -- a
+        // device with no entry should follow the platform -- but doing it silently makes a
+        // miscounted config space look exactly like a deliberate one, and the symptom is audio
+        // coming out of the wrong endpoint with nothing in the log to explain it.
+        let device_params = match params.get_device_params(pcm_info) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(
+                    "virtio-snd: no host device config for {} device {} ({}); \
+                     following the platform's routing",
+                    if pcm_info.direction == VIRTIO_SND_D_INPUT {
+                        "input"
+                    } else {
+                        "output"
+                    },
+                    u32::from(pcm_info.hdr.hda_fn_nid),
+                    e
+                );
+                Default::default()
+            }
+        };
+        // Prefer the name over the number: the number is only what the endpoint happens to be
+        // called today, and a reconnected device gets a new one.
+        let generator = match (&device_params.host_device, params.device_table.as_str()) {
+            (Some(key), table) if !key.is_empty() && !table.is_empty() => {
+                AndroidAudioStreamSourceGenerator::with_host_key(key.clone(), table.into())
+            }
+            _ => AndroidAudioStreamSourceGenerator::new(
+                device_params.device_id.unwrap_or(AAUDIO_DEVICE_UNSPECIFIED),
+            ),
+        };
+        generators.push(Box::new(generator));
     }
     generators
 }
@@ -129,7 +171,7 @@ pub(crate) fn create_stream_source_generators(
 ) -> Vec<Box<dyn StreamSourceGenerator>> {
     match backend {
         #[cfg(feature = "audio_aaudio")]
-        StreamSourceBackend::AAUDIO => create_aaudio_stream_source_generators(snd_data),
+        StreamSourceBackend::AAUDIO => create_aaudio_stream_source_generators(params, snd_data),
         #[cfg(feature = "audio_cras")]
         StreamSourceBackend::CRAS => create_cras_stream_source_generators(params, snd_data),
     }
@@ -202,9 +244,20 @@ impl StreamInfo {
 
         let buffer_writer = UnixBufferWriter::new(self.period_bytes);
 
+        // Built here because this is where the stream's geometry is known. None when the mode is
+        // Silence, or when the format is one the concealer will not guess at.
+        let concealer = UnderrunConcealer::new(
+            self.underrun,
+            self.channels as usize,
+            self.frame_rate,
+            self.period_bytes,
+            self.format,
+        );
+
         Ok(DirectionalStream::Output(SysDirectionOutput {
             async_playback_buffer_stream,
             buffer_writer: Box::new(buffer_writer),
+            concealer,
         }))
     }
 }
@@ -232,6 +285,10 @@ impl CaptureBufferReader for UnixBufferReader {
             .next_capture_buffer(ex)
             .await
             .map_err(Error::FetchBuffer)?)
+    }
+
+    fn set_idle(&mut self, idle: bool) {
+        self.async_stream.set_idle(idle);
     }
 }
 

@@ -78,6 +78,56 @@ impl TryFrom<&str> for StreamSourceBackend {
     }
 }
 
+/// What the device plays when the guest has not queued a period in time.
+///
+/// An underrun is a hole in the stream, and the hole is what the listener hears as a click.
+/// Filling it with silence is honest but maximally audible; holding the previous audio hides
+/// short holes, which is the trade a low-latency configuration wants to make -- fewer periods
+/// in flight means more underruns by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case", try_from = "&str", into = "String")]
+pub enum UnderrunMode {
+    /// Write a period of zeroes. The upstream behaviour, and the default.
+    #[default]
+    Silence,
+    /// Repeat the tail of the last good period, pitch-aligned and fading out.
+    Repeat,
+    /// Waveform Similarity Overlap-Add: re-splice at the best match for each chunk, so a long
+    /// hole wanders through the history rather than looping one period of it.
+    Wsola,
+    /// Fit an all-pole filter to the last good period and run it on, continuing the spectrum
+    /// rather than reusing samples.
+    Lpc,
+}
+
+impl From<UnderrunMode> for String {
+    fn from(mode: UnderrunMode) -> Self {
+        match mode {
+            UnderrunMode::Silence => "silence".to_owned(),
+            UnderrunMode::Repeat => "repeat".to_owned(),
+            UnderrunMode::Wsola => "wsola".to_owned(),
+            UnderrunMode::Lpc => "lpc".to_owned(),
+        }
+    }
+}
+
+impl TryFrom<&str> for UnderrunMode {
+    type Error = Error;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "silence" => Ok(UnderrunMode::Silence),
+            "repeat" => Ok(UnderrunMode::Repeat),
+            "wsola" => Ok(UnderrunMode::Wsola),
+            "lpc" => Ok(UnderrunMode::Lpc),
+            _ => Err(Error::InvalidParameterValue(
+                s.to_owned(),
+                "expected silence, repeat, wsola or lpc".to_owned(),
+            )),
+        }
+    }
+}
+
 /// Holds the parameters for each PCM device
 #[derive(Debug, Clone, Default, Deserialize, Serialize, FromKeyValues, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
@@ -87,6 +137,26 @@ pub struct PCMDeviceParameters {
     #[cfg(all(unix, feature = "audio_cras"))]
     pub stream_type: Option<CrasStreamType>,
     pub effects: Option<Vec<StreamEffect>>,
+    /// Host endpoint this PCM device plays to / records from, as an Android `AudioDeviceInfo`
+    /// id. Only the aaudio backend honours it; `None` (or 0) leaves the routing to the
+    /// platform. The ids are assigned per boot, so whoever writes this has to resolve a stable
+    /// descriptor to a live id at VM start.
+    pub device_id: Option<i32>,
+    /// What this PCM device's host endpoint runs at natively, in Hz. Published to the guest as
+    /// a hint so its mixer can land on that rate instead of one the host would have to convert.
+    /// `None` (or 0) says nothing and the guest keeps its own default.
+    pub preferred_rate: Option<u32>,
+    /// The same for the endpoint's channel count.
+    pub preferred_channels: Option<u8>,
+    /// What kind of thing the host endpoint is: 1 speaker, 2 headphones, 3 headset, 4 line out,
+    /// 5 digital, 6 microphone, 7 telephony. 0 or unset says nothing.
+    pub endpoint_kind: Option<u32>,
+    /// The host endpoint by a name that survives it being unplugged: `TYPE|address`, as
+    /// Android's `AudioDeviceInfo` reports them.
+    ///
+    /// Preferred over `device_id`, which is only today's number for it -- reconnect a headset
+    /// and the number is different while the name is not. Requires `device_table`.
+    pub host_device: Option<String>,
 }
 
 /// Holds the parameters for a cras sound device
@@ -109,6 +179,52 @@ pub struct Parameters {
     pub output_device_config: Vec<PCMDeviceParameters>,
     pub input_device_config: Vec<PCMDeviceParameters>,
     pub card_index: usize,
+    /// What to play on underrun. See [`UnderrunMode`].
+    /// Where the platform's current audio device list is published, for resolving
+    /// `host_device`. Empty when nobody publishes one, and then only `device_id` works.
+    pub device_table: String,
+    pub underrun: UnderrunMode,
+    /// Hint published to the guest (see the device's vendor config block): how many periods it
+    /// should try to keep in flight. 0 leaves the decision to the guest driver.
+    ///
+    /// This is the latency knob, and it can only be a hint -- the device cannot make a driver
+    /// queue more than it wants to, and the driver must never send a period the OS has not
+    /// written yet. A driver that ignores the block keeps its own default.
+    pub guest_outstanding_packets: u32,
+    /// Hint published to the guest: preferred period size in bytes. 0 means no preference.
+    pub guest_period_bytes: u32,
+    /// Run this device's backend in its own process under this uid.
+    ///
+    /// Named to match `--shared-dir` and `--pmem-ext2`, which already take a `uid`/`gid` for the
+    /// process a device runs as. The meaning here is the same -- the identity the device's own
+    /// process has -- with one difference worth knowing: theirs is applied through the sandbox
+    /// and so does nothing at all when sandboxing is off, while this is a real host uid and
+    /// always applies. Android decides whether an audio stream is audible from the real uid, so
+    /// a namespace-relative one would not do.
+    ///
+    /// `None` keeps the device in the VMM's own process, which on Android means silence: the VMM
+    /// is root and the platform mutes uid 0 in both directions.
+    pub uid: Option<u32>,
+    /// Group for that process. Defaults to `uid` when unset.
+    pub gid: Option<u32>,
+    /// Supplementary groups for that process.
+    ///
+    /// Empty drops all of them, which is the safe default: the VMM's own groups are root's, and
+    /// carrying any of them into an unprivileged process would be a privilege leak. Anything the
+    /// backend genuinely needs has to be named here by whoever knows -- the VMM cannot work it
+    /// out, and guessing would defeat the point of dropping them.
+    #[serde(default)]
+    pub supp_gids: Vec<u32>,
+    /// Advertise `VIRTIO_F_ACCESS_PLATFORM`, which is what tells the guest's virtio core to put
+    /// this device's vrings and buffers through the DMA API -- a bounce pool, in a protected VM --
+    /// instead of at guest-physical addresses the host cannot reach.
+    ///
+    /// Only the out-of-process backend reads this. It has no `ProtectionType` of its own to derive
+    /// the bit from the way `virtio::base_features` does for every in-process device, and the
+    /// frontend can only mask against what the backend offers. So the VMM sets this from the VM's
+    /// real protection type just before launching the backend, and a value given on the command
+    /// line is overwritten there.
+    pub access_platform: bool,
 }
 
 impl Default for Parameters {
@@ -129,6 +245,14 @@ impl Default for Parameters {
             output_device_config: vec![],
             input_device_config: vec![],
             card_index: 0,
+            device_table: String::new(),
+            underrun: UnderrunMode::Silence,
+            guest_outstanding_packets: 0,
+            guest_period_bytes: 0,
+            uid: None,
+            gid: None,
+            supp_gids: Vec::new(),
+            access_platform: false,
         }
     }
 }
@@ -366,11 +490,13 @@ mod tests {
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_CROSVM),
                     stream_type: None,
                     effects: None,
+                    device_id: None,
                 },
                 PCMDeviceParameters{
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_ARCVM),
                     stream_type: Some(CrasStreamType::CRAS_STREAM_TYPE_PRO_AUDIO),
                     effects: None,
+                    device_id: None,
                 },
                 Default::default(),
                 ],
@@ -387,16 +513,19 @@ mod tests {
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_CROSVM),
                     stream_type: None,
                     effects: None,
+                    device_id: None,
                 },
                 PCMDeviceParameters{
                     client_type: Some(CrasClientType::CRAS_CLIENT_TYPE_ARCVM),
                     stream_type: Some(CrasStreamType::CRAS_STREAM_TYPE_PRO_AUDIO),
                     effects: Some(vec![StreamEffect::EchoCancellation]),
+                    device_id: None,
                 },
                 PCMDeviceParameters{
                     client_type: None,
                     stream_type: None,
                     effects: Some(vec![StreamEffect::EchoCancellation]),
+                    device_id: None,
                 },
                 Default::default(),
                 ],

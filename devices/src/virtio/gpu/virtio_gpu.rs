@@ -15,20 +15,27 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Context;
-use base::debug;
+use data_model::Le32;
 use base::error;
+use base::info;
+use base::linux::MemoryMappingBuilderUnix;
 use base::FromRawDescriptor;
+use base::MappedRegion;
+use base::MemoryMapping;
+use base::MemoryMappingBuilder;
 use base::IntoRawDescriptor;
 use base::Protection;
 use base::SafeDescriptor;
 use base::VolatileSlice;
 use gpu_display::*;
 use hypervisor::MemCacheType;
+use hypervisor::VmAccept;
 use libc::c_void;
 use rutabaga_gfx::ResourceCreate3D;
 use rutabaga_gfx::ResourceCreateBlob;
 use rutabaga_gfx::Rutabaga;
 use rutabaga_gfx::RutabagaDescriptor;
+#[cfg(windows)]
 use rutabaga_gfx::RutabagaError;
 use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFromRawDescriptor;
@@ -65,6 +72,8 @@ use super::protocol::GpuResponsePlaneInfo;
 use super::protocol::VirtioGpuResult;
 use super::protocol::VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE;
 use super::protocol::VIRTIO_GPU_BLOB_MEM_HOST3D;
+use super::protocol::VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST;
+use super::protocol::VIRTIO_GPU_MAP_INFO_POOL;
 use super::VirtioScanoutBlobData;
 use crate::virtio::gpu::edid::DisplayInfo;
 use crate::virtio::gpu::edid::EdidBytes;
@@ -79,6 +88,117 @@ use crate::virtio::resource_bridge::ResourceInfo;
 use crate::virtio::resource_bridge::ResourceResponse;
 use crate::virtio::SharedMemoryMapper;
 
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
+
+// A guest-pool blob must be at least this large to be retained as a possible scanout source (its
+// udmabuf duped for direct display import in `try_import_resource_to_display`). Real scanouts are
+// multi-MiB; gating on size keeps us from holding an extra fd for every small guest BO (which can
+// be thousands under load). A blob below this can still reach the screen via the pool_scanout_iovecs
+// CPU copy, so the gate only ever costs the accelerated path on a buffer too small to be a scanout.
+const POOL_SCANOUT_DMABUF_MIN_SIZE: u64 = 512 * 1024;
+
+/// A single-plane 8888 RGB layout is the one case where a LINEAR modifier can be trusted
+/// without a 3D query: stride and offset fully describe it, so the display backend can blit
+/// it directly instead of falling back to a CPU copy.
+fn is_single_plane_8888_rgb(format: u32) -> bool {
+    matches!(
+        format,
+        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888
+    )
+}
+
+/// Falling back to the CPU copy path costs a full-frame copy on every present, and every way
+/// into it used to be silent. Say why, once, so a display backend that quietly refuses the
+/// import is visible instead of just slow.
+fn note_no_import(reason: &str) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if !LOGGED.swap(true, Ordering::Relaxed) {
+        base::warn!("zero-copy display import unavailable ({reason}); using CPU copy");
+    }
+}
+
+/// Take the rutabaga transfer_read path for scanouts instead of mapping the exported blob.
+///
+/// A/B switch, not a tuning knob: the two differ in whether anything asks gfxstream to bring the
+/// rendered frame into the memory being read, and that is the open question for a compositor whose
+/// display freezes on its first frame. Read once; unset means the mapping path, as before.
+fn force_transfer_read() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GPU_SCANOUT_FORCE_TRANSFER").is_ok_and(|v| v != "0"))
+}
+
+/// Report which way `flush` went for a scanout, once per distinct outcome.
+///
+/// GPU_SCANOUT_TRACE answers this too, but not usefully here: it writes with `write(2)` on every
+/// step of every present, and that is enough delay to change the result -- a KDE session that is
+/// black without it comes up correctly with it. Anything used to diagnose that has to be quiet
+/// enough not to move the thing it is measuring, so this logs each outcome the first time only,
+/// through the buffered logger.
+fn note_flush_route(outcome: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::BTreeSet<String>>> =
+        std::sync::Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap();
+    let set = seen.get_or_insert_with(Default::default);
+    if set.insert(outcome.to_string()) {
+        base::warn!("FLUSH-ROUTE: {outcome}");
+    }
+}
+
+fn probe_transfer_read(resource_id: u32, counter: &mut u64, bytes: &[u8]) {
+    *counter = counter.wrapping_add(1);
+    if *counter % 64 != 1 {
+        return;
+    }
+    let probe = &bytes[..4096.min(bytes.len())];
+    // Count only color channels: XRGB frames commonly carry 0xff in every fourth byte, which
+    // would make an all-black frame look non-zero.
+    let rgb_nz = probe
+        .chunks_exact(4)
+        .flat_map(|pixel| &pixel[..3])
+        .filter(|byte| **byte != 0)
+        .count();
+    let head: Vec<String> = probe[..16.min(probe.len())]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    scanout_trace_write(format_args!(
+        "flush.transfer_read.probe res={} rgb_nonzero={} head=[{}]",
+        resource_id,
+        rgb_nz,
+        head.join(" ")
+    ));
+    if rgb_nz == 0 {
+        note_flush_route("transfer_read: readback is black");
+    } else {
+        note_flush_route("transfer_read: readback has color");
+    }
+}
+
+/// Scanout tracing: `GPU_SCANOUT_TRACE=1` writes one marker per step of the scanout/flush path
+/// straight to fd 2 with `write(2)`. The buffered loggers are useless for this path -- a guest
+/// page flip can take the whole device down with it, and anything still sitting in a log buffer
+/// (or in `tee`) is lost. Off by default; a raw write costs nothing when the flag is unset.
+pub(crate) fn scanout_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("GPU_SCANOUT_TRACE").is_ok_and(|v| v != "0"))
+}
+
+pub(crate) fn scanout_trace_write(args: std::fmt::Arguments) {
+    if !scanout_trace_enabled() {
+        return;
+    }
+    let line = format!("MKH {}\n", args);
+    // SAFETY: writing `line.len()` initialized bytes from `line` to fd 2.
+    unsafe {
+        libc::write(2, line.as_ptr() as *const c_void, line.len());
+    }
+}
+
+macro_rules! strace {
+    ($($arg:tt)*) => { crate::virtio::gpu::virtio_gpu::scanout_trace_write(format_args!($($arg)*)) };
+}
+
 pub fn to_rutabaga_descriptor(s: SafeDescriptor) -> RutabagaDescriptor {
     // SAFETY:
     // Safe because we own the SafeDescriptor at this point.
@@ -91,6 +211,13 @@ fn to_safe_descriptor(r: RutabagaDescriptor) -> SafeDescriptor {
     unsafe { SafeDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum DisplayImportState {
+    Unknown,
+    Imported { import_id: u32, surface_id: u32 },
+    CpuFallback,
+}
+
 struct VirtioGpuResource {
     resource_id: u32,
     width: u32,
@@ -98,12 +225,39 @@ struct VirtioGpuResource {
     size: u64,
     shmem_offset: Option<u64>,
     scanout_data: Option<VirtioScanoutBlobData>,
-    display_import: Option<u32>,
+    display_import_state: DisplayImportState,
     rutabaga_external_mapping: bool,
+    // DroidVM gfxstream pre-alloc: this host-visible blob lives in the boot-blessed GpuPool at
+    // this byte offset. Its map was reported to the guest as a pool GPA (no runtime SHARE), so
+    // unmap must NOT try to remove a (nonexistent) host mapping.
+    pool_offset: Option<u64>,
 
     // Only saved for snapshotting, so that we can re-attach backing iovecs with the correct new
     // host addresses.
     backing_iovecs: Option<Vec<(GuestAddress, usize)>>,
+
+    // Ranges of a growable pool this resource holds a reference on, so unref_resource can release
+    // exactly what create took. Kept separately from backing_iovecs, which a blob does not
+    // necessarily set and which detach_backing clears independently.
+    pool_refs: Option<Vec<(GuestAddress, usize)>>,
+
+    // For a scanout blob backed by the guest/pre-alloc pool: host (ptr, len) segments into the
+    // pool memory. virgl cannot read a guest-memory blob back for display, so `flush` reads the
+    // composited frame directly from these segments into the display framebuffer.
+    pool_scanout_iovecs: Option<Vec<(usize, usize)>>,
+
+    // Cached host mapping of a blob-backed scanout colorbuffer's exported LINEAR dmabuf. These
+    // colorbuffers have no Resource3DInfo (rutabaga.query() fails), so neither zero-copy import
+    // (VNC can't) nor transfer_read works -- `flush` mmaps the exported dmabuf once and copies its
+    // LINEAR rows into the display framebuffer. Keyed to this resource's lifetime.
+    scanout_blob_map: Option<MemoryMapping>,
+
+    // For a guest-pool scanout blob: a dup of the linear udmabuf that resource_create_blob built
+    // over this blob's pool bytes. `flush` imports it straight to the display -- rutabaga's export
+    // can't hand a guest-alloc blob's dmabuf back on the drm2kgsl/virgl route ("invalid rutabaga
+    // handle"), so without this the frame falls to a per-frame CPU copy via pool_scanout_iovecs.
+    // Only retained for blobs large enough to be a scanout (POOL_SCANOUT_DMABUF_MIN_SIZE).
+    pool_scanout_dmabuf: Option<SafeDescriptor>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -128,16 +282,24 @@ impl VirtioGpuResource {
             size,
             shmem_offset: None,
             scanout_data: None,
-            display_import: None,
+            display_import_state: DisplayImportState::Unknown,
             rutabaga_external_mapping: false,
+            pool_offset: None,
             backing_iovecs: None,
+            pool_refs: None,
+            pool_scanout_iovecs: None,
+            scanout_blob_map: None,
+            pool_scanout_dmabuf: None,
         }
     }
 
     fn snapshot(&self) -> VirtioGpuResourceSnapshot {
         // Only the 2D backend is fully supported and it doesn't use these fields. 3D is WIP.
         assert!(self.scanout_data.is_none());
-        assert!(self.display_import.is_none());
+        assert!(!matches!(
+            self.display_import_state,
+            DisplayImportState::Imported { .. }
+        ));
 
         VirtioGpuResourceSnapshot {
             resource_id: self.resource_id,
@@ -154,6 +316,16 @@ impl VirtioGpuResource {
         resource.backing_iovecs = s.backing_iovecs;
         resource
     }
+
+    fn transition_display_import(&mut self, display: &mut GpuDisplay, next: DisplayImportState) {
+        if let DisplayImportState::Imported {
+            import_id,
+            surface_id,
+        } = std::mem::replace(&mut self.display_import_state, next)
+        {
+            display.release_import(import_id, surface_id);
+        }
+    }
 }
 
 struct VirtioGpuScanout {
@@ -168,10 +340,21 @@ struct VirtioGpuScanout {
     parent_surface_id: Option<u32>,
 
     surface_id: Option<u32>,
+    // The scanout id half of the same fact `parent_surface_id` records: which scanout this cursor
+    // is currently overlayed onto. Snapshot/restore has always read it, but nothing ever wrote it
+    // -- it stayed None for the device's whole life, so a restored cursor came back parented to
+    // nothing. It is written where the parenting actually happens (`update_scanout_resource`), and
+    // it is what `move_cursor` compares the guest's scanout_id against to notice a crossing.
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
+    // Reused packed staging buffer for flushes into padded-stride window buffers.
+    flush_staging: Vec<u8>,
+    flush_probe_counter: u64,
+    // The pool branch needs its own counter: sharing one with the transfer_read probe means a
+    // low-frequency path can sit on the wrong side of the modulus forever and never report.
+    pool_probe_counter: u64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -189,7 +372,7 @@ struct VirtioGpuScanoutSnapshot {
     parent_scanout_id: Option<u32>,
 
     resource_id: Option<NonZeroU32>,
-    position: Option<(u32, u32)>,
+    position: Option<(i32, i32)>,
 }
 
 impl VirtioGpuScanout {
@@ -206,6 +389,9 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_staging: Vec::new(),
+            flush_probe_counter: 0,
+            pool_probe_counter: 0,
         }
     }
 
@@ -223,6 +409,9 @@ impl VirtioGpuScanout {
             parent_scanout_id: None,
             resource_id: None,
             position: None,
+            flush_probe_counter: 0,
+            pool_probe_counter: 0,
+            flush_staging: Vec::new(),
         }
     }
 
@@ -256,6 +445,10 @@ impl VirtioGpuScanout {
         assert_eq!(self.display_params, snapshot.display_params);
 
         self.resource_id = snapshot.resource_id;
+        // The parent the caller just resolved `parent_surface_id` from. Now that the field decides
+        // whether a MOVE_CURSOR is a crossing, a restored cursor that claims no parent would make
+        // the guest's next move look like one.
+        self.parent_scanout_id = snapshot.parent_scanout_id;
         if snapshot.has_surface {
             self.create_surface(display, parent_surface_id, None)?;
         } else {
@@ -359,12 +552,37 @@ impl VirtioGpuScanout {
     fn set_position(
         &mut self,
         display: &Rc<RefCell<GpuDisplay>>,
-        x: u32,
-        y: u32,
+        x: i32,
+        y: i32,
     ) -> VirtioGpuResult {
         if let Some(surface_id) = self.surface_id {
             display.borrow_mut().set_position(surface_id, x, y)?;
             self.position = Some((x, y));
+        }
+        Ok(OkNoData)
+    }
+
+    fn set_cursor_visible(
+        &mut self,
+        display: &Rc<RefCell<GpuDisplay>>,
+        visible: bool,
+    ) -> VirtioGpuResult {
+        if let Some(surface_id) = self.surface_id {
+            display.borrow_mut().set_cursor_visible(surface_id, visible)?;
+        }
+        Ok(OkNoData)
+    }
+
+    fn set_cursor_hotspot(
+        &mut self,
+        display: &Rc<RefCell<GpuDisplay>>,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> VirtioGpuResult {
+        if let Some(surface_id) = self.surface_id {
+            display
+                .borrow_mut()
+                .set_cursor_hotspot(surface_id, hot_x, hot_y)?;
         }
         Ok(OkNoData)
     }
@@ -381,27 +599,310 @@ impl VirtioGpuScanout {
         display: &Rc<RefCell<GpuDisplay>>,
         resource: &mut VirtioGpuResource,
         rutabaga: &mut Rutabaga,
-        mem: &GuestMemory,
     ) -> VirtioGpuResult {
         let surface_id = match self.surface_id {
             Some(id) => id,
             _ => return Ok(OkNoData),
         };
+        strace!(
+            "flush.enter res={} surface={} {}x{} scanout_data={:?} pool_iovecs={}",
+            resource.resource_id,
+            surface_id,
+            self.width,
+            self.height,
+            resource.scanout_data.map(|d| (d.width, d.height, d.strides[0], d.offsets[0])),
+            resource.pool_scanout_iovecs.is_some(),
+        );
 
-        if let Some(import_id) =
-            VirtioGpuScanout::import_resource_to_display(display, surface_id, resource, rutabaga)
+        // Prefer the gfxstream host colorbuffer. For the normal scanout path AND for guest-alloc
+        // colorbuffers, the GPU renders into a HOST-side VkImage (optimally tiled), not into the
+        // guest pool the guest maps -- so the pool bytes stay black. When the resource has an
+        // exportable host colorbuffer, let the display import + flip it (gfxstream detiles/posts
+        // correctly). Only guest-memory blobs with NO host colorbuffer (real pool scanout,
+        // where rutabaga export returns EINVAL) fall through to the pool direct-read below.
+        //
+        // Cursors are excluded: a virtio cursor is an ordinary small guest-backed resource with
+        // no dmabuf provenance to import, so attempting it once per cursor move only produces a
+        // rejection to log before doing the 64x64 copy we were always going to do.
+        // Zero-copy display import is skipped entirely in force-CPU mode. On devices whose
+        // SurfaceFlinger RenderEngine (Skia-GL) cannot import our guest-blob dmabuf, the import
+        // "succeeds" at the crosvm boundary but the frame never composites -- and crosvm, which
+        // no longer owns the bytes, cannot correct it. The CPU-copy path below produces a plain
+        // RGBA_8888 window buffer that every RenderEngine accepts and whose layout crosvm fully
+        // controls at the producer-to-sink edge. The app selects this per device via
+        // GPU_DISPLAY_COPY_MODE;
+        // `zero`/`auto` keep the fast path. See display_copy_mode().
+        if matches!(self.scanout_type, SurfaceType::Scanout)
+            && display_copy_mode() != DisplayCopyMode::ForceCpu
         {
-            display
-                .borrow_mut()
-                .flip_to(surface_id, import_id, None, None, None)
-                .map_err(|e| {
-                    error!("flip_to failed: {:#}", e);
-                    ErrUnspec
-                })?;
+            strace!("flush.import.begin res={}", resource.resource_id);
+            let imported = VirtioGpuScanout::import_resource_to_display(
+                display, surface_id, resource, rutabaga,
+            );
+            strace!("flush.import.end imported={:?}", imported);
+            if let Some(import_id) = imported {
+                strace!("flush.flip_to.begin import={}", import_id);
+                // Bind the flip result to a `let` so the `RefMut` is dropped at the end of this
+                // statement. Holding it as a `match` scrutinee keeps the borrow alive across the
+                // arms, and the error arm below borrows `display` again to release the import.
+                let flip_result = display
+                    .borrow_mut()
+                    .flip_to(surface_id, import_id, None, None, None);
+                match flip_result {
+                    Ok(_) => {
+                        strace!("flush.flip_to.end");
+                        return Ok(OkNoData);
+                    }
+                    // A flip that fails once will keep failing for this resource, and retrying it
+                    // every frame costs an import attempt per present on top of the copy we end up
+                    // doing anyway. Pin the resource to the CPU path instead of erroring out: a
+                    // slow desktop beats a dead one.
+                    Err(e) => {
+                        error!("flip_to failed; switching resource to CPU fallback: {:#}", e);
+                        strace!("flush.flip_to.fail");
+                        resource.transition_display_import(
+                            &mut display.borrow_mut(),
+                            DisplayImportState::CpuFallback,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Guest/pre-alloc pool scanout: read the composited frame straight from the pool
+        // memory into the display framebuffer. virgl can't transfer_read/export a guest-memory
+        // blob for display (it returns EINVAL), so bypass rutabaga entirely for these resources.
+        if resource.pool_scanout_iovecs.is_some() {
+            note_flush_route("pool: direct read from guest pool memory");
+            let packed_stride = self.width as usize * 4;
+            let (src_stride, src_offset) = match resource.scanout_data {
+                Some(d) => (d.strides[0] as usize, d.offsets[0] as usize),
+                None => (packed_stride, 0),
+            };
+            let mut display = display.borrow_mut();
+            if display.next_buffer_in_use(surface_id) {
+                note_flush_route("pool: display buffer busy, frame dropped");
+                return Ok(OkNoData);
+            }
+            // Gather the (possibly fragmented) pool run segments into a contiguous staging buffer.
+            let segs = resource.pool_scanout_iovecs.as_ref().unwrap();
+            let total: usize = segs.iter().map(|&(_, l)| l).sum();
+            if self.flush_staging.len() < total {
+                self.flush_staging.resize(total, 0);
+            }
+            // The rows we are about to read must exist in the gathered segments: src_stride and
+            // src_offset come from the guest's SET_SCANOUT_BLOB, and a short blob would otherwise
+            // walk off the end of the staging buffer below.
+            let last_row_end = (self.height as usize)
+                .checked_sub(1)
+                .and_then(|rows| rows.checked_mul(src_stride))
+                .and_then(|span| span.checked_add(src_offset))
+                .and_then(|start| start.checked_add(packed_stride));
+            match last_row_end {
+                Some(end) if end <= total => {}
+                _ => {
+                    error!(
+                        "pool scanout res={} needs {:?} bytes but the blob gathers {}",
+                        resource.resource_id, last_row_end, total
+                    );
+                    // No flip to release a window buffer here any more: the lock is taken inside
+                    // present_frame, which this path never reaches. It used to be taken before the
+                    // check, and leaving it held was what killed the display for the rest of the
+                    // VM's life.
+                    return Err(ErrUnspec);
+                }
+            }
+            let mut off = 0usize;
+            for &(ptr, len) in segs {
+                // SAFETY: (ptr, len) is a subrange of the VM-lifetime pool memory, validated when
+                // the blob was created (all entries were in-bounds of the pool).
+                let src = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+                self.flush_staging[off..off + len].copy_from_slice(src);
+                off += len;
+            }
+            // Whether the pool actually holds a frame. `transfer_read` has had this probe for a
+            // while and reports colour, but that is a different branch on a different resource --
+            // nothing has ever looked at the bytes this branch copies, so "the host can read the
+            // guest pool" and "the guest pool contains the composited frame" were never
+            // distinguished. Count colour channels only: XRGB carries 0xff in every fourth byte.
+            self.pool_probe_counter = self.pool_probe_counter.wrapping_add(1);
+            // Behind the switch, and the scan with it: this ran on the display path and put a
+            // line in the log several times a second on an idle desktop, which is where anyone
+            // looking for a real message has to find it. GFXSTREAM_DIAG=1 brings it back.
+            if gpu_diag_enabled()
+                && (self.pool_probe_counter <= 3 || self.pool_probe_counter % 64 == 0)
+            {
+                // Read the raw guest bytes before the display edge performs any required
+                // conversion.
+                let staging = &self.flush_staging[..total];
+                let probe = &staging[src_offset.min(staging.len())..];
+                let probe = &probe[..4096.min(probe.len())];
+                let rgb_nz = probe
+                    .chunks_exact(4)
+                    .flat_map(|px| &px[..3])
+                    .filter(|b| **b != 0)
+                    .count();
+                let head: Vec<String> = probe[..16.min(probe.len())]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                // fb_stride is gone from this line: the destination is not fetched here any more,
+                // and locking a window buffer to put a number in a diagnostic would be a worse
+                // trade than losing the number.
+                base::warn!(
+                    "POOL-SCANOUT#{} res={} {}x{} src_stride={} src_off={} total={} segs={} rgb_nonzero={} head=[{}]",
+                    self.pool_probe_counter,
+                    resource.resource_id,
+                    self.width,
+                    self.height,
+                    src_stride,
+                    src_offset,
+                    total,
+                    segs.len(),
+                    rgb_nz,
+                    head.join(" "),
+                );
+            }
+            // Preserve the bytes exactly as the guest produced them. The source fourcc and the
+            // sink framebuffer's fourcc meet in present_frame, which either copies directly or
+            // exchanges red and blue once while copying. A legacy pool resource has no
+            // SET_SCANOUT_BLOB metadata; retain its historical R-first desktop interpretation.
+            let frame = ScanoutFrame {
+                bytes: &self.flush_staging[src_offset.min(total)..total],
+                stride: src_stride as u32,
+                width: self.width,
+                height: self.height,
+                fourcc: resource
+                    .scanout_data
+                    .map(|d| d.drm_format.0)
+                    .unwrap_or(DRM_FORMAT_ABGR8888),
+                damage: Damage::Full,
+            };
+            if matches!(
+                display.present_frame(surface_id, &frame),
+                PresentOutcome::NoFramebuffer
+            ) {
+                note_flush_route("pool: no framebuffer for the surface");
+                return Err(ErrUnspec);
+            }
             return Ok(OkNoData);
         }
 
+        // Blob-backed scanout colorbuffer (gfxstream host-visible / pre-alloc pool / udmabuf under
+        // `udmabuf=true`): these have a valid exported LINEAR dmabuf but NO Resource3DInfo, so both
+        // the zero-copy display import (unsupported by VNC) and rutabaga.transfer_read() fail,
+        // leaving the frame black. mmap the exported dmabuf once (it aliases the host colorbuffer
+        // the GPU composited into) and copy its LINEAR rows into the display framebuffer.
+        // A mapped colorbuffer is only worth reading if something keeps it current. gfxstream
+        // renders into a tiled VkImage and the exported dmabuf is a separate linear copy, so if
+        // nothing asks for a readback the mapping stays at whatever it held when it was made --
+        // which looks exactly like a frozen display. GPU_SCANOUT_FORCE_TRANSFER=1 skips the
+        // mapping entirely and takes the transfer_read path, which does ask, so the two can be
+        // compared on one build instead of two.
+        if resource.scanout_data.is_some() && !force_transfer_read() {
+            strace!("flush.blob.branch res={}", resource.resource_id);
+            let queryable = rutabaga.query(resource.resource_id).is_ok();
+            if resource.scanout_blob_map.is_none() && !queryable {
+                strace!("flush.blob.export.begin res={}", resource.resource_id);
+                let exported = rutabaga.export_blob(resource.resource_id);
+                strace!("flush.blob.export.end ok={}", exported.is_ok());
+                // The error text distinguishes the cases that matter here without pulling in
+                // RutabagaError, which is only imported on Windows: "invalid rutabaga handle" is
+                // gfxstream reporting success with fd -1, anything else is the export itself
+                // failing. One line per distinct message, so this cannot run away.
+                match &exported {
+                    Ok(_) => note_flush_route("blob: export ok"),
+                    Err(e) => note_flush_route(&format!("blob: export failed: {e}")),
+                }
+                if let Ok(handle) = exported {
+                    let desc = to_safe_descriptor(handle.os_handle);
+                    let data = resource.scanout_data.unwrap();
+                    let map_size =
+                        data.offsets[0] as usize + data.strides[0] as usize * data.height as usize;
+                    // A pool-resident blob exports the whole pool's memfd, not a descriptor for
+                    // the buffer: where the buffer actually lives is the pool offset. Mapping from
+                    // zero therefore reads whatever is at the start of the pool, which is right
+                    // exactly once -- for the first blob allocated, at offset zero -- and wrong
+                    // for every buffer after it. That is what a compositor cycling through
+                    // buffers looks like: the first composited frame appears and the display then
+                    // never changes again, with no error anywhere, because the copy keeps
+                    // succeeding against the buffer that is no longer being drawn into.
+                    let pool_offset = rutabaga.resource_pool_offset(resource.resource_id);
+                    strace!(
+                        "flush.blob.mmap.begin size={} pool_offset={:?}",
+                        map_size,
+                        pool_offset
+                    );
+                    note_flush_route(match pool_offset {
+                        Some(_) => "blob: mapping at a pool offset",
+                        None => "blob: mapping a whole descriptor",
+                    });
+                    let mut builder = MemoryMappingBuilder::new(map_size).from_descriptor(&desc);
+                    if let Some(off) = pool_offset {
+                        builder = builder.offset(off);
+                    }
+                    let mapped = builder.build();
+                    strace!("flush.blob.mmap.end ok={}", mapped.is_ok());
+                    if let Ok(m) = mapped {
+                        resource.scanout_blob_map = Some(m);
+                    }
+                }
+            }
+            if resource.scanout_blob_map.is_none() && queryable {
+                // rutabaga has Resource3DInfo for this one, so the blob mmap is skipped and the
+                // transfer_read path below is supposed to handle it.
+                note_flush_route("blob: skipped, resource is 3D-queryable");
+            }
+            if let Some(ref m) = resource.scanout_blob_map {
+                note_flush_route("blob: copying from the mapped colorbuffer");
+                let data = resource.scanout_data.unwrap();
+                let src_stride = data.strides[0] as usize;
+                let src_offset = data.offsets[0] as usize;
+                let mut display = display.borrow_mut();
+                if display.next_buffer_in_use(surface_id) {
+                    return Ok(OkNoData);
+                }
+                // SAFETY: `m` maps at least `map_size` bytes of the exported dmabuf; we read within.
+                let src = unsafe {
+                    std::slice::from_raw_parts(m.as_ptr() as *const u8, m.size())
+                };
+                strace!(
+                    "flush.blob.copy.begin src_len={} src_stride={} src_off={} rows={}",
+                    src.len(),
+                    src_stride,
+                    src_offset,
+                    self.height,
+                );
+                let frame = ScanoutFrame {
+                    bytes: &src[src_offset.min(src.len())..],
+                    stride: src_stride as u32,
+                    width: self.width,
+                    height: self.height,
+                    fourcc: data.drm_format.0,
+                    damage: Damage::Full,
+                };
+                let outcome = display.present_frame(surface_id, &frame);
+                strace!("flush.blob.copy.end");
+                strace!("flush.blob.flip.end");
+                return match outcome {
+                    PresentOutcome::Flipped => Ok(OkNoData),
+                    PresentOutcome::NoFramebuffer => Err(ErrUnspec),
+                };
+            }
+        }
+
         // Import failed, fall back to a copy.
+        strace!("flush.transfer_read.branch res={}", resource.resource_id);
+        note_flush_route("transfer_read: rutabaga readback into the framebuffer");
+        // transfer_read returns the resource's own format. Prefer the renderer's Resource3DInfo,
+        // because SET_SCANOUT_BLOB describes the scanout view while the resource creation format
+        // is what selected gfxstream's readColorBuffer output layout.
+        let transfer_fourcc = rutabaga
+            .query(resource.resource_id)
+            .ok()
+            .map(|query| query.drm_fourcc)
+            .or_else(|| resource.scanout_data.map(|data| data.drm_format.0))
+            .unwrap_or(DRM_FORMAT_XRGB8888);
         let mut display = display.borrow_mut();
 
         // Prevent overwriting a buffer that is currently being used by the compositor.
@@ -413,118 +914,64 @@ impl VirtioGpuScanout {
             .framebuffer_region(surface_id, 0, 0, self.width, self.height)
             .ok_or(ErrUnspec)?;
 
-        let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
-        transfer.stride = fb.stride();
-        let fb_slice = fb.as_volatile_slice();
-        let buf = IoSliceMut::new(
-            // SAFETY: trivially safe
-            unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
-        );
-
-        let transfer_ok = rutabaga
-            .transfer_read(0, resource.resource_id, transfer, Some(buf))
-            .is_ok();
-
-        if transfer_ok {
-            // Check if the transferred data is all zeros (possible GL readback failure).
-            // If so and we have backing memory, prefer that instead.
-            let all_zero = unsafe {
-                let ptr = fb_slice.as_ptr();
-                let len = fb_slice.size();
-                // Sample several positions to check for non-zero data.
-                let positions = [
+        // Everything from here to the flip runs with the window buffer LOCKED
+        // (framebuffer_region above). A readback error used to `?`-return past the flip and leave
+        // the ANativeWindow locked, after which every later lock failed ("Failed to lock window")
+        // and the display was dead until the VM was closed -- seen on every stock (unprovisioned)
+        // guest the moment KDE started (transfer_read -> ComponentError(-22)). Do the readback in
+        // a closure and release the buffer on both paths.
+        let readback: VirtioGpuResult = (|| {
+            let packed_stride = self.width as usize * 4;
+            let fb_stride = fb.stride() as usize;
+            if fb_stride == packed_stride && fb.can_copy_direct_from(transfer_fourcc) {
+                let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
+                transfer.stride = fb.stride();
+                let fb_slice = fb.as_volatile_slice();
+                let buf = IoSliceMut::new(
+                    // SAFETY: trivially safe
+                    unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
+                );
+                rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
+                // SAFETY: transfer_read just initialized this locked framebuffer memory.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(fb_slice.as_mut_ptr() as *const u8, fb_slice.size())
+                };
+                probe_transfer_read(resource.resource_id, &mut self.flush_probe_counter, bytes);
+            } else {
+                // Staging is needed when gralloc pads rows (gfxstream writes packed rows despite
+                // Transfer3D::stride) or when producer and sink have different channel order. In
+                // the latter case copy_from_frame combines the re-stride and R/B exchange instead
+                // of following the copy with a second full-frame pass in the Android backend.
+                let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
+                transfer.stride = packed_stride as u32;
+                let size = packed_stride * self.height as usize;
+                if self.flush_staging.len() < size {
+                    self.flush_staging.resize(size, 0);
+                }
+                let staging = &mut self.flush_staging[..size];
+                rutabaga.transfer_read(
                     0,
-                    len / 4,
-                    len / 2,
-                    len * 3 / 4,
-                    len.saturating_sub(4),
-                ];
-                positions.iter().all(|&p| {
-                    p + 4 <= len && {
-                        let val = std::ptr::read_unaligned(ptr.add(p) as *const u32);
-                        // Mask off alpha channel (byte 3) for BGRX format
-                        val & 0x00FFFFFF == 0
-                    }
-                })
-            };
-            if all_zero && resource.backing_iovecs.is_some() {
-            } else {
-                display.flip(surface_id);
-                return Ok(OkNoData);
+                    resource.resource_id,
+                    transfer,
+                    Some(IoSliceMut::new(staging)),
+                )?;
+                probe_transfer_read(resource.resource_id, &mut self.flush_probe_counter, staging);
+                fb.copy_from_frame(&ScanoutFrame {
+                    bytes: staging,
+                    stride: packed_stride as u32,
+                    width: self.width,
+                    height: self.height,
+                    fourcc: transfer_fourcc,
+                    damage: Damage::Full,
+                });
             }
-        }
 
-        // transfer_read failed or returned blank data.
-        // Fall back to reading pixel data from guest backing memory directly.
-        {
-            if let Some(ref backing_iovecs) = resource.backing_iovecs {
-                let bpp = 4usize;
-                let src_stride = resource.width as usize * bpp;
-                let dst_stride = fb.stride() as usize;
-                let copy_w = std::cmp::min(self.width as usize * bpp, src_stride);
-                let mut src_offset = 0usize;
-                let mut nonzero_pixels = 0u32;
-                for &(addr, len) in backing_iovecs.iter() {
-                    let src_slice =
-                        mem.get_slice_at_addr(addr, len).map_err(|_| ErrUnspec)?;
-                    // SAFETY: src_slice is valid for the lifetime of this function.
-                    let src_bytes = unsafe {
-                        std::slice::from_raw_parts(src_slice.as_ptr(), src_slice.size())
-                    };
-                    let mut pos = 0;
-                    while pos < src_bytes.len() {
-                        let row = src_offset / src_stride;
-                        if row >= self.height as usize {
-                            break;
-                        }
-                        let col = src_offset % src_stride;
-                        let avail = std::cmp::min(src_bytes.len() - pos, src_stride - col);
-                        if col < copy_w {
-                            let n = std::cmp::min(avail, copy_w - col);
-                            let dst_off = row * dst_stride + col;
-                            if dst_off + n <= fb_slice.size() {
-                                // SAFETY: bounds checked above.
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        src_bytes.as_ptr().add(pos),
-                                        fb_slice.as_mut_ptr().add(dst_off),
-                                        n,
-                                    );
-                                }
-                                // Sample a pixel from the copied data for diagnostics.
-                                if nonzero_pixels < 10 && n >= 4 {
-                                    let val = unsafe {
-                                        std::ptr::read_unaligned(
-                                            src_bytes.as_ptr().add(pos) as *const u32,
-                                        )
-                                    };
-                                    if val & 0x00FFFFFF != 0 {
-                                        nonzero_pixels += 1;
-                                    }
-                                }
-                            }
-                        }
-                        pos += avail;
-                        src_offset += avail;
-                    }
-                }
-                if nonzero_pixels == 0 {
-                    debug!(
-                        "backing memory also all zeros for resource {} ({}x{})",
-                        resource.resource_id, resource.width, resource.height
-                    );
-                }
-            } else {
-                if !transfer_ok {
-                    return Err(ErrUnspec);
-                }
-                // transfer_read succeeded but data was all zeros and no backing.
-                // Still flip the (empty) data.
-            }
-        }
-
+            Ok(OkNoData)
+        })();
+        strace!("flush.transfer_read.copy.end");
         display.flip(surface_id);
-        Ok(OkNoData)
+        strace!("flush.transfer_read.flip.end");
+        readback
     }
 
     fn import_resource_to_display(
@@ -533,46 +980,236 @@ impl VirtioGpuScanout {
         resource: &mut VirtioGpuResource,
         rutabaga: &mut Rutabaga,
     ) -> Option<u32> {
-        if let Some(import_id) = resource.display_import {
-            return Some(import_id);
+        match resource.display_import_state {
+            DisplayImportState::Imported {
+                import_id,
+                surface_id: import_surface_id,
+            } if import_surface_id == surface_id => {
+                return Some(import_id);
+            }
+            DisplayImportState::Imported { .. } => {
+                resource.transition_display_import(
+                    &mut display.borrow_mut(),
+                    DisplayImportState::Unknown,
+                );
+            }
+            DisplayImportState::CpuFallback => return None,
+            DisplayImportState::Unknown => {}
         }
 
-        let dmabuf = to_safe_descriptor(rutabaga.export_blob(resource.resource_id).ok()?.os_handle);
-        let query = rutabaga.query(resource.resource_id).ok()?;
+        if !display.borrow_mut().is_dmabuf_import_supported() {
+            note_no_import("display backend has no dmabuf import");
+            resource.display_import_state = DisplayImportState::CpuFallback;
+            return None;
+        }
 
-        let (width, height, format, stride, offset) = match resource.scanout_data {
+        // A resource that failed once will fail the same way every present. Cache the verdict
+        // instead of paying an export + query + refused import per frame on top of the copy.
+        let imported = Self::try_import_resource_to_display(display, surface_id, resource, rutabaga);
+        if imported.is_none() {
+            resource.display_import_state = DisplayImportState::CpuFallback;
+        }
+        imported
+    }
+
+    fn try_import_resource_to_display(
+        display: &Rc<RefCell<GpuDisplay>>,
+        surface_id: u32,
+        resource: &mut VirtioGpuResource,
+        rutabaga: &mut Rutabaga,
+    ) -> Option<u32> {
+        // Guest-pool scanout fast path: we already hold a linear udmabuf over exactly this blob's
+        // pool bytes (duped in resource_create_blob). Import it directly. The rutabaga export below
+        // cannot hand a guest-alloc blob's dmabuf back on the drm2kgsl/virgl route ("invalid
+        // rutabaga handle"), so without this the frame falls to a per-frame CPU copy via
+        // pool_scanout_iovecs. Requires SET_SCANOUT_BLOB geometry (scanout_data) to describe it.
+        if resource.pool_scanout_dmabuf.is_some() {
+            if let Some(data) = resource.scanout_data {
+                let width = data.width;
+                let height = data.height;
+                let format: u32 = data.drm_format.into();
+                let stride = data.strides[0];
+                let source_offset = data.offsets[0];
+                let min_stride = width.checked_mul(4);
+                let image_size = u64::from(stride).checked_mul(u64::from(height));
+                let image_end = image_size.and_then(|s| u64::from(source_offset).checked_add(s));
+                // The udmabuf is a window over exactly this blob, so byte zero is the image start.
+                let linear_layout_verified = source_offset == 0
+                    && min_stride.is_some_and(|m| stride >= m)
+                    && image_end.is_some_and(|end| end <= resource.size)
+                    && is_single_plane_8888_rgb(format);
+                // Scope the &-borrow of pool_scanout_dmabuf so the resource is free to mutate after.
+                let import_result = {
+                    let dmabuf = resource.pool_scanout_dmabuf.as_ref().unwrap();
+                    display.borrow_mut().import_resource(
+                        surface_id,
+                        DisplayExternalResourceImport::Dmabuf {
+                            descriptor: dmabuf,
+                            offset: 0,
+                            stride,
+                            modifiers: DRM_FORMAT_MOD_LINEAR,
+                            linear_layout_verified,
+                            width,
+                            height,
+                            fourcc: format,
+                        },
+                    )
+                };
+                match import_result {
+                    Ok(import_id) => {
+                        // One line per process confirms the accelerated path engaged; the
+                        // per-resource detail stays at debug so the log is not spammed as the
+                        // compositor cycles scanout buffers.
+                        static ENGAGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !ENGAGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            base::warn!(
+                                "pool-scanout udmabuf import engaged (drm2kgsl 1-gpu-copy): \
+                                 res={} {}x{} fourcc={:#x} stride={}",
+                                resource.resource_id, width, height, format, stride,
+                            );
+                        } else {
+                            base::debug!(
+                                "pool-scanout udmabuf import res={} {}x{} fourcc={:#x} stride={} linear_verified={}",
+                                resource.resource_id, width, height, format, stride, linear_layout_verified,
+                            );
+                        }
+                        resource.display_import_state = DisplayImportState::Imported {
+                            import_id,
+                            surface_id,
+                        };
+                        return Some(import_id);
+                    }
+                    Err(e) => {
+                        note_no_import(&format!(
+                            "pool udmabuf import refused {width}x{height} fourcc={format:#x} stride={stride}: {e:#}"
+                        ));
+                        // fall through to the rutabaga export path below
+                    }
+                }
+            }
+        }
+
+        // Virgl's normal export for a pool/arena-backed resource is a shared-memory fd covering
+        // the WHOLE pool, which must not be handed to the display. The display-only export
+        // builds a UDMABUF window over just this resource's range and leaves the guest export
+        // contract untouched. gfxstream has no such export, so it falls back to export_blob.
+        let display_export = rutabaga.export_display_blob(resource.resource_id);
+        let display_exported = display_export.is_ok();
+        let exported = match display_export.or_else(|_| rutabaga.export_blob(resource.resource_id))
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                note_no_import(&format!("export_blob failed: {e:#}"));
+                return None;
+            }
+        };
+        let handle_type = exported.handle_type;
+        // Pool-resident gfxstream blobs export as MEM_POOL: a dup of the pool memfd, not a
+        // dmabuf. The display backend cannot import one, and those resources reach the screen
+        // through pool_scanout_iovecs instead.
+        if handle_type != RUTABAGA_HANDLE_TYPE_MEM_DMABUF {
+            note_no_import(&format!("exported handle type {handle_type:#x} is not a dmabuf"));
+            return None;
+        }
+        let dmabuf = to_safe_descriptor(exported.os_handle);
+        // gfxstream blob-backed scanout colorbuffers (host-visible / pre-alloc pool / udmabuf) have
+        // a valid exported LINEAR dmabuf but no Resource3DInfo, so rutabaga.query() returns
+        // "no 3d info available". Don't treat that as fatal: when the guest supplied scanout
+        // geometry via SET_SCANOUT_BLOB (resource.scanout_data), import the dmabuf directly using
+        // that geometry with a LINEAR modifier. Only require the 3d query when there is no
+        // scanout_data (plain SET_SCANOUT path).
+        let query_opt = rutabaga.query(resource.resource_id).ok();
+
+        let (width, height, format, stride, source_offset, modifier) = match resource.scanout_data {
             Some(data) => (
                 data.width,
                 data.height,
                 data.drm_format.into(),
                 data.strides[0],
                 data.offsets[0],
+                // These blobs are converted to LINEAR by gfxstream; use the query modifier when
+                // available, else DRM_FORMAT_MOD_LINEAR (0).
+                query_opt
+                    .as_ref()
+                    .map(|q| q.modifier)
+                    .unwrap_or(DRM_FORMAT_MOD_LINEAR),
             ),
-            None => (
-                resource.width,
-                resource.height,
-                query.drm_fourcc,
-                query.strides[0],
-                query.offsets[0],
-            ),
+            None => match query_opt {
+                Some(ref query) => (
+                    resource.width,
+                    resource.height,
+                    query.drm_fourcc,
+                    query.strides[0],
+                    query.offsets[0],
+                    query.modifier,
+                ),
+                None => {
+                    note_no_import("no scanout geometry and no 3d query");
+                    return None;
+                }
+            },
         };
+        // The display-only UDMABUF is a window over exactly this resource, so byte zero of the
+        // new fd is already the start of the image.
+        let offset = if display_exported { 0 } else { source_offset };
+        let min_stride = width.checked_mul(4);
+        let image_size = u64::from(stride).checked_mul(u64::from(height));
+        let image_end = image_size.and_then(|size| u64::from(source_offset).checked_add(size));
+        // Tell the backend when stride and offset fully describe the buffer, so it can blit
+        // without a modifier it would otherwise have to distrust. Everything here has to hold:
+        // a window export starting at byte zero, a stride that covers the row, an image that
+        // fits inside the resource, single-plane 8888 RGB, and a modifier that is either LINEAR
+        // or absent.
+        let linear_layout_verified = display_exported
+            && source_offset == 0
+            && min_stride.is_some_and(|minimum| stride >= minimum)
+            && image_end.is_some_and(|end| end <= resource.size)
+            && is_single_plane_8888_rgb(format)
+            && matches!(modifier, DRM_FORMAT_MOD_INVALID | DRM_FORMAT_MOD_LINEAR);
 
-        let import_id = display
-            .borrow_mut()
-            .import_resource(
-                surface_id,
-                DisplayExternalResourceImport::Dmabuf {
-                    descriptor: &dmabuf,
-                    offset,
-                    stride,
-                    modifiers: query.modifier,
-                    width,
-                    height,
-                    fourcc: format,
-                },
-            )
-            .ok()?;
-        resource.display_import = Some(import_id);
+        strace!(
+            "import res={} handle_type={:#x} display_export={} linear_verified={} \
+             source_offset={:#x} import_offset={:#x} stride={} modifier={:#x} {}x{} fourcc={:#x}",
+            resource.resource_id,
+            handle_type,
+            display_exported,
+            linear_layout_verified,
+            source_offset,
+            offset,
+            stride,
+            modifier,
+            width,
+            height,
+            format,
+        );
+
+        let import_id = match display.borrow_mut().import_resource(
+            surface_id,
+            DisplayExternalResourceImport::Dmabuf {
+                descriptor: &dmabuf,
+                offset,
+                stride,
+                modifiers: modifier,
+                linear_layout_verified,
+                width,
+                height,
+                fourcc: format,
+            },
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                note_no_import(&format!(
+                    "display backend refused dmabuf {width}x{height} \
+                     fourcc={format:#x} stride={stride} modifier={modifier:#x}: {e:#}"
+                ));
+                return None;
+            }
+        };
+        resource.display_import_state = DisplayImportState::Imported {
+            import_id,
+            surface_id,
+        };
         Some(import_id)
     }
 }
@@ -591,6 +1228,10 @@ pub struct VirtioGpu {
     udmabuf_driver: Option<UdmabufDriver>,
     snapshot_scratch_directory: Option<PathBuf>,
     deferred_snapshot_load: Option<VirtioGpuSnapshot>,
+    /// Completion fence of the most recent zero-copy flip (see `take_pending_flip_fence`).
+    /// Deliberately NOT snapshot'd: a fence outstanding across a snapshot degrades to the
+    /// synchronous completion the pre-fence code always had.
+    pending_flip_fence: Option<base::SafeDescriptor>,
 }
 
 // Only the 2D mode is supported. Notes on `VirtioGpu` fields:
@@ -630,16 +1271,9 @@ fn sglist_to_rutabaga_iovecs(
     vecs: &[(GuestAddress, usize)],
     mem: &GuestMemory,
 ) -> Result<Vec<RutabagaIovec>, ()> {
-    if vecs
-        .iter()
-        .any(|&(addr, len)| mem.get_slice_at_addr(addr, len).is_err())
-    {
-        return Err(());
-    }
-
-    let mut rutabaga_iovecs: Vec<RutabagaIovec> = Vec::new();
+    let mut rutabaga_iovecs: Vec<RutabagaIovec> = Vec::with_capacity(vecs.len());
     for &(addr, len) in vecs {
-        let slice = mem.get_slice_at_addr(addr, len).unwrap();
+        let slice = mem.get_slice_at_addr(addr, len).map_err(|_| ())?;
         rutabaga_iovecs.push(RutabagaIovec {
             base: slice.as_mut_ptr() as *mut c_void,
             len,
@@ -652,6 +1286,42 @@ pub enum ProcessDisplayResult {
     Success,
     CloseRequested,
     Error(GpuDisplayError),
+}
+
+/// One switch for the per-operation gpu traces on this route, shared with gfxstream's host side so
+/// that a single variable turns both halves on. Read once; a site that is off costs a load.
+fn gpu_diag_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("GFXSTREAM_DIAG").map_or(false, |v| !v.is_empty() && v != "0")
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayCopyMode {
+    /// Try zero-copy dmabuf import + flip first; fall back to CPU copy only on failure (default).
+    Auto,
+    /// Never import: always CPU-copy the scanout into a plain RGBA_8888 window buffer. For devices
+    /// whose SurfaceFlinger cannot composite our guest-blob dmabuf (Skia-GL RenderEngine), where a
+    /// zero-copy flip is accepted at the boundary but never reaches the screen.
+    ForceCpu,
+}
+
+/// Host-side display path selector, set by the app from the device's compositing capability.
+/// `GPU_DISPLAY_COPY_MODE=cpu` forces the CPU-copy path; `zero`/`auto`/unset keep the zero-copy
+/// fast path (which the flip fence orders). Read once.
+fn display_copy_mode() -> DisplayCopyMode {
+    static MODE: std::sync::OnceLock<DisplayCopyMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("GPU_DISPLAY_COPY_MODE") {
+        Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "cpu" | "one-copy" | "onecopy" | "force-cpu" => {
+                base::info!("GPU: display copy mode = force-cpu (zero-copy import disabled)");
+                DisplayCopyMode::ForceCpu
+            }
+            _ => DisplayCopyMode::Auto,
+        },
+        Err(_) => DisplayCopyMode::Auto,
+    })
 }
 
 impl VirtioGpu {
@@ -700,6 +1370,7 @@ impl VirtioGpu {
             fixed_blob_mapping,
             udmabuf_driver,
             deferred_snapshot_load: None,
+            pending_flip_fence: None,
             snapshot_scratch_directory,
         })
     }
@@ -856,26 +1527,86 @@ impl VirtioGpu {
         resource_id: u32,
         scanout_data: Option<VirtioScanoutBlobData>,
     ) -> VirtioGpuResult {
-        self.update_scanout_resource(
+        strace!(
+            "set_scanout.enter scanout={} res={} rect={}x{}+{}+{} blob={:?}",
+            scanout_id,
+            resource_id,
+            scanout_rect.width.to_native(),
+            scanout_rect.height.to_native(),
+            scanout_rect.x.to_native(),
+            scanout_rect.y.to_native(),
+            scanout_data.map(|d| (d.width, d.height, d.strides[0], d.offsets[0])),
+        );
+        // The geometry in SET_SCANOUT_BLOB is guest-controlled and `flush` turns it into raw
+        // pointer arithmetic over the resource's mapping. Reject anything that would read past
+        // the resource here: a guest must not be able to fault the VMM (a Vulkan KMS client, for
+        // instance, hands over whatever stride and offset its swapchain image happens to have).
+        if let (Some(data), true) = (scanout_data, resource_id != 0) {
+            let resource = self
+                .resources
+                .get(&resource_id)
+                .ok_or(ErrInvalidResourceId)?;
+            let bytes_needed = (data.height as u64)
+                .checked_sub(1)
+                .and_then(|rows| rows.checked_mul(data.strides[0] as u64))
+                .and_then(|span| span.checked_add(data.offsets[0] as u64))
+                .and_then(|start| start.checked_add((data.width as u64).checked_mul(4)?));
+            let fits = match bytes_needed {
+                Some(needed) => needed <= resource.size,
+                None => false,
+            };
+            if data.width == 0
+                || data.height == 0
+                || (data.strides[0] as u64) < data.width as u64 * 4
+                || !fits
+            {
+                error!(
+                    "SET_SCANOUT_BLOB res={} rejects {}x{} stride={} offset={} against size={}",
+                    resource_id,
+                    data.width,
+                    data.height,
+                    data.strides[0],
+                    data.offsets[0],
+                    resource.size,
+                );
+                return Err(ErrUnspec);
+            }
+        }
+
+        // Disabling a scanout takes down whatever was overlayed on it. Until now the cursor layer
+        // only ever came down when the guest volunteered UPDATE_CURSOR with resource_id 0, which is
+        // goodwill rather than a guarantee: a guest that shows a pointer and then simply stops
+        // driving virtio-gpu (an OS handover to a driver that scans out some other way) left the
+        // last cursor image floating over the frozen last frame, because releasing the surface only
+        // drops crosvm's handle -- neither sink tears down what the viewer sees. Say it at the
+        // device's own edge instead, while the surface still exists to carry the message, and in
+        // the same two steps update_cursor's resource_id==0 arm uses.
+        if resource_id == 0 && self.cursor_scanout.parent_scanout_id == Some(scanout_id) {
+            self.cursor_scanout.set_cursor_visible(&self.display, false)?;
+            self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, 0)?;
+        }
+
+        let r = self.update_scanout_resource(
             SurfaceType::Scanout,
             Some(scanout_rect),
             scanout_id,
             scanout_data,
             resource_id,
-        )
+        );
+        strace!("set_scanout.exit ok={}", r.is_ok());
+        r
     }
 
     /// If the resource is the scanout resource, flush it to the display.
-    pub fn flush_resource(&mut self, resource_id: u32, mem: &GuestMemory) -> VirtioGpuResult {
+    pub fn flush_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
         if resource_id == 0 {
             return Ok(OkNoData);
         }
+        strace!("flush_resource.enter res={}", resource_id);
 
+        #[cfg(windows)]
         match self.rutabaga.resource_flush(resource_id) {
-            Ok(_) => {
-                #[cfg(windows)]
-                return Ok(OkNoData);
-            }
+            Ok(_) => return Ok(OkNoData),
             Err(RutabagaError::Unsupported) => {}
             Err(e) => return Err(ErrRutabaga(e)),
         }
@@ -891,25 +1622,38 @@ impl VirtioGpu {
             None => return Ok(OkNoData),
         };
 
-        let mut flushed = false;
         for scanout in self.scanouts.values_mut() {
             if scanout.resource_id == resource_id {
-                scanout.flush(&self.display, resource, &mut self.rutabaga, mem)?;
-                flushed = true;
+                scanout.flush(&self.display, resource, &mut self.rutabaga)?;
+                // A zero-copy flip may leave a completion fence on the surface: a sync_file that
+                // signals when the display's async blit has finished READING the flipped buffer.
+                // Park it for the frontend, which defers this RESOURCE_FLUSH's virtio fence until
+                // it fires -- that is what orders the guest's next render into this dmabuf against
+                // the blit. A CpuFallback resource never reaches flip_to at all, and the VNC sink
+                // reaches it but has finished reading the source before returning, so both leave
+                // this None and keep their synchronous completion. That the VNC sink leaves it None
+                // is deliberate and load-bearing: a fence from a network sink would gate the
+                // guest's vblank on whoever happens to be watching (plan §7).
+                if let Some(id) = scanout.surface_id {
+                    if let Some(fence) = self.display.borrow_mut().take_flip_completion_fence(id) {
+                        self.pending_flip_fence = Some(fence);
+                    }
+                }
             }
-        }
-        if !flushed {
-            debug!(
-                "flush_resource: resource {:?} did not match any scanout",
-                resource_id,
-            );
         }
         if self.cursor_scanout.resource_id == resource_id {
             self.cursor_scanout
-                .flush(&self.display, resource, &mut self.rutabaga, mem)?;
+                .flush(&self.display, resource, &mut self.rutabaga)?;
         }
 
+        strace!("flush_resource.exit res={:?}", resource_id);
         Ok(OkNoData)
+    }
+
+    /// Takes the display completion fence of the most recent `flush_resource`, if that flush
+    /// performed a zero-copy flip whose backend handed one back.
+    pub fn take_pending_flip_fence(&mut self) -> Option<base::SafeDescriptor> {
+        self.pending_flip_fence.take()
     }
 
     /// Updates the cursor's memory to the given resource_id, and sets its position to the given
@@ -918,19 +1662,86 @@ impl VirtioGpu {
         &mut self,
         resource_id: u32,
         scanout_id: u32,
-        x: u32,
-        y: u32,
-        mem: &GuestMemory,
+        x: i32,
+        y: i32,
+        hot_x: u32,
+        hot_y: u32,
     ) -> VirtioGpuResult {
+        // resource_id 0 is the guest hiding its pointer (a switch to a text console does exactly
+        // this). Tell the backend BEFORE update_scanout_resource releases the surface, or the last
+        // cursor image simply stays on screen with nothing left to take it down.
+        if resource_id == 0 {
+            self.cursor_scanout.set_cursor_visible(&self.display, false)?;
+            return self.update_scanout_resource(
+                SurfaceType::Cursor, None, scanout_id, None, resource_id);
+        }
         self.update_scanout_resource(SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
+        self.cursor_scanout.set_cursor_visible(&self.display, true)?;
 
+        // What the guest actually asked for. Two cursor complaints need this and neither can be
+        // settled by reading the code: a VNC client's own pointer drifting up-left from the one
+        // crosvm composites, worst on the double-headed resize cursor, and the native path
+        // freezing the position once the pointer nears the left edge. Both would follow from a
+        // hotspot applied on one path and not the other, or a position clamped after subtracting
+        // it -- so print the four numbers and compare them with what lands on screen.
+        if gpu_diag_enabled() {
+            base::warn!(
+                "CURSOR: res={} pos=({},{}) hot=({},{})",
+                resource_id, x, y, hot_x, hot_y
+            );
+        }
+        // Before flush_resource, which is what hands the pixels to the backend: a backend that
+        // publishes image and hotspot together (VNC's rfbSetCursor does) would otherwise publish
+        // this frame's image with the previous frame's hotspot.
+        self.cursor_scanout
+            .set_cursor_hotspot(&self.display, hot_x, hot_y)?;
         self.cursor_scanout.set_position(&self.display, x, y)?;
 
-        self.flush_resource(resource_id, mem)
+        self.flush_resource(resource_id)
     }
 
-    /// Moves the cursor's position to the given coordinates.
-    pub fn move_cursor(&mut self, _scanout_id: u32, x: u32, y: u32) -> VirtioGpuResult {
+    /// Moves the cursor's position to the given coordinates, on the given scanout.
+    ///
+    /// MOVE_CURSOR is the whole message a guest sends while the pointer travels with an unchanged
+    /// image, crossing between scanouts included -- so the scanout_id it carries is the only notice
+    /// the device gets that the single cursor surface now belongs somewhere else. Dropping it left
+    /// the surface parented to the scanout of the last UPDATE_CURSOR while wearing coordinates
+    /// meant for a different one: the pointer draws on the wrong screen, or at an offset on the
+    /// right one, and nothing reports an error.
+    pub fn move_cursor(&mut self, scanout_id: u32, x: i32, y: i32) -> VirtioGpuResult {
+        if gpu_diag_enabled() {
+            base::warn!("CURSOR-MOVE: scanout={} pos=({},{})", scanout_id, x, y);
+        }
+        // Re-parent through the exact call update_cursor makes, so the two paths cannot describe
+        // the move differently. A single-scanout guest never reaches it: scanout_id is 0 forever
+        // and the cursor is already parented to 0, leaving position + commit as the whole of this
+        // function, as before.
+        //
+        // Only for a cursor that is actually somewhere -- a surface on screen and a live resource
+        // behind it. Re-parenting means building a new surface for the image to be flushed into,
+        // so with either missing there is nothing to move and every call below would be a
+        // surface-gated no-op anyway; asking for the move with a resource the guest has already
+        // unref'd would turn one into an error response instead.
+        if self.cursor_scanout.surface_id.is_some()
+            && self.cursor_scanout.parent_scanout_id != Some(scanout_id)
+        {
+            let cursor_resource_id = self
+                .cursor_scanout
+                .resource_id
+                .map(|id| id.get())
+                .filter(|id| self.resources.contains_key(id));
+            if let Some(resource_id) = cursor_resource_id {
+                self.update_scanout_resource(
+                    SurfaceType::Cursor, None, scanout_id, None, resource_id)?;
+                self.cursor_scanout.set_cursor_visible(&self.display, true)?;
+                // The new surface is empty until something writes the cursor image into it, and a
+                // move carries no image of its own. Push the resource the cursor already has, the
+                // same flush update_cursor ends on. (Its hotspot does not come along: MOVE_CURSOR
+                // has no hotspot field, and only VNC's RFB cursor uses one -- it keeps the last
+                // one it was given, server-wide, until the next UPDATE_CURSOR restates it.)
+                self.flush_resource(resource_id)?;
+            }
+        }
         self.cursor_scanout.set_position(&self.display, x, y)?;
         self.cursor_scanout.commit(&self.display)?;
         Ok(OkNoData)
@@ -1105,18 +1916,46 @@ impl VirtioGpu {
     }
 
     /// Releases guest kernel reference on the resource.
-    pub fn unref_resource(&mut self, resource_id: u32) -> VirtioGpuResult {
-        let resource = self
+    /// `mem` is only for releasing growable-pool grants this resource was holding. It is a
+    /// parameter rather than a field because VirtioGpu does not otherwise keep GuestMemory, and
+    /// the caller has it.
+    pub fn unref_resource(&mut self, mem: &GuestMemory, resource_id: u32) -> VirtioGpuResult {
+        let mut resource = self
             .resources
             .remove(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        if resource.rutabaga_external_mapping {
-            self.rutabaga.unmap(resource_id)?;
+        // Keep the pool reference until the renderer has actually dropped the resource. If an
+        // unmap/unref fails, put the resource back so a later cleanup can retry; releasing the
+        // grant before that point would let the guest reuse pages still held by the renderer.
+        let result = (|| -> VirtioGpuResult {
+            resource.transition_display_import(
+                &mut self.display.borrow_mut(),
+                DisplayImportState::Unknown,
+            );
+
+            if resource.rutabaga_external_mapping {
+                self.rutabaga.unmap(resource_id)?;
+                resource.rutabaga_external_mapping = false;
+            }
+
+            self.rutabaga.unref_resource(resource_id)?;
+            Ok(OkNoData)
+        })();
+
+        if result.is_err() {
+            self.resources.insert(resource_id, resource);
+            return result;
         }
 
-        self.rutabaga.unref_resource(resource_id)?;
-        Ok(OkNoData)
+        // Release the growable-pool grants only after the renderer no longer owns the resource.
+        // Paired with the ref taken in resource_create_blob; the ranges are stored on the resource
+        // rather than recomputed here because backing_iovecs can be detached independently.
+        if let Some(refs) = resource.pool_refs.take() {
+            mem.pool_unref_iovecs(&refs[..]);
+        }
+
+        result
     }
 
     /// Copies data to host resource from the attached iovecs. Can also be used to flush caches.
@@ -1165,18 +2004,98 @@ impl VirtioGpu {
     ) -> VirtioGpuResult {
         let mut descriptor = None;
         let mut rutabaga_iovecs = None;
+        let mut pool_iovecs: Option<Vec<(usize, usize)>> = None;
+        let mut pool_refs: Option<Vec<(GuestAddress, usize)>> = None;
 
         if resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE != 0 {
+            // debug!, like the GPU-MAPBLOB traces below: this fires once per blob creation,
+            // which is hundreds per desktop session and thousands under a benchmark.
+            base::debug!(
+                "GUEST-ALLOC: create_blob CREATE_GUEST_HANDLE res={} mem={} nvecs={} first={:#x} len={} udmabuf={}",
+                resource_id,
+                resource_create_blob.blob_mem,
+                vecs.len(),
+                vecs.first().map(|v| v.0.offset()).unwrap_or(0),
+                vecs.first().map(|v| v.1).unwrap_or(0),
+                self.udmabuf_driver.is_some(),
+            );
+            // Refuse an import over unbacked pool memory, and hold the grants until this
+            // resource is gone. The udmabuf path resolves addresses through find_region, which
+            // check_host_access does not gate, so nothing else would catch a guest handing over
+            // an address inside the declared window that has never been granted -- and reading a
+            // hole in the sparse pool memfd allocates host memory rather than failing.
+            if let Err(e) = mem.pool_ref_iovecs(&vecs[..]) {
+                base::error!(
+                    "GUEST-ALLOC: refusing blob res={}: iovecs are not backed by a live grant ({:?})",
+                    resource_id, e
+                );
+                return Err(ErrUnspec);
+            }
+            pool_refs = Some(vecs.clone());
             descriptor = match self.udmabuf_driver {
-                Some(ref driver) => Some(driver.create_udmabuf(mem, &vecs[..])?),
-                None => return Err(ErrUnspec),
+                Some(ref driver) => Some(driver.create_udmabuf(mem, &vecs[..]).map_err(|e| {
+                    mem.pool_unref_iovecs(&vecs[..]);
+                    base::error!("GUEST-ALLOC: create_udmabuf failed res={}: {:?}", resource_id, e);
+                    ErrUnspec
+                })?),
+                None => {
+                    mem.pool_unref_iovecs(&vecs[..]);
+                    base::error!("GUEST-ALLOC: udmabuf_driver is None (need /dev/udmabuf)");
+                    return Err(ErrUnspec);
+                }
+            };
+            // DroidVM guest-alloc scanout: the composited frame lives in the guest pool
+            // (GpuPoolGuest, a host-accessible GuestMemory region). gfxstream can't
+            // transfer_read/export a guest-alloc blob back for display (black frame), so keep
+            // host pointers to the pool slices and let the scanout flush read the frame directly
+            // -- the pool-scanout mechanism, resolved via GuestMemory.
+            if !vecs.is_empty() {
+                let mut segs = Vec::with_capacity(vecs.len());
+                let mut all_ok = true;
+                for &(addr, len) in vecs.iter() {
+                    match mem.get_slice_at_addr(addr, len) {
+                        Ok(s) => segs.push((s.as_ptr() as usize, len)),
+                        Err(_) => {
+                            all_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if all_ok {
+                    pool_iovecs = Some(segs);
+                }
+            }
+
+            // HOST3D_GUEST means both storages: the renderer's context produces the host object
+            // AND the guest supplies the pages. virglrenderer enforces the second half -- it
+            // rejects the blob if the iovecs do not cover its size -- so a guest-allocated blob
+            // on that path needs the iovecs as well as the dma-buf, not one or the other. The
+            // udmabuf above is what the GPU ends up bound to; these are what makes the resource
+            // legal to create in the first place.
+            if resource_create_blob.blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST {
+                let iovs = match sglist_to_rutabaga_iovecs(&vecs[..], mem) {
+                    Ok(iovs) => iovs,
+                    Err(_) => {
+                        mem.pool_unref_iovecs(&vecs[..]);
+                        return Err(ErrUnspec);
+                    }
+                };
+                rutabaga_iovecs = Some(iovs);
             }
         } else if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
-            rutabaga_iovecs =
-                Some(sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?);
+            let iovs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
+            rutabaga_iovecs = Some(iovs);
         }
 
-        self.rutabaga.resource_create_blob(
+        // Retain a dup of the pool udmabuf so `flush` can import it straight to the display; see
+        // the pool_scanout_dmabuf field. Must happen before `descriptor` is moved into rutabaga.
+        let pool_scanout_dmabuf = if resource_create_blob.size >= POOL_SCANOUT_DMABUF_MIN_SIZE {
+            descriptor.as_ref().and_then(|d| d.try_clone().ok())
+        } else {
+            None
+        };
+
+        let create_result = self.rutabaga.resource_create_blob(
             ctx_id,
             resource_id,
             resource_create_blob,
@@ -1185,9 +2104,18 @@ impl VirtioGpu {
                 os_handle: to_rutabaga_descriptor(descriptor),
                 handle_type: RUTABAGA_HANDLE_TYPE_MEM_DMABUF,
             }),
-        )?;
+        );
+        if create_result.is_err() {
+            if let Some(refs) = pool_refs.as_ref() {
+                mem.pool_unref_iovecs(refs);
+            }
+        }
+        create_result?;
 
-        let resource = VirtioGpuResource::new(resource_id, 0, 0, resource_create_blob.size);
+        let mut resource = VirtioGpuResource::new(resource_id, 0, 0, resource_create_blob.size);
+        resource.pool_scanout_iovecs = pool_iovecs;
+        resource.pool_refs = pool_refs;
+        resource.pool_scanout_dmabuf = pool_scanout_dmabuf;
 
         // Rely on rutabaga to check for duplicate resource ids.
         self.resources.insert(resource_id, resource);
@@ -1201,25 +2129,56 @@ impl VirtioGpu {
     /// When sandboxing is enabled, external_blob is set and opaque fds must be mapped in the
     /// hypervisor process by Vulkano using metadata provided by Rutabaga::vulkan_info().
     pub fn resource_map_blob(&mut self, resource_id: u32, offset: u64) -> VirtioGpuResult {
+        // PRE-ALLOC, either renderer: a pool-resident blob is already in the guest's stage-2
+        // (its pool was SHARE-blessed at boot). Don't runtime-SHARE anything and don't touch the
+        // BAR -- just tell the guest its pool byte offset. It maps pool_gpa + offset directly
+        // (VIRTIO_GPU_MAP_INFO_POOL flag set; the offset rides the spec's padding field, and no
+        // runtime SHARE happens at all). gfxstream records the offset when it sub-allocates from
+        // the HostVisiblePool; virglrenderer's drm2kgsl backend when it sub-allocates from the
+        // Drm2KgslPool. Both arrive here as RutabagaResource::pool_offset.
+        if let Some(pool_offset) = self.rutabaga.resource_pool_offset(resource_id) {
+            let resource = self
+                .resources
+                .get_mut(&resource_id)
+                .ok_or(ErrInvalidResourceId)?;
+            resource.pool_offset = Some(pool_offset);
+            let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+            base::debug!(
+                "GPU-MAPBLOB: res={} POOL-resident offset={:#x} (no SHARE)",
+                resource_id,
+                pool_offset,
+            );
+            return Ok(OkMapInfo {
+                map_info: (map_info & RUTABAGA_MAP_CACHE_MASK) | VIRTIO_GPU_MAP_INFO_POOL,
+                // A 2 GiB pool keeps the offset within u32.
+                pool_offset: Some(pool_offset as u32),
+            });
+        }
+
         let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = match self.rutabaga.map_info(resource_id) {
-            Ok(info) => info,
-            Err(e) => {
-                error!("resource_map_blob: map_info failed for resource {}: {}", resource_id, e);
-                return Err(ErrUnspec);
-            }
-        };
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+
+        // A remap re-backs the resource, so any display import cached against the old backing is
+        // stale. Drop it here rather than letting the next flush post the previous frame's pages.
+        resource.transition_display_import(
+            &mut self.display.borrow_mut(),
+            DisplayImportState::Unknown,
+        );
 
         let mut source: Option<VmMemorySource> = None;
         match self.rutabaga.export_blob(resource_id) {
             Ok(export) => {
-                debug!(
-                    "resource_map_blob: export_blob OK for resource {}, handle_type=0x{:x}, size={}",
-                    resource_id, export.handle_type, resource.size
+                let has_vk = self.rutabaga.vulkan_info(resource_id).is_ok();
+                base::debug!(
+                    "GPU-MAPBLOB: res={} export OK handle_type=0x{:x} vulkan_info={} offset={}",
+                    resource_id,
+                    export.handle_type,
+                    has_vk,
+                    offset,
                 );
                 if let Ok(vulkan_info) = self.rutabaga.vulkan_info(resource_id) {
                     source = Some(VmMemorySource::Vulkan {
@@ -1236,34 +2195,42 @@ impl VirtioGpu {
                         offset: 0,
                         size: resource.size,
                     });
-                } else {
-                    debug!(
-                        "resource_map_blob: handle_type is MEM_OPAQUE_FD, cannot use Descriptor source"
-                    );
                 }
             }
             Err(e) => {
-                debug!("resource_map_blob: export_blob failed for resource {}: {}", resource_id, e);
+                // Not an error: expected for ColorBuffers whose Vulkan memory this Adreno can't
+                // export as AHB/dmabuf; falls through to the rutabaga host-ptr map below.
+                base::debug!(
+                    "GPU-MAPBLOB: res={} export_blob ERR {:?} offset={}",
+                    resource_id,
+                    e,
+                    offset,
+                );
             }
         }
 
-        // fallback to ExternalMapping via rutabaga if sandboxing (hence external_blob) and fixed
-        // mapping are both disabled as neither is currently compatible.
+        // qemu-android-gunyah parity: when export_blob yields no usable OS handle (e.g. a
+        // ColorBuffer whose Vulkan memory this Adreno can't export as AHB/dmabuf), fall back to
+        // rutabaga's host-pointer mapping — exactly what qemu does for every blob
+        // (rutabaga_resource_map -> memory_region_init_ram_ptr(mapping.ptr)). This avoids the
+        // InvalidRutabagaHandle dead-end. ExternalMapping (a raw host VA) is only unsafe when the
+        // GPU device is sandboxed; this VM runs --disable-sandbox, so the pointer is valid in-proc.
+        // NOTE: the original gate returned ErrUnspec here when external_blob/fixed_blob_mapping
+        // were set; we deliberately relax it for the Gunyah + disable-sandbox configuration.
         if source.is_none() {
-            if self.external_blob || self.fixed_blob_mapping {
-                error!(
-                    "resource_map_blob: no source and external_blob={} fixed_blob_mapping={}, cannot fallback",
-                    self.external_blob, self.fixed_blob_mapping
-                );
+            if self.fixed_blob_mapping {
                 return Err(ErrUnspec);
             }
 
             match self.rutabaga.map(resource_id) {
                 Ok(mapping) => {
-                    debug!(
-                        "resource_map_blob: ExternalMapping fallback, ptr={:?} size={}",
-                        mapping.ptr, mapping.size
+                    base::debug!(
+                        "GPU-MAPBLOB: res={} export failed, fallback rutabaga.map() OK ptr=0x{:x} size={} (qemu host-ptr path)",
+                        resource_id,
+                        mapping.ptr,
+                        mapping.size,
                     );
+                    // resources mapped via rutabaga must also be marked for unmap via rutabaga.
                     resource.rutabaga_external_mapping = true;
                     source = Some(VmMemorySource::ExternalMapping {
                         ptr: mapping.ptr,
@@ -1271,8 +2238,12 @@ impl VirtioGpu {
                     });
                 }
                 Err(e) => {
-                    error!("resource_map_blob: rutabaga.map() failed: {}", e);
-                    return Err(ErrRutabaga(e));
+                    base::warn!(
+                        "GPU-MAPBLOB: res={} export failed AND rutabaga.map() ERR {:?} (not host-mappable)",
+                        resource_id,
+                        e,
+                    );
+                    return Err(ErrUnspec);
                 }
             }
         };
@@ -1281,10 +2252,7 @@ impl VirtioGpu {
             RUTABAGA_MAP_ACCESS_READ => Protection::read(),
             RUTABAGA_MAP_ACCESS_WRITE => Protection::write(),
             RUTABAGA_MAP_ACCESS_RW => Protection::read_write(),
-            _ => {
-                error!("resource_map_blob: invalid access mask 0x{:x}", map_info);
-                return Err(ErrUnspec);
-            }
+            _ => return Err(ErrUnspec),
         };
 
         let cache = if cfg!(feature = "noncoherent-dma")
@@ -1295,29 +2263,69 @@ impl VirtioGpu {
             MemCacheType::CacheCoherent
         };
 
-        if let Err(e) = self.mapper
+        let res_size = resource.size;
+        // The guest-side memparcel accept is always driven host-side over the
+        // virtio-gunyah-accept transport (VmAccept::Sync), so nothing about it reaches the
+        // virtio-gpu protocol: no handle in the response, no accept in the guest driver.
+        match self
+            .mapper
             .lock()
             .as_mut()
             .expect("No backend request connection found")
-            .add_mapping(source.unwrap(), offset, prot, cache)
+            .add_mapping_blob(source.unwrap(), offset, prot, cache, VmAccept::Sync)
         {
-            error!("resource_map_blob: add_mapping failed at offset 0x{:x}: {:#}", offset, e);
-            return Err(ErrUnspec);
-        }
+            Ok(_) => (),
+            Err(e) => {
+                // Surface the real backend error (a runtime-share ENOMEM at the RM memparcel limit,
+                // a source.map mmap failure, a BAR-offset overflow, ...) instead of collapsing every
+                // cause into a bare ErrUnspec -- the guest only sees VK_ERROR_OUT_OF_DEVICE_MEMORY.
+                base::error!(
+                    "GPU-MAPBLOB: res={} add_mapping_blob failed offset={:#x} res_size={:#x} prot={:?}: {:#}",
+                    resource_id,
+                    offset,
+                    res_size,
+                    prot,
+                    e
+                );
+                return Err(ErrUnspec);
+            }
+        };
 
         resource.shmem_offset = Some(offset);
+        resource
+            .transition_display_import(&mut self.display.borrow_mut(), DisplayImportState::Unknown);
         // Access flags not a part of the virtio-gpu spec.
         Ok(OkMapInfo {
             map_info: map_info & RUTABAGA_MAP_CACHE_MASK,
+            pool_offset: None,
         })
     }
 
     /// Uses the hypervisor to unmap the blob resource.
     pub fn resource_unmap_blob(&mut self, resource_id: u32) -> VirtioGpuResult {
+        // Gunyah: actually reclaim the SHARE'd blob now (instead of the old PIN no-op that left it
+        // shared forever). remove_mapping -> UnregisterMemory -> Vm::unshare_blob does the
+        // gh_rm_mem_reclaim. The guest's virtio-gpu driver releases its own stage-2 acceptance
+        // (gunyah_guest_mem_release) BEFORE sending this UNMAP, so the host-side reclaim here is
+        // safe and keeps the BAR offset free for clean reuse -- fixing the offset-0 mem_share
+        // EINVAL that the lazy overlap-reclaim caused by orphaning still-live parcels.
         let resource = self
             .resources
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
+
+        // The backing is going away, so a cached display import of it must go first.
+        resource.transition_display_import(
+            &mut self.display.borrow_mut(),
+            DisplayImportState::Unknown,
+        );
+
+        // PRE-ALLOC: pool-resident blobs were never runtime-SHARE'd (the guest maps the pool GPA
+        // out of its own blessed RAM), so there is no host mapping to remove. The pool
+        // sub-allocation is returned to the pool on the host side by gfxstream at vkFreeMemory.
+        if resource.pool_offset.take().is_some() {
+            return Ok(OkNoData);
+        }
 
         let shmem_offset = resource.shmem_offset.ok_or(ErrUnspec)?;
         self.mapper
@@ -1451,6 +2459,12 @@ impl VirtioGpu {
             }
 
             scanout.resource_id = None;
+            // A cursor with no surface is overlayed onto nothing, and saying so keeps
+            // `parent_scanout_id` an answer to "where is the cursor now" rather than "where was it
+            // last" -- which is what both `move_cursor` and the scanout-disable edge ask it.
+            if matches!(scanout_type, SurfaceType::Cursor) {
+                scanout.parent_scanout_id = None;
+            }
             return Ok(OkNoData);
         }
 
@@ -1460,21 +2474,20 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         // Ensure scanout has a display surface.
+        let previous_surface_id = scanout.surface_id;
         match scanout_type {
             SurfaceType::Cursor => {
                 if let Some(scanout_parent_surface_id) = scanout_parent_surface_id {
-                    match scanout.create_surface(
+                    scanout.create_surface(
                         &self.display,
                         Some(scanout_parent_surface_id),
                         scanout_rect,
-                    ) {
-                        Ok(_) => {}
-                        Err(ErrDisplay(GpuDisplayError::Unsupported)) => {
-                            // Display doesn't support cursor subsurfaces (e.g. VNC).
-                            return Ok(OkNoData);
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    )?;
+                    // The parenting just happened (or was already in force -- create_surface is a
+                    // no-op when the parent is unchanged); record which scanout it was against.
+                    // Not recorded when the parent scanout has no surface of its own, because then
+                    // the cursor was not re-parented and still hangs off whatever it hung off.
+                    scanout.parent_scanout_id = Some(scanout_id);
                 }
             }
             SurfaceType::Scanout => {
@@ -1482,7 +2495,27 @@ impl VirtioGpu {
             }
         }
 
+        if resource.scanout_data != scanout_data || scanout.surface_id != previous_surface_id {
+            resource.transition_display_import(
+                &mut self.display.borrow_mut(),
+                DisplayImportState::Unknown,
+            );
+        }
         resource.scanout_data = scanout_data;
+
+        let buffer_fourcc = scanout_data
+            .map(|data| data.drm_format.into())
+            .or_else(|| {
+                self.rutabaga
+                    .query(resource_id)
+                    .ok()
+                    .map(|query| query.drm_fourcc)
+            });
+        if let (Some(surface_id), Some(fourcc)) = (scanout.surface_id, buffer_fourcc) {
+            self.display
+                .borrow_mut()
+                .set_buffer_fourcc(surface_id, fourcc)?;
+        }
 
         // `resource_id` has already been verified to be non-zero
         let resource_id = match NonZeroU32::new(resource_id) {
@@ -1500,22 +2533,58 @@ impl VirtioGpu {
             .context("failed to suspend rutabaga")
     }
 
-    /// Clears all GPU resources and scanout bindings.
-    /// Called on device reset so the next driver starts with a clean state.
-    pub fn reset_state(&mut self) {
-        let resource_ids: Vec<u32> = self.resources.keys().copied().collect();
-        for id in resource_ids {
-            if let Some(resource) = self.resources.remove(&id) {
-                if resource.rutabaga_external_mapping {
-                    let _ = self.rutabaga.unmap(id);
-                }
-                let _ = self.rutabaga.unref_resource(id);
-            }
-        }
+    /// Reset the device to a clean state on a guest-initiated device reset: forget each scanout's
+    /// resource association and drop every resource/context (ours and rutabaga's), while keeping
+    /// the rutabaga render server alive so re-init is instant. Lets a guest that takes the device
+    /// over from another one (UEFI firmware -> OS) recreate resource ids from scratch -- rutabaga
+    /// rejects a duplicate resource id otherwise.
+    pub fn reset(&mut self) -> anyhow::Result<()> {
         for scanout in self.scanouts.values_mut() {
             scanout.resource_id = None;
+            // Drop the previous guest's surface: update_scanout_resource() only recreates a
+            // surface when the modeset size differs from scanout.width/height, so after the
+            // restore below, an OS modeset to the configured size would otherwise keep using a
+            // stale firmware-geometry surface (its content posted top-left into a larger frame).
+            scanout.release_surface(&self.display);
+            // Also restore the configured boot resolution. set_scanout() tracks the guest's
+            // modesets in scanout.width/height, which GET_DISPLAY_INFO then reports; a device
+            // reset means a NEW guest is taking over, and the previous guest's last modeset
+            // (e.g. the UEFI firmware console at 800x600) must not leak into it. The guest
+            // virtio-gpu driver prunes any EDID *preferred* mode that mismatches display info
+            // by >16px, so a leaked firmware resolution permanently locks the OS out of the
+            // configured mode and it falls back to an arbitrary (wrong-aspect) one.
+            if let Some(params) = &scanout.display_params {
+                let (width, height) = params.get_virtual_display_size();
+                info!(
+                    "gpu reset: scanout {:?} restored {}x{} -> {}x{}, surface dropped",
+                    scanout.scanout_id, scanout.width, scanout.height, width, height
+                );
+                scanout.width = width;
+                scanout.height = height;
+            }
         }
+        // Hide before releasing, and not instead of it: `release_surface` drops crosvm's handle to
+        // the surface, which at neither sink is what removes the pointer from the screen. The
+        // Android surface is never destroy_android_surface'd (the app keeps the cursor Surface and
+        // the last buffer posted to it), and `VncCursorSurface` has no Drop, so the composited
+        // pointer and the RFB cursor both outlive it. Both sinks do act on the hide -- the Android
+        // one parks the layer at CURSOR_HIDDEN_POS, VNC clears fb.cursor.visible and sends
+        // rfbSetCursor(NULL) -- but only while the surface is still here to be told.
+        self.cursor_scanout
+            .set_cursor_visible(&self.display, false)
+            .map_err(|e| anyhow::anyhow!("gpu reset: failed to hide the cursor: {}", e))?;
         self.cursor_scanout.resource_id = None;
+        self.cursor_scanout.parent_scanout_id = None;
+        self.cursor_scanout.release_surface(&self.display);
+        {
+            let mut display = self.display.borrow_mut();
+            for resource in self.resources.values_mut() {
+                resource.transition_display_import(&mut display, DisplayImportState::Unknown);
+            }
+        }
+        self.resources.clear();
+        self.rutabaga.reset().context("failed to reset rutabaga")?;
+        Ok(())
     }
 
     pub fn snapshot(&self) -> anyhow::Result<VirtioGpuSnapshot> {

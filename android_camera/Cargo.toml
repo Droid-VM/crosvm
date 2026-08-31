@@ -1,0 +1,16 @@
+[package]
+name = "android_camera"
+version = "0.1.0"
+authors = ["DroidVM contributors"]
+edition = "2021"
+
+[dependencies]
+base = { path = "../base" }
+thiserror = "1"
+
+[[bin]]
+name = "camera_probe"
+path = "src/probe.rs"
+
+[dev-dependencies]
+libc = "0.2"

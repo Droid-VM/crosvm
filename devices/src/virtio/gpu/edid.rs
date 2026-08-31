@@ -43,6 +43,7 @@ impl EdidBytes {
 
         populate_header(&mut edid);
         populate_edid_version(&mut edid);
+        populate_input_and_features(&mut edid);
         populate_size(&mut edid, info);
         populate_standard_timings(&mut edid)?;
 
@@ -271,6 +272,13 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &DisplayInfo) {
     edid_block[12] = width_millimeters_lsb;
     edid_block[13] = height_millimeters_lsb;
     edid_block[14] = height_millimeters_msb | (width_millimeters_msb << 4);
+
+    // Signal definitions: digital separate sync, positive h/v polarity (same as a real digital
+    // panel and QEMU's generator). A zero here means "analog composite sync", which newer guest
+    // kernels reject outright -- dropping this (the preferred!) mode from the connector's list,
+    // so the guest falls back to whichever standard timing is largest and renders at the wrong
+    // aspect ratio.
+    edid_block[17] = 0x1E;
 }
 
 // The EDID header. This is defined by the EDID spec.
@@ -320,18 +328,21 @@ fn populate_standard_timings(edid: &mut [u8]) -> VirtioGpuResult {
     ];
 
     // Index 0 is horizontal pixels / 8 - 31
-    // Index 1 is a combination of the refresh_rate - 60 (so we are setting to 0, for now) and two
-    // bits for the aspect ratio.
+    // Index 1 is the aspect ratio in bits 7:6 and the refresh_rate - 60 in bits 5:0 (so we are
+    // setting the refresh field to 0 = 60 Hz, for now).
     for (index, r) in resolutions.iter().enumerate() {
         edid[0x26 + (index * 2)] = (r.width / 8 - 31) as u8;
-        let ar_bits = match r.get_aspect_ratio() {
+        let ar_bits: u8 = match r.get_aspect_ratio() {
             (8, 5) => 0x0,
             (4, 3) => 0x1,
             (5, 4) => 0x2,
             (16, 9) => 0x3,
             (x, y) => return Err(ErrEdid(format!("Unsupported aspect ratio: {} {}", x, y))),
         };
-        edid[0x27 + (index * 2)] = ar_bits;
+        // The aspect ratio lives in the TOP two bits; writing it to the low bits (a former bug)
+        // declares every entry as 16:10 with a bogus 61-63 Hz refresh, which turns the whole
+        // list into phantom modes (e.g. 1856x1160) the host never meant to advertise.
+        edid[0x27 + (index * 2)] = ar_bits << 6;
     }
     Ok(OkNoData)
 }
@@ -340,6 +351,15 @@ fn populate_standard_timings(edid: &mut [u8]) -> VirtioGpuResult {
 fn populate_edid_version(edid: &mut [u8]) {
     edid[18] = 1;
     edid[19] = 4;
+}
+
+// Video input definition (byte 20) and feature support (byte 24). We are a digital display (the
+// detailed timing also declares digital separate sync) and the first detailed timing block is the
+// native/preferred mode -- stating it explicitly keeps EDID 1.3-era parsers on the same page as
+// the EDID 1.4 "first detailed timing is preferred" rule.
+fn populate_input_and_features(edid: &mut [u8]) {
+    edid[20] = 0x80; // digital input, bit depth/interface undefined
+    edid[24] = 0x02; // preferred timing mode includes the native timing
 }
 
 fn populate_size(edid: &mut [u8], info: &DisplayInfo) {

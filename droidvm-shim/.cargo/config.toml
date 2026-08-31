@@ -1,0 +1,20 @@
+# Bare metal: no std, no dynamic loader, one flat binary linked by our own script.
+#
+# SOFTFLOAT, not plain aarch64-unknown-none. That target carries +neon, and the compiler will use
+# it -- eleven SIMD instructions turned up in the first build of this shim. Nothing has enabled
+# FP/SIMD at that point: the shim runs before anything sets CPACR_EL1.FPEN, so the first such
+# instruction is an undefined-instruction trap in a VM with no console, no handler and nothing to
+# say for itself. Both targets already set +strict-align, which matters just as much here: with
+# the MMU off every access is Device memory, where an unaligned one faults. `-C
+# relocation-model=static` because nothing processes relocations at load time -- crosvm copies the
+# bytes to a fixed address and the hypervisor branches to them.
+[build]
+target = "aarch64-unknown-none-softfloat"
+
+[target.aarch64-unknown-none-softfloat]
+rustflags = [
+    "-C", "link-arg=-Tshim.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "relocation-model=static",
+    "-C", "force-frame-pointers=yes",
+]

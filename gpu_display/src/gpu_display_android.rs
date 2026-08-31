@@ -2,7 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::ffi::c_char;
+use std::ffi::c_int;
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::panic::catch_unwind;
@@ -14,15 +17,19 @@ use std::slice;
 use base::error;
 use base::AsRawDescriptor;
 use base::Event;
+use base::FromRawDescriptor;
 use base::RawDescriptor;
+use base::SafeDescriptor;
 use base::VolatileSlice;
 use vm_control::gpu::DisplayParameters;
 
 use crate::DisplayT;
+use crate::DRM_FORMAT_ABGR8888;
 use crate::GpuDisplayError;
 use crate::GpuDisplayFramebuffer;
 use crate::GpuDisplayResult;
 use crate::GpuDisplaySurface;
+use crate::SemaphoreTimepoint;
 use crate::SurfaceType;
 use crate::SysDisplayT;
 
@@ -54,6 +61,14 @@ pub(crate) struct ANativeWindow_Buffer {
 }
 
 pub(crate) type ErrorCallback = unsafe extern "C" fn(message: *const c_char);
+
+/// virtio-gpu's cursor plane is fixed at 64x64 (drivers/gpu/drm/virtio registers it with that
+/// single size), and a smaller cursor image arrives in the top-left of it.
+const CURSOR_PLANE_SIZE: u32 = 64;
+
+/// Sentinel position meaning "the guest hid its pointer". A real cursor position is a framebuffer
+/// coordinate, so u32::MAX can never collide with one.
+const CURSOR_HIDDEN_POS: u32 = u32::MAX;
 
 extern "C" {
     /// Constructs an AndroidDisplayContext for this backend. This awlays returns a valid (ex:
@@ -110,6 +125,47 @@ extern "C" {
         ctx: *mut AndroidDisplayContext,
         surface: *mut AndroidDisplaySurface,
     );
+
+    fn set_android_surface_buffer_format(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        fourcc: u32,
+    );
+
+    fn android_display_import_dmabuf(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        fd: RawDescriptor,
+        offset: u32,
+        stride: u32,
+        modifier: u64,
+        linear_layout_verified: bool,
+        width: u32,
+        height: u32,
+        fourcc: u32,
+    ) -> i64;
+
+    fn android_display_release_import(ctx: *mut AndroidDisplayContext, raw_handle: i64);
+
+    fn android_display_is_vulkan_blit_available(ctx: *mut AndroidDisplayContext) -> bool;
+
+    /// Whether the app has a native window attached to the scanout surface, i.e. whether a frame
+    /// posted now can reach a screen. The native side reads the current state under its surface
+    /// lock and never waits for one to arrive: this is asked once per frame from a timer thread.
+    fn android_display_has_consumer(ctx: *mut AndroidDisplayContext) -> bool;
+
+    /// `out_completion_fence_fd` is written by the callee and is mandatory: the C side rejects a
+    /// null pointer outright, and on the async-blit path it hands back an owned sync_file fd that
+    /// this side must close. Keep the arity in step with the definition in
+    /// `crosvm_android_display_client.cpp` -- these symbols are not declared in any shared header,
+    /// so this extern block is the only "declaration" the compiler ever sees and a mismatch links
+    /// silently.
+    fn android_display_flip_to(
+        ctx: *mut AndroidDisplayContext,
+        surface: *mut AndroidDisplaySurface,
+        raw_handle: i64,
+        out_completion_fence_fd: *mut c_int,
+    ) -> bool;
 }
 
 unsafe extern "C" fn error_callback(message: *const c_char) {
@@ -156,13 +212,25 @@ impl From<ANativeWindow_Buffer> for GpuDisplayFramebuffer<'_> {
             // SAFETY: get_android_surface_buffer guarantees that bits points to a valid buffer and
             // the buffer remains available until post_android_surface_buffer is called.
             unsafe { slice::from_raw_parts_mut(anb.bits, buffer_size.try_into().unwrap()) };
-        Self::new(VolatileSlice::new(buffer), stride_bytes, BYTES_PER_PIXEL)
+        // HAL_PIXEL_FORMAT_RGBA_8888 is R, G, B, A in memory, i.e. DRM AB24 on a
+        // little-endian host.
+        Self::new(
+            VolatileSlice::new(buffer),
+            stride_bytes,
+            BYTES_PER_PIXEL,
+            DRM_FORMAT_ABGR8888,
+        )
     }
 }
 
 struct AndroidSurface {
     context: Rc<AndroidDisplayContextWrapper>,
     surface: NonNull<AndroidDisplaySurface>,
+    imports: Rc<RefCell<BTreeMap<u32, i64>>>,
+    /// Completion fence of the most recent async flip, parked here until the caller collects it
+    /// with `take_flip_completion_fence()`. A fence that is never collected is closed (without
+    /// waiting) when the next flip replaces it, which degrades to the old drop-it behaviour.
+    pending_flip_fence: Option<SafeDescriptor>,
 }
 
 impl GpuDisplaySurface for AndroidSurface {
@@ -189,14 +257,101 @@ impl GpuDisplaySurface for AndroidSurface {
         unsafe { post_android_surface_buffer(self.context.0.as_ptr(), self.surface.as_ptr()) }
     }
 
-    fn set_position(&mut self, x: u32, y: u32) {
+    fn set_position(&mut self, x: i32, y: i32) {
+        // The image origin goes negative when the pointer is within the hotspot of the left or top
+        // edge, but the app owns this FFI and it takes u32 -- and u32::MAX is the hide sentinel,
+        // which -1 would land on exactly, making the pointer vanish near the edge. Clamp instead:
+        // the cursor stops up to a hotspot short of the corner rather than disappearing into it.
+        // Drawing it properly clipped would mean re-rendering the plane, which is the app's side.
         // SAFETY: context is an opaque handle.
-        unsafe { set_android_surface_position(self.context.0.as_ptr(), x, y) };
+        unsafe {
+            set_android_surface_position(self.context.0.as_ptr(), x.max(0) as u32, y.max(0) as u32)
+        };
+    }
+
+    fn set_buffer_fourcc(&mut self, fourcc: u32) {
+        // SAFETY: context and surface are live opaque handles owned by this surface.
+        unsafe {
+            set_android_surface_buffer_format(
+                self.context.0.as_ptr(),
+                self.surface.as_ptr(),
+                fourcc,
+            )
+        };
+    }
+
+    /// Hiding rides the existing position pipe rather than a new FFI entry point: the native side
+    /// forwards whatever it is given straight to the app, so a coordinate the guest can never
+    /// produce carries the message with no change to the C bridge or the AIDL.
+    fn set_cursor_visible(&mut self, visible: bool) {
+        if visible {
+            return; // the next real position makes it visible again
+        }
+        // SAFETY: context is an opaque handle.
+        unsafe {
+            set_android_surface_position(self.context.0.as_ptr(), CURSOR_HIDDEN_POS, CURSOR_HIDDEN_POS)
+        };
+    }
+
+    fn flip_to(
+        &mut self,
+        import_id: u32,
+        _acquire_timepoint: Option<SemaphoreTimepoint>,
+        _release_timepoint: Option<SemaphoreTimepoint>,
+        _extra_info: Option<crate::FlipToExtraInfo>,
+    ) -> anyhow::Result<sync::Waitable> {
+        let raw_handle = self
+            .imports
+            .borrow()
+            .get(&import_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid Android display import id {}", import_id))?;
+        // On the synchronous blit path the bridge waits for the Turnip queue before handing the AHB
+        // to SurfaceControl and reports -1 here. The async path instead exports a sync_file for the
+        // blit's completion and transfers it to us, so this fd must be owned on every success path
+        // or the process leaks one per presented frame.
+        let mut completion_fence_fd: c_int = -1;
+        let success = unsafe {
+            android_display_flip_to(
+                self.context.0.as_ptr(),
+                self.surface.as_ptr(),
+                raw_handle,
+                &mut completion_fence_fd,
+            )
+        };
+        // Adopt the fd before the error check: `success` says whether the flip happened, not
+        // whether an fd came back, and leaking it on the failure path would be the same bug.
+        let completion_fence = if completion_fence_fd >= 0 {
+            // SAFETY: the bridge transfers ownership of this fd to us, and it is only written when
+            // the export succeeded.
+            Some(unsafe { SafeDescriptor::from_raw_descriptor(completion_fence_fd) })
+        } else {
+            None
+        };
+        if !success {
+            return Err(anyhow::anyhow!(
+                "Android display Vulkan blit failed; switching to CPU fallback"
+            ));
+        }
+        // Park the fence for take_flip_completion_fence(). The caller (virtio_gpu.rs
+        // flush_resource) collects it and defers the RESOURCE_FLUSH virtio fence until it
+        // signals, which is what finally orders the guest's reuse of the source dmabuf against
+        // the async blit reading it (the bridge's own reclaimSlot() only bounds the AHB slots,
+        // not the source). An uncollected fence is closed on the next flip -- the old
+        // drop-immediately behaviour.
+        self.pending_flip_fence = completion_fence;
+        Ok(sync::Waitable::signaled())
+    }
+
+    fn take_flip_completion_fence(&mut self) -> Option<SafeDescriptor> {
+        self.pending_flip_fence.take()
     }
 }
 
 pub struct DisplayAndroid {
     context: Rc<AndroidDisplayContextWrapper>,
+    imports: Rc<RefCell<BTreeMap<u32, i64>>>,
+    surfaces: BTreeMap<u32, NonNull<AndroidDisplaySurface>>,
     /// This event is never triggered and is used solely to fulfill AsRawDescriptor.
     event: Event,
 }
@@ -213,21 +368,64 @@ impl DisplayAndroid {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
         Ok(DisplayAndroid {
             context: context.into(),
+            imports: Rc::new(RefCell::new(BTreeMap::new())),
+            surfaces: BTreeMap::new(),
             event,
         })
     }
 }
 
+impl Drop for DisplayAndroid {
+    fn drop(&mut self) {
+        let context = self.context.0.as_ptr();
+        let imports = std::mem::take(&mut *self.imports.borrow_mut());
+        for raw_handle in imports.into_values() {
+            // SAFETY: every handle was created by the matching native import call and is
+            // released before the context is dropped.
+            unsafe { android_display_release_import(context, raw_handle) };
+        }
+    }
+}
+
 impl DisplayT for DisplayAndroid {
+    fn is_dmabuf_import_supported(&mut self) -> bool {
+        // SAFETY: context is a live opaque handle owned by this DisplayAndroid.
+        unsafe { android_display_is_vulkan_blit_available(self.context.0.as_ptr()) }
+    }
+
+    /// The app already tells this side when nobody is watching: leaving the display view destroys
+    /// the SurfaceView, and the `removeSurface(forCursor=false)` that follows clears the native
+    /// window behind the scanout. That knowledge stopped at the C bridge -- the trait default
+    /// answered `true` regardless -- so the simplefb bridge went on reading a whole framebuffer out
+    /// of guest memory 30 times a second and copying it into a sink buffer that is never displayed.
+    ///
+    /// Answering honestly is only useful because the consumer of the answer is
+    /// `simplefb_display_loop`, and it is only safe there for the same reason: a frame may be
+    /// skipped on a `false` where the producer is a timer that will offer the next one anyway, so a
+    /// consumer that comes back is picked up on the following tick. A producer driven by the guest
+    /// (virtio-gpu's flush) never gets a second chance at a dropped frame and must not gate on this.
+    fn has_consumer(&self) -> bool {
+        // SAFETY: context is a live opaque handle owned by this DisplayAndroid.
+        unsafe { android_display_has_consumer(self.context.0.as_ptr()) }
+    }
+
     fn create_surface(
         &mut self,
         parent_surface_id: Option<u32>,
-        _surface_id: u32,
+        surface_id: u32,
         _scanout_id: Option<u32>,
         display_params: &DisplayParameters,
         _surf_type: SurfaceType,
     ) -> GpuDisplayResult<Box<dyn GpuDisplaySurface>> {
-        let (requested_width, requested_height) = display_params.get_virtual_display_size();
+        // A parented surface is virtio-gpu's cursor. Its scanout carries no display_params of its
+        // own, so crosvm passes DisplayParameters::default() -- sizing the cursor surface from
+        // that would configure it at the default DISPLAY resolution instead of the cursor plane's
+        // 64x64, and the Android side would allocate a full-screen buffer per pointer image.
+        let (requested_width, requested_height) = if parent_surface_id.is_some() {
+            (CURSOR_PLANE_SIZE, CURSOR_PLANE_SIZE)
+        } else {
+            display_params.get_virtual_display_size()
+        };
         // SAFETY: context is an opaque handle.
         let surface = NonNull::new(unsafe {
             create_android_surface(
@@ -238,11 +436,70 @@ impl DisplayT for DisplayAndroid {
             )
         })
         .ok_or(GpuDisplayError::CreateSurface)?;
+        self.surfaces.insert(surface_id, surface);
 
         Ok(Box::new(AndroidSurface {
             context: self.context.clone(),
             surface,
+            imports: self.imports.clone(),
+            pending_flip_fence: None,
         }))
+    }
+
+    fn import_resource(
+        &mut self,
+        import_id: u32,
+        surface_id: u32,
+        external_display_resource: crate::DisplayExternalResourceImport,
+    ) -> anyhow::Result<()> {
+        let crate::DisplayExternalResourceImport::Dmabuf {
+            descriptor,
+            offset,
+            stride,
+            modifiers,
+            linear_layout_verified,
+            width,
+            height,
+            fourcc,
+        } = external_display_resource
+        else {
+            return Err(anyhow::anyhow!(
+                "Android display only supports DMA-BUF imports"
+            ));
+        };
+
+        let surface = self
+            .surfaces
+            .get(&surface_id)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("invalid Android display surface {}", surface_id))?;
+        let raw_handle = unsafe {
+            android_display_import_dmabuf(
+                self.context.0.as_ptr(),
+                surface.as_ptr(),
+                descriptor.as_raw_descriptor(),
+                offset,
+                stride,
+                modifiers,
+                linear_layout_verified,
+                width,
+                height,
+                fourcc,
+            )
+        };
+        if raw_handle == 0 {
+            return Err(anyhow::anyhow!("Turnip DMA-BUF import failed"));
+        }
+        self.imports.borrow_mut().insert(import_id, raw_handle);
+        Ok(())
+    }
+
+    fn release_import(&mut self, import_id: u32, _surface_id: u32) {
+        // The common display wrapper owns the import id counter; remove the native
+        // object by id and let the shared map keep surface flips coherent.
+        if let Some((_, raw_handle)) = self.imports.borrow_mut().remove_entry(&import_id) {
+            unsafe { android_display_release_import(self.context.0.as_ptr(), raw_handle) };
+        }
     }
 }
 

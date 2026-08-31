@@ -438,6 +438,7 @@ impl GpuDisplaySurface for XSurface {
             framebuffer.as_volatile_slice(),
             framebuffer.stride() as u32,
             bytes_per_pixel,
+            crate::DRM_FORMAT_XRGB8888,
         ))
     }
 

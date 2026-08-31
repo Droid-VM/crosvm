@@ -46,6 +46,16 @@ pub enum AudioDeviceMode {
     OneGlobal,
 }
 
+/// What gfxstream does when its host-visible folio budget is exhausted or a collapse fails.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum VramExceedPolicy {
+    /// Keep the allocation on ordinary 4 KiB pages.
+    Fallback,
+    /// Fail the Vulkan allocation.
+    Oom,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, default, rename_all = "kebab-case")]
 pub struct GpuParameters {
@@ -93,6 +103,33 @@ pub struct GpuParameters {
     // When running with device sandboxing, the path of a directory available for
     // scratch space.
     pub snapshot_scratch_path: Option<PathBuf>,
+    // DroidVM gfxstream host-visible VRAM quota and folio policy. These are renderer allocation
+    // knobs, plumbed to gfxstream as GFXSTREAM_VRAM_* env before the GPU process forks.
+    //   vram-limit=<MB>: N>0 = cap; 0 = unmetered; -1 = explicitly unlimited (still counts as
+    //   "defined", which enables fusion routing together with a --pre-alloc gfx pool).
+    // Not exported when udmabuf=true: in guest-alloc mode the pool itself is the cap.
+    pub vram_limit: Option<i64>,
+    // Allocations at least this large are rounded and collapsed into 2 MiB folios before gfxstream
+    // creates the udmabuf imported by the host Vulkan driver. 0 means every allocation.
+    pub vram_folio_threshold_kb: Option<u64>,
+    // On folio quota/collapse failure, either keep ordinary pages or fail the allocation.
+    pub vram_exceed_policy: Option<VramExceedPolicy>,
+    // CMDLINE_V2 v3 fusion size gate: host-visible allocations <= this (KB) try the pre-alloc
+    // pool first; larger ones go straight to the runtime-SHARE path. Only effective when fusion
+    // routing is enabled (udmabuf=false AND vram-limit defined AND a --pre-alloc gfx pool exists);
+    // otherwise forced 0 (= no gate). Plumbed to gfxstream as GFXSTREAM_POOL_BLOB_MAX_KB.
+    pub pool_blob_max_kb: Option<u64>,
+    // Guest-alloc (udmabuf=true) pool partition: the host-owned slice (MB) of the gfx pre-alloc
+    // pool that serves ALL gfx host-alloc requests (ASG rings, stray HOST3D blobs); exhausted =>
+    // runtime-share fallback (module present) or clean per-client failure. The remainder is the
+    // guest slice (announced to the guest driver via capset). gfx- prefix = per-proxy namespace
+    // (other proxy variants may follow). Ignored when udmabuf=false (whole pool is host-owned).
+    // Plumbed to gfxstream as GFXSTREAM_POOL_HOST_MB.
+    pub gfx_host_pre_alloc_mb: Option<u64>,
+    // gunyah-pvm: gate the Gunyah pVM-specific gfxstream behavior (pin RingBlob backing so the
+    // permanent Gunyah SHARE mapping stays stable). Only Qualcomm/Gunyah needs it; leave off on
+    // other SoCs (MediaTek, Tensor, ...). Plumbed to GFXSTREAM_GUNYAH_PIN_RINGBLOB.
+    pub gunyah_pvm: Option<bool>,
 }
 
 impl Default for GpuParameters {
@@ -113,7 +150,7 @@ impl Default for GpuParameters {
             cache_path: None,
             cache_size: None,
             pci_address: None,
-            pci_bar_size: (1 << 33),
+            pci_bar_size: (1 << 28),
             udmabuf: false,
             capset_mask: 0,
             external_blob: false,
@@ -121,10 +158,21 @@ impl Default for GpuParameters {
             // TODO(b/324649619): not yet fully compatible with other platforms (windows)
             // TODO(b/246334944): gfxstream may map vulkan opaque blobs directly (without vulkano),
             // so set the default to disabled when built with the gfxstream feature.
+            //
+            // Gunyah note: the SingleMappingOnFirst ("persistent BAR") path does NOT work — it
+            // SHAREs a BAR-sized PROT_NONE arena, which Gunyah rejects (no backing to pin). Keep
+            // DynamicPerMapping (per-blob SHARE), matching qemu-android-gunyah; each blob must be
+            // backed by an exportable memfd (see AcquireGunyahRingBlob -> CreateWithShmem).
             fixed_blob_mapping: cfg!(target_os = "linux") && !cfg!(feature = "gfxstream"),
             allow_implicit_render_server_exec: false,
             renderer_features: None,
             snapshot_scratch_path: None,
+            vram_limit: None,
+            vram_folio_threshold_kb: None,
+            vram_exceed_policy: None,
+            pool_blob_max_kb: None,
+            gfx_host_pre_alloc_mb: None,
+            gunyah_pvm: None,
         }
     }
 }

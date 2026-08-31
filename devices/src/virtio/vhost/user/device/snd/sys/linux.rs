@@ -47,6 +47,12 @@ pub struct Options {
     /// Example: [capture=true,backend=BACKEND,
     /// num_output_devices=1,num_input_devices=1,num_output_streams=1,num_input_streams=1]
     params: Parameters,
+
+    #[argh(option, arg_name = "JSON", hidden_help)]
+    /// JSON-encoded parameters, used when crosvm spawns this backend itself. The key=value form
+    /// of --config cannot round-trip the nested per-device configuration, and a backend crosvm
+    /// launched does not need a human-writable command line. Takes precedence over --config.
+    config_json: Option<String>,
 }
 
 fn snd_parameters_from_str(input: &str) -> Result<Parameters, String> {
@@ -56,8 +62,12 @@ fn snd_parameters_from_str(input: &str) -> Result<Parameters, String> {
 /// Starts a vhost-user snd device.
 /// Returns an error if the given `args` is invalid or the device fails to run.
 pub fn run_snd_device(opts: Options) -> anyhow::Result<()> {
+    let params = match opts.config_json.as_deref() {
+        Some(json) => serde_json::from_str(json).context("failed to parse --config-json")?,
+        None => opts.params,
+    };
     let ex = Executor::new().context("Failed to create executor")?;
-    let snd_device = Box::new(SndBackend::new(&ex, opts.params, 0)?);
+    let snd_device = Box::new(SndBackend::new(&ex, params, 0)?);
 
     let conn =
         BackendConnection::from_opts(opts.socket.as_deref(), opts.socket_path.as_deref(), opts.fd)?;

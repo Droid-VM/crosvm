@@ -66,6 +66,14 @@ extern "C" fn AAudioStreamBuilder_setChannelCount(
 }
 
 #[no_mangle]
+extern "C" fn AAudioStreamBuilder_setDeviceId(
+    _builder: *mut AAudioStreamBuilder,
+    _device_id: i32,
+) {
+    unimplemented!();
+}
+
+#[no_mangle]
 extern "C" fn AAudioStreamBuilder_openStream(
     _builder: *mut AAudioStreamBuilder,
     _stream: *mut *mut AAudioStream,

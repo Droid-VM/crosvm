@@ -220,6 +220,9 @@ pub type virgl_log_callback_type = ::std::option::Option<
     ),
 >;
 extern "C" {
+    pub fn virgl_set_log_level(log_level: virgl_log_level_flags);
+}
+extern "C" {
     pub fn virgl_renderer_resource_create(
         args: *mut virgl_renderer_resource_create_args,
         iov: *mut iovec,
@@ -431,6 +434,16 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
+    pub fn virgl_renderer_resource_get_map_ptr(
+        res_handle: u32,
+        out_map: *mut *mut ::std::os::raw::c_void,
+        out_size: *mut u64,
+    ) -> ::std::os::raw::c_int;
+    pub fn virgl_renderer_resource_set_guest_blob_fd(
+        ctx_id: u32,
+        blob_id: u64,
+        fd: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
     pub fn virgl_renderer_resource_map(
         res_handle: u32,
         map: *mut *mut ::std::os::raw::c_void,
@@ -448,6 +461,13 @@ extern "C" {
 }
 extern "C" {
     pub fn virgl_renderer_resource_export_blob(
+        res_id: u32,
+        fd_type: *mut u32,
+        fd: *mut ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+extern "C" {
+    pub fn virgl_renderer_resource_export_display_blob(
         res_id: u32,
         fd_type: *mut u32,
         fd: *mut ::std::os::raw::c_int,

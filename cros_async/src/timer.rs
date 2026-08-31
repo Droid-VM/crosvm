@@ -55,6 +55,17 @@ impl TimerAsync<Timer> {
     /// NOTE: on Windows, this sleep may wake early. See `base::Timer` docs
     /// for details.
     pub async fn sleep(ex: &Executor, dur: Duration) -> std::result::Result<(), Error> {
+        // A zero duration means "do not wait", but an itimerspec of zero *disarms* a timerfd, so
+        // arming one with it produces a descriptor that never becomes readable and a sleep that
+        // never returns. Callers pacing against a wall-clock schedule reach zero the moment they
+        // fall behind it, which on a phone is a matter of time rather than a possibility, so the
+        // cost of getting this wrong is the whole task wedged. Ask for the shortest armed timer
+        // instead of the disarmed one; the executor still gets its poll.
+        let dur = if dur.is_zero() {
+            Duration::from_nanos(1)
+        } else {
+            dur
+        };
         let mut tfd = Timer::new().map_err(Error::Timer)?;
         tfd.reset_oneshot(dur).map_err(Error::Timer)?;
         let t = TimerAsync::new(tfd, ex).map_err(Error::TimerAsync)?;

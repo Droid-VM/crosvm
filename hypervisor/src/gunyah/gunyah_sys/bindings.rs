@@ -73,6 +73,57 @@ pub struct gh_userspace_memory_region {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
+pub struct gh_vm_share_blob {
+    pub label: u32,
+    pub flags: u32,
+    pub guest_phys_addr: u64,
+    pub memory_size: u64,
+    pub userspace_addr: u64,
+    pub mem_handle: u32,
+    pub padding: u32,
+}
+/// ABI for the standalone `gunyah_share_mod` kernel module (`/dev/gunyah_share`).
+///
+/// The in-tree `GH_VM_ANDROID_SHARE_BLOB` ioctl lives on the gunyah VM fd, but the
+/// out-of-tree module cannot inject a case into `gh_vm_ioctl()`, so it exposes its own
+/// `/dev/gunyah_share` char device and takes the VM fd as the `vm_fd` field instead.
+/// Layout must match `struct ghsm_share_blob` in `uapi_gunyah_share.h` byte-for-byte.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct ghsm_share_blob {
+    pub vm_fd: i32,
+    pub label: u32,
+    pub flags: u32,
+    pub mem_handle: u32,
+    pub guest_phys_addr: u64,
+    pub memory_size: u64,
+    pub userspace_addr: u64,
+}
+/// Share a DMA-BUF without trying to GUP its userspace mmap.
+/// Layout must match `struct ghsm_share_dmabuf` in `uapi_gunyah_share.h` byte-for-byte.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct ghsm_share_dmabuf {
+    pub vm_fd: i32,
+    pub dmabuf_fd: i32,
+    pub label: u32,
+    pub flags: u32,
+    pub mem_handle: u32,
+    pub reserved: u32,
+    pub guest_phys_addr: u64,
+    pub memory_size: u64,
+    pub dmabuf_offset: u64,
+}
+/// Reclaim a blob previously shared via `GHSM_SHARE_BLOB`, by its label.
+/// Layout must match `struct ghsm_unshare_blob` in `uapi_gunyah_share.h` byte-for-byte.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct ghsm_unshare_blob {
+    pub vm_fd: i32,
+    pub label: u32,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
 pub struct gh_vm_dtb_config {
     pub guest_phys_addr: u64,
     pub size: u64,

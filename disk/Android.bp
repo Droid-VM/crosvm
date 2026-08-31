@@ -51,7 +51,9 @@ rust_test {
         "libuuid", // Added manually
         "libvm_memory",
         "libzerocopy",
-        "libzstd_rust", // Added manually: qcow2 zstd cluster decompression (C libzstd)
+    ],
+    static_libs: [
+        "libzstd", // Added manually: qcow2 zstd cluster decompression (C libzstd)
     ],
     proc_macros: [
         "libasync_trait",
@@ -92,7 +94,9 @@ rust_library {
         "libuuid", // Added manually
         "libvm_memory",
         "libzerocopy",
-        "libzstd_rust", // Added manually: qcow2 zstd cluster decompression (C libzstd)
+    ],
+    static_libs: [
+        "libzstd", // Added manually: qcow2 zstd cluster decompression (C libzstd)
     ],
     proc_macros: [
         "libasync_trait",

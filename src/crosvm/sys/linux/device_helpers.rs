@@ -140,6 +140,8 @@ pub enum DeviceControlTube {
     // Sends `GpuControlCommand`.
     #[cfg(feature = "gpu")]
     Gpu(Tube),
+    // Sends `GunyahAcceptRequest` (VmAccept::Sync transport); held by the vm_memory handler.
+    GunyahAccept(Tube),
     // Sends `PvClockCommand`.
     #[cfg(feature = "pvclock")]
     PvClock(Tube),
@@ -525,13 +527,39 @@ pub fn create_rng_device(
     })
 }
 
+/// virtio-gunyah-accept: transport for VmAccept::Sync runtime attaches on protected Gunyah.
+/// `tube` is the device end for accept notifications; `pool_tube` is a second device end used
+/// only by the pool worker for its RegisterMemory round trips. Two tubes and two worker threads,
+/// because a grow makes the pool worker wait on a share whose completion needs the accept worker.
+pub fn create_gunyah_accept_device(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    tube: Tube,
+    pool_tube: Tube,
+) -> DeviceResult {
+    let dev = virtio::GunyahAccept::new(virtio::base_features(protection_type), tube, pool_tube);
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "gunyah_accept_device")?,
+    })
+}
+
 #[cfg(feature = "audio")]
 pub fn create_virtio_snd_device(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,
     snd_params: SndParameters,
     snd_device_tube: Tube,
+    worker_process_pids: &mut BTreeSet<Pid>,
 ) -> DeviceResult {
+    if snd_params.uid.is_some() {
+        return create_unprivileged_virtio_snd_device(
+            protection_type,
+            snd_params,
+            worker_process_pids,
+        );
+    }
     let backend = snd_params.backend;
     let dev = virtio::snd::common_backend::VirtioSnd::new(
         virtio::base_features(protection_type),
@@ -579,6 +607,47 @@ pub fn create_virtio_snd_device(
     })
 }
 
+/// Builds a virtio-snd device whose audio backend runs as `uid` in a child process.
+///
+/// The guest cannot tell this apart from the in-process device: vhost-user moves the virtqueue
+/// handling to the other side of a socket, but the device the guest enumerates is the same one.
+/// See `snd_helper` for why the backend cannot simply stay here.
+fn create_unprivileged_virtio_snd_device(
+    protection_type: ProtectionType,
+    mut snd_params: SndParameters,
+    worker_process_pids: &mut BTreeSet<Pid>,
+) -> DeviceResult {
+    // The backend process builds its own feature set out of nothing but these parameters, and the
+    // frontend below can only mask against what the backend offers -- so the one thing the backend
+    // cannot work out for itself, that this VM's memory is not the host's to address, has to be
+    // carried across. Same rule `base_features` applies to every in-process device.
+    snd_params.access_platform = protection_type != ProtectionType::Unprotected;
+
+    let (vmm_end, pid) = crate::crosvm::sys::linux::snd_helper::launch(snd_params)
+        .context("failed to launch the unprivileged snd backend")?;
+    // So that the child exiting is not reported as a device crashing.
+    worker_process_pids.insert(pid);
+
+    let connection = vmm_end
+        .try_into()
+        .context("failed to create a vhost-user connection to the snd backend")?;
+
+    let dev = VhostUserFrontend::new(
+        virtio::DeviceType::Sound,
+        virtio::base_features(protection_type),
+        connection,
+        None,
+        None,
+    )
+    .context("failed to set up the vhost-user frontend for snd")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // No sandbox here: virtqueue handling happens in the backend process.
+        jail: None,
+    })
+}
+
 #[cfg(feature = "vtpm")]
 pub fn create_vtpm_proxy_device(
     protection_type: ProtectionType,
@@ -619,6 +688,34 @@ pub fn create_single_touch_device<T: IntoUnixStream>(
         .context("failed configuring virtio single touch")?;
 
     let dev = virtio::input::new_single_touch(
+        idx,
+        socket,
+        width,
+        height,
+        name,
+        virtio::base_features(protection_type),
+    )
+    .context("failed to set up input device")?;
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
+pub fn create_absolute_mouse_device<T: IntoUnixStream>(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    absolute_mouse_socket: T,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+    idx: u32,
+) -> DeviceResult {
+    let socket = absolute_mouse_socket
+        .into_unix_stream()
+        .context("failed configuring virtio absolute mouse")?;
+
+    let dev = virtio::input::new_absolute_mouse(
         idx,
         socket,
         width,
@@ -730,7 +827,10 @@ pub fn create_mouse_device<T: IntoUnixStream>(
         .into_unix_stream()
         .context("failed configuring virtio mouse")?;
 
-    let dev = virtio::input::new_mouse(idx, socket, virtio::base_features(protection_type))
+    // `--input mouse` takes no name=: a relative pointer carries no output binding (it walks from
+    // one output to the next and the compositor follows focus), so there is nothing for a
+    // per-device name to key a mapping to.
+    let dev = virtio::input::new_mouse(idx, socket, None, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -743,13 +843,17 @@ pub fn create_keyboard_device<T: IntoUnixStream>(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,
     keyboard_socket: T,
+    name: Option<&str>,
     idx: u32,
 ) -> DeviceResult {
     let socket = keyboard_socket
         .into_unix_stream()
         .context("failed configuring virtio keyboard")?;
 
-    let dev = virtio::input::new_keyboard(idx, socket, virtio::base_features(protection_type))
+    // Named, unlike the relative mouse above: a keyboard belongs to a scanout, so a VM has one per
+    // screen and the guest's device list needs them told apart. `None` keeps the generated
+    // "Crosvm Virtio Keyboard <idx>", which still fits a lone unnamed keyboard.
+    let dev = virtio::input::new_keyboard(idx, socket, name, virtio::base_features(protection_type))
         .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
@@ -1245,6 +1349,7 @@ pub fn create_fs_device(
     ugid: (Option<u32>, Option<u32>),
     uid_map: &str,
     gid_map: &str,
+    supp_gids: &[u32],
     src: &Path,
     tag: &str,
     fs_cfg: virtio::fs::Config,
@@ -1267,7 +1372,33 @@ pub fn create_fs_device(
         };
         create_sandbox_minijail(src, max_open_files, &config)?
     } else {
-        create_base_minijail(src, max_open_files)?
+        // Sandboxing off still forks and pivot_roots this device (fs and 9p always do), so the
+        // identity it runs as is still ours to choose -- and `uid`/`gid` used to be quietly
+        // ignored on this path, which made them look like sandbox-only options when what they
+        // describe is a real host uid. Honour them here too, so a file server can serve as
+        // somebody other than root without dragging in seccomp and user namespaces (neither of
+        // which this build has: EMBEDDED_BPFS is empty on Android, b/246968493).
+        //
+        // minijail_enter() applies these after the pivot_root and in exactly this order --
+        // setgroups, then setresgid, then setresuid -- which is the only order that works: each
+        // step needs the privilege the next one gives away.
+        //
+        // Supplementary groups are set only here. The sandboxed path runs inside a user namespace
+        // with setgroups denied (`namespace_user_disable_setgroups`), where the setgroups(2) this
+        // asks for would fail and take the process down with it.
+        let mut jail = create_base_minijail(src, max_open_files)?;
+        if !supp_gids.is_empty() {
+            jail.set_supplementary_gids(supp_gids);
+        }
+        // libminijail treats a change to 0 as a caller mistake and aborts the process, so a
+        // caller that means "stay root" has to say it by leaving these unset.
+        if let Some(gid) = ugid.1.filter(|g| *g != 0) {
+            jail.change_gid(gid);
+        }
+        if let Some(uid) = ugid.0.filter(|u| *u != 0) {
+            jail.change_uid(uid);
+        }
+        jail
     };
 
     let features = virtio::base_features(protection_type);
