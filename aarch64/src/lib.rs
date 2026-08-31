@@ -629,29 +629,48 @@ fn get_vcpu_mpidr_aff<Vcpu: VcpuAArch64>(vcpus: &[Vcpu], index: usize) -> Option
     Some(vcpus.get(index)?.get_mpidr().ok()? & MPIDR_AFF_MASK)
 }
 
-/// Whether the GPU/test pools come out of the VM's system RAM instead of being added on top.
-///
-/// `--pre-alloc alloc-from-vm-sys-ram=true` (bridged to the environment with every other pool
-/// size, before anything reads the layout).
-fn pools_from_sys_ram() -> bool {
-    std::env::var("NCTX_POOL_FROM_SYSRAM")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
+/// One pre-allocated pool, as both the layout and the sys-RAM accounting need to see it.
+struct PoolSpec {
+    /// For the log line that reports the layout.
+    name: &'static str,
+    size: u64,
+    purpose: MemoryRegionPurpose,
+    /// Whether this pool's `prealloc` comes out of `--mem` rather than being added on top of it.
+    ///
+    /// Purely accounting, and nothing else: the pool is laid out in the same place either way, at
+    /// the same size, shared and grown the same. All this decides is whether `--mem` is made
+    /// smaller by the pool's pre-shared prefix first -- which is the same VM the operator would
+    /// get by typing that smaller number themselves, and exactly why it is safe to set on any
+    /// pool whatever it is for and whether or not it grows.
+    ///
+    /// Internal to crosvm on purpose: no CLI reaches it. A pool is either the kind that belongs
+    /// inside a VM's memory budget or it is not, and that is a property of what the pool is for,
+    /// not something an operator should have to get right per VM.
+    consume_system_mem: bool,
+    /// Bytes SHARE'd before boot; the rest is granted at runtime in `step` chunks.
+    prealloc: u64,
+    step: u64,
+    max_grants: u32,
+    /// Guest-physical address space to leave empty in front of the pool. Diagnostic; test only.
+    gap_before: u64,
 }
 
-/// How much of `--mem` the pools take when they take it from there, padding included.
+/// Every pool the layout can create, in the order it lays them out.
 ///
-/// Every pool the layout below can create is counted, each rounded up to the 2 MiB its region is
-/// aligned to, plus the diagnostic gap a test pool can ask for -- that is address space rather
-/// than memory, but it still has to fit inside `--mem` along with everything else.
+/// This list is the only place a pool is written down. It used to be written down twice -- an
+/// env-var array for the accounting and a block per pool in the layout -- and the two could
+/// disagree, which the reconciliation log at the end of the layout existed to notice after the
+/// fact. A pool added to one and not the other silently came out of the space above the pools,
+/// which belongs to the swiotlb and the framebuffer.
 ///
-/// This reads the same environment the layout does, which means the two can drift. They cannot
-/// drift silently: the layout logs what it set aside against what it went on to use, and says so
-/// when the second is larger.
-fn sys_ram_pool_bytes() -> u64 {
-    if !pools_from_sys_ram() {
-        return 0;
-    }
+/// `consume_system_mem` is per pool, and the three HOST pools fix it to true. They hold a
+/// renderer's own command-stream buffers -- tens of MiB, and only for whichever renderer the VM
+/// happens to run -- so adding them on top of `--mem` would make what a VM costs depend on a
+/// choice that has nothing to do with how much memory it was given. Splitting a fixed reserve
+/// between VMs then means doing that arithmetic by hand, per VM, to answer "will two of these
+/// fit". The guest pool is the opposite: it is the VM's VRAM, it is sized deliberately, and it is
+/// already in anyone's budget, so it stays additive unless asked otherwise.
+fn pool_specs() -> Vec<PoolSpec> {
     let mb = |name: &str| -> u64 {
         std::env::var(name)
             .ok()
@@ -659,51 +678,159 @@ fn sys_ram_pool_bytes() -> u64 {
             .unwrap_or(0)
             << 20
     };
+    let mut out = Vec::new();
+
+    let gfx = mb("NCTX_GFX_POOL_MB");
+    if gfx != 0 {
+        out.push(PoolSpec {
+            name: "gfx_host",
+            size: gfx,
+            purpose: MemoryRegionPurpose::GpuPool,
+            consume_system_mem: true,
+            prealloc: gfx,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    let guest = mb("NCTX_GFX_GUEST_POOL_MB");
+    if guest != 0 {
+        let prealloc = std::env::var("NCTX_GFX_GUEST_POOL_PREALLOC_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|v| v << 20)
+            .unwrap_or(guest);
+        out.push(PoolSpec {
+            name: "gpu_guest",
+            size: guest,
+            purpose: MemoryRegionPurpose::GpuPoolGuest,
+            // The VRAM the operator asked for, on top of the RAM they asked for. Flipping this
+            // to true would fold it into `--mem` like the host pools -- a one-word change, but it
+            // redefines what the app's "video memory" field means against the memory field beside
+            // it, so it is the app's decision to make, not a default to drift into.
+            consume_system_mem: false,
+            prealloc: prealloc.min(guest),
+            step: mb("NCTX_GFX_GUEST_POOL_STEP_MB"),
+            max_grants: std::env::var("NCTX_GFX_GUEST_POOL_MAX_GRANTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
+            gap_before: 0,
+        });
+    }
+
+    let drm = mb("NCTX_DRM2KGSL_POOL_MB");
+    if drm != 0 {
+        out.push(PoolSpec {
+            name: "drm2kgsl_host",
+            size: drm,
+            purpose: MemoryRegionPurpose::Drm2KgslPool,
+            consume_system_mem: true,
+            prealloc: drm,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    let venus = mb("NCTX_VENUS_POOL_MB");
+    if venus != 0 {
+        out.push(PoolSpec {
+            name: "venus_host",
+            size: venus,
+            purpose: MemoryRegionPurpose::VenusPool,
+            consume_system_mem: true,
+            prealloc: venus,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    for suffix in ["", "_2"] {
+        let size = mb(&format!("DROIDVM_TEST_POOL{}_MB", suffix));
+        if size == 0 {
+            continue;
+        }
+        let prealloc = std::env::var(format!("DROIDVM_TEST_POOL{}_PREALLOC_MB", suffix))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|v| v << 20)
+            .unwrap_or(size);
+        out.push(PoolSpec {
+            name: if suffix.is_empty() { "test" } else { "test_2" },
+            size,
+            purpose: MemoryRegionPurpose::DynamicTestPool,
+            // Test scaffolding: additive, so a test pool never moves the guest's RAM out from
+            // under whatever is being measured.
+            consume_system_mem: false,
+            prealloc: prealloc.min(size),
+            step: mb(&format!("DROIDVM_TEST_POOL{}_STEP_MB", suffix)),
+            // One grant is one memparcel and the VM-wide limit is 1024, shared with Android's
+            // own. 64 is deliberately far below it: this pool is for testing, and exhausting
+            // the quota takes the phone down until it reboots.
+            max_grants: 64,
+            gap_before: mb(&format!("DROIDVM_TEST_POOL{}_GAP_MB", suffix)),
+        });
+    }
+    out
+}
+
+/// How much of `--mem` the pools take out of it, rounded to the folios the host backs them in.
+///
+/// A pool's `prealloc`, not its `size`: that is what is really held when the VM boots. The rest of
+/// a growable pool's window is address space with nothing behind it until the guest asks for a
+/// grant, and a grant is memory the VM did not have a moment earlier -- so charging for it up
+/// front would make a VM cost less than `--mem` at boot, which is the same kind of arithmetic by
+/// hand this is trying to remove, only in the other direction.
+///
+/// `gap_before` is not counted: it is address space, and address space no longer comes out of
+/// `--mem` now that the pools sit above the block rather than inside it.
+fn sys_ram_pool_bytes() -> u64 {
     let folio = 2 << 20;
-    [
-        "NCTX_GFX_POOL_MB",
-        "NCTX_GFX_GUEST_POOL_MB",
-        "NCTX_DRM2KGSL_POOL_MB",
-        "NCTX_VENUS_POOL_MB",
-        "DROIDVM_TEST_POOL_MB",
-        "DROIDVM_TEST_POOL_GAP_MB",
-        "DROIDVM_TEST_POOL_2_MB",
-        "DROIDVM_TEST_POOL_2_GAP_MB",
-    ]
-    .iter()
-    .map(|name| mb(name).next_multiple_of(folio))
-    .sum()
+    pool_specs()
+        .iter()
+        .filter(|p| p.consume_system_mem)
+        .map(|p| p.prealloc.next_multiple_of(folio))
+        .sum()
+}
+
+/// The height of the block `--mem` describes: guest RAM, the simplefb and the swiotlb, and nothing
+/// else. Everything anchored to the top of the VM's memory is anchored to this.
+///
+/// `--mem` minus what the pools take out of it. The pools' windows then start where this ends, so
+/// what the VM holds at boot is the block plus every pool's pre-shared prefix -- which adds back
+/// up to `--mem` exactly when every pool comes out of it, and grows past `--mem` only when a
+/// growable pool is actually granted more.
+fn vm_block_size(components: &VmComponents) -> u64 {
+    let pools = sys_ram_pool_bytes();
+    if pools >= components.memory_size {
+        base::error!(
+            "GH-POOL: pools want {:#x} of a {:#x} VM; not taking them out of its RAM",
+            pools,
+            components.memory_size,
+        );
+        return components.memory_size;
+    }
+    components.memory_size - pools
 }
 
 fn main_memory_size(components: &VmComponents, hypervisor: &(impl Hypervisor + ?Sized)) -> u64 {
-    // Static swiotlb and simplefb are allocated from the end of RAM as separate
-    // memory regions (for Gunyah), so make the main region smaller.
-    let mut main_memory_size = components.memory_size;
+    // Static swiotlb and simplefb are allocated from the end of the block as separate memory
+    // regions (for Gunyah), so make the main region smaller. The block itself is already smaller
+    // than `--mem` by whatever the pools took; see `vm_block_size`.
+    let block = vm_block_size(components);
+    let mut main_memory_size = block;
     if hypervisor.check_capability(HypervisorCap::StaticSwiotlbAllocationRequired) {
         if let Some(size) = components.swiotlb {
             main_memory_size -= size;
         }
         if let Some(ref sfb) = components.simplefb {
-            main_memory_size -= get_simplefb_size(
-                sfb,
-                components.memory_size,
-                components.swiotlb,
-                hypervisor,
-            );
+            main_memory_size -= get_simplefb_size(sfb, block, components.swiotlb, hypervisor);
         }
     }
-    // The pools, when they are asked to come out of the VM rather than out of the host on top of
-    // it. Everything else about them is unchanged -- same size, same address, same sharing.
-    let pools = sys_ram_pool_bytes();
-    if pools >= main_memory_size {
-        base::error!(
-            "GH-POOL: pools want {:#x} of a {:#x} VM; not taking them out of its RAM",
-            pools,
-            main_memory_size,
-        );
-        return main_memory_size;
-    }
-    main_memory_size - pools
+    main_memory_size
 }
 
 pub struct ArchMemoryLayout {
@@ -835,7 +962,7 @@ impl arch::LinuxArch for AArch64 {
         }
 
         if let Some(size) = components.swiotlb {
-            if let Some(addr) = get_swiotlb_addr(components.memory_size, size, hypervisor) {
+            if let Some(addr) = get_swiotlb_addr(vm_block_size(components), size, hypervisor) {
                 memory_regions.push((
                     addr,
                     size,
@@ -844,217 +971,65 @@ impl arch::LinuxArch for AArch64 {
             }
         }
 
-        // DroidVM GPU pre-alloc pool: a swiotlb-style purpose region appended immediately
-        // AFTER guest RAM (the platform-MMIO + PCI windows stack above end_addr(), so they
-        // move up past the pool automatically — no window overlap, no special GPA formula).
-        // GunyahVm::new SHARE-blesses it (lend=false) and hugepage-prepares it; build_vm
-        // hands its memfd view to the gfxstream renderer (NCTX_GFX_POOL_MB) and emits the
-        // no-map reserved-memory node the Gunyah RM matches by `reg`. The guest learns the
-        // pool GPA dynamically (map_blob response), so moving it is transparent. Sized by
-        // NCTX_GFX_POOL_MB until CMDLINE_V2 moves this to a --gpu sub-option.
-        let gpu_pool_mb: u64 = std::env::var("NCTX_GFX_POOL_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        // Guest-alloc pool (gfx-guest-mb): a second SHARE'd region the guest virtio-gpu driver owns.
-        // Stacked immediately above the host pool; the platform-MMIO + PCI windows sit above
-        // end_addr() so they move up past both automatically.
-        let gpu_guest_pool_mb: u64 = std::env::var("NCTX_GFX_GUEST_POOL_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let gpu_guest_prealloc_mb: u64 = std::env::var("NCTX_GFX_GUEST_POOL_PREALLOC_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(gpu_guest_pool_mb);
-        let gpu_guest_step_mb: u64 = std::env::var("NCTX_GFX_GUEST_POOL_STEP_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let gpu_guest_max_grants: u32 = std::env::var("NCTX_GFX_GUEST_POOL_MAX_GRANTS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        // The pools stack above the top of `--mem`, unless they are being taken out of it -- in
-        // which case they stack above the RAM that has already been made smaller by exactly their
-        // size, and the whole VM still ends at the top of `--mem`. The swiotlb and the simplefb
-        // are anchored to that top and are already subtracted from the RAM below, so the span
-        // between the two is the pools' and nothing else's.
-        let from_sys_ram = pools_from_sys_ram();
-        let pool_floor = if from_sys_ram {
-            AARCH64_PHYS_MEM_START + main_memory_size
-        } else {
-            AARCH64_PHYS_MEM_START + components.memory_size
-        };
-        let mut pool_top = pool_floor;
-        if gpu_pool_mb != 0 {
-            memory_regions.push((
-                GuestAddress(pool_top),
-                gpu_pool_mb << 20,
-                MemoryRegionOptions::new()
-                    .purpose(MemoryRegionPurpose::GpuPool)
-                    .align(2 << 20)
-                    .alloc_from_vm_sys_ram(from_sys_ram)
-                    // Fully pre-shared: this pool does not grow. `growable_pool(size, 0)` is
-                    // the same thing the defaults already produce -- it is written out so the
-                    // intent is in the code rather than in an absent field, and so that turning
-                    // one of these into a growable pool is a visible edit here.
-                    .growable_pool(gpu_pool_mb << 20, 0),
-            ));
-            pool_top += gpu_pool_mb << 20;
-        }
-        if gpu_guest_pool_mb != 0 {
-            // 2 MiB-align the base (matches the pool align) so it never overlaps the host pool.
-            let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
-            let size = gpu_guest_pool_mb << 20;
-            let prealloc = gpu_guest_prealloc_mb << 20;
-            let step = gpu_guest_step_mb << 20;
-            memory_regions.push((
-                GuestAddress(base),
-                size,
-                MemoryRegionOptions::new()
-                    .purpose(MemoryRegionPurpose::GpuPoolGuest)
-                    .align(2 << 20)
-                    .alloc_from_vm_sys_ram(from_sys_ram)
-                    // The default remains fully pre-shared. With a non-zero step, the whole
-                    // window is declared in the guest but only the prealloc prefix is SHARE'd at
-                    // boot; the guest pool allocator grows and shrinks the suffix at runtime.
-                    .growable_pool(prealloc, step)
-                    .max_grants(gpu_guest_max_grants),
-            ));
-            pool_top = base + size;
-        }
-        // DRM native context HOST-alloc pool (--pre-alloc drm-host-mb): what virglrenderer's DRM
-        // backend sub-allocates from. Since BO backing moved to the guest pool above, this holds
-        // only the per-context msm shmem rings. Separate from GpuPool so a binary carrying both
-        // renderers cannot hand this one to gfxstream's HostVisiblePool.
-        let drm2kgsl_pool_mb: u64 = std::env::var("NCTX_DRM2KGSL_POOL_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if drm2kgsl_pool_mb != 0 {
-            let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
-            memory_regions.push((
-                GuestAddress(base),
-                drm2kgsl_pool_mb << 20,
-                MemoryRegionOptions::new()
-                    .purpose(MemoryRegionPurpose::Drm2KgslPool)
-                    .align(2 << 20)
-                    .alloc_from_vm_sys_ram(from_sys_ram)
-                    // Fully pre-shared: this pool does not grow. `growable_pool(size, 0)` is
-                    // the same thing the defaults already produce -- it is written out so the
-                    // intent is in the code rather than in an absent field, and so that turning
-                    // one of these into a growable pool is a visible edit here.
-                    .growable_pool(drm2kgsl_pool_mb << 20, 0),
-            ));
-        }
-
-        // venus (vkr) HOST-alloc transport pool (--pre-alloc venus-host-mb): where vkr's
-        // blob_id==0 shmems are served from (pool merge). Blessed like the others. The drm
-        // block above does not advance pool_top, so chain from the highest pushed region.
-        let venus_pool_mb: u64 = std::env::var("NCTX_VENUS_POOL_MB")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        if venus_pool_mb != 0 {
-            let top = memory_regions
-                .last()
-                .map(|(a, s, _)| a.offset() + *s)
-                .unwrap_or(pool_top)
-                .max(pool_top);
-            let base = (top + (2 << 20) - 1) & !((2 << 20) - 1);
-            memory_regions.push((
-                GuestAddress(base),
-                venus_pool_mb << 20,
-                MemoryRegionOptions::new()
-                    .purpose(MemoryRegionPurpose::VenusPool)
-                    .align(2 << 20)
-                    .alloc_from_vm_sys_ram(from_sys_ram)
-                    .growable_pool(venus_pool_mb << 20, 0),
-            ));
-            pool_top = base + (venus_pool_mb << 20);
-        }
-
-        // Growable TEST pool. Declared whole, SHARE'd only up to the prealloc prefix; the rest is
-        // granted at runtime. Unlike the three pools above this one really does have a non-zero
-        // step, so it is the only region for which the grant table and the host-access gate do
-        // anything.
-        // Up to two growable TEST pools. The suffixed env vars (…_2) declare a second pool so
-        // the two-pool / hole-in-the-middle grow+unshare path can be exercised. Each pool is
-        // declared whole, SHARE'd only up to its prealloc prefix, and grows in `step` chunks.
-        for suffix in ["", "_2"] {
-            let ev = |name: &str| -> Option<u64> {
-                std::env::var(format!("DROIDVM_TEST_POOL{}_{}", suffix, name))
-                    .ok()
-                    .and_then(|s| s.parse().ok())
-            };
-            // Base key is DROIDVM_TEST_POOL_MB (suffix "") / DROIDVM_TEST_POOL_2_MB (suffix "_2").
-            let test_pool_mb: u64 = std::env::var(format!("DROIDVM_TEST_POOL{}_MB", suffix))
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            if test_pool_mb == 0 {
-                continue;
-            }
-            let step_mb = ev("STEP_MB").unwrap_or(0);
-            // Default to fully pre-shared, i.e. an ordinary non-growable pool: asking for a test
-            // pool without saying how much of it to hold back should not change any behaviour.
-            let prealloc_mb = ev("PREALLOC_MB").unwrap_or(test_pool_mb);
-            // DROIDVM_TEST_POOL_GAP_MB (diagnostic): leave a hole of guest-physical address space
-            // in FRONT of this pool -- no region, no DT node, no shm vdevice, nothing SHARE'd.
-            // It is the pseudo-unprotected window in miniature: the layout covers it (ram_top and
-            // therefore size-max are computed from the pool above it), the guest is never told it
-            // exists, and the only way anything appears there is a runtime SHARE plus the guest's
-            // own MEM_ACCEPT. Measuring that on the sm8650-era RM is what the flag is for.
-            let gap = ev("GAP_MB").unwrap_or(0) << 20;
-            if gap != 0 {
+        // The DroidVM pre-alloc pools. Each is a swiotlb-style purpose region: GunyahVm::new
+        // SHARE-blesses it (lend=false) and hugepage-prepares it, build_vm hands its memfd view
+        // to the renderer that owns it, and the DT gets the no-map reserved-memory node the
+        // Gunyah RM matches by `reg`. The platform-MMIO and PCI windows stack above end_addr(),
+        // so they move up past whatever these take -- no window overlap, no special GPA formula.
+        // A guest learns a pool's GPA dynamically (map_blob response), so moving one is
+        // transparent to it.
+        //
+        // What each pool is, how big, and whether it comes out of `--mem`: `pool_specs`.
+        // One cursor, above everything `--mem` describes. A pool's window never sits inside the
+        // block: the block is only as tall as what the pools charged for, and a growable pool's
+        // window is larger than that by the part nothing is backing yet. Putting every window
+        // above the block instead is what lets `consume_system_mem` be about accounting alone --
+        // it decides how much shorter the block is, never where the pool goes -- so a pool can be
+        // growable and come out of `--mem` at the same time, which is the useful combination:
+        // it costs its `prealloc` at boot and costs more only when the guest is granted more.
+        //
+        // The platform-MMIO and PCI windows stack above end_addr(), so they move up past whatever
+        // this takes on their own.
+        let mut top = AARCH64_PHYS_MEM_START + vm_block_size(components);
+        for spec in pool_specs() {
+            if spec.gap_before != 0 {
+                // A hole of guest-physical address space in FRONT of the pool -- no region, no
+                // DT node, no shm vdevice, nothing SHARE'd. The pseudo-unprotected window in
+                // miniature: the layout covers it, the guest is never told it exists, and the
+                // only way anything appears there is a runtime SHARE plus the guest's own
+                // MEM_ACCEPT. Measuring that on the sm8650-era RM is what the flag is for.
+                let at = top.next_multiple_of(2 << 20);
                 base::info!(
-                    "GH-POOL: leaving a {:#x} byte hole at {:#x} before the {} test pool",
-                    gap,
-                    (pool_top + (2 << 20) - 1) & !((2 << 20) - 1),
-                    if suffix.is_empty() { "first" } else { "second" },
+                    "GH-POOL: leaving a {:#x} byte hole at {:#x} before the {} pool",
+                    spec.gap_before,
+                    at,
+                    spec.name,
                 );
-                pool_top = ((pool_top + (2 << 20) - 1) & !((2 << 20) - 1)) + gap;
+                top = at + spec.gap_before;
             }
-            let base = (pool_top + (2 << 20) - 1) & !((2 << 20) - 1);
-            let size = test_pool_mb << 20;
-            let prealloc = (prealloc_mb << 20).min(size);
-            let step = step_mb << 20;
+            let base = top.next_multiple_of(2 << 20);
             memory_regions.push((
                 GuestAddress(base),
-                size,
+                spec.size,
                 MemoryRegionOptions::new()
-                    .purpose(MemoryRegionPurpose::DynamicTestPool)
+                    .purpose(spec.purpose)
                     .align(2 << 20)
-                    .alloc_from_vm_sys_ram(from_sys_ram)
-                    .growable_pool(prealloc, step)
-                    // One grant is one memparcel and the VM-wide limit is 1024, shared with
-                    // Android's own. 64 is deliberately far below it: this pool is for testing,
-                    // and exhausting the quota takes the phone down until it reboots.
-                    .max_grants(64),
+                    // Written out even where it is the default the builder already produces, so
+                    // that turning one of these into a growable pool is a visible edit to its
+                    // entry in `pool_specs` rather than an absent field here.
+                    .growable_pool(spec.prealloc, spec.step)
+                    .max_grants(spec.max_grants),
             ));
-            pool_top = base + size;
-        }
-
-        // What was set aside against what was used. `sys_ram_pool_bytes` reads the environment a
-        // second time to answer a question that has to be answered before this code runs -- how
-        // much smaller to make the guest's RAM -- so a pool added here and not there would come
-        // out of the space above the pools, which belongs to the swiotlb and the framebuffer.
-        if from_sys_ram {
-            let reserved = sys_ram_pool_bytes();
-            let used = pool_top - pool_floor;
             base::info!(
-                "GH-POOL: {:#x} of --mem set aside for pools, {:#x} used",
-                reserved,
-                used,
+                "GH-POOL: {} pool {:#x}..{:#x} prealloc {:#x} step {:#x} ({} --mem)",
+                spec.name,
+                base,
+                base + spec.size,
+                spec.prealloc,
+                spec.step,
+                if spec.consume_system_mem { "out of" } else { "on top of" },
             );
-            if used > reserved {
-                base::error!(
-                    "GH-POOL: the pools overran what was set aside for them by {:#x} -- \
-                     sys_ram_pool_bytes() has fallen behind the layout",
-                    used - reserved,
-                );
-            }
+            top = base + spec.size;
         }
 
         // Add simplefb region as SharedFramebuffer.
@@ -1066,8 +1041,8 @@ impl arch::LinuxArch for AArch64 {
         // regular RAM, while allowing ioremap_wc() from the simplefb driver.
         // For non-Gunyah, the region stays at a fixed MMIO address (0x50000000).
         if let Some(ref sfb) = components.simplefb {
-            let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, hypervisor);
-            let fb_alloc = get_simplefb_size(sfb, components.memory_size, components.swiotlb, hypervisor);
+            let fb_addr = get_simplefb_addr(sfb, vm_block_size(components), components.swiotlb, hypervisor);
+            let fb_alloc = get_simplefb_size(sfb, vm_block_size(components), components.swiotlb, hypervisor);
             // 2 MiB-aligned like the pools, and for the pool reason: GunyahVm::new folds this
             // region into 2 MiB folios through its own mapping before anything can reference a
             // page, and MADV_COLLAPSE only forms a PMD where the virtual address and the file
@@ -1176,6 +1151,9 @@ impl arch::LinuxArch for AArch64 {
         let mem = vm.get_memory().clone();
 
         let main_memory_size = main_memory_size(&components, vm.get_hypervisor());
+        // Once, here: `components` is consumed field by field further down, and every anchor below
+        // needs the same number the layout used.
+        let vm_block = vm_block_size(&components);
 
         // Where the guest's RAM begins. In a pseudo-unprotected VM the bottom of the address
         // space is the shim's, the device tree's and the handoff page's; everything the payload
@@ -1696,8 +1674,8 @@ impl arch::LinuxArch for AArch64 {
         // For Gunyah: placed in RAM range, shared via set_user_memory_region + SHM node.
         // A reserved-memory no-map node prevents the kernel from using it as regular RAM.
         if let Some(ref sfb) = components.simplefb {
-            let fb_size_aligned = get_simplefb_size(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
-            let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
+            let fb_size_aligned = get_simplefb_size(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
+            let fb_addr = get_simplefb_addr(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
             let bpp: u32 = match sfb.format.as_str() {
                 "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
                 "r8g8b8" => 3,
@@ -1897,7 +1875,7 @@ impl arch::LinuxArch for AArch64 {
             psci_version,
             components.swiotlb.map(|size| {
                 (
-                    get_swiotlb_addr(components.memory_size, size, vm.get_hypervisor()),
+                    get_swiotlb_addr(vm_block, size, vm.get_hypervisor()),
                     size,
                 )
             }),
@@ -1917,8 +1895,8 @@ impl arch::LinuxArch for AArch64 {
                     _ => 4,
                 };
                 let stride = sfb.width * bpp;
-                let fb_addr = get_simplefb_addr(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
-                let fb_alloc = get_simplefb_size(sfb, components.memory_size, components.swiotlb, vm.get_hypervisor());
+                let fb_addr = get_simplefb_addr(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
+                let fb_alloc = get_simplefb_size(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
                 fdt::SimplefbDtConfig {
                     addr: fb_addr,
                     size: fb_alloc,

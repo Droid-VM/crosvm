@@ -2369,9 +2369,6 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Some(mb) = pa.venus_host_mb {
             std::env::set_var("NCTX_VENUS_POOL_MB", mb.to_string());
         }
-        if let Some(v) = pa.alloc_from_vm_sys_ram {
-            std::env::set_var("NCTX_POOL_FROM_SYSRAM", if v { "1" } else { "0" });
-        }
         if let Some(mb) = pa.test_pool_mb {
             std::env::set_var("DROIDVM_TEST_POOL_MB", mb.to_string());
         }
