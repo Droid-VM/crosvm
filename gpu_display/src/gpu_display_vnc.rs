@@ -51,6 +51,7 @@ extern "C" {
     fn vnc_server_create(
         width: c_int,
         height: c_int,
+        host: *const c_char,
         port: c_int,
         password: *const c_char,
     ) -> *mut std::ffi::c_void;
@@ -672,11 +673,22 @@ impl DisplayVnc {
     ) -> GpuDisplayResult<DisplayVnc> {
         let event = Event::new().map_err(|_| GpuDisplayError::CreateEvent)?;
 
-        let port = addr
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse::<c_int>().ok())
-            .unwrap_or(5900);
+        // "host:port", built by the two callers with the port last, so the LAST colon is the
+        // separator. That is what makes an unbracketed IPv6 literal work here: every colon of the
+        // address itself is before it. A bracketed host is unwrapped too, since that is how the
+        // rest of the world writes one.
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((h, p)) => (
+                h.trim_start_matches('[').trim_end_matches(']'),
+                p.parse::<c_int>().unwrap_or(5900),
+            ),
+            None => ("", 5900),
+        };
+        // The host reaches the bridge, which binds it: a literal of either family binds that
+        // family alone, a wildcard binds both. It used to be dropped on the floor here -- the port
+        // was all this function took out of `addr` -- so every VNC screen listened on every
+        // address whatever the config said.
+        let c_host = std::ffi::CString::new(host).map_err(|_| GpuDisplayError::Allocate)?;
 
         let c_password;
         let password_ptr = match &password {
@@ -689,11 +701,21 @@ impl DisplayVnc {
         };
 
         let server_ptr = unsafe {
-            vnc_server_create(width as c_int, height as c_int, port, password_ptr)
+            vnc_server_create(
+                width as c_int,
+                height as c_int,
+                c_host.as_ptr(),
+                port,
+                password_ptr,
+            )
         };
         if server_ptr.is_null() {
-            base::error!("VNC server failed to start on port {}", port);
-            return Err(GpuDisplayError::Allocate);
+            // Every way the bridge returns NULL is this same thing: a VNC server that was
+            // configured and could not be brought up. Reported as Listen rather than Allocate so
+            // the display chain treats it as a failure instead of a backend declining -- the
+            // bridge has already logged which family failed and why.
+            base::error!("VNC server failed to start on {}:{}", host, port);
+            return Err(GpuDisplayError::Listen(format!("{}:{}", host, port)));
         }
 
         unsafe {
@@ -710,7 +732,7 @@ impl DisplayVnc {
         };
 
         unsafe { vnc_server_start(server_ptr) };
-        base::info!("VNC server started on TCP port {}", port);
+        base::info!("VNC server started on {}:{}", host, port);
 
         let server = Arc::new(VncServerHandle { ptr: server_ptr });
 

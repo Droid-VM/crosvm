@@ -14,11 +14,14 @@ use base::info;
 use base::warn;
 use base::AsRawDescriptor;
 use base::SafeDescriptor;
+use base::SendTube;
+use base::VmEventType;
 use base::VolatileSlice;
 use base::WaitContext;
 use gpu_display::Damage;
 use gpu_display::DisplayExternalResourceImport;
 use gpu_display::GpuDisplay;
+use gpu_display::GpuDisplayError;
 use gpu_display::GpuDisplayExt;
 use gpu_display::PresentOutcome;
 use gpu_display::ScanoutFrame;
@@ -104,11 +107,20 @@ fn tick_duration(poll_hz: u32) -> Duration {
     Duration::from_nanos(1_000_000_000 / poll_hz.max(1) as u64)
 }
 
+/// Spawns the bridge.
+///
+/// `vm_evt_wrtube` is how the thread reports that the exporter it was given could not be opened at
+/// all. It is needed because the display is opened on the thread and not before it: `GpuDisplay`
+/// holds `Rc`s and cannot be moved across one, so the failure cannot be handed back to the caller
+/// as a `Result` the way the rest of VM setup reports things. Without it the thread's only option
+/// was to log and return, which left the VM running with the screen the user configured silently
+/// unexported -- the same failure this whole change is about, one layer up.
 pub fn start_simplefb_display_thread(
     guest_mem: GuestMemory,
     params: SimplefbDisplayParams,
     target: SimplefbDisplayTarget,
     transport_cap: TransportCap,
+    vm_evt_wrtube: SendTube,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("simplefb_display".into())
@@ -136,6 +148,17 @@ pub fn start_simplefb_display_thread(
             };
             let mut display = match display_result {
                 Ok(d) => d,
+                // An address that could not be listened on is a VM that is not what was asked for,
+                // so it stops rather than runs on: the bridge has already logged which family
+                // failed and why. Every other way a display can fail to open keeps the old
+                // behaviour -- the bridge gives up and the rest of the VM carries on.
+                Err(e @ GpuDisplayError::Listen(_)) => {
+                    error!("simplefb: {}; stopping the VM", e);
+                    if let Err(e) = vm_evt_wrtube.send::<VmEventType>(&VmEventType::Exit) {
+                        error!("simplefb: failed to request VM exit: {}", e);
+                    }
+                    return;
+                }
                 Err(e) => {
                     error!("simplefb: failed to open display: {:?}", e);
                     return;

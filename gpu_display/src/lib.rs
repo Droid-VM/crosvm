@@ -217,6 +217,16 @@ pub enum GpuDisplayError {
     /// An input/output error occured.
     #[error("an input/output error occur: {0}")]
     IoError(IoError),
+    /// The exporter could not take the address it was configured with.
+    ///
+    /// Kept apart from the errors above because it means something different to the caller. A
+    /// display backend that cannot open is usually declining -- the X entry on an Android host has
+    /// never opened and never will -- and the chain that tries backends in turn is built on that.
+    /// This one is not a decline: an address was named and the socket for it could not be had, so
+    /// falling through to the next backend would hand the user a VM that boots with the display
+    /// they asked for silently missing.
+    #[error("failed to listen on {0}")]
+    Listen(String),
     /// A required feature was missing.
     #[error("required feature was missing: {0}")]
     RequiredFeature(&'static str),
