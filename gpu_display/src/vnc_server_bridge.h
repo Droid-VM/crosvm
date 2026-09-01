@@ -33,7 +33,16 @@ struct vnc_input_event {
     uint8_t  button_mask;
 };
 
-vnc_server_t* vnc_server_create(int width, int height, int port, const char* password);
+/* Bring up the RFB server on `host`:`port`, or NULL on a `host` this cannot bind.
+ *
+ * `host` is a numeric address literal, or NULL/""/"0.0.0.0"/"::" for every address. A literal of
+ * either family binds that family alone; a wildcard binds both, which is what this server did
+ * before it was given a host at all. It is deliberately not a name: an IPv4 listen address reaches
+ * LibVNCServer as an in_addr with nowhere for a resolver to run, and quietly listening on
+ * everything because a name did not parse is the one failure a bind address must not have. A host
+ * that is neither a literal nor a wildcard is refused, and the display fails to open. */
+vnc_server_t* vnc_server_create(int width, int height, const char* host, int port,
+                                const char* password);
 void vnc_server_start(vnc_server_t* server);
 int vnc_server_has_input_events(vnc_server_t* server);
 int vnc_server_resize(vnc_server_t* server, int width, int height);

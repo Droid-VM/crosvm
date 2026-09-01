@@ -326,6 +326,15 @@ fn build(
                 display_opt = Some((display_backend, c));
                 break;
             }
+            // A backend that could not take its configured address is not declining, so it does
+            // not go on the list that the loop shrugs at and moves past: the next backend in the
+            // chain is a fallback for "this host has no such display", not for "the display this
+            // VM was configured with is unreachable". Fail here instead, which reaches
+            // Worker::new's caller and stops the VM coming up at all.
+            Err(e @ GpuDisplayError::Listen(_)) => {
+                error!("{}: {}", display_backend.name(), e);
+                return None;
+            }
             Err(e) => declined.push(format!("{}: {}", display_backend.name(), e)),
         };
     }

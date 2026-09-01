@@ -8,10 +8,14 @@
 
 #include <rfb/rfb.h>
 #include <rfb/keysym.h>
+#include <arpa/inet.h>
+#include <errno.h>
 #include <linux/input-event-codes.h>
+#include <netinet/in.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "vnc_frame_consumer.h"
@@ -294,7 +298,129 @@ struct vnc_h264_rfb* vnc_server_h264_rfb_for_client(struct _rfbClientRec* client
     return server ? server->h264_rfb : NULL;
 }
 
-vnc_server_t* vnc_server_create(int width, int height, int port, const char* password) {
+/* Point the screen's listeners at `host`. Returns 0 on success, -1 on a host that cannot be bound.
+ *
+ * Two listeners, always, because LibVNCServer sets IPV6_V6ONLY on its IPv6 socket ("some OS's do
+ * not support dual binding") -- a wildcard v6 socket does not also serve v4, so the families are
+ * two sockets and `port`/`ipv6port` decide independently whether each exists. A family whose port
+ * is <= 0 gets no listener at all: that is how "this family only" is spelt here, and it is NOT
+ * "pick a free port" -- that is the separate `autoPort` flag, which rfbGetScreen leaves FALSE and
+ * this bridge never sets.
+ *
+ * The v4 address goes in as an in_addr because that is what rfbListenOnTCPPort takes; the v6 one
+ * goes in as the string LibVNCServer hands to getaddrinfo, so it is strdup'd (the screen owns it
+ * for its lifetime, and this server outlives every caller's buffer). */
+/* An in_addr as text, for a log line. Static buffer: only ever called to build one message at a
+ * time, on the one thread that brings a server up. */
+static const char* vnc_v4_str(in_addr_t iface) {
+    static char buf[INET_ADDRSTRLEN];
+    struct in_addr a;
+    a.s_addr = iface;
+    if (!inet_ntop(AF_INET, &a, buf, sizeof(buf)))
+        return "?";
+    return buf;
+}
+
+static int vnc_server_set_listen(rfbScreenInfoPtr screen, const char* host, int port) {
+    struct in_addr v4;
+    struct in6_addr v6;
+
+    screen->port = port;
+    screen->ipv6port = port;
+    /* Unset or either family's wildcard: both listeners, as before this argument existed. */
+    if (host == NULL || host[0] == '\0'
+        || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "::") == 0)
+        return 0;
+
+    if (inet_pton(AF_INET, host, &v4) == 1) {
+        screen->listenInterface = v4.s_addr;
+        screen->ipv6port = 0;
+        return 0;
+    }
+    if (inet_pton(AF_INET6, host, &v6) == 1) {
+        screen->listen6Interface = strdup(host);
+        if (!screen->listen6Interface)
+            return -1;
+        screen->port = 0;
+        return 0;
+    }
+    rfbErr("VNC: listen address \"%s\" is not an IPv4 or IPv6 literal\n", host);
+    return -1;
+}
+
+/* Open the listening sockets the screen asked for. Returns 0 if at least one came up, -1 if none
+ * did.
+ *
+ * Done here rather than left to rfbInitServer, which cannot report any of this. Its rfbInitSockets
+ * logs a bind failure and `return`s -- through a void, so nothing upstream learns anything -- and
+ * because the IPv4 block comes first, a busy v4 port also skips the IPv6 one that would have bound
+ * fine. What crosvm got out of that was a VNC server that started, said so, and was listening on
+ * nothing at all. Binding here instead means each family reports its own outcome, one family's
+ * failure does not take the other down, and "no listener at all" can be a refusal to start.
+ *
+ * The sockets are handed over exactly as rfbInitSockets would have left them -- the two socket
+ * fields, the fd_set and maxFd -- and socketState is set to READY so that the rfbInitSockets call
+ * inside rfbInitServer sees the work as already done and returns immediately. */
+static int vnc_server_bind_listeners(rfbScreenInfoPtr screen) {
+    int wanted = 0;
+    int bound = 0;
+
+    FD_ZERO(&screen->allFds);
+    screen->maxFd = 0;
+    screen->listenSock = RFB_INVALID_SOCKET;
+    screen->listen6Sock = RFB_INVALID_SOCKET;
+
+    if (screen->port > 0) {
+        wanted++;
+        screen->listenSock = rfbListenOnTCPPort(screen->port, screen->listenInterface);
+        if (screen->listenSock == RFB_INVALID_SOCKET) {
+            rfbErr("VNC: failed to bind IPv4 %s:%d: %s\n",
+                   vnc_v4_str(screen->listenInterface), screen->port, strerror(errno));
+        } else {
+            FD_SET(screen->listenSock, &screen->allFds);
+            if ((int)screen->listenSock > screen->maxFd)
+                screen->maxFd = (int)screen->listenSock;
+            bound++;
+            rfbLog("VNC: listening on IPv4 %s:%d\n",
+                   vnc_v4_str(screen->listenInterface), screen->port);
+        }
+    }
+
+    if (screen->ipv6port > 0) {
+        const char* iface = screen->listen6Interface ? screen->listen6Interface : "::";
+        wanted++;
+        /* rfbListenOnTCP6Port prints its own detail on failure. */
+        screen->listen6Sock = rfbListenOnTCP6Port(screen->ipv6port, screen->listen6Interface);
+        if (screen->listen6Sock == RFB_INVALID_SOCKET) {
+            rfbErr("VNC: failed to bind IPv6 [%s]:%d\n", iface, screen->ipv6port);
+        } else {
+            FD_SET(screen->listen6Sock, &screen->allFds);
+            if ((int)screen->listen6Sock > screen->maxFd)
+                screen->maxFd = (int)screen->listen6Sock;
+            bound++;
+            rfbLog("VNC: listening on IPv6 [%s]:%d\n", iface, screen->ipv6port);
+        }
+    }
+
+    if (bound == 0) {
+        /* Nowhere to accept a client: the exporter this screen was configured with does not
+         * exist, and coming up anyway is the failure this function was written to end. */
+        rfbErr("VNC: no listening socket could be opened (%d attempted)\n", wanted);
+        return -1;
+    }
+    if (bound < wanted) {
+        /* Only reachable on a wildcard host, where both families were asked for. One of them is
+         * still servable, so this is a warning and not a refusal -- but it is the difference
+         * between "reachable over IPv6" and "reachable", and nobody can see it from outside. */
+        rfbErr("VNC: warning: only %d of %d address families could be bound\n", bound, wanted);
+    }
+    /* Tells rfbInitSockets, called from rfbInitServer below, that the sockets already exist. */
+    screen->socketState = RFB_SOCKET_READY;
+    return 0;
+}
+
+vnc_server_t* vnc_server_create(int width, int height, const char* host, int port,
+                                const char* password) {
     vnc_server_t* server = calloc(1, sizeof(vnc_server_t));
     if (!server)
         return NULL;
@@ -305,6 +431,12 @@ vnc_server_t* vnc_server_create(int width, int height, int port, const char* pas
         free(server);
         return NULL;
     }
+    /* Before the framebuffer, so a host that cannot be bound costs nothing to refuse. */
+    if (vnc_server_set_listen(server->screen, host, port) != 0) {
+        rfbScreenCleanup(server->screen);
+        free(server);
+        return NULL;
+    }
     server->screen->frameBuffer = calloc(width * height, 4);
     if (!server->screen->frameBuffer) {
         rfbScreenCleanup(server->screen);
@@ -312,8 +444,7 @@ vnc_server_t* vnc_server_create(int width, int height, int port, const char* pas
         return NULL;
     }
     server->screen->desktopName = "crosvm";
-    server->screen->port = port;
-    server->screen->ipv6port = port;
+    /* The two ports are vnc_server_set_listen's; it is what knows which families to open. */
     server->screen->alwaysShared = TRUE;
     server->screen->screenData = server;
     server->screen->kbdAddEvent = vnc_kbd_callback;
@@ -327,6 +458,19 @@ vnc_server_t* vnc_server_create(int width, int height, int port, const char* pas
     }
     vnc_server_set_bgrx_format(server->screen);
     attach_frame_consumers(server);
+    /* Before rfbInitServer, which is what would otherwise do this and cannot say how it went. */
+    if (vnc_server_bind_listeners(server->screen) != 0) {
+        free(server->screen->frameBuffer);
+        server->screen->frameBuffer = NULL;
+        free(server->passwords[0]);
+        /* Ours to free: rfbScreenCleanup's FREE_IF list does not name this one. */
+        free(server->screen->listen6Interface);
+        server->screen->listen6Interface = NULL;
+        rfbScreenCleanup(server->screen);
+        pthread_mutex_destroy(&server->ring_lock);
+        free(server);
+        return NULL;
+    }
     rfbInitServer(server->screen);
     return server;
 }
@@ -848,6 +992,9 @@ void vnc_server_destroy(vnc_server_t* server) {
         }
         free(server->screen->frameBuffer);
         server->screen->frameBuffer = NULL;
+        /* strdup'd by vnc_server_set_listen; rfbScreenCleanup does not free it. */
+        free(server->screen->listen6Interface);
+        server->screen->listen6Interface = NULL;
         rfbScreenCleanup(server->screen);
     }
     pthread_mutex_destroy(&server->ring_lock);
