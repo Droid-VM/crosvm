@@ -6,6 +6,7 @@
 
 mod guest_address;
 pub mod guest_memory;
+pub mod media_pool;
 pub mod pool_grants;
 pub mod udmabuf;
 mod udmabuf_bindings;
@@ -13,3 +14,5 @@ mod udmabuf_bindings;
 pub use guest_address::*;
 pub use guest_memory::Error as GuestMemoryError;
 pub use guest_memory::*;
+pub use media_pool::media_guest_region;
+pub use media_pool::MediaPoolHandle;
