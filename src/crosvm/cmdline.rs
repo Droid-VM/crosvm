@@ -2048,18 +2048,26 @@ pub struct RunCommand {
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
-    #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB")]
+    #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB,venus-host-mb=MB,media-host-mb=MB,media-guest-mb=MB,test-pool-mb=MB,test-pool-prealloc-mb=MB,test-pool-step-mb=MB")]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
-    /// host-owned pre-allocated GPU pool sizes (MB). Boot-blessed regions the in-process renderer
-    /// sub-allocates host-visible blobs from (no runtime per-blob SHARE). crosvm exports these to
-    /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
+    /// pre-allocated pool sizes (MB). Boot-blessed regions laid out above guest RAM and SHARE'd
+    /// rather than lent, so host and guest reach the same pages without a runtime SHARE per
+    /// buffer. crosvm exports these to the consumer as NCTX_* env before anything reads the
+    /// memory layout, so the user no longer hand-exports them. A key that is absent means that
+    /// pool is not created at all. Possible keys:
     ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
     ///     gpu-guest-mb=<MB> - guest-alloc pool size, shared by both renderers (0 = off)
     ///     gpu-guest-prealloc-mb=<MB> - boot-SHARE'd floor; defaults to gpu-guest-mb
     ///     gpu-guest-step-mb=<MB> - runtime grow/reclaim granularity (0 = fully pre-shared)
     ///     gpu-guest-max-grants=<N> - per-pool live runtime grant cap (0 = no local cap)
     ///     drm-host-mb=<MB>  - drm2kgsl host arena size (0 = drm2kgsl runtime-share)
+    ///     venus-host-mb=<MB> - venus (vkr) transport pool size (0 = per-blob runtime SHARE)
+    ///     media-host-mb=<MB> - virtio-media host-owned buffer pool (0 = per-buffer memfd + BAR)
+    ///     media-guest-mb=<MB> - virtio-media guest-owned buffer pool (0 = guest allocates from RAM)
+    ///     test-pool-mb=<MB> - growable TEST pool window; nothing but the test driver uses it
+    ///     test-pool-prealloc-mb=<MB> - its boot-SHARE'd floor; defaults to the whole window
+    ///     test-pool-step-mb=<MB> - its grant granularity (0 = fully pre-shared, does not grow)
     pub pre_alloc: Option<PreAllocConfig>,
 
     #[argh(switch)]

@@ -766,6 +766,42 @@ fn pool_specs() -> Vec<PoolSpec> {
         });
     }
 
+    // The virtio-media pools. Both are fully pre-shared (step 0): a growable one would need
+    // runtime grants over a share device the development phone does not load, and would put a
+    // second growable pool into the `pool_id` ordering, which is assigned by call order in the
+    // device tree and by address order on the host. See VPU_DESIGN.md §2.2.
+    let media = mb("NCTX_MEDIA_POOL_MB");
+    if media != 0 {
+        out.push(PoolSpec {
+            name: "media_host",
+            size: media,
+            purpose: MemoryRegionPurpose::MediaPool,
+            // Host-owned, like the other three host pools: the media device's own buffers, sized
+            // by how many streams the VM runs rather than by how much memory it was given.
+            consume_system_mem: true,
+            prealloc: media,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
+    let media_guest = mb("NCTX_MEDIA_GUEST_POOL_MB");
+    if media_guest != 0 {
+        out.push(PoolSpec {
+            name: "media_guest",
+            size: media_guest,
+            purpose: MemoryRegionPurpose::MediaPoolGuest,
+            // Guest-owned, like gpu_guest: the guest driver allocates from it, it is the VM's
+            // memory, and it stays on top of `--mem` rather than inside it.
+            consume_system_mem: false,
+            prealloc: media_guest,
+            step: 0,
+            max_grants: 0,
+            gap_before: 0,
+        });
+    }
+
     for suffix in ["", "_2"] {
         let size = mb(&format!("DROIDVM_TEST_POOL{}_MB", suffix));
         if size == 0 {
@@ -1769,6 +1805,15 @@ impl arch::LinuxArch for AArch64 {
             .map(|r| (r.guest_addr.offset(), r.size as u64));
         let mut drm2kgsl_resv: Option<(u64, u64)> = None;
         let mut venus_resv: Option<(u64, u64)> = None;
+        // The virtio-media pools: only (gpa, size), for the two reserved-memory nodes. Neither
+        // gets env vars. The host pool's consumer is the media device, which is built here in the
+        // VMM (or exec'd from here as a vhost-user helper) and takes the region itself through
+        // `vm_memory::MediaPoolHandle::from_guest_memory` -- the env-var handoff exists for the
+        // renderer, which is forked before any of this runs and cannot be handed a descriptor.
+        // The guest pool has no host-side consumer at all: the guest driver owns it and the host
+        // meets it as ordinary guest addresses in a scatter-gather list.
+        let mut media_resv: Option<(u64, u64)> = None;
+        let mut media_guest_resv: Option<(u64, u64)> = None;
         let gpu_resv: Option<(u64, u64)> = {
             let mut found = None;
             for region in vm.get_memory().regions() {
@@ -1873,6 +1918,37 @@ impl arch::LinuxArch for AArch64 {
                     );
                     venus_resv = Some((gpa, region.size as u64));
                 }
+                // virtio-media host pool. Logged with the same shape as the pools above -- a
+                // missing pool and a pool that was never blessed look identical from the guest,
+                // and this line is what tells the two apart in a boot log -- but deliberately
+                // exported through no env at all: see the declaration of `media_resv`.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::MediaPool {
+                    let gpa = region.guest_addr.offset();
+                    base::warn!(
+                        "MEDIA-POOL: MediaPool region gpa={:#x} size={:#x} fd={} off={:#x} \
+                         hva={:#x} (blessed by GunyahVm::new)",
+                        gpa,
+                        region.size,
+                        region.shm.as_raw_descriptor(),
+                        region.shm_offset,
+                        region.host_addr,
+                    );
+                    media_resv = Some((gpa, region.size as u64));
+                }
+                // virtio-media guest pool: the `media_guest` node and nothing else, exactly like
+                // GpuPoolGuest. The guest driver finds it by name and owns the allocator.
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                if region.options.purpose == vm_memory::MemoryRegionPurpose::MediaPoolGuest {
+                    let gpa = region.guest_addr.offset();
+                    base::warn!(
+                        "MEDIA-POOL: MediaPoolGuest region gpa={:#x} size={:#x} \
+                         (blessed, guest-owned)",
+                        gpa,
+                        region.size,
+                    );
+                    media_guest_resv = Some((gpa, region.size as u64));
+                }
             }
             found
         };
@@ -1915,6 +1991,8 @@ impl arch::LinuxArch for AArch64 {
             gpu_resv,
             gpu_guest_resv,
             venus_resv,
+            media_resv,
+            media_guest_resv,
             test_pool_resv,
             shim_handoff_resv,
             drm2kgsl_resv,
@@ -2495,6 +2573,87 @@ impl AArch64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pool_specs()` lays the pools out in list order, and list order is guest-physical order.
+    ///
+    /// The media pools go in after the four that were there before and before the test pools, so
+    /// the layout reads gfx / gpu_guest / drm2kgsl / venus / media_host / media_guest / test.
+    /// That is not cosmetic: the growable pools' `pool_id` is handed to the guest in device-tree
+    /// call order and looked up on the host by address rank, and the two agree only while a
+    /// pool's position in this list matches its position in `create_fdt` (see `fdt.rs`). Both
+    /// media pools are non-growable, so they take no `pool_id` -- but they sit between the one
+    /// growable pool that exists and the test pools, which is exactly where inserting them in the
+    /// wrong place would have moved the test pools' ids without changing a single test.
+    ///
+    /// This is the only test in this module that touches the environment, deliberately:
+    /// `pool_specs()` reads process-global state, and two tests setting it would race.
+    #[test]
+    fn pool_specs_orders_the_media_pools_after_the_gpu_pools() {
+        for (var, mb) in [
+            ("NCTX_GFX_POOL_MB", "16"),
+            ("NCTX_GFX_GUEST_POOL_MB", "32"),
+            ("NCTX_DRM2KGSL_POOL_MB", "8"),
+            ("NCTX_VENUS_POOL_MB", "8"),
+            ("NCTX_MEDIA_POOL_MB", "256"),
+            ("NCTX_MEDIA_GUEST_POOL_MB", "128"),
+            ("DROIDVM_TEST_POOL_MB", "4"),
+        ] {
+            std::env::set_var(var, mb);
+        }
+
+        let specs = pool_specs();
+        let names: Vec<&str> = specs.iter().map(|p| p.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "gfx_host",
+                "gpu_guest",
+                "drm2kgsl_host",
+                "venus_host",
+                "media_host",
+                "media_guest",
+                "test",
+            ]
+        );
+
+        let media_host = specs.iter().find(|p| p.name == "media_host").unwrap();
+        assert_eq!(media_host.purpose, MemoryRegionPurpose::MediaPool);
+        assert_eq!(media_host.size, 256 << 20);
+        // Fully pre-shared: a non-growable pool must have prealloc == size, or the difference is
+        // memory the guest was told about and could never obtain (reads there return zeros).
+        assert_eq!(media_host.prealloc, media_host.size);
+        assert_eq!(media_host.step, 0);
+        // Host-owned, so it comes out of `--mem` like the other three host pools.
+        assert!(media_host.consume_system_mem);
+
+        let media_guest = specs.iter().find(|p| p.name == "media_guest").unwrap();
+        assert_eq!(media_guest.purpose, MemoryRegionPurpose::MediaPoolGuest);
+        assert_eq!(media_guest.size, 128 << 20);
+        assert_eq!(media_guest.prealloc, media_guest.size);
+        assert_eq!(media_guest.step, 0);
+        // Guest-owned, so it is additive to `--mem`, like gpu_guest.
+        assert!(!media_guest.consume_system_mem);
+
+        // The host pool is inside `--mem`; the guest pool is not. Rounded to the 2 MiB folio the
+        // share path backs a pool in, which both of these already are.
+        let expected_host_bytes = (16 + 8 + 8 + 256) << 20;
+        assert_eq!(sys_ram_pool_bytes(), expected_host_bytes);
+
+        // A pool whose knob is absent is not created at all.
+        for var in [
+            "NCTX_MEDIA_POOL_MB",
+            "NCTX_MEDIA_GUEST_POOL_MB",
+            "NCTX_GFX_POOL_MB",
+            "NCTX_GFX_GUEST_POOL_MB",
+            "NCTX_DRM2KGSL_POOL_MB",
+            "NCTX_VENUS_POOL_MB",
+            "DROIDVM_TEST_POOL_MB",
+        ] {
+            std::env::remove_var(var);
+        }
+        assert!(pool_specs().is_empty());
+        assert_eq!(sys_ram_pool_bytes(), 0);
+    }
 
     #[test]
     fn vcpu_init_unprotected_kernel() {

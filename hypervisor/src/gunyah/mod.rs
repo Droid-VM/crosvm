@@ -447,6 +447,14 @@ impl GunyahVm {
                     // process and must keep reaching it.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                     MemoryRegionPurpose::VenusPool => false,
+                    // virtio-media host pool: SHARE'd like the gfx pools; the media device fills
+                    // every host-owned buffer in it and must keep reaching it after boot.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::MediaPool => false,
+                    // virtio-media guest pool: SHARE'd like GpuPoolGuest -- the guest driver
+                    // allocates from it and the host resolves its scatter-gather lists into it.
+                    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                    MemoryRegionPurpose::MediaPoolGuest => false,
                     // Growable test pool: SHARE'd like the others. Only its pre_alloc prefix is
                     // shared at boot; the remainder is granted at runtime.
                     #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
@@ -619,6 +627,8 @@ impl GunyahVm {
                         | MemoryRegionPurpose::GpuPoolGuest
                         | MemoryRegionPurpose::Drm2KgslPool
                         | MemoryRegionPurpose::VenusPool
+                        | MemoryRegionPurpose::MediaPool
+                        | MemoryRegionPurpose::MediaPoolGuest
                         | MemoryRegionPurpose::DynamicTestPool
                         | MemoryRegionPurpose::ShimHandoff
                 );

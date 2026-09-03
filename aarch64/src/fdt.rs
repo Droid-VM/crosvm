@@ -219,11 +219,26 @@ struct GrowablePool {
 ///
 /// 1. `vm_memory::MemoryRegionPurpose`: give it its own variant. Sharing an existing variant means
 ///    sharing that pool's region, which is exactly what the separate variants exist to prevent.
-/// 2. `aarch64/src/lib.rs`: carve the region out after guest RAM and collect its `(gpa, size)`.
+/// 2. `aarch64/src/lib.rs`: add a `PoolSpec` to `pool_specs()` and collect the region's
+///    `(gpa, size)` in the layout loop.
 /// 3. Here: one more `create_pool_node()` call, named `<consumer>_<side>`.
 /// 4. The consuming driver: find the node by that name prefix.
 ///
-/// Nothing else needs touching, because both of the things that read this node are generic:
+/// # The two that fail silently
+///
+/// Most of the matches a new purpose has to appear in are exhaustive, so the compiler names them
+/// one at a time. Two are not, and a pool that skips them builds, boots, and is wrong:
+///
+/// * `vm_memory::GuestMemory::check_host_access` ends in `other => Err(ProtectedMemoryAccess)`.
+///   A purpose missing from it is unreachable *from the host* in every protected VM -- every
+///   `get_slice_at_addr` into the pool fails, which surfaces as EFAULT from whatever ioctl was
+///   being served and reads like a guest bug.
+/// * `hypervisor::gunyah`'s `is_pool` is a `matches!`. A purpose missing from it is SHARE'd at
+///   `full_size` instead of its boot-share length **and skips the folio preparation and the
+///   mlock entirely** -- so the pool is unpinned memory under a stage-2 mapping the resource
+///   manager will never update, which is the failure the mlock check exists to refuse.
+///
+/// Everything else about the node is generic, because both of the things that read it are:
 ///
 /// * The Gunyah RM blesses the range by matching this node's `reg` against the lend=false
 ///   memparcel registered before VM start (`vm_creation.c
@@ -987,6 +1002,8 @@ pub fn create_fdt(
     gpu_resv: Option<(u64, u64)>,
     gpu_guest_resv: Option<(u64, u64, u64, u64)>,
     venus_resv: Option<(u64, u64)>,
+    media_resv: Option<(u64, u64)>,
+    media_guest_resv: Option<(u64, u64)>,
     test_pool_resv: Vec<(u64, u64, u64, u64)>,
     shim_handoff_resv: Option<(u64, u64)>,
     drm2kgsl_resv: Option<(u64, u64)>,
@@ -1148,6 +1165,23 @@ pub fn create_fdt(
     // (MAP_INFO_POOL), same contract as gfx_host.
     if let Some((gpa, size)) = venus_resv {
         create_pool_node(&mut fdt, "venus_host", gpa, size, None, None)?;
+    }
+
+    // virtio-media's host-alloc buffer pool: the host media device sub-allocates every host-owned
+    // V4L2 buffer from it and the guest driver maps them at this base plus the pool-relative
+    // offset QUERYBUF answered with -- the same contract as gfx_host, one layer up. On Gunyah
+    // this node is also what makes the 4 GiB shared-memory BAR unnecessary; the 64-bit MMIO
+    // window has room for exactly one of those and the GPU has it.
+    if let Some((gpa, size)) = media_resv {
+        create_pool_node(&mut fdt, "media_host", gpa, size, None, None)?;
+    }
+
+    // virtio-media's guest-alloc buffer pool: the guest driver owns a drm_buddy allocator over
+    // this range and cuts the buffers it produces out of it -- bitstreams to decode, raw frames
+    // to encode -- handing the host bare guest-physical scatter-gather lists that resolve into
+    // these pages. Same shape as gpu_guest, and like it the host allocates nothing here.
+    if let Some((gpa, size)) = media_guest_resv {
+        create_pool_node(&mut fdt, "media_guest", gpa, size, None, None)?;
     }
 
     create_cpu_nodes(

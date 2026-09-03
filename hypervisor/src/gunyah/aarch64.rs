@@ -204,6 +204,14 @@ impl VmAArch64 for GunyahVm {
                 MemoryRegionPurpose::Drm2KgslPool => true,
                 // venus transport pool: same -- shm vdevice + stage-2 mapping, no runtime accept.
                 MemoryRegionPurpose::VenusPool => true,
+                // virtio-media host pool: same -- the guest maps host-owned buffers pool-relative
+                // out of the stage-2 mapping this node builds, so there is no per-buffer accept
+                // and, on Gunyah, no need for the 4 GiB shared-memory BAR the upstream device
+                // would otherwise want.
+                MemoryRegionPurpose::MediaPool => true,
+                // virtio-media guest pool: same -- the guest driver needs the stage-2 mapping to
+                // allocate from it at all, and the host resolves its SG lists into the same pages.
+                MemoryRegionPurpose::MediaPoolGuest => true,
                 // Growable test pool: needs the shm vdevice for its pre-shared floor, exactly
                 // like the pools above. Runtime grants do not use it -- they go through
                 // runtime_share and the guest's own MEM_ACCEPT.
