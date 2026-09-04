@@ -163,58 +163,40 @@ impl SharedMemoryMapper for ArcedMemoryMapper {
 /// Size of the shared-memory BAR a `Bar` backing asks for.
 const HOST_MAPPER_RANGE: u64 = 1 << 32;
 
-/// What backs host-owned (`MMAP`) buffers, and how the guest gets to see them.
+/// The VM-wide `media_host` pool: one offset space, shared by every media device.
 ///
-/// One value implements both of the crate's host-side traits: it hands buffers out
-/// (`VirtioMediaBufferAllocator`) and makes them visible to the guest
-/// (`VirtioMediaHostMemoryMapper`), because in `Pool` mode those are the same act -- a buffer's
-/// place in the pool *is* its guest mapping.
-pub enum HostBacking {
-    /// Upstream: a memfd per buffer, mapped on demand into the PCI shared-memory BAR.
-    Bar {
-        shm_mapper: ArcedMemoryMapper,
-        /// The BAR's offset space, `[0, HOST_MAPPER_RANGE)`, page aligned.
-        allocator: AddressAllocator,
-        memfd: MemFdAllocator,
-    },
-    /// DroidVM: buffers are slices of the `media_host` pool the guest maps as a whole.
-    Pool {
-        pool: MediaPoolHandle,
-        /// The pool's offset space, `[0, pool.size)`, page aligned.
-        allocator: AddressAllocator,
-        /// Our own mapping of the pool, so that buffers can be filled from this process.
-        host_map: MemoryMapping,
-        /// Key for the next allocation; `AddressAllocator` wants every live allocation to have a
-        /// distinct one.
-        next_id: usize,
-        /// Bytes currently handed out, for the exhaustion log line.
-        used: u64,
-    },
+/// It has to be VM-wide. A pool offset is what the device answers `VIDIOC_QUERYBUF` with and the
+/// guest adds the `media_host` node's base to it, so two devices with private allocators over the
+/// same window both hand out offset 0, 0x1000, ... and the guest maps the same physical bytes for
+/// two unrelated buffers -- while one device's `release` frees space the other is still filling
+/// (`VPU_DESIGN.md` §2.2 sizes the one 256 MiB pool for every media device in the VM).
+///
+/// The descriptor is dup'ed and the whole pool mapped exactly once, here; a buffer's own dup is
+/// what the crate's `HostBuffer` carries.
+pub struct MediaPoolAllocator {
+    pool: MediaPoolHandle,
+    /// The pool's offset space, `[0, pool.size)`, page aligned.
+    allocator: AddressAllocator,
+    /// Our own mapping of the pool, so that buffers can be filled from this process.
+    host_map: MemoryMapping,
+    /// Key for the next allocation; `AddressAllocator` wants every live allocation to have a
+    /// distinct one.
+    next_id: usize,
+    /// Id for the next lease.
+    next_owner: u64,
+    /// `pool offset -> (owner, size)` for every slice handed out. The owner is what lets a
+    /// device that goes away -- a virtio reset drops its worker and every buffer with it -- give
+    /// its slices back to a pool the rest of the VM keeps using.
+    live: BTreeMap<u64, (u64, u64)>,
+    /// Bytes currently handed out, for the exhaustion log line.
+    used: u64,
 }
 
-impl HostBacking {
-    fn bar(shm_mapper: ArcedMemoryMapper) -> anyhow::Result<Self> {
-        Ok(HostBacking::Bar {
-            shm_mapper,
-            allocator: AddressAllocator::new(
-                AddressRange::from_start_and_end(0, HOST_MAPPER_RANGE - 1),
-                Some(base::pagesize() as u64),
-                None,
-            )?,
-            memfd: MemFdAllocator::new(),
-        })
-    }
-
-    /// A backing over `pool`, with its own dup of the descriptor and its own mapping of the pool
-    /// (a device can be activated more than once, and a helper process could not use the VMM's
-    /// `host_va` anyway).
-    fn pool(pool: &MediaPoolHandle) -> anyhow::Result<Self> {
-        let fd = pool
-            .fd
-            .try_clone()
-            .context("cannot dup the media_host pool descriptor")?;
+impl MediaPoolAllocator {
+    fn new(pool: MediaPoolHandle) -> anyhow::Result<Self> {
         let file = File::from(
-            fd.try_clone()
+            pool.fd
+                .try_clone()
                 .context("cannot dup the media_host pool descriptor")?,
         );
         let host_map = MemoryMappingBuilder::new(pool.size as usize)
@@ -227,34 +209,259 @@ impl HostBacking {
             Some(base::pagesize() as u64),
             None,
         )?;
-        info!(
-            "virtio-media: serving MMAP buffers from the media_host pool (gpa {:#x}, {} MiB)",
-            pool.gpa,
-            pool.size >> 20
-        );
-        Ok(HostBacking::Pool {
-            pool: MediaPoolHandle {
-                fd,
-                fd_offset: pool.fd_offset,
-                host_va: pool.host_va,
-                gpa: pool.gpa,
-                size: pool.size,
-            },
+        Ok(MediaPoolAllocator {
+            pool,
             allocator,
             host_map,
             next_id: 0,
+            next_owner: 0,
+            live: BTreeMap::new(),
             used: 0,
+        })
+    }
+
+    /// Carve `len` bytes out of the pool for `owner`. `card` only names the device in the
+    /// exhaustion log -- with one pool for the whole VM, "the pool is full" is useless without
+    /// knowing who asked.
+    fn allocate(&mut self, len: u64, owner: u64, card: &str) -> Result<HostBuffer, i32> {
+        if len == 0 {
+            return Err(libc::EINVAL);
+        }
+        let page = base::pagesize() as u64;
+        let size = len.checked_next_multiple_of(page).ok_or(libc::EINVAL)?;
+        let id = self.next_id;
+        self.next_id += 1;
+        let (used, pool_size) = (self.used, self.pool.size);
+        // Every allocation gets its own key; the offsets are what matter, the key is only a name.
+        let offset = self
+            .allocator
+            .allocate(size, Alloc::Anon(id), "media buffer".into())
+            .map_err(|e| {
+                // The one place exhaustion surfaces: REQBUFS/CREATE_BUFS get ENOMEM, and the log
+                // says which device asked and how full the pool was (VPU_DESIGN.md §4.1).
+                error!(
+                    "virtio-media: media_host pool exhausted for \"{}\": {} bytes requested with \
+                     {} of {} in use ({:?})",
+                    card, size, used, pool_size, e
+                );
+                libc::ENOMEM
+            })?;
+
+        let fd: OwnedFd = match self.pool.fd.try_clone() {
+            Ok(fd) => fd.into(),
+            Err(e) => {
+                error!("virtio-media: cannot dup the pool descriptor: {}", e);
+                let _ = self.allocator.release_containing(offset);
+                return Err(libc::EIO);
+            }
+        };
+        self.used += size;
+        self.live.insert(offset, (owner, size));
+        // SAFETY: `offset + size <= pool.size` (the allocator's range), and `host_map` maps all
+        // `pool.size` bytes for as long as this allocator exists, which is longer than any buffer
+        // it hands out (buffers come back through `release`, and a lease that dies takes its
+        // buffers' space with it).
+        let ptr = unsafe { self.host_map.as_ptr().add(offset as usize) };
+        let ptr = match NonNull::new(ptr) {
+            Some(ptr) => ptr,
+            None => {
+                self.free(offset);
+                return Err(libc::EIO);
+            }
+        };
+        // SAFETY: `ptr` maps the `len` bytes at `pool.fd_offset + offset` of `fd`, and stays
+        // valid for the life of the allocator (see above).
+        Ok(unsafe {
+            HostBuffer::from_raw_parts(
+                fd,
+                self.pool.fd_offset + offset,
+                len,
+                ptr,
+                Some(offset),
+            )
+        })
+    }
+
+    /// Give one offset back to the offset space.
+    fn free(&mut self, offset: u64) {
+        match self.live.remove(&offset) {
+            Some((_, size)) => {
+                self.used = self.used.saturating_sub(size);
+                if let Err(e) = self.allocator.release_containing(offset) {
+                    error!(
+                        "virtio-media: releasing a buffer at pool offset {:#x} that is not \
+                         allocated: {}",
+                        offset, e
+                    );
+                }
+            }
+            None => error!(
+                "virtio-media: releasing a buffer at pool offset {:#x} that is not allocated",
+                offset
+            ),
+        }
+    }
+
+    fn release(&mut self, buf: HostBuffer) {
+        if let Some(offset) = buf.pool_offset {
+            self.free(offset);
+        }
+        // Dropping closes the descriptor dup; the pool mapping is ours, not the buffer's.
+        drop(buf);
+    }
+
+    /// Take back everything a lease still holds. Its buffers are gone with the device (dropping
+    /// a `HostBuffer` frees nothing in the pool by design), so only the offset space is at stake.
+    fn release_owner(&mut self, owner: u64) {
+        let offsets: Vec<u64> = self
+            .live
+            .iter()
+            .filter(|(_, (o, _))| *o == owner)
+            .map(|(offset, _)| *offset)
+            .collect();
+        if !offsets.is_empty() {
+            info!(
+                "virtio-media: reclaiming {} media_host buffers from a device that went away",
+                offsets.len()
+            );
+        }
+        for offset in offsets {
+            self.free(offset);
+        }
+    }
+}
+
+/// Handle on the VM-wide [`MediaPoolAllocator`], created once per VM and cloned into every media
+/// device.
+#[derive(Clone)]
+pub struct MediaPool {
+    inner: Arc<Mutex<MediaPoolAllocator>>,
+    /// The pool descriptor, for `keep_rds`. The allocator owns the only dup this side keeps.
+    fd: base::RawDescriptor,
+}
+
+impl MediaPool {
+    /// Map the pool and build its allocator. One dup of the descriptor and one host mapping, for
+    /// the whole VM.
+    pub fn new(pool: MediaPoolHandle) -> anyhow::Result<Self> {
+        let fd = pool.fd.as_raw_descriptor();
+        let (gpa, size) = (pool.gpa, pool.size);
+        let inner = MediaPoolAllocator::new(pool)?;
+        info!(
+            "virtio-media: serving MMAP buffers from the media_host pool (gpa {:#x}, {} MiB)",
+            gpa,
+            size >> 20
+        );
+        Ok(MediaPool {
+            inner: Arc::new(Mutex::new(inner)),
+            fd,
+        })
+    }
+
+    pub fn as_raw_descriptor(&self) -> base::RawDescriptor {
+        self.fd
+    }
+
+    /// One device's lease on the pool. What the lease still holds when it is dropped goes back
+    /// to the pool, so a device that is reset does not eat the VM's pool for good.
+    fn lease(&self, card: String) -> PoolBufferAllocator {
+        let owner = {
+            let mut pool = self.inner.lock();
+            pool.next_owner += 1;
+            pool.next_owner
+        };
+        PoolBufferAllocator {
+            pool: Arc::clone(&self.inner),
+            card,
+            owner,
+        }
+    }
+}
+
+/// One device's lease on the VM-wide pool.
+pub struct PoolBufferAllocator {
+    pool: Arc<Mutex<MediaPoolAllocator>>,
+    /// The device's V4L2 card name, for the exhaustion log.
+    card: String,
+    owner: u64,
+}
+
+impl VirtioMediaBufferAllocator for PoolBufferAllocator {
+    fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
+        self.pool.lock().allocate(len, self.owner, &self.card)
+    }
+
+    fn release(&mut self, buf: HostBuffer) {
+        self.pool.lock().release(buf)
+    }
+}
+
+impl Drop for PoolBufferAllocator {
+    fn drop(&mut self) {
+        self.pool.lock().release_owner(self.owner);
+    }
+}
+
+/// Where a device's host-owned (`MMAP`) buffers come from.
+pub enum BufferAllocator {
+    /// Upstream: a memfd per buffer, mapped on demand into the PCI shared-memory BAR.
+    Memfd(MemFdAllocator),
+    /// DroidVM: slices of the VM-wide `media_host` pool the guest maps as a whole.
+    Pool(PoolBufferAllocator),
+}
+
+impl VirtioMediaBufferAllocator for BufferAllocator {
+    fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
+        match self {
+            BufferAllocator::Memfd(memfd) => memfd.allocate(len),
+            BufferAllocator::Pool(pool) => pool.allocate(len),
+        }
+    }
+
+    fn release(&mut self, buf: HostBuffer) {
+        match self {
+            BufferAllocator::Memfd(memfd) => memfd.release(buf),
+            BufferAllocator::Pool(pool) => pool.release(buf),
+        }
+    }
+}
+
+/// How a device's host-owned buffers are made visible to the guest (`VPU_DESIGN.md` §3.2).
+///
+/// This is per device -- a BAR belongs to one PCI function, and with a pool there is nothing to
+/// map at all -- while the buffers themselves come from [`BufferAllocator`], which with a pool is
+/// VM-wide. Never take the pool lock while holding this: the mapper never calls the allocator.
+pub enum HostMapper {
+    /// Upstream: buffers are mapped on demand into the PCI shared-memory BAR.
+    Bar {
+        shm_mapper: ArcedMemoryMapper,
+        /// The BAR's offset space, `[0, HOST_MAPPER_RANGE)`, page aligned.
+        allocator: AddressAllocator,
+    },
+    /// DroidVM: the guest maps the whole pool, so a buffer's offset inside it is its address and
+    /// nothing has to be mapped per buffer.
+    Pool,
+}
+
+impl HostMapper {
+    fn bar(shm_mapper: ArcedMemoryMapper) -> anyhow::Result<Self> {
+        Ok(HostMapper::Bar {
+            shm_mapper,
+            allocator: AddressAllocator::new(
+                AddressRange::from_start_and_end(0, HOST_MAPPER_RANGE - 1),
+                Some(base::pagesize() as u64),
+                None,
+            )?,
         })
     }
 }
 
-impl VirtioMediaHostMemoryMapper for HostBacking {
+impl VirtioMediaHostMemoryMapper for HostMapper {
     fn add_mapping(&mut self, buffer: &HostBuffer, offset: u64, rw: bool) -> Result<u64, i32> {
         match self {
-            HostBacking::Bar {
+            HostMapper::Bar {
                 shm_mapper,
                 allocator,
-                ..
             } => {
                 // TODO: technically `offset` can be used twice if a buffer is deleted and some
                 // other takes its place...
@@ -289,8 +496,10 @@ impl VirtioMediaHostMemoryMapper for HostBacking {
                     }
                 }
             }
-            // The guest maps the whole pool; a buffer's offset inside it is its address.
-            HostBacking::Pool { .. } => buffer.pool_offset.ok_or_else(|| {
+            // The guest maps the whole pool; a buffer's offset inside it is its address. `rw` is
+            // not ours to enforce: the guest kernel decides what its own VMA may do, and the pool
+            // is mapped read-write once for the VM.
+            HostMapper::Pool => buffer.pool_offset.ok_or_else(|| {
                 error!("virtio-media: a buffer that is not in the pool cannot be mapped");
                 libc::EINVAL
             }),
@@ -299,132 +508,16 @@ impl VirtioMediaHostMemoryMapper for HostBacking {
 
     fn remove_mapping(&mut self, offset: u64) -> Result<(), i32> {
         match self {
-            HostBacking::Bar {
+            HostMapper::Bar {
                 shm_mapper,
                 allocator,
-                ..
             } => {
                 let _ = allocator.release_containing(offset);
                 shm_mapper.remove_mapping(offset).map_err(|_| libc::EINVAL)
             }
             // Nothing was mapped for it.
-            HostBacking::Pool { .. } => Ok(()),
+            HostMapper::Pool => Ok(()),
         }
-    }
-}
-
-impl VirtioMediaBufferAllocator for HostBacking {
-    fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
-        match self {
-            HostBacking::Bar { memfd, .. } => memfd.allocate(len),
-            HostBacking::Pool {
-                pool,
-                allocator,
-                host_map,
-                next_id,
-                used,
-            } => {
-                if len == 0 {
-                    return Err(libc::EINVAL);
-                }
-                let page = base::pagesize() as u64;
-                let size = len.checked_next_multiple_of(page).ok_or(libc::EINVAL)?;
-                let id = *next_id;
-                *next_id += 1;
-                // Every allocation gets its own key; the pool is private to this device, so a
-                // plain counter is as good a name as any.
-                let offset = allocator
-                    .allocate(size, Alloc::Anon(id), "media buffer".into())
-                    .map_err(|e| {
-                        // The one place exhaustion surfaces: REQBUFS/CREATE_BUFS get ENOMEM,
-                        // and the log says how full the pool was (VPU_DESIGN.md §4.1).
-                        error!(
-                            "virtio-media: media_host pool exhausted: {} bytes requested with \
-                             {} of {} in use ({:?})",
-                            size, used, pool.size, e
-                        );
-                        libc::ENOMEM
-                    })?;
-                *used += size;
-
-                let fd: OwnedFd = match pool.fd.try_clone() {
-                    Ok(fd) => fd.into(),
-                    Err(e) => {
-                        error!("virtio-media: cannot dup the pool descriptor: {}", e);
-                        let _ = allocator.release_containing(offset);
-                        *used -= size;
-                        return Err(libc::EIO);
-                    }
-                };
-                // SAFETY: `offset + size <= pool.size` (the allocator's range), and `host_map`
-                // maps all `pool.size` bytes for as long as this backing exists, which is longer
-                // than any buffer it hands out (buffers come back through `release`).
-                let ptr = unsafe { host_map.as_ptr().add(offset as usize) };
-                let ptr = NonNull::new(ptr).ok_or(libc::EIO)?;
-                // SAFETY: `ptr` maps the `len` bytes at `pool.fd_offset + offset` of `fd`, and
-                // stays valid for the life of the backing (see above).
-                Ok(unsafe {
-                    HostBuffer::from_raw_parts(fd, pool.fd_offset + offset, len, ptr, Some(offset))
-                })
-            }
-        }
-    }
-
-    fn release(&mut self, buf: HostBuffer) {
-        match self {
-            HostBacking::Bar { memfd, .. } => memfd.release(buf),
-            HostBacking::Pool {
-                allocator, used, ..
-            } => {
-                if let Some(offset) = buf.pool_offset {
-                    match allocator.release_containing(offset) {
-                        Ok(range) => *used = used.saturating_sub(range.len().unwrap_or(0)),
-                        Err(e) => error!(
-                            "virtio-media: releasing a buffer at pool offset {:#x} that is not \
-                             allocated: {}",
-                            offset, e
-                        ),
-                    }
-                }
-                // Dropping closes the descriptor dup; the pool mapping is ours, not the
-                // buffer's.
-                drop(buf);
-            }
-        }
-    }
-}
-
-/// A `HostBacking` a device can hold from two places at once: as its host memory mapper and as
-/// its buffer allocator.
-///
-/// The lock is uncontended -- a device runs on one worker thread -- and exists only because the
-/// two crate traits are implemented by one object.
-#[derive(Clone)]
-pub struct SharedHostBacking(Arc<Mutex<HostBacking>>);
-
-impl SharedHostBacking {
-    pub fn new(backing: HostBacking) -> Self {
-        Self(Arc::new(Mutex::new(backing)))
-    }
-}
-
-impl VirtioMediaHostMemoryMapper for SharedHostBacking {
-    fn add_mapping(&mut self, buffer: &HostBuffer, offset: u64, rw: bool) -> Result<u64, i32> {
-        self.0.lock().add_mapping(buffer, offset, rw)
-    }
-
-    fn remove_mapping(&mut self, shm_offset: u64) -> Result<(), i32> {
-        self.0.lock().remove_mapping(shm_offset)
-    }
-}
-
-impl VirtioMediaBufferAllocator for SharedHostBacking {
-    fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
-        self.0.lock().allocate(len)
-    }
-
-    fn release(&mut self, buf: HostBuffer) {
-        self.0.lock().release(buf)
     }
 }
 
@@ -604,7 +697,7 @@ where
 /// Implements the required traits to operate a [`VirtioMediaDevice`] under crosvm.
 struct CrosvmVirtioMediaDevice<
     D: VirtioMediaDevice<Reader, Writer>,
-    F: Fn(EventQueue, GuestMemoryMapper, SharedHostBacking) -> anyhow::Result<D>,
+    F: Fn(EventQueue, GuestMemoryMapper, HostMapper, BufferAllocator) -> anyhow::Result<D>,
 > {
     /// Closure to create the device once all its resources are acquired.
     create_device: F,
@@ -613,9 +706,9 @@ struct CrosvmVirtioMediaDevice<
 
     /// Virtio device features.
     base_features: u64,
-    /// The `media_host` pool, when the VM has one: `MMAP` buffers are served out of it and no
-    /// shared-memory BAR is declared.
-    pool: Option<MediaPoolHandle>,
+    /// The VM-wide `media_host` pool, when the VM has one: `MMAP` buffers are served out of it
+    /// and no shared-memory BAR is declared.
+    pool: Option<MediaPool>,
     /// Mapper to make host video buffers visible to the guest, in `Bar` mode.
     ///
     /// We unfortunately need to put it behind a `Arc` because the mapper is only passed once,
@@ -629,12 +722,12 @@ struct CrosvmVirtioMediaDevice<
 impl<D, F> CrosvmVirtioMediaDevice<D, F>
 where
     D: VirtioMediaDevice<Reader, Writer>,
-    F: Fn(EventQueue, GuestMemoryMapper, SharedHostBacking) -> anyhow::Result<D>,
+    F: Fn(EventQueue, GuestMemoryMapper, HostMapper, BufferAllocator) -> anyhow::Result<D>,
 {
     fn new(
         base_features: u64,
         config: VirtioMediaDeviceConfig,
-        pool: Option<MediaPoolHandle>,
+        pool: Option<MediaPool>,
         create_device: F,
     ) -> Self {
         Self {
@@ -651,7 +744,7 @@ where
 impl<D, F> VirtioDevice for CrosvmVirtioMediaDevice<D, F>
 where
     D: VirtioMediaDevice<Reader, Writer> + Send + 'static,
-    F: Fn(EventQueue, GuestMemoryMapper, SharedHostBacking) -> anyhow::Result<D> + Send,
+    F: Fn(EventQueue, GuestMemoryMapper, HostMapper, BufferAllocator) -> anyhow::Result<D> + Send,
 {
     fn keep_rds(&self) -> Vec<base::RawDescriptor> {
         let mut keep_rds = Vec::new();
@@ -660,7 +753,7 @@ where
             keep_rds.push(fd);
         }
         if let Some(pool) = &self.pool {
-            keep_rds.push(pool.fd.as_raw_descriptor());
+            keep_rds.push(pool.as_raw_descriptor());
         }
 
         keep_rds
@@ -699,14 +792,22 @@ where
         let cmd_queue = queues.remove(&0).context("missing queue 0")?;
         let event_queue = EventQueue(queues.remove(&1).context("missing queue 1")?);
 
-        let backing = match &self.pool {
-            Some(pool) => HostBacking::pool(pool)?,
+        // The offset space is the pool's, and the pool belongs to the VM; the mapper is this
+        // device's. A lease that outlives its device gives the device's slices back.
+        let (mapper, allocator) = match &self.pool {
+            Some(pool) => (
+                HostMapper::Pool,
+                BufferAllocator::Pool(pool.lease(card_str(&self.config.card))),
+            ),
             None => {
                 let shm_mapper = self
                     .shm_mapper
                     .clone()
                     .context("shared memory mapper was not specified")?;
-                HostBacking::bar(shm_mapper)?
+                (
+                    HostMapper::bar(shm_mapper)?,
+                    BufferAllocator::Memfd(MemFdAllocator::new()),
+                )
             }
         };
 
@@ -714,7 +815,8 @@ where
         let device = (self.create_device)(
             event_queue,
             GuestMemoryMapper::new(mem),
-            SharedHostBacking::new(backing),
+            mapper,
+            allocator,
         )?;
 
         let worker_thread = WorkerThread::start("v_media_worker", move |e| {
@@ -762,6 +864,12 @@ where
     }
 }
 
+/// The card name a config area carries, for log lines that have to say which device spoke.
+fn card_str(card: &[u8; 32]) -> String {
+    let end = card.iter().position(|&b| b == 0).unwrap_or(card.len());
+    String::from_utf8_lossy(&card[..end]).into_owned()
+}
+
 /// The `card` field of the config area: `name`, truncated to fit with a terminating NUL.
 fn card_name(name: &str) -> [u8; 32] {
     let mut card = [0u8; 32];
@@ -776,7 +884,7 @@ fn card_name(name: &str) -> [u8; 32] {
 /// for checking that the virtio-media pipeline is working properly.
 pub fn create_virtio_media_simple_capture_device(
     features: u64,
-    pool: Option<MediaPoolHandle>,
+    pool: Option<MediaPool>,
 ) -> Box<dyn VirtioDevice> {
     use virtio_media::devices::SimpleCaptureDevice;
     use virtio_media::v4l2r::ioctl::Capabilities;
@@ -790,12 +898,12 @@ pub fn create_virtio_media_simple_capture_device(
             card: card_name("simple_device"),
         },
         pool,
-        |event_queue, guest_mapper, backing| {
+        |event_queue, guest_mapper, mapper, allocator| {
             Ok(SimpleCaptureDevice::new(
                 event_queue,
                 guest_mapper,
-                backing.clone(),
-                backing,
+                mapper,
+                allocator,
             ))
         },
     );
@@ -811,7 +919,7 @@ pub fn create_virtio_media_simple_capture_device(
 pub fn create_virtio_media_loopback_device(
     features: u64,
     card: &str,
-    pool: Option<MediaPoolHandle>,
+    pool: Option<MediaPool>,
 ) -> Box<dyn VirtioDevice> {
     use virtio_media::devices::LoopbackDevice;
     use virtio_media::v4l2r::ioctl::Capabilities;
@@ -825,12 +933,12 @@ pub fn create_virtio_media_loopback_device(
             card: card_name(card),
         },
         pool,
-        |event_queue, guest_mapper, backing| {
+        |event_queue, guest_mapper, mapper, allocator| {
             Ok(LoopbackDevice::new(
                 event_queue,
                 guest_mapper,
-                backing.clone(),
-                backing,
+                mapper,
+                allocator,
             ))
         },
     );
@@ -877,9 +985,11 @@ pub fn create_virtio_media_v4l2_proxy_device<P: AsRef<Path>>(
         features,
         config,
         None,
-        move |event_queue, guest_mapper, backing| {
+        // The proxied buffers belong to the host V4L2 device, so the proxy has no allocator of
+        // its own to be handed.
+        move |event_queue, guest_mapper, mapper, _allocator| {
             let device =
-                V4l2ProxyDevice::new(device_path.clone(), event_queue, guest_mapper, backing);
+                V4l2ProxyDevice::new(device_path.clone(), event_queue, guest_mapper, mapper);
 
             Ok(device)
         },
@@ -896,7 +1006,7 @@ pub fn create_virtio_media_decoder_adapter_device(
     features: u64,
     _gpu_tube: base::Tube,
     backend: VideoBackendType,
-    pool: Option<MediaPoolHandle>,
+    pool: Option<MediaPool>,
 ) -> anyhow::Result<Box<dyn VirtioDevice>> {
     use decoder_adapter::VirtioVideoAdapter;
     use virtio_media::devices::video_decoder::VideoDecoder;
@@ -918,7 +1028,7 @@ pub fn create_virtio_media_decoder_adapter_device(
         card: card_name(&card_name_str),
     };
 
-    let create_device = move |event_queue, _, backing: SharedHostBacking| {
+    let create_device = move |event_queue, _, mapper: HostMapper, allocator: BufferAllocator| {
         let backend = match backend {
             #[cfg(feature = "libvda")]
             VideoBackendType::Libvda => {
@@ -935,7 +1045,7 @@ pub fn create_virtio_media_decoder_adapter_device(
         };
 
         let adapter = VirtioVideoAdapter::new(backend);
-        let decoder = VideoDecoder::new(adapter, event_queue, backing.clone(), backing);
+        let decoder = VideoDecoder::new(adapter, event_queue, mapper, allocator);
 
         Ok(decoder)
     };
