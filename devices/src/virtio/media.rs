@@ -18,6 +18,13 @@
 //!   MMIO window has room for one 4 GiB BAR and the GPU already has it.
 //!
 //! Guest-owned (`USERPTR`) buffers are resolved in `guest_buf` (`VPU_DESIGN.md` §3.4).
+//!
+//! A device runs either inside the VMM (`CrosvmVirtioMediaDevice`, a `VirtioDevice`) or in a
+//! vhost-user helper process under the app's uid (`vhost::user::device::media`, `VPU_DESIGN.md`
+//! §6). Both drive the same [`Worker`] on the same kind of OS thread ([`start_worker`]) with the
+//! same [`EventQueue`], [`GuestMemoryMapper`], [`HostMapper`] and [`BufferAllocator`]; what
+//! differs is who hands them the queues and who answers whether the host may touch a guest
+//! address (`guest_buf::HostAccessPolicy`).
 
 #[cfg(feature = "video-decoder")]
 pub mod decoder_adapter;
@@ -35,7 +42,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use base::error;
 use base::Descriptor;
-use base::Event;
 use base::EventToken;
 use base::EventType;
 use base::Protection;
@@ -45,6 +51,9 @@ use base::WorkerThread;
 use resources::address_allocator::AddressAllocator;
 use resources::AddressRange;
 use resources::Alloc;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_keyvalue::FromKeyValues;
 use sync::Mutex;
 use virtio_media::io::WriteToDescriptorChain;
 use virtio_media::poll::SessionPoller;
@@ -70,6 +79,7 @@ use crate::virtio::device_constants::media::QUEUE_SIZES;
 #[cfg(feature = "video-decoder")]
 use crate::virtio::device_constants::video::VideoBackendType;
 use crate::virtio::media::guest_buf::GuestBufferImport;
+use crate::virtio::media::guest_buf::HostAccessPolicy;
 pub use crate::virtio::media::pool::MediaPool;
 use crate::virtio::media::pool::PoolBufferAllocator;
 use crate::virtio::DeviceType;
@@ -81,23 +91,60 @@ use crate::virtio::SharedMemoryRegion;
 use crate::virtio::VirtioDevice;
 use crate::virtio::Writer;
 
+/// What a `--virtio-media` device is (`VPU_DESIGN.md` §3.5).
+///
+/// Lives here rather than in the VMM's config because a vhost-user helper is told the same thing
+/// in its parameters and must spell it the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum MediaDeviceKind {
+    /// The crate's pattern-generating capture device; what `--simple-media-device` makes.
+    Simple,
+    /// A memory-to-memory device copying OUTPUT buffers into CAPTURE buffers, for testing the
+    /// buffer memory model from the guest.
+    Loopback,
+    /// A host camera (not wired yet).
+    Camera,
+    /// A host video decoder (not wired yet).
+    Decoder,
+    /// A host video encoder (not wired yet).
+    Encoder,
+}
+
 /// Structure supporting the implementation of `VirtioMediaEventQueue` for sending events to the
 /// driver.
-struct EventQueue(Queue);
+///
+/// The queue is shared rather than owned because the device that holds this is dropped on the
+/// worker thread, and a vhost-user backend has to give the queue back to the frontend afterwards
+/// (`stop_queue`); the in-VMM device never asks for it again. Only the worker thread ever locks
+/// it.
+pub struct EventQueue(Arc<Mutex<Queue>>);
+
+impl EventQueue {
+    pub fn new(queue: Queue) -> Self {
+        Self(Arc::new(Mutex::new(queue)))
+    }
+
+    /// A second handle on the queue, for whoever has to recover it once the device is gone.
+    pub fn shared(&self) -> Arc<Mutex<Queue>> {
+        Arc::clone(&self.0)
+    }
+}
 
 impl VirtioMediaEventQueue for EventQueue {
     /// Wait until an event descriptor becomes available and send `event` to the guest.
     fn send_event(&mut self, event: V4l2Event) {
+        let mut queue = self.0.lock();
         let mut desc;
 
         loop {
-            match self.0.pop() {
+            match queue.pop() {
                 Some(d) => {
                     desc = d;
                     break;
                 }
                 None => {
-                    if let Err(e) = self.0.event().wait() {
+                    if let Err(e) = queue.event().wait() {
                         error!("could not obtain a descriptor to send event to: {:#}", e);
                         return;
                     }
@@ -116,8 +163,8 @@ impl VirtioMediaEventQueue for EventQueue {
         }
 
         let written = desc.writer.bytes_written() as u32;
-        self.0.add_used(desc, written);
-        self.0.trigger_interrupt();
+        queue.add_used(desc, written);
+        queue.trigger_interrupt();
     }
 }
 
@@ -126,7 +173,7 @@ impl VirtioMediaEventQueue for EventQueue {
 /// This is required by the fact that devices can be activated several times, but the mapper is
 /// only provided once. This might be a defect of the `VirtioDevice` interface.
 #[derive(Clone)]
-struct ArcedMemoryMapper(Arc<Mutex<Box<dyn SharedMemoryMapper>>>);
+pub struct ArcedMemoryMapper(Arc<Mutex<Box<dyn SharedMemoryMapper>>>);
 
 impl From<Box<dyn SharedMemoryMapper>> for ArcedMemoryMapper {
     fn from(mapper: Box<dyn SharedMemoryMapper>) -> Self {
@@ -224,11 +271,8 @@ impl VirtioMediaHostMemoryMapper for HostMapper {
                     .allocate(buffer.len, Alloc::FileBacked(offset), "".into())
                     .map_err(|_| libc::ENOMEM)?;
 
-                let descriptor: SafeDescriptor = buffer
-                    .fd
-                    .try_clone()
-                    .map_err(|_| libc::EIO)?
-                    .into();
+                let descriptor: SafeDescriptor =
+                    buffer.fd.try_clone().map_err(|_| libc::EIO)?.into();
                 match shm_mapper.add_mapping(
                     VmMemorySource::Descriptor {
                         descriptor,
@@ -286,22 +330,34 @@ impl GuestMemoryRange for GuestBufferImport {
     }
 }
 
-/// Newtype to implement `VirtioMediaGuestMemoryMapper` on `GuestMemory`.
+/// Implements `VirtioMediaGuestMemoryMapper` on a `GuestMemory` and a `HostAccessPolicy`.
 ///
 /// Whether to use a direct mapping or to copy the guest data into a shadow buffer is decided by
 /// the size of the guest mapping (see `guest_buf::MAPPING_THRESHOLD`). A device that says which
 /// way it will access the buffer (`new_mapping_for`) gets a mapping that can only be used that
 /// way: an OUTPUT buffer is the guest's own memory, which on a protected VM it shared with the
 /// host and goes on trusting, so the host maps it read-only (`VPU_DESIGN.md` §3.4).
-pub struct GuestMemoryMapper(GuestMemory);
+///
+/// Before any entry is mapped the policy is asked whether the host may touch it: inside the VMM
+/// the `GuestMemory` answers for itself, in a helper the VMM's window list does (`VPU_DESIGN.md`
+/// §6.2). Either way a refusal reaches the guest as `EFAULT`, never as a fault in the host.
+pub struct GuestMemoryMapper {
+    mem: GuestMemory,
+    policy: HostAccessPolicy,
+}
 
 impl GuestMemoryMapper {
+    /// The in-VMM shape: `mem` knows its purposes and whether the VM is protected.
     pub fn new(mem: GuestMemory) -> Self {
-        Self(mem)
+        Self::with_policy(mem, HostAccessPolicy::GuestMemory)
+    }
+
+    pub fn with_policy(mem: GuestMemory, policy: HostAccessPolicy) -> Self {
+        Self { mem, policy }
     }
 
     pub fn guest_memory(&self) -> &GuestMemory {
-        &self.0
+        &self.mem
     }
 }
 
@@ -311,7 +367,7 @@ impl GuestMemoryMapper {
             .iter()
             .map(|sg| (GuestAddress(sg.start), sg.len as usize))
             .collect();
-        GuestBufferImport::new(&self.0, ranges, prot).map_err(|e| {
+        GuestBufferImport::new(&self.mem, ranges, prot, &self.policy).map_err(|e| {
             // The errno travels as the error's root so the device can hand it to the guest.
             anyhow::Error::from(GuestMappingError(e.errno())).context(e.to_string())
         })
@@ -342,7 +398,7 @@ impl VirtioMediaGuestMemoryMapper for GuestMemoryMapper {
 }
 
 #[derive(EventToken, Debug)]
-enum Token {
+pub enum Token {
     CommandQueue,
     V4l2Session(u32),
     Kill,
@@ -369,7 +425,9 @@ impl SessionPoller for WaitContextPoller {
 }
 
 /// Worker to operate a virtio-media device inside a worker thread.
-struct Worker<D: VirtioMediaDevice<Reader, Writer>> {
+///
+/// Shared by the in-VMM device and the vhost-user backend; see [`start_worker`].
+pub struct Worker<D: VirtioMediaDevice<Reader, Writer>> {
     runner: VirtioMediaDeviceRunner<Reader, Writer, D, WaitContextPoller>,
     cmd_queue: Queue,
     wait_ctx: Rc<WaitContext<Token>>,
@@ -379,28 +437,23 @@ impl<D> Worker<D>
 where
     D: VirtioMediaDevice<Reader, Writer>,
 {
-    /// Create a new worker instance for `device`.
-    fn new(
-        device: D,
-        cmd_queue: Queue,
-        kill_evt: Event,
-        wait_ctx: Rc<WaitContext<Token>>,
-    ) -> anyhow::Result<Self> {
-        wait_ctx
-            .add_many(&[
-                (cmd_queue.event(), Token::CommandQueue),
-                (&kill_evt, Token::Kill),
-            ])
-            .context("when adding worker events to wait context")?;
-
-        Ok(Self {
+    /// Create a new worker instance for `device`. `wait_ctx` must already carry the command
+    /// queue's event as `Token::CommandQueue` and the kill event as `Token::Kill` (see
+    /// [`start_worker`]).
+    pub fn new(device: D, cmd_queue: Queue, wait_ctx: Rc<WaitContext<Token>>) -> Self {
+        Self {
             runner: VirtioMediaDeviceRunner::new(device, WaitContextPoller(Rc::clone(&wait_ctx))),
             cmd_queue,
             wait_ctx,
-        })
+        }
     }
 
-    fn run(&mut self) -> anyhow::Result<()> {
+    /// Give the command queue back, dropping the device and its sessions.
+    pub fn into_cmd_queue(self) -> Queue {
+        self.cmd_queue
+    }
+
+    pub fn run(&mut self) -> anyhow::Result<()> {
         loop {
             let wait_events = self.wait_ctx.wait().context("Wait error")?;
 
@@ -449,6 +502,53 @@ where
     }
 }
 
+/// Run a virtio-media device on its own OS thread until the thread is told to stop.
+///
+/// This is the one thread model both process shapes use (`VPU_DESIGN.md` §6.2): the device is
+/// built by `create_device` *on the worker thread* and dropped there when the thread ends, so a
+/// device that is `!Send` -- M4's camera, whose NDK handles are raw pointers -- can be opened and
+/// closed on the thread that drives it; only the closure that builds it has to be `Send`. The
+/// thread hands the command queue back when it exits, which is how a vhost-user backend returns
+/// the queue to the frontend in `stop_queue`; the event queue is recovered through the
+/// [`EventQueue::shared`] handle once the device is gone.
+///
+/// A device that cannot be built, or a wait context that cannot be armed, is logged and the queue
+/// is simply given back: the guest then sees a device that never answers, and the VM lives.
+pub fn start_worker<D, F>(
+    create_device: F,
+    cmd_queue: Queue,
+    wait_ctx: WaitContext<Token>,
+) -> WorkerThread<Queue>
+where
+    D: VirtioMediaDevice<Reader, Writer> + 'static,
+    F: FnOnce() -> anyhow::Result<D> + Send + 'static,
+{
+    WorkerThread::start("v_media_worker", move |kill_evt| {
+        if let Err(e) = wait_ctx
+            .add_many(&[
+                (cmd_queue.event(), Token::CommandQueue),
+                (&kill_evt, Token::Kill),
+            ])
+            .context("when adding worker events to wait context")
+        {
+            error!("failed to create virtio-media worker: {:#}", e);
+            return cmd_queue;
+        }
+        let device = match create_device() {
+            Ok(device) => device,
+            Err(e) => {
+                error!("failed to create virtio-media device: {:#}", e);
+                return cmd_queue;
+            }
+        };
+        let mut worker = Worker::new(device, cmd_queue, Rc::new(wait_ctx));
+        if let Err(e) = worker.run() {
+            error!("virtio_media worker exited with error: {:#}", e);
+        }
+        worker.into_cmd_queue()
+    })
+}
+
 /// Implements the required traits to operate a [`VirtioMediaDevice`] under crosvm.
 struct CrosvmVirtioMediaDevice<
     D: VirtioMediaDevice<Reader, Writer>,
@@ -471,7 +571,7 @@ struct CrosvmVirtioMediaDevice<
     /// even after it is passed to the device.
     shm_mapper: Option<ArcedMemoryMapper>,
     /// Worker thread for the device.
-    worker_thread: Option<WorkerThread<()>>,
+    worker_thread: Option<WorkerThread<Queue>>,
 }
 
 impl<D, F> CrosvmVirtioMediaDevice<D, F>
@@ -545,7 +645,7 @@ where
         }
 
         let cmd_queue = queues.remove(&0).context("missing queue 0")?;
-        let event_queue = EventQueue(queues.remove(&1).context("missing queue 1")?);
+        let event_queue = EventQueue::new(queues.remove(&1).context("missing queue 1")?);
 
         // The offset space is the pool's, and the pool belongs to the VM; the mapper is this
         // device's. A lease that outlives its device gives the device's slices back.
@@ -567,34 +667,19 @@ where
         };
 
         let wait_ctx = WaitContext::new()?;
-        let device = (self.create_device)(
-            event_queue,
-            GuestMemoryMapper::new(mem),
-            mapper,
-            allocator,
-        )?;
+        let device =
+            (self.create_device)(event_queue, GuestMemoryMapper::new(mem), mapper, allocator)?;
 
-        let worker_thread = WorkerThread::start("v_media_worker", move |e| {
-            let wait_ctx = Rc::new(wait_ctx);
-            let mut worker = match Worker::new(device, cmd_queue, e, wait_ctx) {
-                Ok(worker) => worker,
-                Err(e) => {
-                    error!("failed to create virtio-media worker: {:#}", e);
-                    return;
-                }
-            };
-            if let Err(e) = worker.run() {
-                error!("virtio_media worker exited with error: {:#}", e);
-            }
-        });
-
-        self.worker_thread = Some(worker_thread);
+        // The device was built here, on the VMM's thread, so that a device that cannot be built
+        // fails the activation rather than only a log line; it is moved to the worker thread.
+        self.worker_thread = Some(start_worker(move || Ok(device), cmd_queue, wait_ctx));
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
         if let Some(worker_thread) = self.worker_thread.take() {
-            worker_thread.stop();
+            // The queue comes back with the thread; there is nothing to do with it here.
+            let _ = worker_thread.stop();
         }
 
         Ok(())
@@ -620,17 +705,41 @@ where
 }
 
 /// The card name a config area carries, for log lines that have to say which device spoke.
-fn card_str(card: &[u8; 32]) -> String {
+pub(crate) fn card_str(card: &[u8; 32]) -> String {
     let end = card.iter().position(|&b| b == 0).unwrap_or(card.len());
     String::from_utf8_lossy(&card[..end]).into_owned()
 }
 
 /// The `card` field of the config area: `name`, truncated to fit with a terminating NUL.
-fn card_name(name: &str) -> [u8; 32] {
+pub(crate) fn card_name(name: &str) -> [u8; 32] {
     let mut card = [0u8; 32];
     let n = name.len().min(card.len() - 1);
     card[..n].copy_from_slice(&name.as_bytes()[..n]);
     card
+}
+
+/// The virtio config area of a `simple` device, wherever it runs.
+pub fn simple_capture_config() -> VirtioMediaDeviceConfig {
+    use virtio_media::v4l2r::ioctl::Capabilities;
+
+    VirtioMediaDeviceConfig {
+        device_caps: (Capabilities::VIDEO_CAPTURE | Capabilities::STREAMING).bits(),
+        // VFL_TYPE_VIDEO
+        device_type: 0,
+        card: card_name("simple_device"),
+    }
+}
+
+/// The virtio config area of a `loopback` device called `card`, wherever it runs.
+pub fn loopback_config(card: &str) -> VirtioMediaDeviceConfig {
+    use virtio_media::v4l2r::ioctl::Capabilities;
+
+    VirtioMediaDeviceConfig {
+        device_caps: (Capabilities::VIDEO_M2M_MPLANE | Capabilities::STREAMING).bits(),
+        // VFL_TYPE_VIDEO
+        device_type: 0,
+        card: card_name(card),
+    }
 }
 
 /// Create a simple media capture device.
@@ -642,16 +751,10 @@ pub fn create_virtio_media_simple_capture_device(
     pool: Option<MediaPool>,
 ) -> Box<dyn VirtioDevice> {
     use virtio_media::devices::SimpleCaptureDevice;
-    use virtio_media::v4l2r::ioctl::Capabilities;
 
     let device = CrosvmVirtioMediaDevice::new(
         features,
-        VirtioMediaDeviceConfig {
-            device_caps: (Capabilities::VIDEO_CAPTURE | Capabilities::STREAMING).bits(),
-            // VFL_TYPE_VIDEO
-            device_type: 0,
-            card: card_name("simple_device"),
-        },
+        simple_capture_config(),
         pool,
         |event_queue, guest_mapper, mapper, allocator| {
             Ok(SimpleCaptureDevice::new(
@@ -677,16 +780,10 @@ pub fn create_virtio_media_loopback_device(
     pool: Option<MediaPool>,
 ) -> Box<dyn VirtioDevice> {
     use virtio_media::devices::LoopbackDevice;
-    use virtio_media::v4l2r::ioctl::Capabilities;
 
     let device = CrosvmVirtioMediaDevice::new(
         features,
-        VirtioMediaDeviceConfig {
-            device_caps: (Capabilities::VIDEO_M2M_MPLANE | Capabilities::STREAMING).bits(),
-            // VFL_TYPE_VIDEO
-            device_type: 0,
-            card: card_name(card),
-        },
+        loopback_config(card),
         pool,
         |event_queue, guest_mapper, mapper, allocator| {
             Ok(LoopbackDevice::new(

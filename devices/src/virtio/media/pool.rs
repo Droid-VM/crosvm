@@ -23,13 +23,52 @@ use base::AsRawDescriptor;
 use base::MappedRegion;
 use base::MemoryMapping;
 use base::MemoryMappingBuilder;
+use base::SafeDescriptor;
 use resources::address_allocator::AddressAllocator;
 use resources::AddressRange;
 use resources::Alloc;
 use sync::Mutex;
 use virtio_media::HostBuffer;
 use virtio_media::VirtioMediaBufferAllocator;
+use vm_memory::GuestMemory;
 use vm_memory::MediaPoolHandle;
+
+/// Rebuild the `media_host` pool handle from a memory table that has lost its purposes: the
+/// region starting at `gpa` (`VPU_DESIGN.md` §6.2, the `--pool-gpa` handoff).
+///
+/// A vhost-user helper's `GuestMemory` is what `SET_MEM_TABLE` describes -- every region of the
+/// VMM's, memfd and offset included, but no `MemoryRegionPurpose`, so
+/// `MediaPoolHandle::from_guest_memory` finds nothing there. The pool's guest-physical base is
+/// enough to find it again, and everything else the handle needs is read off that region, so the
+/// helper cannot disagree with the VMM about which bytes the pool is. `host_va` is the helper's
+/// own mapping of the region; the handle's consumer maps the pool once more for itself
+/// ([`MediaPool::new`]), which is what `MediaPoolHandle` says an out-of-process consumer must do.
+pub fn pool_handle_at(mem: &GuestMemory, gpa: u64) -> anyhow::Result<MediaPoolHandle> {
+    let region = mem
+        .regions()
+        .find(|region| region.guest_addr.offset() == gpa)
+        .ok_or_else(|| {
+            let starts: Vec<String> = mem
+                .regions()
+                .map(|r| format!("{:#x}+{:#x}", r.guest_addr.offset(), r.size))
+                .collect();
+            anyhow::anyhow!(
+                "no memory region starts at the media_host pool base {:#x}; the memory table \
+                 has [{}]",
+                gpa,
+                starts.join(", ")
+            )
+        })?;
+    let fd = SafeDescriptor::try_from(region.shm as &dyn AsRawDescriptor)
+        .with_context(|| format!("cannot dup the backing object of the region at {:#x}", gpa))?;
+    Ok(MediaPoolHandle {
+        fd,
+        fd_offset: region.shm_offset,
+        host_va: region.host_addr as u64,
+        gpa,
+        size: region.size as u64,
+    })
+}
 
 /// The VM-wide `media_host` pool: one offset space, shared by every media device.
 ///
@@ -140,13 +179,7 @@ impl MediaPoolAllocator {
         // SAFETY: `ptr` maps the `len` bytes at `pool.fd_offset + offset` of `fd`, and stays
         // valid for the life of the allocator (see above).
         Ok(unsafe {
-            HostBuffer::from_raw_parts(
-                fd,
-                self.pool.fd_offset + offset,
-                len,
-                ptr,
-                Some(offset),
-            )
+            HostBuffer::from_raw_parts(fd, self.pool.fd_offset + offset, len, ptr, Some(offset))
         })
     }
 
@@ -211,6 +244,9 @@ pub struct MediaPool {
     inner: Arc<Mutex<MediaPoolAllocator>>,
     /// The pool descriptor, for `keep_rds`. The allocator owns the only dup this side keeps.
     fd: base::RawDescriptor,
+    /// The guest-physical window, `(base, size)`: what a helper is told so it can find the pool
+    /// again in its own memory table.
+    guest_range: (u64, u64),
 }
 
 impl MediaPool {
@@ -228,11 +264,17 @@ impl MediaPool {
         Ok(MediaPool {
             inner: Arc::new(Mutex::new(inner)),
             fd,
+            guest_range: (gpa, size),
         })
     }
 
     pub fn as_raw_descriptor(&self) -> base::RawDescriptor {
         self.fd
+    }
+
+    /// The pool's guest-physical `(base, size)`, as the `media_host` device-tree node has it.
+    pub fn guest_range(&self) -> (u64, u64) {
+        self.guest_range
     }
 
     /// One device's lease on the pool. What the lease still holds when it is dropped goes back
@@ -275,12 +317,12 @@ impl Drop for PoolBufferAllocator {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use base::pagesize;
     use base::SafeDescriptor;
     use base::SharedMemory;
+    use vm_memory::GuestAddress;
 
     use super::*;
 
@@ -380,6 +422,55 @@ mod tests {
     }
 
     /// Exhaustion is `ENOMEM`, and a failed allocation leaves nothing behind.
+    /// A helper rebuilds the pool from the memory table it was sent, given only the base: the
+    /// region that starts there, with its memfd and its offset inside it. The pool is the second
+    /// region of the same backing object, the way the aarch64 layout appends it above guest RAM,
+    /// so a handle that lost the offset would map the guest's RAM instead.
+    #[test]
+    fn the_pool_is_found_again_by_its_guest_base() {
+        let ram_base = GuestAddress(0x8000_0000);
+        let ram_size = 4 * pagesize() as u64;
+        let pool_gpa = 0x1_0000_0000u64;
+        let mem =
+            GuestMemory::new(&[(ram_base, ram_size), (GuestAddress(pool_gpa), POOL_SIZE)]).unwrap();
+
+        let handle = pool_handle_at(&mem, pool_gpa).unwrap();
+        assert_eq!((handle.gpa, handle.size), (pool_gpa, POOL_SIZE));
+        assert_eq!(
+            handle.fd_offset, ram_size,
+            "the pool sits behind guest RAM in the memfd"
+        );
+        assert_eq!(handle.guest_range(), (GuestAddress(pool_gpa), POOL_SIZE));
+
+        // Bytes written through the helper's own mapping of the pool are the guest's bytes.
+        let pool = MediaPool::new(handle).unwrap();
+        assert_eq!(pool.guest_range(), (pool_gpa, POOL_SIZE));
+        let mut lease = pool.lease("lb0".into());
+        let mut buffer = lease.allocate(pagesize() as u64).unwrap();
+        let offset = buffer.pool_offset.unwrap();
+        // SAFETY: the buffer maps at least one page, and nothing else references it.
+        unsafe { buffer.as_mut_ptr().write_bytes(0xa5, 16) };
+        let mut seen = [0u8; 16];
+        mem.read_exact_at_addr(&mut seen, GuestAddress(pool_gpa + offset))
+            .unwrap();
+        assert_eq!(seen, [0xa5; 16]);
+        // ... and not RAM's, which is what forgetting `fd_offset` would have written.
+        mem.read_exact_at_addr(&mut seen, GuestAddress(ram_base.offset() + offset))
+            .unwrap();
+        assert_eq!(seen, [0; 16]);
+        lease.release(buffer);
+
+        // A base that is not a region start, even one inside a region, is refused by name.
+        let e = pool_handle_at(&mem, pool_gpa + pagesize() as u64)
+            .err()
+            .expect("a base inside a region is not that region's base");
+        assert!(
+            e.to_string().contains("no memory region starts at"),
+            "{e:#}"
+        );
+        assert!(pool_handle_at(&mem, 0).is_err());
+    }
+
     #[test]
     fn an_exhausted_pool_answers_enomem_and_stays_usable() {
         let pool = pool();

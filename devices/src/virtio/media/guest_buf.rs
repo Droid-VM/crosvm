@@ -16,13 +16,15 @@
 //! backing memfd; the memfd offset to map is the sum of the last two. Treating the address itself
 //! as a memfd offset, or as an offset from the first region's base, is wrong on aarch64 where RAM
 //! starts at `0x8000_0000`, and wrong for every region that is not the first. The host's right to
-//! touch the bytes is checked first, through the same gate `get_slice_at_addr` uses, so lent
-//! memory in a protected VM answers `EFAULT` instead of a `SIGBUS` -- and so the four sources a
-//! guest-owned buffer can come from (`media_guest` pool, restricted-dma-pool swiotlb, shared RAM,
-//! plain KVM RAM) all take the same path.
+//! touch the bytes is checked first, before anything is mapped, so lent memory in a protected VM
+//! answers `EFAULT` instead of a `SIGBUS` -- and so the four sources a guest-owned buffer can come
+//! from (`media_guest` pool, restricted-dma-pool swiotlb, shared RAM, plain KVM RAM) all take the
+//! same path. Who answers that question is a [`HostAccessPolicy`]: in the VMM the `GuestMemory`
+//! itself, in a vhost-user helper the list of windows the VMM computed for it (`VPU_DESIGN.md`
+//! §6.2).
 //!
-//! This module deliberately depends only on `base` and `vm_memory`, not on the virtio-media crate,
-//! so it can be tested on its own.
+//! This module deliberately depends only on `base`, `vm_memory` and `resources` (for
+//! `AddressRange`), not on the virtio-media crate, so it can be tested on its own.
 
 use std::cell::OnceCell;
 
@@ -31,6 +33,7 @@ use base::MappedRegion;
 use base::MemoryMappingArena;
 use base::Protection;
 use base::SafeDescriptor;
+use resources::AddressRange;
 use thiserror::Error;
 use vm_memory::udmabuf::UdmabufDriver;
 use vm_memory::udmabuf::UdmabufDriverTrait;
@@ -38,6 +41,8 @@ use vm_memory::udmabuf::UdmabufError;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
+#[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+use vm_memory::MemoryRegionPurpose;
 
 /// Below this many bytes a guest buffer is shadowed (copied in, copied back on drop) rather than
 /// re-mapped: a mapping costs more than copying a control payload.
@@ -51,6 +56,8 @@ pub enum ImportError {
     NotLinear(&'static str),
     #[error("guest range {0:#x}+{1:#x} is not accessible to the host: {2}")]
     Inaccessible(u64, usize, GuestMemoryError),
+    #[error("guest range {0:#x}+{1:#x} is outside every window the host may touch")]
+    OutsideWindows(u64, usize),
     #[error("guest range {0:#x}+{1:#x} is not valid guest memory: {2}")]
     InvalidRange(u64, usize, GuestMemoryError),
     #[error("scatter-gather list length overflows")]
@@ -68,7 +75,7 @@ impl ImportError {
     pub fn errno(&self) -> i32 {
         match self {
             // Memory the host is not allowed to touch: the address is the guest's mistake.
-            ImportError::Inaccessible(..) => libc::EFAULT,
+            ImportError::Inaccessible(..) | ImportError::OutsideWindows(..) => libc::EFAULT,
             ImportError::Empty
             | ImportError::NotLinear(_)
             | ImportError::InvalidRange(..)
@@ -89,6 +96,91 @@ fn access_error(addr: GuestAddress, len: usize, e: GuestMemoryError) -> ImportEr
     }
 }
 
+/// Who decides whether the host may touch a guest-physical range (`VPU_DESIGN.md` §6.2).
+///
+/// In the VMM the `GuestMemory` knows: its regions carry a purpose and it is marked protected
+/// once the VM is, so `get_slice_at_addr` refuses lent memory by itself. In a vhost-user helper it
+/// does not: the memory table the frontend sends carries no purpose and no protection flag, so
+/// every address maps and a lent one would fault on first touch and take the helper -- and the VM
+/// -- with it. The VMM therefore works out, from its own `GuestMemory`, which windows the host
+/// may touch ([`host_accessible_windows`]), hands them to the helper, and the helper checks every
+/// scatter-gather entry against them before mapping anything. Same question, two answerers.
+pub enum HostAccessPolicy {
+    /// The `GuestMemory`'s own gate: `check_host_access`, through `get_slice_at_addr`.
+    GuestMemory,
+    /// Only these guest-physical windows; an entry outside all of them is `EFAULT`.
+    Windows(Vec<AddressRange>),
+}
+
+impl HostAccessPolicy {
+    /// Refuse `addr..addr+len` unless the host may touch all of it.
+    ///
+    /// An entry has to lie inside one window, the way `get_slice_at_addr` needs it inside one
+    /// region; the windows are the VMM's regions, so nothing legitimate straddles two. Whichever
+    /// policy this is, an address that is not guest memory at all is `EINVAL`, and in the VMM the
+    /// `GuestMemory` gate still runs after the window check -- it is the one that knows about a
+    /// growable pool's grants.
+    pub fn check(
+        &self,
+        mem: &GuestMemory,
+        addr: GuestAddress,
+        len: usize,
+    ) -> Result<(), ImportError> {
+        if let HostAccessPolicy::Windows(windows) = self {
+            let range = AddressRange::from_start_and_size(addr.offset(), len as u64)
+                .ok_or(ImportError::Overflow)?;
+            if len != 0 && !windows.iter().any(|window| window.contains_range(range)) {
+                return Err(ImportError::OutsideWindows(addr.offset(), len));
+            }
+        }
+        mem.get_slice_at_addr(addr, len)
+            .map(|_| ())
+            .map_err(|e| access_error(addr, len, e))
+    }
+}
+
+/// The guest-physical windows the host may touch in `mem`, for a helper that cannot tell.
+///
+/// The same rule `GuestMemory::check_host_access` applies once the VM is protected, written out
+/// here because the VMM computes this before `set_protected` is called and the gate is not
+/// public: every pool (SHARE'd, never lent), the static swiotlb region, the shared RAM window of
+/// a pseudo-unprotected VM and the page its shim is told about, and the shared framebuffer. When
+/// the VM's memory is not lent at all (`memory_is_lent == false`, i.e.
+/// `!ProtectionType::isolates_memory()`), every region is the host's to touch.
+///
+/// A growable pool is listed whole: its ungranted pages are still the host's own memory, so
+/// touching them cannot fault the helper; they are merely invisible to the guest, and a guest
+/// cannot name them in a scatter-gather list it did not allocate. Every pool that exists today
+/// is fully pre-shared anyway.
+pub fn host_accessible_windows(mem: &GuestMemory, memory_is_lent: bool) -> Vec<AddressRange> {
+    mem.regions()
+        .filter(|region| {
+            if !memory_is_lent {
+                return true;
+            }
+            #[allow(clippy::match_like_matches_macro)]
+            match region.options.purpose {
+                #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+                MemoryRegionPurpose::GpuPool
+                | MemoryRegionPurpose::GpuPoolGuest
+                | MemoryRegionPurpose::Drm2KgslPool
+                | MemoryRegionPurpose::VenusPool
+                | MemoryRegionPurpose::MediaPool
+                | MemoryRegionPurpose::MediaPoolGuest
+                | MemoryRegionPurpose::DynamicTestPool
+                | MemoryRegionPurpose::SharedGuestRam
+                | MemoryRegionPurpose::ShimHandoff
+                | MemoryRegionPurpose::SharedFramebuffer
+                | MemoryRegionPurpose::StaticSwiotlbRegion => true,
+                _ => false,
+            }
+        })
+        .filter_map(|region| {
+            AddressRange::from_start_and_size(region.guest_addr.offset(), region.size as u64)
+        })
+        .collect()
+}
+
 /// Direct linear mapping of sparse guest memory: an arena into which every SG entry's pages are
 /// mapped back to back from the guest memory's backing memfd.
 pub struct GuestArenaMapping {
@@ -103,6 +195,7 @@ impl GuestArenaMapping {
         mem: &GuestMemory,
         sgs: &[(GuestAddress, usize)],
         prot: Protection,
+        policy: &HostAccessPolicy,
     ) -> Result<Self, ImportError> {
         let page_size = pagesize() as u64;
         let page_mask = page_size - 1;
@@ -149,16 +242,14 @@ impl GuestArenaMapping {
         }
         // Align to page size if the last entry did not cover a full page.
         let arena_size = arena_size.next_multiple_of(page_size);
-        let mut arena =
-            MemoryMappingArena::new(arena_size as usize).map_err(ImportError::Arena)?;
+        let mut arena = MemoryMappingArena::new(arena_size as usize).map_err(ImportError::Arena)?;
 
         // Map all SG entries.
         let mut pos = 0usize;
         for (addr, len) in sgs {
             // The host's right to these bytes, before anything is mapped: this is the gate that
             // refuses lent memory in a protected VM.
-            mem.get_slice_at_addr(*addr, *len)
-                .map_err(|e| access_error(*addr, *len, e))?;
+            policy.check(mem, *addr, *len)?;
 
             // Address of the first page of the region, and the whole pages to map.
             let first_page = GuestAddress(addr.offset() & !page_mask);
@@ -237,7 +328,11 @@ pub struct GuestShadowMapping {
 }
 
 impl GuestShadowMapping {
-    pub fn new(mem: &GuestMemory, sgs: Vec<(GuestAddress, usize)>) -> Result<Self, ImportError> {
+    pub fn new(
+        mem: &GuestMemory,
+        sgs: Vec<(GuestAddress, usize)>,
+        policy: &HostAccessPolicy,
+    ) -> Result<Self, ImportError> {
         let mut total_size = 0usize;
         for (_, len) in &sgs {
             total_size = total_size.checked_add(*len).ok_or(ImportError::Overflow)?;
@@ -248,6 +343,8 @@ impl GuestShadowMapping {
         let mut data = vec![0u8; total_size];
         let mut pos = 0;
         for (addr, len) in &sgs {
+            // Same gate as the arena's, before the copy touches anything.
+            policy.check(mem, *addr, *len)?;
             mem.read_exact_at_addr(&mut data[pos..pos + len], *addr)
                 .map_err(|e| access_error(*addr, *len, e))?;
             pos += len;
@@ -289,7 +386,10 @@ impl Drop for GuestShadowMapping {
 
         let mut pos = 0;
         for (addr, len) in &self.sgs {
-            if let Err(e) = self.mem.write_all_at_addr(&self.data[pos..pos + len], *addr) {
+            if let Err(e) = self
+                .mem
+                .write_all_at_addr(&self.data[pos..pos + len], *addr)
+            {
                 base::error!("failed to write back guest memory shadow mapping: {:#}", e);
             }
             pos += len;
@@ -349,11 +449,12 @@ pub struct GuestBufferImport {
 impl GuestBufferImport {
     /// Import `sgs`, mapped with `prot` (the direction the device will access it in: read-only
     /// for an OUTPUT buffer, read-write for a CAPTURE one; a caller that cannot tell passes
-    /// read-write).
+    /// read-write), once `policy` has agreed that the host may touch every entry.
     pub fn new(
         mem: &GuestMemory,
         sgs: Vec<(GuestAddress, usize)>,
         prot: Protection,
+        policy: &HostAccessPolicy,
     ) -> Result<Self, ImportError> {
         let mut total_size = 0usize;
         for (_, len) in &sgs {
@@ -364,9 +465,9 @@ impl GuestBufferImport {
         }
 
         let mapping = if total_size >= MAPPING_THRESHOLD {
-            GuestMemoryChunk::Mapping(GuestArenaMapping::new(mem, &sgs, prot)?)
+            GuestMemoryChunk::Mapping(GuestArenaMapping::new(mem, &sgs, prot, policy)?)
         } else {
-            GuestMemoryChunk::Shadow(GuestShadowMapping::new(mem, sgs.clone())?)
+            GuestMemoryChunk::Shadow(GuestShadowMapping::new(mem, sgs.clone(), policy)?)
         };
 
         Ok(Self {
@@ -453,6 +554,9 @@ mod tests {
     /// real thing, which is what udmabuf needs.
     const RAM_BASE: u64 = 0x8000_0000;
 
+    /// The in-VMM policy: the `GuestMemory` answers for itself.
+    const VMM: HostAccessPolicy = HostAccessPolicy::GuestMemory;
+
     fn guest_memory(pages: u64) -> GuestMemory {
         GuestMemory::new(&[(GuestAddress(RAM_BASE), pages * pagesize() as u64)]).unwrap()
     }
@@ -472,7 +576,7 @@ mod tests {
         mem.write_all_at_addr(&pattern(page, 2), b).unwrap();
 
         let sgs = vec![(a, 2 * page), (b, page)];
-        let mut import = GuestBufferImport::new(&mem, sgs, Protection::read_write()).unwrap();
+        let mut import = GuestBufferImport::new(&mem, sgs, Protection::read_write(), &VMM).unwrap();
         assert!(!import.is_shadowed());
         assert_eq!(import.len(), 3 * page);
 
@@ -503,8 +607,8 @@ mod tests {
         mem.write_all_at_addr(&pattern(0x800, 3), start).unwrap();
 
         // Large enough to be mapped, not shadowed, and ending mid-page (last entry may).
-        let import = GuestBufferImport::new(&mem, vec![(start, 0x800)], Protection::read())
-            .unwrap();
+        let import =
+            GuestBufferImport::new(&mem, vec![(start, 0x800)], Protection::read(), &VMM).unwrap();
         assert!(!import.is_shadowed());
         // SAFETY: the import maps `len` bytes.
         let view = unsafe { std::slice::from_raw_parts(import.as_ptr(), import.len()) };
@@ -518,8 +622,9 @@ mod tests {
         let start = GuestAddress(RAM_BASE + 2 * page as u64 + 0x40);
         mem.write_all_at_addr(&pattern(0x100, 4), start).unwrap();
 
-        let mut import = GuestBufferImport::new(&mem, vec![(start, 0x100)], Protection::read_write())
-            .unwrap();
+        let mut import =
+            GuestBufferImport::new(&mem, vec![(start, 0x100)], Protection::read_write(), &VMM)
+                .unwrap();
         assert!(import.is_shadowed());
         // SAFETY: the shadow holds `len` bytes.
         let view = unsafe { std::slice::from_raw_parts_mut(import.as_mut_ptr(), import.len()) };
@@ -543,16 +648,23 @@ mod tests {
         let mem = guest_memory(4);
         let a = GuestAddress(RAM_BASE + page as u64);
 
-        let e = GuestBufferImport::new(&mem, vec![], Protection::read()).err().expect("import should have failed");
+        let e = GuestBufferImport::new(&mem, vec![], Protection::read(), &VMM)
+            .err()
+            .expect("import should have failed");
         assert_eq!(e.errno(), libc::EINVAL);
 
         // A non-initial entry that is not page aligned cannot be made linear.
         let e = GuestBufferImport::new(
             &mem,
-            vec![(a, page), (GuestAddress(a.offset() + page as u64 + 8), page)],
+            vec![
+                (a, page),
+                (GuestAddress(a.offset() + page as u64 + 8), page),
+            ],
             Protection::read(),
+            &VMM,
         )
-        .err().expect("import should have failed");
+        .err()
+        .expect("import should have failed");
         assert_eq!(e.errno(), libc::EINVAL);
 
         // Outside guest memory.
@@ -560,8 +672,10 @@ mod tests {
             &mem,
             vec![(GuestAddress(RAM_BASE + 64 * page as u64), page)],
             Protection::read(),
+            &VMM,
         )
-        .err().expect("import should have failed");
+        .err()
+        .expect("import should have failed");
         assert_eq!(e.errno(), libc::EINVAL);
     }
 
@@ -572,14 +686,18 @@ mod tests {
         let page = pagesize();
         let mem = guest_memory(4);
         let a = GuestAddress(RAM_BASE + page as u64);
-        assert!(GuestBufferImport::new(&mem, vec![(a, page)], Protection::read()).is_ok());
+        assert!(GuestBufferImport::new(&mem, vec![(a, page)], Protection::read(), &VMM).is_ok());
         // Small enough to shadow: the copy path must refuse too.
-        assert!(GuestBufferImport::new(&mem, vec![(a, 0x100)], Protection::read()).is_ok());
+        assert!(GuestBufferImport::new(&mem, vec![(a, 0x100)], Protection::read(), &VMM).is_ok());
 
         mem.set_protected();
-        let e = GuestBufferImport::new(&mem, vec![(a, page)], Protection::read()).err().expect("import should have failed");
+        let e = GuestBufferImport::new(&mem, vec![(a, page)], Protection::read(), &VMM)
+            .err()
+            .expect("import should have failed");
         assert_eq!(e.errno(), libc::EFAULT, "{e}");
-        let e = GuestBufferImport::new(&mem, vec![(a, 0x100)], Protection::read()).err().expect("import should have failed");
+        let e = GuestBufferImport::new(&mem, vec![(a, 0x100)], Protection::read(), &VMM)
+            .err()
+            .expect("import should have failed");
         assert_eq!(e.errno(), libc::EFAULT, "{e}");
     }
 
@@ -601,9 +719,13 @@ mod tests {
         mem.write_all_at_addr(&pattern(page, 5), a).unwrap();
         mem.write_all_at_addr(&pattern(page, 6), b).unwrap();
 
-        let import =
-            GuestBufferImport::new(&mem, vec![(a, page), (b, page)], Protection::read_write())
-                .unwrap();
+        let import = GuestBufferImport::new(
+            &mem,
+            vec![(a, page), (b, page)],
+            Protection::read_write(),
+            &VMM,
+        )
+        .unwrap();
         let fd = import.dmabuf(&driver).expect("udmabuf import failed");
         // Asking again is free and gives the same descriptor.
         let again = import.dmabuf(&driver).unwrap();
@@ -624,5 +746,155 @@ mod tests {
         assert_eq!(via_dmabuf, via_arena);
         assert_eq!(&via_dmabuf[..page], &pattern(page, 5)[..]);
         assert_eq!(&via_dmabuf[page..], &pattern(page, 6)[..]);
+    }
+
+    /// The helper's policy: a window list the VMM computed, consulted before anything is mapped.
+    /// Inside a window the import works as in the VMM; outside, or straddling a window's end, it
+    /// is `EFAULT` -- and nothing was mapped or copied to find that out.
+    #[test]
+    fn windows_policy_refuses_what_is_outside_them() {
+        let page = pagesize();
+        // Eight pages of guest memory, all of which are really mapped in this process (as they
+        // are in a helper), of which the VMM allows only pages 2..=5.
+        let mem = guest_memory(8);
+        let allowed_start = RAM_BASE + 2 * page as u64;
+        let policy = HostAccessPolicy::Windows(vec![AddressRange::from_start_and_size(
+            allowed_start,
+            4 * page as u64,
+        )
+        .unwrap()]);
+        let inside = GuestAddress(allowed_start + page as u64);
+        mem.write_all_at_addr(&pattern(page, 7), inside).unwrap();
+
+        // Inside: both the mapped and the shadowed shape.
+        let import =
+            GuestBufferImport::new(&mem, vec![(inside, page)], Protection::read(), &policy)
+                .unwrap();
+        // SAFETY: the import maps `len` bytes.
+        let view = unsafe { std::slice::from_raw_parts(import.as_ptr(), import.len()) };
+        assert_eq!(view, &pattern(page, 7)[..]);
+        assert!(
+            GuestBufferImport::new(&mem, vec![(inside, 0x100)], Protection::read(), &policy)
+                .unwrap()
+                .is_shadowed()
+        );
+
+        // Outside: page 0 is guest memory the helper could map, and must not.
+        let outside = GuestAddress(RAM_BASE);
+        for len in [page, 0x100] {
+            let e = GuestBufferImport::new(&mem, vec![(outside, len)], Protection::read(), &policy)
+                .err()
+                .expect("import outside the windows should have failed");
+            assert_eq!(e.errno(), libc::EFAULT, "{e}");
+        }
+
+        // Straddling: starts on the last allowed page and runs one page past the window.
+        let last = GuestAddress(allowed_start + 3 * page as u64);
+        let e = GuestBufferImport::new(&mem, vec![(last, 2 * page)], Protection::read(), &policy)
+            .err()
+            .expect("import straddling the window end should have failed");
+        assert_eq!(e.errno(), libc::EFAULT, "{e}");
+        // Exactly up to the window's end is fine.
+        assert!(
+            GuestBufferImport::new(&mem, vec![(last, page)], Protection::read(), &policy).is_ok()
+        );
+        // One good entry and one bad one: the whole list is refused.
+        let e = GuestBufferImport::new(
+            &mem,
+            vec![(inside, page), (outside, page)],
+            Protection::read(),
+            &policy,
+        )
+        .err()
+        .expect("a list with an entry outside the windows should have failed");
+        assert_eq!(e.errno(), libc::EFAULT, "{e}");
+
+        // Outside every window, an address is EFAULT whether or not it is memory: the guest
+        // named something the host may not touch, and that is the whole of the answer.
+        let nowhere = GuestAddress(RAM_BASE + 64 * page as u64);
+        let e = GuestBufferImport::new(&mem, vec![(nowhere, page)], Protection::read(), &policy)
+            .err()
+            .expect("import of non-memory should have failed");
+        assert_eq!(e.errno(), libc::EFAULT, "{e}");
+        // Inside a window that covers no memory -- a window list is what the VMM says, not a
+        // promise that pages exist -- it is not memory, and stays EINVAL as in the VMM.
+        let generous = HostAccessPolicy::Windows(vec![AddressRange::from_start_and_size(
+            RAM_BASE,
+            128 * page as u64,
+        )
+        .unwrap()]);
+        for policy in [&generous, &VMM] {
+            let e = GuestBufferImport::new(&mem, vec![(nowhere, page)], Protection::read(), policy)
+                .err()
+                .expect("import of non-memory should have failed");
+            assert_eq!(e.errno(), libc::EINVAL, "{e}");
+        }
+    }
+
+    /// What the VMM hands a helper: every region when the guest's memory is not lent, and only
+    /// the SHARE'd purposes when it is. Plain guest RAM is lent in a protected VM, so it drops
+    /// out; on aarch64 the pools and the swiotlb region stay.
+    #[test]
+    fn accessible_windows_follow_the_protected_vm_rule() {
+        use vm_memory::MemoryRegionOptions;
+        use vm_memory::MemoryRegionPurpose;
+
+        let page = pagesize() as u64;
+        let ram = (GuestAddress(RAM_BASE), 4 * page, MemoryRegionOptions::new());
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        let mem = GuestMemory::new_with_options(&[
+            ram,
+            (
+                GuestAddress(RAM_BASE + 4 * page),
+                2 * page,
+                MemoryRegionOptions::new().purpose(MemoryRegionPurpose::StaticSwiotlbRegion),
+            ),
+            (
+                GuestAddress(RAM_BASE + 8 * page),
+                2 * page,
+                MemoryRegionOptions::new().purpose(MemoryRegionPurpose::MediaPool),
+            ),
+        ])
+        .unwrap();
+        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+        let mem = GuestMemory::new_with_options(&[
+            ram,
+            (
+                GuestAddress(RAM_BASE + 4 * page),
+                2 * page,
+                MemoryRegionOptions::new().purpose(MemoryRegionPurpose::ReservedMemory),
+            ),
+        ])
+        .unwrap();
+
+        let everything: Vec<(u64, u64)> = host_accessible_windows(&mem, false)
+            .into_iter()
+            .map(|w| (w.start, w.end))
+            .collect();
+        let all_regions: Vec<(u64, u64)> = mem
+            .regions()
+            .map(|r| {
+                (
+                    r.guest_addr.offset(),
+                    r.guest_addr.offset() + r.size as u64 - 1,
+                )
+            })
+            .collect();
+        assert_eq!(everything, all_regions);
+
+        let lent: Vec<(u64, u64)> = host_accessible_windows(&mem, true)
+            .into_iter()
+            .map(|w| (w.start, w.end))
+            .collect();
+        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+        assert_eq!(
+            lent,
+            vec![
+                (RAM_BASE + 4 * page, RAM_BASE + 6 * page - 1),
+                (RAM_BASE + 8 * page, RAM_BASE + 10 * page - 1),
+            ]
+        );
+        #[cfg(not(any(target_arch = "arm", target_arch = "aarch64")))]
+        assert!(lent.is_empty(), "{lent:?}");
     }
 }
