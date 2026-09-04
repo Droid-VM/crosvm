@@ -1559,9 +1559,9 @@ impl Default for Config {
             virt_cpufreq: false,
             virt_cpufreq_v2: false,
             virtio_input: Vec::new(),
-            #[cfg(feature = "audio")]
             #[cfg(feature = "media")]
             virtio_media: Vec::new(),
+            #[cfg(feature = "audio")]
             virtio_snds: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             #[cfg(feature = "media")]
