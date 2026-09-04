@@ -2837,7 +2837,12 @@ pub struct RunCommand {
     /// once. On gunyah every such device serves its MMAP buffers
     /// out of the media_host pool and refuses to start without
     /// `--pre-alloc media-host-mb`; elsewhere it falls back to a
-    /// PCI shared-memory BAR when there is no pool.
+    /// PCI shared-memory BAR when there is no pool. The gunyah
+    /// requirement holds even with the guest driver's
+    /// driver_owned_queues=all, which never maps a host buffer:
+    /// the device must still be able to serve one the moment the
+    /// guest asks, and the only place it can put one there is the
+    /// pool. All the devices in a VM share the one pool.
     /// Possible key values:
     ///     kind=(simple,loopback,camera,decoder,encoder) - What
     ///         the device is. simple is the fixed-pattern capture
