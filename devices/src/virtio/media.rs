@@ -9,6 +9,7 @@
 
 #[cfg(feature = "video-decoder")]
 pub mod decoder_adapter;
+pub mod guest_buf;
 
 use std::collections::BTreeMap;
 use std::os::fd::AsRawFd;
