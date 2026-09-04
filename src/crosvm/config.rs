@@ -845,6 +845,84 @@ pub struct PreAllocConfig {
     pub test_pool_step_mb: Option<u64>,
 }
 
+/// What a `--virtio-media` device is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "lowercase")]
+pub enum MediaDeviceKind {
+    /// The crate's pattern-generating capture device; what `--simple-media-device` makes.
+    Simple,
+    /// A memory-to-memory device copying OUTPUT buffers into CAPTURE buffers, for testing the
+    /// buffer memory model from the guest.
+    Loopback,
+    /// A host camera (not wired yet).
+    Camera,
+    /// A host video decoder (not wired yet).
+    Decoder,
+    /// A host video encoder (not wired yet).
+    Encoder,
+}
+
+/// One `--virtio-media KEY=VALUE,...` device (`VPU_DESIGN.md` §3.5).
+///
+/// Every kind parses; only `simple` and `loopback` can be created today, the others fail at
+/// device creation with a "not implemented yet" error rather than silently making something
+/// else. Keys are `snake_case` on the command line, like `--virtio-snd`'s.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields)]
+pub struct MediaDeviceConfig {
+    pub kind: MediaDeviceKind,
+    /// The V4L2 card name the guest sees (31 bytes at most; longer is truncated). Each kind has
+    /// a default.
+    #[serde(default)]
+    pub card: Option<String>,
+    /// Which host camera to expose (`kind=camera`).
+    #[serde(default)]
+    pub camera_id: Option<String>,
+    /// `main` or `aux` (`kind=camera`).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Run the device's backend in its own process under this host uid, the way `--virtio-snd`
+    /// does, because the host's camera and codec services decide from the real uid. Unset keeps
+    /// the device in the VMM's process. Only meaningful for `camera`, `decoder` and `encoder`.
+    #[serde(default)]
+    pub uid: Option<u32>,
+    /// Group for that process. Defaults to `uid`.
+    #[serde(default)]
+    pub gid: Option<u32>,
+}
+
+#[cfg(test)]
+mod media_device_config_tests {
+    use super::*;
+
+    #[test]
+    fn parses_every_kind_and_only_known_keys() {
+        let cfg: MediaDeviceConfig = from_key_values("kind=loopback,card=lb0").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Loopback);
+        assert_eq!(cfg.card.as_deref(), Some("lb0"));
+        assert_eq!(cfg.uid, None);
+
+        let cfg: MediaDeviceConfig = from_key_values("kind=simple").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Simple);
+
+        let cfg: MediaDeviceConfig =
+            from_key_values("kind=camera,camera_id=0,role=main,uid=10123,gid=10123").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Camera);
+        assert_eq!(cfg.camera_id.as_deref(), Some("0"));
+        assert_eq!(cfg.role.as_deref(), Some("main"));
+        assert_eq!((cfg.uid, cfg.gid), (Some(10123), Some(10123)));
+
+        for kind in ["decoder", "encoder"] {
+            assert!(from_key_values::<MediaDeviceConfig>(&format!("kind={kind}")).is_ok());
+        }
+
+        // `kind` is required, and a key that is not one of ours is an error, not ignored.
+        assert!(from_key_values::<MediaDeviceConfig>("card=x").is_err());
+        assert!(from_key_values::<MediaDeviceConfig>("kind=webcam").is_err());
+        assert!(from_key_values::<MediaDeviceConfig>("kind=simple,pool=1").is_err());
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct SimplefbConfig {
@@ -1238,6 +1316,8 @@ pub struct Config {
     pub virt_cpufreq: bool,
     pub virt_cpufreq_v2: bool,
     pub virtio_input: Vec<InputDeviceOption>,
+    #[cfg(feature = "media")]
+    pub virtio_media: Vec<MediaDeviceConfig>,
     #[cfg(feature = "audio")]
     #[serde(skip)]
     pub virtio_snds: Vec<SndParameters>,
@@ -1480,6 +1560,8 @@ impl Default for Config {
             virt_cpufreq_v2: false,
             virtio_input: Vec::new(),
             #[cfg(feature = "audio")]
+            #[cfg(feature = "media")]
+            virtio_media: Vec::new(),
             virtio_snds: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             #[cfg(feature = "media")]

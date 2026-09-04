@@ -91,7 +91,13 @@ use resources::SystemAllocator;
 use sync::Mutex;
 use vm_control::api::VmMemoryClient;
 use vm_memory::GuestAddress;
+#[cfg(feature = "media")]
+use vm_memory::MediaPoolHandle;
 
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceConfig;
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceKind;
 use crate::crosvm::config::PmemOption;
 use crate::crosvm::config::VhostUserFrontendOption;
 use crate::crosvm::config::VhostUserFsOption;
@@ -1250,12 +1256,37 @@ pub fn register_video_device(
     Ok(())
 }
 
+/// Create the `--virtio-media` device `config` describes, serving its `MMAP` buffers out of
+/// `pool` when the VM has a `media_host` pool and out of a PCI shared-memory BAR otherwise
+/// (`VPU_DESIGN.md` §3.2, §3.5).
+///
+/// Only `simple` and `loopback` exist today; the other kinds are refused here, by name, so a
+/// command line written for a later milestone fails to start rather than starting something
+/// else.
 #[cfg(feature = "media")]
-pub fn create_simple_media_device(protection_type: ProtectionType) -> DeviceResult {
+pub fn create_virtio_media_device(
+    protection_type: ProtectionType,
+    config: &MediaDeviceConfig,
+    pool: Option<MediaPoolHandle>,
+) -> DeviceResult {
+    use devices::virtio::media::create_virtio_media_loopback_device;
     use devices::virtio::media::create_virtio_media_simple_capture_device;
 
     let features = virtio::base_features(protection_type);
-    let dev = create_virtio_media_simple_capture_device(features);
+    let dev = match config.kind {
+        MediaDeviceKind::Simple => create_virtio_media_simple_capture_device(features, pool),
+        MediaDeviceKind::Loopback => create_virtio_media_loopback_device(
+            features,
+            config.card.as_deref().unwrap_or("droidvm loopback"),
+            pool,
+        ),
+        MediaDeviceKind::Camera | MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
+            bail!(
+                "--virtio-media kind={:?} is not implemented yet (only simple and loopback are)",
+                config.kind
+            )
+        }
+    };
 
     Ok(VirtioDeviceStub { dev, jail: None })
 }
@@ -1294,7 +1325,9 @@ pub fn create_virtio_media_adapter(
     };
 
     let features = virtio::base_features(protection_type);
-    let dev = create_virtio_media_decoder_adapter_device(features, tube, backend)?;
+    // The decoder adapter keeps the upstream shared-memory BAR shape; its backends are not
+    // built for Android, where the pool matters.
+    let dev = create_virtio_media_decoder_adapter_device(features, tube, backend, None)?;
 
     Ok(VirtioDeviceStub { dev, jail })
 }

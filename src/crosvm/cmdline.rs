@@ -97,6 +97,8 @@ use crate::crosvm::config::parse_vhost_user_fs_option;
 #[cfg(feature = "android_display")]
 use crate::crosvm::config::AndroidDisplayServiceConfig;
 use crate::crosvm::config::BatteryConfig;
+#[cfg(all(unix, feature = "media"))]
+use crate::crosvm::config::MediaDeviceConfig;
 use crate::crosvm::config::PreAllocConfig;
 use crate::crosvm::config::CpuOptions;
 use crate::crosvm::config::DtboOption;
@@ -2824,6 +2826,36 @@ pub struct RunCommand {
     /// with the driver in upstream linux
     pub virt_cpufreq_upstream: Option<bool>,
 
+    #[cfg(all(unix, feature = "media"))]
+    #[argh(
+        option,
+        arg_name = "kind=KIND[,card=NAME][,camera_id=ID][,role=ROLE][,uid=N][,gid=N]"
+    )]
+    #[serde(default)]
+    #[merge(strategy = append)]
+    /// add a virtio-media (V4L2) device. May be given more than
+    /// once. On gunyah every such device serves its MMAP buffers
+    /// out of the media_host pool and refuses to start without
+    /// `--pre-alloc media-host-mb`; elsewhere it falls back to a
+    /// PCI shared-memory BAR when there is no pool.
+    /// Possible key values:
+    ///     kind=(simple,loopback,camera,decoder,encoder) - What
+    ///         the device is. simple is the fixed-pattern capture
+    ///         device --simple-media-device makes; loopback is a
+    ///         memory-to-memory device copying every OUTPUT buffer
+    ///         into a CAPTURE buffer, for testing guest-owned and
+    ///         host-owned buffers together. camera, decoder and
+    ///         encoder parse but are not implemented yet.
+    ///     card=NAME - V4L2 card name shown to the guest (31
+    ///         bytes at most).
+    ///     camera_id=ID - Host camera to expose (camera).
+    ///     role=(main,aux) - Camera role (camera).
+    ///     uid=INT - Run the backend in its own process under
+    ///         this host uid, as --virtio-snd does (camera,
+    ///         decoder, encoder).
+    ///     gid=INT - Group for that process. Defaults to uid.
+    pub virtio_media: Vec<MediaDeviceConfig>,
+
     #[cfg(feature = "audio")]
     #[argh(
         option,
@@ -4009,6 +4041,11 @@ impl TryFrom<RunCommand> for super::config::Config {
         {
             cfg.v4l2_proxy = cmd.v4l2_proxy;
             cfg.simple_media_device = cmd.simple_media_device.unwrap_or_default();
+        }
+
+        #[cfg(all(unix, feature = "media"))]
+        {
+            cfg.virtio_media = cmd.virtio_media;
         }
 
         #[cfg(all(unix, feature = "media", feature = "video-decoder"))]

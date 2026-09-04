@@ -193,6 +193,8 @@ use vm_control::api::VmMemoryClient;
 use vm_control::*;
 use vm_memory::FileBackedMappingParameters;
 use vm_memory::GuestAddress;
+#[cfg(feature = "media")]
+use vm_memory::MediaPoolHandle;
 use vm_memory::GuestMemory;
 use vm_memory::MemoryPolicy;
 use vm_memory::MemoryRegionOptions;
@@ -209,6 +211,10 @@ use crate::crosvm::config::DEFAULT_VNC_PORT;
 use crate::crosvm::config::Executable;
 use crate::crosvm::config::HypervisorKind;
 use crate::crosvm::config::InputDeviceOption;
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceConfig;
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceKind;
 use crate::crosvm::config::IrqChipKind;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_HEIGHT;
 use crate::crosvm::config::DEFAULT_TOUCH_DEVICE_WIDTH;
@@ -1123,8 +1129,32 @@ fn create_virtio_devices(
     }
 
     #[cfg(feature = "media")]
-    if cfg.simple_media_device {
-        devs.push(create_simple_media_device(cfg.protection_type)?);
+    {
+        // `--simple-media-device` is the old spelling of `--virtio-media kind=simple`.
+        let simple = cfg.simple_media_device.then(|| MediaDeviceConfig {
+            kind: MediaDeviceKind::Simple,
+            card: None,
+            camera_id: None,
+            role: None,
+            uid: None,
+            gid: None,
+        });
+        for media_cfg in cfg.virtio_media.iter().chain(simple.iter()) {
+            // The `media_host` pool, when the VM has one. Each device gets its own dup of the
+            // descriptor.
+            let pool = MediaPoolHandle::from_guest_memory(vm.get_memory());
+            if pool.is_none() && hypervisor_is_gunyah(cfg) {
+                // No silent fallback to the shared-memory BAR here: on Gunyah it would not fit
+                // next to the GPU's, and the guest would find a device with no usable buffers
+                // (VPU_DESIGN.md §3.3).
+                bail!("virtio-media on gunyah needs --pre-alloc media-host-mb");
+            }
+            devs.push(create_virtio_media_device(
+                cfg.protection_type,
+                media_cfg,
+                pool,
+            )?);
+        }
     }
 
     #[cfg(all(feature = "media", feature = "video-decoder"))]
@@ -2301,6 +2331,29 @@ fn run_gunyah(
         #[cfg(feature = "swap")]
         swap_controller,
     )
+}
+
+/// Whether this VM runs on Gunyah, from the same resolution `run_config` makes: an explicit
+/// `--hypervisor`, else the first hypervisor device found. Used before the VM is created, by
+/// devices that must refuse a configuration Gunyah cannot serve.
+#[cfg(feature = "media")]
+fn hypervisor_is_gunyah(cfg: &Config) -> bool {
+    #[cfg(all(
+        unix,
+        any(target_arch = "arm", target_arch = "aarch64"),
+        feature = "gunyah"
+    ))]
+    {
+        return matches!(
+            cfg.hypervisor.clone().or_else(get_default_hypervisor),
+            Some(HypervisorKind::Gunyah { .. })
+        );
+    }
+    #[allow(unreachable_code)]
+    {
+        let _ = cfg;
+        false
+    }
 }
 
 /// Choose a default hypervisor if no `--hypervisor` option was specified.
