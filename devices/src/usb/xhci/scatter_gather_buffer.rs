@@ -47,9 +47,12 @@ impl ScatterGatherBuffer {
     pub fn new(mem: GuestMemory, td: TransferDescriptor) -> Result<ScatterGatherBuffer> {
         for atrb in &td {
             let trb_type = atrb.trb.get_trb_type().map_err(Error::UnknownTrbType)?;
+            // An Event Data TRB carries no buffer: it only asks for a Transfer Event that reports
+            // the TD's accumulated length. Windows ends every TD with one, Linux never does.
             if trb_type != TrbType::Normal
                 && trb_type != TrbType::DataStage
                 && trb_type != TrbType::Isoch
+                && trb_type != TrbType::EventData
             {
                 return Err(Error::BadTrbType(trb_type));
             }
@@ -57,10 +60,18 @@ impl ScatterGatherBuffer {
         Ok(ScatterGatherBuffer { mem, td })
     }
 
+    /// Whether this TRB moves bytes at all; an Event Data TRB has no buffer behind it.
+    fn carries_data(atrb: &AddressedTrb) -> Result<bool> {
+        Ok(atrb.trb.get_trb_type().map_err(Error::UnknownTrbType)? != TrbType::EventData)
+    }
+
     /// Total len of this buffer.
     pub fn len(&self) -> Result<usize> {
         let mut total_len = 0usize;
         for atrb in &self.td {
+            if !Self::carries_data(atrb)? {
+                continue;
+            }
             total_len += atrb
                 .trb
                 .cast::<NormalTrb>()
@@ -97,6 +108,9 @@ impl ScatterGatherBuffer {
         let mut total_size = 0usize;
         let mut offset = 0;
         for atrb in &self.td {
+            if !Self::carries_data(atrb)? {
+                continue;
+            }
             let (guest_address, len) = self.get_trb_data(atrb)?;
             let buffer_len = {
                 if offset == buffer.len() {
@@ -124,6 +138,9 @@ impl ScatterGatherBuffer {
         let mut total_size = 0usize;
         let mut offset = 0;
         for atrb in &self.td {
+            if !Self::carries_data(atrb)? {
+                continue;
+            }
             let (guest_address, len) = self.get_trb_data(atrb)?;
             let buffer_len = {
                 if offset == buffer.len() {

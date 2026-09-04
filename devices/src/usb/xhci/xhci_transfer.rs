@@ -396,11 +396,21 @@ impl XhciTransfer {
             {
                 // For details about event data trb and EDTLA, see spec 4.11.5.2.
                 if atrb.trb.get_trb_type().map_err(Error::TrbType)? == TrbType::EventData {
+                    // The event reports what the TD moved so far (EDTLA, spec 4.11.5.2) and
+                    // carries the TD's own outcome: a stalled or short TD is not a success just
+                    // because the Event Data TRB itself had nothing to transfer.
                     let tlength = min(edtla, bytes_transferred);
+                    let code = if *status == TransferStatus::Stalled {
+                        TrbCompletionCode::StallError
+                    } else if edtla > bytes_transferred {
+                        TrbCompletionCode::ShortPacket
+                    } else {
+                        TrbCompletionCode::Success
+                    };
                     self.interrupter
                         .lock()
                         .send_transfer_event_trb(
-                            TrbCompletionCode::Success,
+                            code,
                             atrb.trb
                                 .cast::<EventDataTrb>()
                                 .map_err(Error::CastTrb)?
@@ -420,7 +430,9 @@ impl XhciTransfer {
                             TrbCompletionCode::StallError,
                             atrb.gpa,
                             residual_transfer_length,
-                            true,
+                            // ED is clear: the pointer is the TRB that completed, not an Event
+                            // Data value.
+                            false,
                             self.slot_id,
                             self.endpoint_id,
                         )
@@ -436,7 +448,7 @@ impl XhciTransfer {
                                 TrbCompletionCode::ShortPacket,
                                 atrb.gpa,
                                 residual_transfer_length,
-                                true,
+                                false,
                                 self.slot_id,
                                 self.endpoint_id,
                             )
@@ -449,7 +461,7 @@ impl XhciTransfer {
                                 TrbCompletionCode::Success,
                                 atrb.gpa,
                                 0, // transfer length
-                                true,
+                                false,
                                 self.slot_id,
                                 self.endpoint_id,
                             )
@@ -468,10 +480,17 @@ impl XhciTransfer {
             let port = self.port.clone();
             let mut backend = port.backend_device();
             match &mut *backend {
-                Some(backend) => backend
-                    .lock()
-                    .submit_xhci_transfer(self)
-                    .map_err(|_| Error::SubmitTransfer)?,
+                Some(backend) => {
+                    let (slot_id, endpoint_id) = (self.slot_id, self.endpoint_id);
+                    backend.lock().submit_xhci_transfer(self).map_err(|e| {
+                        // The controller dies on this; say why before it does.
+                        error!(
+                            "xhci: backend rejected transfer on slot {} endpoint {}: {}",
+                            slot_id, endpoint_id, e
+                        );
+                        Error::SubmitTransfer
+                    })?
+                }
                 None => {
                     error!("backend is already disconnected");
                     self.transfer_completion_event

@@ -572,8 +572,10 @@ impl BackendDeviceType {
                 }
                 usb_trace!("setup stage: setup buffer: {:?}", setup);
                 control_transfer_state.control_request_setup = setup;
+                // The eight setup bytes are this stage's transfer; an Event Data TRB behind the
+                // Setup TRB reports them as EDTLA and would read as a short TD otherwise.
                 xhci_transfer
-                    .on_transfer_complete(&TransferStatus::Completed, 0)
+                    .on_transfer_complete(&TransferStatus::Completed, 8)
                     .map_err(Error::TransferComplete)?;
                 control_transfer_state.ctl_ep_state = ControlEndpointState::DataStage;
             }
