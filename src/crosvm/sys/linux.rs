@@ -6,6 +6,7 @@
 mod android;
 pub mod cmdline;
 pub mod config;
+pub(crate) mod device_helper;
 mod device_helpers;
 pub(crate) mod ext2;
 #[cfg(feature = "gpu")]
@@ -19,7 +20,6 @@ pub(crate) mod pci_hotplug_manager;
 #[cfg(feature = "vnc")]
 mod simplefb_display;
 #[cfg(feature = "audio")]
-pub(crate) mod snd_helper;
 mod vcpu;
 
 #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]
@@ -502,6 +502,7 @@ fn create_virtio_devices(
     #[cfg_attr(not(feature = "gpu"), allow(unused_variables))] vm_evt_wrtube: &SendTube,
     #[cfg(feature = "balloon")] balloon_inflate_tube: Option<Tube>,
     worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
     #[cfg(feature = "gpu")] render_server_fd: Option<SafeDescriptor>,
     #[cfg(feature = "gpu")] has_vfio_gfx_device: bool,
     #[cfg(feature = "registered_events")] registered_evt_q: &SendTube,
@@ -1177,6 +1178,9 @@ fn create_virtio_devices(
                 cfg.protection_type,
                 media_cfg,
                 pool.clone(),
+                vm.get_memory(),
+                worker_process_pids,
+                helper_pid_labels,
             )?);
         }
     }
@@ -1354,6 +1358,8 @@ fn create_devices(
     vfio_container_manager: &mut VfioContainerManager,
     // Stores a set of PID of child processes that are suppose to exit cleanly.
     worker_process_pids: &mut BTreeSet<Pid>,
+    // What to call a helper process crosvm exec'd itself, for the crash log.
+    helper_pid_labels: &mut BTreeMap<u32, String>,
     #[cfg(feature = "vnc")] simplefb_vnc_input_out: &mut VncBindingInput,
 ) -> DeviceResult<Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)>> {
     let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
@@ -1486,6 +1492,7 @@ fn create_devices(
         #[cfg(feature = "balloon")]
         balloon_inflate_tube,
         worker_process_pids,
+        helper_pid_labels,
         #[cfg(feature = "gpu")]
         render_server_fd,
         #[cfg(feature = "gpu")]
@@ -2641,6 +2648,9 @@ where
         Tube::directional_pair().context("failed to create registered event tube")?;
 
     let mut worker_process_pids = BTreeSet::new();
+    // Helpers crosvm exec'd itself (`device_helper::launch`) are not jailed devices, so nothing
+    // names them in `pid_debug_label_map`; they are collected here and added once the VM exists.
+    let mut helper_pid_labels = BTreeMap::new();
 
     #[cfg(feature = "vnc")]
     let mut simplefb_vnc_input = VncBindingInput::default();
@@ -2661,6 +2671,7 @@ where
         &reg_evt_wrtube,
         &mut vfio_container_manager,
         &mut worker_process_pids,
+        &mut helper_pid_labels,
         #[cfg(feature = "vnc")]
         &mut simplefb_vnc_input,
     )?;
@@ -2856,6 +2867,10 @@ where
     if cfg.protection_type.isolates_memory() {
         linux.vm.get_memory().set_protected();
     }
+
+    // A helper that dies is then logged by name, the way a jailed device's process is, and its
+    // exit is judged as one of crosvm's own children rather than waved through as a stray.
+    linux.pid_debug_label_map.extend(helper_pid_labels);
 
     for tube in linux.vm_request_tubes.drain(..) {
         add_control_tube(TaggedControlTube::Vm(tube).into());

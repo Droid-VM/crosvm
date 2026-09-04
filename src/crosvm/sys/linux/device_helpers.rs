@@ -94,6 +94,8 @@ use sync::Mutex;
 use vm_control::api::VmMemoryClient;
 use vm_memory::GuestAddress;
 #[cfg(feature = "media")]
+use vm_memory::GuestMemory;
+#[cfg(feature = "media")]
 
 #[cfg(feature = "media")]
 use crate::crosvm::config::MediaDeviceConfig;
@@ -618,7 +620,7 @@ pub fn create_virtio_snd_device(
 ///
 /// The guest cannot tell this apart from the in-process device: vhost-user moves the virtqueue
 /// handling to the other side of a socket, but the device the guest enumerates is the same one.
-/// See `snd_helper` for why the backend cannot simply stay here.
+/// See `device_helper` for why the backend cannot simply stay here.
 fn create_unprivileged_virtio_snd_device(
     protection_type: ProtectionType,
     mut snd_params: SndParameters,
@@ -630,8 +632,20 @@ fn create_unprivileged_virtio_snd_device(
     // carried across. Same rule `base_features` applies to every in-process device.
     snd_params.access_platform = protection_type != ProtectionType::Unprotected;
 
-    let (vmm_end, pid) = crate::crosvm::sys::linux::snd_helper::launch(snd_params)
-        .context("failed to launch the unprivileged snd backend")?;
+    let uid = snd_params
+        .uid
+        .ok_or_else(|| anyhow!("create_unprivileged_virtio_snd_device called without a uid"))?;
+    let gid = snd_params.gid.unwrap_or(uid);
+    let supp_gids = std::mem::take(&mut snd_params.supp_gids);
+    // Whatever the child does, it must not try to spawn a backend of its own.
+    snd_params.uid = None;
+    snd_params.gid = None;
+    let config =
+        serde_json::to_string(&snd_params).context("failed to serialise snd parameters")?;
+
+    let (vmm_end, pid) =
+        crate::crosvm::sys::linux::device_helper::launch("snd", config, uid, gid, supp_gids)
+            .context("failed to launch the unprivileged snd backend")?;
     // So that the child exiting is not reported as a device crashing.
     worker_process_pids.insert(pid);
 
@@ -1261,6 +1275,10 @@ pub fn register_video_device(
 /// `pool` when the VM has a `media_host` pool and out of a PCI shared-memory BAR otherwise
 /// (`VPU_DESIGN.md` §3.2, §3.5).
 ///
+/// With `uid=` the device runs in a helper process under that uid instead, the way `--virtio-snd`
+/// does (`VPU_DESIGN.md` §6); `mem` is then what the host-accessible windows are computed from,
+/// and the helper's pid is recorded so its exit is judged and logged as one of ours.
+///
 /// Only `simple` and `loopback` exist today; the other kinds are refused here, by name, so a
 /// command line written for a later milestone fails to start rather than starting something
 /// else.
@@ -1269,9 +1287,23 @@ pub fn create_virtio_media_device(
     protection_type: ProtectionType,
     config: &MediaDeviceConfig,
     pool: Option<MediaPool>,
+    mem: &GuestMemory,
+    worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
 ) -> DeviceResult {
     use devices::virtio::media::create_virtio_media_loopback_device;
     use devices::virtio::media::create_virtio_media_simple_capture_device;
+
+    if config.uid.is_some() {
+        return create_unprivileged_virtio_media_device(
+            protection_type,
+            config,
+            pool,
+            mem,
+            worker_process_pids,
+            helper_pid_labels,
+        );
+    }
 
     let features = virtio::base_features(protection_type);
     let dev = match config.kind {
@@ -1290,6 +1322,100 @@ pub fn create_virtio_media_device(
     };
 
     Ok(VirtioDeviceStub { dev, jail: None })
+}
+
+/// Builds a virtio-media device whose backend runs as `config.uid` in a child process
+/// (`crosvm device media`, `VPU_DESIGN.md` §6).
+///
+/// The guest cannot tell this apart from the in-process device: vhost-user moves the virtqueue
+/// handling to the other side of a socket, but the device the guest enumerates is the same one.
+/// The helper is pool-mode only -- the frontend forwards a shared-memory BAR to the GPU alone, so
+/// there is no `Bar` shape out of process -- which is why a VM without a `media_host` pool is
+/// refused here rather than given a device with no usable buffers (design §6.2, §3.3).
+///
+/// The helper's `GuestMemory` has no purposes and is never marked protected, so it is told, from
+/// this VMM's memory, which guest-physical windows the host may touch; everything it maps for a
+/// guest scatter-gather list is checked against them first (`HostAccessPolicy::Windows`).
+#[cfg(feature = "media")]
+fn create_unprivileged_virtio_media_device(
+    protection_type: ProtectionType,
+    config: &MediaDeviceConfig,
+    pool: Option<MediaPool>,
+    mem: &GuestMemory,
+    worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
+) -> DeviceResult {
+    use devices::virtio::media::guest_buf::host_accessible_windows;
+    use devices::virtio::vhost::user::MediaBackendParams;
+
+    let uid = config
+        .uid
+        .ok_or_else(|| anyhow!("create_unprivileged_virtio_media_device called without a uid"))?;
+    let gid = config.gid.unwrap_or(uid);
+    let pool = pool.ok_or_else(|| {
+        anyhow!(
+            "--virtio-media kind={:?},uid={} runs the device in a helper process, which serves \
+             MMAP buffers from the media_host pool only, and this VM has no such pool: add \
+             --pre-alloc media-host-mb=<MiB> (VPU_DESIGN.md §6.2)",
+            config.kind,
+            uid
+        )
+    })?;
+    let (pool_gpa, _) = pool.guest_range();
+
+    // The helper builds its own feature set out of nothing but these parameters, and the frontend
+    // below can only mask against what the backend offers -- so the one thing the helper cannot
+    // work out for itself, that this VM's memory is not the host's to address, is carried across.
+    // Same rule `base_features` applies to every in-process device, and the same one the snd
+    // helper is told.
+    let params = MediaBackendParams {
+        kind: config.kind,
+        card: config.card.clone(),
+        camera_id: config.camera_id.clone(),
+        role: config.role.clone(),
+        pool_gpa,
+        access_windows: host_accessible_windows(mem, protection_type.isolates_memory())
+            .into_iter()
+            .map(|window| (window.start, window.end - window.start + 1))
+            .collect(),
+        access_platform: protection_type != ProtectionType::Unprotected,
+    };
+    let config_json =
+        serde_json::to_string(&params).context("failed to serialise media parameters")?;
+
+    // No supplementary groups: nothing a media device needs is granted by group membership, and
+    // crosvm's own groups are root's.
+    let (vmm_end, pid) = crate::crosvm::sys::linux::device_helper::launch(
+        "media",
+        config_json,
+        uid,
+        gid,
+        Vec::new(),
+    )
+    .context("failed to launch the unprivileged media backend")?;
+    // So that the child exiting cleanly is not reported as a device crashing, and anything else
+    // is, under a name.
+    worker_process_pids.insert(pid);
+    helper_pid_labels.insert(pid as u32, "media helper".to_string());
+
+    let connection = vmm_end
+        .try_into()
+        .context("failed to create a vhost-user connection to the media backend")?;
+
+    let dev = VhostUserFrontend::new(
+        virtio::DeviceType::Media,
+        virtio::base_features(protection_type),
+        connection,
+        None,
+        None,
+    )
+    .context("failed to set up the vhost-user frontend for media")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // No sandbox here: virtqueue handling happens in the backend process.
+        jail: None,
+    })
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
