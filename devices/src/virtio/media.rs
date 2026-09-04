@@ -441,9 +441,10 @@ impl GuestMemoryRange for GuestBufferImport {
 /// Newtype to implement `VirtioMediaGuestMemoryMapper` on `GuestMemory`.
 ///
 /// Whether to use a direct mapping or to copy the guest data into a shadow buffer is decided by
-/// the size of the guest mapping (see `guest_buf::MAPPING_THRESHOLD`). The crate's trait does not
-/// say which way the device will access the memory, so the mapping is read-write; a device that
-/// knows can build a `GuestBufferImport` with the right protection itself.
+/// the size of the guest mapping (see `guest_buf::MAPPING_THRESHOLD`). A device that says which
+/// way it will access the buffer (`new_mapping_for`) gets a mapping that can only be used that
+/// way: an OUTPUT buffer is the guest's own memory, which on a protected VM it shared with the
+/// host and goes on trusting, so the host maps it read-only (`VPU_DESIGN.md` §3.4).
 pub struct GuestMemoryMapper(GuestMemory);
 
 impl GuestMemoryMapper {
@@ -456,18 +457,39 @@ impl GuestMemoryMapper {
     }
 }
 
-impl VirtioMediaGuestMemoryMapper for GuestMemoryMapper {
-    type GuestMemoryMapping = GuestBufferImport;
-
-    fn new_mapping(&self, sgs: Vec<SgEntry>) -> anyhow::Result<Self::GuestMemoryMapping> {
+impl GuestMemoryMapper {
+    fn import(&self, sgs: Vec<SgEntry>, prot: Protection) -> anyhow::Result<GuestBufferImport> {
         let ranges: Vec<(GuestAddress, usize)> = sgs
             .iter()
             .map(|sg| (GuestAddress(sg.start), sg.len as usize))
             .collect();
-        GuestBufferImport::new(&self.0, ranges, Protection::read_write()).map_err(|e| {
+        GuestBufferImport::new(&self.0, ranges, prot).map_err(|e| {
             // The errno travels as the error's root so the device can hand it to the guest.
             anyhow::Error::from(GuestMappingError(e.errno())).context(e.to_string())
         })
+    }
+}
+
+impl VirtioMediaGuestMemoryMapper for GuestMemoryMapper {
+    type GuestMemoryMapping = GuestBufferImport;
+
+    fn new_mapping(&self, sgs: Vec<SgEntry>) -> anyhow::Result<Self::GuestMemoryMapping> {
+        self.import(sgs, Protection::read_write())
+    }
+
+    fn new_mapping_for(
+        &self,
+        sgs: Vec<SgEntry>,
+        writable: bool,
+    ) -> anyhow::Result<Self::GuestMemoryMapping> {
+        self.import(
+            sgs,
+            if writable {
+                Protection::read_write()
+            } else {
+                Protection::read()
+            },
+        )
     }
 }
 
