@@ -96,6 +96,8 @@ use devices::virtio::device_constants::video::VideoDeviceType;
 // there, since that is the build where the simplefb bridge is the only display.
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 use devices::virtio::gpu::EventDevice;
+#[cfg(feature = "media")]
+use devices::virtio::media::MediaPool;
 #[cfg(target_arch = "x86_64")]
 use devices::virtio::memory_mapper::MemoryMapper;
 use devices::virtio::memory_mapper::MemoryMapperTrait;
@@ -1130,8 +1132,15 @@ fn create_virtio_devices(
 
     #[cfg(feature = "media")]
     {
-        // `--simple-media-device` is the old spelling of `--virtio-media kind=simple`.
-        let simple = cfg.simple_media_device.then(|| MediaDeviceConfig {
+        // `--simple-media-device` is the old spelling of `--virtio-media kind=simple`, so it adds
+        // a simple device only when the command line does not already ask for one; giving both
+        // used to make two.
+        let simple = (cfg.simple_media_device
+            && !cfg
+                .virtio_media
+                .iter()
+                .any(|m| m.kind == MediaDeviceKind::Simple))
+        .then(|| MediaDeviceConfig {
             kind: MediaDeviceKind::Simple,
             card: None,
             camera_id: None,
@@ -1139,20 +1148,35 @@ fn create_virtio_devices(
             uid: None,
             gid: None,
         });
-        for media_cfg in cfg.virtio_media.iter().chain(simple.iter()) {
-            // The `media_host` pool, when the VM has one. Each device gets its own dup of the
-            // descriptor.
-            let pool = MediaPoolHandle::from_guest_memory(vm.get_memory());
-            if pool.is_none() && hypervisor_is_gunyah(cfg) {
-                // No silent fallback to the shared-memory BAR here: on Gunyah it would not fit
-                // next to the GPU's, and the guest would find a device with no usable buffers
-                // (VPU_DESIGN.md §3.3).
-                bail!("virtio-media on gunyah needs --pre-alloc media-host-mb");
+        let media_devices: Vec<&MediaDeviceConfig> =
+            cfg.virtio_media.iter().chain(simple.iter()).collect();
+
+        // The `media_host` pool, when the VM has one, is created once and shared by every media
+        // device: the offsets it hands out are what the guest maps, so two allocators over the
+        // same window would alias each other's buffers (VPU_DESIGN.md §2.2, review B2). One dup
+        // of the descriptor and one host mapping for the whole VM.
+        let pool = if media_devices.is_empty() {
+            None
+        } else {
+            match MediaPoolHandle::from_guest_memory(vm.get_memory()) {
+                Some(handle) => Some(MediaPool::new(handle)?),
+                None if hypervisor_is_gunyah(cfg) => {
+                    // No silent fallback to the shared-memory BAR here: on Gunyah it would not
+                    // fit next to the GPU's, and the guest would find a device with no usable
+                    // buffers (VPU_DESIGN.md §3.3). This holds even when the guest driver owns
+                    // every queue: the device still needs somewhere to put a host-owned buffer
+                    // the moment the guest asks for one.
+                    bail!("virtio-media on gunyah needs --pre-alloc media-host-mb");
+                }
+                None => None,
             }
+        };
+
+        for media_cfg in media_devices {
             devs.push(create_virtio_media_device(
                 cfg.protection_type,
                 media_cfg,
-                pool,
+                pool.clone(),
             )?);
         }
     }

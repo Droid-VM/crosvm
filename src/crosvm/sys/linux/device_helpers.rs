@@ -37,6 +37,8 @@ use devices::virtio::block::DiskOption;
 use devices::virtio::device_constants::video::VideoBackendType;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoDeviceType;
+#[cfg(feature = "media")]
+use devices::virtio::media::MediaPool;
 use devices::virtio::ipc_memory_mapper::create_ipc_mapper;
 use devices::virtio::ipc_memory_mapper::CreateIpcMapperRet;
 use devices::virtio::memory_mapper::BasicMemoryMapper;
@@ -92,7 +94,6 @@ use sync::Mutex;
 use vm_control::api::VmMemoryClient;
 use vm_memory::GuestAddress;
 #[cfg(feature = "media")]
-use vm_memory::MediaPoolHandle;
 
 #[cfg(feature = "media")]
 use crate::crosvm::config::MediaDeviceConfig;
@@ -1267,7 +1268,7 @@ pub fn register_video_device(
 pub fn create_virtio_media_device(
     protection_type: ProtectionType,
     config: &MediaDeviceConfig,
-    pool: Option<MediaPoolHandle>,
+    pool: Option<MediaPool>,
 ) -> DeviceResult {
     use devices::virtio::media::create_virtio_media_loopback_device;
     use devices::virtio::media::create_virtio_media_simple_capture_device;
