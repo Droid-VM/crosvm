@@ -303,15 +303,35 @@ impl Xhci {
         let _trace = cros_tracing::trace_event!(USB, "portsc_callback", index, value);
         let mut value = value;
         let port_id = (index + 1) as u8;
-        // xHCI spec 4.19.5. Note: we might want to change this logic if we support USB 3.0.
+        let old = self.regs.portsc[index as usize].get_value();
+        // The link-state field only takes a write when the strobe is set (spec 5.4.8, LWS); any
+        // other write carries whatever the driver read back or zero. Windows writes zero, which
+        // left every empty SuperSpeed port claiming U0 with nothing attached -- a state its hub
+        // driver answers with a controller reset, ten times over, and the root hub is dead. The
+        // strobe itself always reads as zero.
+        if (value & PORTSC_PORT_LINK_STATE_WRITE_STROBE) == 0 {
+            value = (value & !PORTSC_PORT_LINK_STATE_MASK) | (old & PORTSC_PORT_LINK_STATE_MASK);
+        }
+        value &= !PORTSC_PORT_LINK_STATE_WRITE_STROBE;
+        // xHCI spec 4.19.5.
         if (value & PORTSC_PORT_RESET) > 0 || (value & PORTSC_WARM_PORT_RESET) > 0 {
             self.device_slots
                 .reset_port(port_id)
                 .map_err(|_| Error::ResetPort)?;
-            value &= !PORTSC_PORT_LINK_STATE_MASK;
-            value &= !PORTSC_PORT_RESET;
-            value |= PORTSC_PORT_ENABLED;
+            let warm = (value & PORTSC_WARM_PORT_RESET) > 0;
+            value &= !(PORTSC_PORT_RESET | PORTSC_WARM_PORT_RESET | PORTSC_PORT_LINK_STATE_MASK);
+            // A reset ends with the link in U0 and the port enabled only when something is
+            // attached; an empty port goes back to RxDetect and stays disabled.
+            if (value & PORTSC_CURRENT_CONNECT_STATUS) > 0 {
+                value |= PORTSC_PORT_ENABLED | (PORTSC_PLS_U0 << PORTSC_PORT_LINK_STATE_SHIFT);
+            } else {
+                value &= !PORTSC_PORT_ENABLED;
+                value |= PORTSC_PLS_RXDETECT << PORTSC_PORT_LINK_STATE_SHIFT;
+            }
             value |= PORTSC_PORT_RESET_CHANGE;
+            if warm {
+                value |= PORTSC_WARM_RESET_CHANGE;
+            }
             self.interrupter
                 .lock()
                 .send_port_status_change_trb(port_id)

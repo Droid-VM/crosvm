@@ -23,6 +23,7 @@ use super::xhci_regs::PORTSC_PORT_ENABLED;
 use super::xhci_regs::PORTSC_PORT_ENABLED_DISABLED_CHANGE;
 use super::xhci_regs::PORTSC_PORT_SPEED_MASK;
 use super::xhci_regs::PORTSC_PORT_SPEED_SHIFT;
+use super::xhci_regs::PORTSC_RESET_VALUE;
 use super::xhci_regs::USB2_PORTS_END;
 use super::xhci_regs::USB2_PORTS_START;
 use super::xhci_regs::USB3_PORTS_END;
@@ -123,7 +124,15 @@ impl UsbPort {
     }
 
     fn reset(&self) -> std::result::Result<(), InterrupterError> {
-        if self.is_attached() {
+        // A host controller reset puts the port back to its reset value -- an empty port has to
+        // read PLS = RxDetect again, not whatever link state the driver last wrote -- and then
+        // re-announces whatever is still plugged in.
+        let device = self.backend_device().clone();
+        self.portsc.clear_bits(!0u32);
+        self.portsc.set_bits(PORTSC_RESET_VALUE);
+        if let Some(device) = device {
+            let speed = device.lock().get_speed();
+            self.set_speed_bits(speed);
             self.send_device_connected_event()?;
         }
         Ok(())
@@ -138,8 +147,13 @@ impl UsbPort {
         let mut locked = self.backend_device();
         assert!(locked.is_none());
         *locked = Some(device);
+        self.set_speed_bits(speed);
+        self.send_device_connected_event()
+    }
+
+    // Speed mappings from xHCI spec 7.2.2.1.1 ("Default Speed ID Mapping").
+    fn set_speed_bits(&self, speed: Option<DeviceSpeed>) {
         self.portsc.clear_bits(PORTSC_PORT_SPEED_MASK);
-        // Speed mappings from xHCI spec 7.2.2.1.1 ("Default Speed ID Mapping")
         let speed_id: u32 = match speed {
             None => 0,
             Some(DeviceSpeed::Full) => 1,
@@ -149,7 +163,6 @@ impl UsbPort {
             Some(DeviceSpeed::SuperPlus) => 5,
         };
         self.portsc.set_bits(speed_id << PORTSC_PORT_SPEED_SHIFT);
-        self.send_device_connected_event()
     }
 
     /// Inform the guest kernel there is device connected to this port. It combines first few steps

@@ -68,6 +68,18 @@ pub const PORTSC_PORT_RESET: u32 = 1u32 << 4;
 /// Bitmask for portsc register, see spec 5.4.8.
 pub const PORTSC_PORT_LINK_STATE_MASK: u32 = 0x000001E0;
 /// Bitmask for portsc register, see spec 5.4.8.
+pub const PORTSC_PORT_LINK_STATE_SHIFT: u32 = 5;
+/// Bitmask for portsc register, see spec 5.4.8.
+pub const PORTSC_PORT_LINK_STATE_WRITE_STROBE: u32 = 1u32 << 16;
+/// Bitmask for portsc register, see spec 5.4.8.
+pub const PORTSC_WARM_RESET_CHANGE: u32 = 1u32 << 19;
+/// PLS value for a link in U0, see spec 4.19.1.
+pub const PORTSC_PLS_U0: u32 = 0;
+/// PLS value for RxDetect, what a port with nothing attached reports, see spec 4.19.1.
+pub const PORTSC_PLS_RXDETECT: u32 = 5;
+/// The portsc reset value: PP set, PLS = RxDetect, see spec 5.4.8.
+pub const PORTSC_RESET_VALUE: u32 = 0x000002A0;
+/// Bitmask for portsc register, see spec 5.4.8.
 pub const PORTSC_PORT_POWER: u32 = 1u32 << 9;
 /// Bitmask for portsc register, see spec 5.4.8.
 pub const PORTSC_PORT_SPEED_MASK: u32 = 0x00003C00;
@@ -336,7 +348,7 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
         cnt: MAX_PORTS,
         base_offset: 0x420,
         stride: 16,
-        reset_value: 0x000002A0,
+        reset_value: PORTSC_RESET_VALUE,
         guest_writeable_mask: 0x8EFFC3F2,
         guest_write_1_to_clear_mask: 0x00FE0002,);
     mmio.add_register_array(&portsc);
