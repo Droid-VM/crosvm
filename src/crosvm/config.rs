@@ -845,28 +845,17 @@ pub struct PreAllocConfig {
     pub test_pool_step_mb: Option<u64>,
 }
 
-/// What a `--virtio-media` device is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
-#[serde(deny_unknown_fields, rename_all = "lowercase")]
-pub enum MediaDeviceKind {
-    /// The crate's pattern-generating capture device; what `--simple-media-device` makes.
-    Simple,
-    /// A memory-to-memory device copying OUTPUT buffers into CAPTURE buffers, for testing the
-    /// buffer memory model from the guest.
-    Loopback,
-    /// A host camera (not wired yet).
-    Camera,
-    /// A host video decoder (not wired yet).
-    Decoder,
-    /// A host video encoder (not wired yet).
-    Encoder,
-}
+/// What a `--virtio-media` device is. Defined next to the device, because the vhost-user media
+/// helper is told the same thing in its parameters.
+#[cfg(feature = "media")]
+pub use devices::virtio::media::MediaDeviceKind;
 
 /// One `--virtio-media KEY=VALUE,...` device (`VPU_DESIGN.md` §3.5).
 ///
 /// Every kind parses; only `simple` and `loopback` can be created today, the others fail at
 /// device creation with a "not implemented yet" error rather than silently making something
 /// else. Keys are `snake_case` on the command line, like `--virtio-snd`'s.
+#[cfg(feature = "media")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields)]
 pub struct MediaDeviceConfig {
@@ -891,7 +880,7 @@ pub struct MediaDeviceConfig {
     pub gid: Option<u32>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "media"))]
 mod media_device_config_tests {
     use super::*;
 
