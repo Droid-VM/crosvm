@@ -1584,9 +1584,9 @@ impl Default for Config {
             virtio_mmio_gpu: false,
             virtio_mmio_input: false,
             virtio_mmio_net: false,
-            #[cfg(feature = "audio")]
             #[cfg(feature = "media")]
             virtio_media: Vec::new(),
+            #[cfg(feature = "audio")]
             virtio_snds: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             #[cfg(feature = "media")]
