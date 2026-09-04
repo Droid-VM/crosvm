@@ -186,6 +186,7 @@ where
         let event_queue =
             EventQueue::new(self.queues[1].take().context("event queue not started")?);
         let shared_event_queue = event_queue.shared();
+        let kill_signal = event_queue.kill_signal();
 
         let guest_mapper =
             GuestMemoryMapper::with_policy(mem, HostAccessPolicy::Windows(self.windows.clone()));
@@ -195,7 +196,7 @@ where
             .context("cannot create the media device")?;
 
         self.running = Some(Running {
-            thread: start_worker(move || Ok(device), cmd_queue, wait_ctx),
+            thread: start_worker(move || Ok(device), cmd_queue, wait_ctx, kill_signal),
             event_queue: shared_event_queue,
         });
         Ok(())

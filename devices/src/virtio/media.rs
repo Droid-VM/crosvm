@@ -29,6 +29,7 @@
 #[cfg(feature = "video-decoder")]
 pub mod decoder_adapter;
 pub mod guest_buf;
+pub mod kill;
 pub mod pool;
 
 use std::collections::BTreeMap;
@@ -41,6 +42,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use base::error;
+use base::warn;
 use base::Descriptor;
 use base::EventToken;
 use base::EventType;
@@ -80,6 +82,8 @@ use crate::virtio::device_constants::media::QUEUE_SIZES;
 use crate::virtio::device_constants::video::VideoBackendType;
 use crate::virtio::media::guest_buf::GuestBufferImport;
 use crate::virtio::media::guest_buf::HostAccessPolicy;
+use crate::virtio::media::kill::KillSignal;
+use crate::virtio::media::kill::Wakeup;
 pub use crate::virtio::media::pool::MediaPool;
 use crate::virtio::media::pool::PoolBufferAllocator;
 use crate::virtio::DeviceType;
@@ -118,23 +122,42 @@ pub enum MediaDeviceKind {
 /// worker thread, and a vhost-user backend has to give the queue back to the frontend afterwards
 /// (`stop_queue`); the in-VMM device never asks for it again. Only the worker thread ever locks
 /// it.
-pub struct EventQueue(Arc<Mutex<Queue>>);
+pub struct EventQueue {
+    queue: Arc<Mutex<Queue>>,
+    /// The worker's kill event, so that waiting for the guest to hand over a descriptor cannot
+    /// outlive the worker (`kill`'s module documentation; `logs/vpu_wp/M3.md` §9 item 2).
+    /// [`start_worker`] arms it before the device that holds this queue is built.
+    kill: KillSignal,
+}
 
 impl EventQueue {
     pub fn new(queue: Queue) -> Self {
-        Self(Arc::new(Mutex::new(queue)))
+        Self {
+            queue: Arc::new(Mutex::new(queue)),
+            kill: KillSignal::new(),
+        }
     }
 
     /// A second handle on the queue, for whoever has to recover it once the device is gone.
     pub fn shared(&self) -> Arc<Mutex<Queue>> {
-        Arc::clone(&self.0)
+        Arc::clone(&self.queue)
+    }
+
+    /// The slot [`start_worker`] fills with the worker thread's kill event.
+    pub fn kill_signal(&self) -> KillSignal {
+        self.kill.clone()
     }
 }
 
 impl VirtioMediaEventQueue for EventQueue {
     /// Wait until an event descriptor becomes available and send `event` to the guest.
+    ///
+    /// A guest that supplies none -- because it is gone, or being reset -- would block the worker
+    /// here forever, and with it the `reset` or `stop_queue` that is trying to join it, so the
+    /// wait also ends on the worker's kill event; the event is then dropped, which is what a
+    /// device being torn down owes the guest anyway.
     fn send_event(&mut self, event: V4l2Event) {
-        let mut queue = self.0.lock();
+        let mut queue = self.queue.lock();
         let mut desc;
 
         loop {
@@ -143,12 +166,17 @@ impl VirtioMediaEventQueue for EventQueue {
                     desc = d;
                     break;
                 }
-                None => {
-                    if let Err(e) = queue.event().wait() {
+                None => match self.kill.wait_or_kill(queue.event()) {
+                    Ok(Wakeup::Ready) => (),
+                    Ok(Wakeup::Killed) => {
+                        warn!("media worker is stopping: an event for the guest is dropped");
+                        return;
+                    }
+                    Err(e) => {
                         error!("could not obtain a descriptor to send event to: {:#}", e);
                         return;
                     }
-                }
+                },
             }
         }
 
@@ -514,16 +542,25 @@ where
 ///
 /// A device that cannot be built, or a wait context that cannot be armed, is logged and the queue
 /// is simply given back: the guest then sees a device that never answers, and the VM lives.
+///
+/// `kill_signal` is the event queue's ([`EventQueue::kill_signal`]): it is armed with this
+/// thread's kill event before the device is built, so a `send_event` that blocks waiting for the
+/// guest ends when the thread is told to stop instead of holding the joiner forever (`kill`).
 pub fn start_worker<D, F>(
     create_device: F,
     cmd_queue: Queue,
     wait_ctx: WaitContext<Token>,
+    kill_signal: KillSignal,
 ) -> WorkerThread<Queue>
 where
     D: VirtioMediaDevice<Reader, Writer> + 'static,
     F: FnOnce() -> anyhow::Result<D> + Send + 'static,
 {
     WorkerThread::start("v_media_worker", move |kill_evt| {
+        // Before the device exists, so no event can be sent before the wait can be interrupted.
+        if let Err(e) = kill_signal.arm(&kill_evt) {
+            error!("virtio-media events will not be interruptible: {:#}", e);
+        }
         if let Err(e) = wait_ctx
             .add_many(&[
                 (cmd_queue.event(), Token::CommandQueue),
@@ -667,12 +704,18 @@ where
         };
 
         let wait_ctx = WaitContext::new()?;
+        let kill_signal = event_queue.kill_signal();
         let device =
             (self.create_device)(event_queue, GuestMemoryMapper::new(mem), mapper, allocator)?;
 
         // The device was built here, on the VMM's thread, so that a device that cannot be built
         // fails the activation rather than only a log line; it is moved to the worker thread.
-        self.worker_thread = Some(start_worker(move || Ok(device), cmd_queue, wait_ctx));
+        self.worker_thread = Some(start_worker(
+            move || Ok(device),
+            cmd_queue,
+            wait_ctx,
+            kill_signal,
+        ));
         Ok(())
     }
 
