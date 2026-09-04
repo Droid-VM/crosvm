@@ -72,6 +72,10 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
             false
         }
     }
+
+    fn is_quiesced(&self) -> bool {
+        !self.transfer_manager.has_pending_transfers()
+    }
 }
 
 impl TransferRingController {

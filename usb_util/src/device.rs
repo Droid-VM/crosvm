@@ -48,6 +48,9 @@ use crate::StandardControlRequest;
 // This is the maximum block size observed during storage performance test
 const MMAP_SIZE: usize = 1024 * 1024;
 
+// usbfs rejects an isochronous URB that does not carry between 1 and 128 packet descriptors.
+const MAX_ISO_PACKETS: usize = 128;
+
 /// ManagedDmaBuffer represents the entire DMA buffer allocated by a device
 struct ManagedDmaBuffer {
     /// The entire DMA buffer
@@ -605,6 +608,13 @@ impl Transfer {
             .try_into()
             .map_err(Error::InvalidBufferLength)?;
 
+        if transfer_type == usb_sys::USBDEVFS_URB_TYPE_ISO {
+            transfer.urb_mut().number_of_packets_or_stream_id = iso_packets.len() as u32;
+            // Without ISO_ASAP the kernel demands a valid, near-future start_frame; letting it
+            // pick the next available frame is the only thing we can do from here.
+            transfer.urb_mut().flags = usb_sys::USBDEVFS_URB_ISO_ASAP;
+        }
+
         // SAFETY:
         // Safe because we ensured there is enough space in transfer.urb to hold the number of
         // isochronous frames required.
@@ -643,10 +653,35 @@ impl Transfer {
         Ok(transfer)
     }
 
-    /// Create an isochronous transfer.
-    pub fn new_isochronous(endpoint: u8, buffer: TransferBuffer) -> Result<Transfer> {
-        // TODO(dverkamp): allow user to specify iso descriptors
-        Self::new(usb_sys::USBDEVFS_URB_TYPE_ISO, endpoint, buffer, &[])
+    /// Create an isochronous transfer. Each entry of `packet_lengths` describes one isochronous
+    /// packet; usbfs derives the transfer length from the descriptors rather than from
+    /// `buffer_length`, so their sum has to cover the whole buffer.
+    pub fn new_isochronous(
+        endpoint: u8,
+        buffer: TransferBuffer,
+        packet_lengths: &[u32],
+    ) -> Result<Transfer> {
+        if packet_lengths.is_empty() || packet_lengths.len() > MAX_ISO_PACKETS {
+            return Err(Error::InvalidIsoPackets);
+        }
+        let total: u64 = packet_lengths.iter().map(|len| *len as u64).sum();
+        if total != buffer.size().ok_or(Error::InvalidBuffer)? as u64 {
+            return Err(Error::InvalidIsoPackets);
+        }
+        let iso_packets: Vec<usb_sys::usbdevfs_iso_packet_desc> = packet_lengths
+            .iter()
+            .map(|len| usb_sys::usbdevfs_iso_packet_desc {
+                length: *len,
+                actual_length: 0,
+                status: 0,
+            })
+            .collect();
+        Self::new(
+            usb_sys::USBDEVFS_URB_TYPE_ISO,
+            endpoint,
+            buffer,
+            &iso_packets,
+        )
     }
 
     /// Get the status of a completed transfer.
@@ -669,6 +704,34 @@ impl Transfer {
     /// the original length.
     pub fn actual_length(&self) -> usize {
         self.urb().actual_length as usize
+    }
+
+    /// Get the number of isochronous packets in this transfer, or 0 if it is not isochronous.
+    pub fn iso_packet_count(&self) -> usize {
+        if self.urb().urb_type != usb_sys::USBDEVFS_URB_TYPE_ISO {
+            return 0;
+        }
+        self.urb().number_of_packets_or_stream_id as usize
+    }
+
+    /// Get the descriptor of the `i`th isochronous packet, which the kernel fills in with that
+    /// packet's own length and status when the transfer completes. Returns `None` if this is not
+    /// an isochronous transfer or `i` is out of range.
+    pub fn iso_packet(&self, i: usize) -> Option<usb_sys::usbdevfs_iso_packet_desc> {
+        let count = self.iso_packet_count();
+        if i >= count {
+            return None;
+        }
+        // SAFETY:
+        // Safe because self.urb was allocated by `vec_with_array_field` with room for `count`
+        // trailing descriptors - the very array the constructor wrote - and i < count.
+        let iso_frame_desc = unsafe { self.urb().iso_frame_desc.as_slice(count) };
+        Some(iso_frame_desc[i])
+    }
+
+    /// Get the number of isochronous packets of this transfer that failed.
+    pub fn error_count(&self) -> i32 {
+        self.urb().error_count
     }
 
     /// Set callback function for transfer completion.
@@ -711,5 +774,59 @@ impl TransferHandle {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn isochronous_transfer_packets() {
+        let transfer =
+            Transfer::new_isochronous(0x81, TransferBuffer::Vector(vec![0u8; 384]), &[192, 192])
+                .expect("new_isochronous failed");
+
+        assert_eq!(transfer.urb().number_of_packets_or_stream_id, 2);
+        assert_ne!(transfer.urb().flags & usb_sys::USBDEVFS_URB_ISO_ASAP, 0);
+        assert_eq!(transfer.urb().start_frame, 0);
+        assert_eq!(transfer.iso_packet_count(), 2);
+        assert_eq!(transfer.iso_packet(0).unwrap().length, 192);
+        assert_eq!(transfer.iso_packet(1).unwrap().length, 192);
+        assert_eq!(transfer.iso_packet(1).unwrap().actual_length, 0);
+        assert_eq!(transfer.iso_packet(1).unwrap().status, 0);
+        assert!(transfer.iso_packet(2).is_none());
+    }
+
+    #[test]
+    fn isochronous_transfer_bad_packet_lengths() {
+        // No packets at all: usbfs would reject the URB with EINVAL.
+        assert!(
+            Transfer::new_isochronous(0x81, TransferBuffer::Vector(vec![0u8; 384]), &[]).is_err()
+        );
+        // More packets than usbfs accepts.
+        assert!(Transfer::new_isochronous(
+            0x81,
+            TransferBuffer::Vector(vec![0u8; MAX_ISO_PACKETS + 1]),
+            &[1u32; MAX_ISO_PACKETS + 1]
+        )
+        .is_err());
+        // Packet lengths that do not add up to the buffer size.
+        assert!(Transfer::new_isochronous(
+            0x81,
+            TransferBuffer::Vector(vec![0u8; 384]),
+            &[192, 100]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn non_isochronous_transfer_has_no_packets() {
+        let transfer = Transfer::new_bulk(0x81, TransferBuffer::Vector(vec![0u8; 64]), None)
+            .expect("new_bulk failed");
+
+        assert_eq!(transfer.urb().flags, 0);
+        assert_eq!(transfer.iso_packet_count(), 0);
+        assert!(transfer.iso_packet(0).is_none());
     }
 }

@@ -229,6 +229,18 @@ impl BackendDevice for HostDevice {
         ))
     }
 
+    fn build_isochronous_transfer(
+        &mut self,
+        ep_addr: u8,
+        transfer_buffer: TransferBuffer,
+        packet_lengths: &[u32],
+    ) -> Result<BackendTransferType> {
+        Ok(BackendTransferType::HostDevice(
+            Transfer::new_isochronous(ep_addr, transfer_buffer, packet_lengths)
+                .map_err(Error::CreateTransfer)?,
+        ))
+    }
+
     fn get_control_transfer_state(&mut self) -> Arc<RwLock<ControlTransferState>> {
         self.control_transfer_state.clone()
     }
@@ -400,6 +412,10 @@ impl BackendTransfer for Transfer {
 
     fn buffer(&self) -> &TransferBuffer {
         &self.buffer
+    }
+
+    fn iso_packet(&self, i: usize) -> Option<(usize, i32)> {
+        Transfer::iso_packet(self, i).map(|d| (d.actual_length as usize, d.status as i32))
     }
 
     fn set_callback<C: 'static + Fn(BackendTransferType) + Send + Sync>(&mut self, cb: C) {

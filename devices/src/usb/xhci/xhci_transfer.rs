@@ -213,6 +213,13 @@ impl XhciTransferManager {
         });
     }
 
+    /// Returns true while any transfer this manager created is still alive. A transfer removes
+    /// itself here when it is dropped, which happens once the backend has finished with it and its
+    /// completion has been reported, so this answers whether the endpoint is really quiescent.
+    pub fn has_pending_transfers(&self) -> bool {
+        self.transfers.lock().iter().any(|t| t.upgrade().is_some())
+    }
+
     fn remove_transfer(&self, t: &Arc<Mutex<XhciTransferState>>) {
         let mut transfers = self.transfers.lock();
         match transfers.iter().position(|wt| match wt.upgrade() {

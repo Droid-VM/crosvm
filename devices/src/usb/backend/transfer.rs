@@ -44,6 +44,12 @@ pub trait BackendTransfer {
     fn actual_length(&self) -> usize;
     /// Returns a reference to the `TransferBuffer` object.
     fn buffer(&self) -> &TransferBuffer;
+    /// Per-packet result of an isochronous transfer: (actual_length, status), or None when the
+    /// backend does not track packets or `i` is out of range.
+    fn iso_packet(&self, i: usize) -> Option<(usize, i32)> {
+        let _ = i;
+        None
+    }
     /// Sets an optional callback on the transfer to be called when the transfer completes.
     fn set_callback<C: 'static + Fn(BackendTransferType) + Send + Sync>(&mut self, cb: C);
 }
@@ -68,6 +74,13 @@ impl BackendTransfer for BackendTransferType {
         match self {
             BackendTransferType::HostDevice(transfer) => BackendTransfer::buffer(transfer),
             BackendTransferType::FidoDevice(transfer) => BackendTransfer::buffer(transfer),
+        }
+    }
+
+    fn iso_packet(&self, i: usize) -> Option<(usize, i32)> {
+        match self {
+            BackendTransferType::HostDevice(transfer) => BackendTransfer::iso_packet(transfer, i),
+            BackendTransferType::FidoDevice(transfer) => BackendTransfer::iso_packet(transfer, i),
         }
     }
 

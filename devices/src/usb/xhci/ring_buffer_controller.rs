@@ -4,6 +4,8 @@
 
 use std::fmt;
 use std::fmt::Display;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::MutexGuard;
 
@@ -72,7 +74,23 @@ pub trait TransferDescriptorHandler {
     fn stop(&self) -> bool {
         true
     }
+
+    /// Returns false while the handler still has descriptors it has not finished with. The ring
+    /// buffer controller parks itself in `Stopped` -- which releases the stop callback the guest
+    /// is waiting on -- only once this is true, so a handler holding several descriptors in flight
+    /// must not report itself quiesced early. A handler that tracks nothing is quiesced by
+    /// definition.
+    fn is_quiesced(&self) -> bool {
+        true
+    }
 }
+
+/// Upper bound on the descriptors one `on_event` hands off when the whole ring is drained. A ring
+/// segment holds fewer TRBs than this, so a guest never hits it in normal use; the cap is there
+/// because the ring is guest memory, and one whose link TRB never toggles the consumer cycle state
+/// yields descriptors forever, which would spin here with `state` held and wedge the event loop
+/// this controller shares with every other endpoint.
+const MAX_DEQUEUE_PER_EVENT: usize = 256;
 
 /// RingBufferController owns a ring buffer. It lives on a event_loop. It will pop out transfer
 /// descriptor and let TransferDescriptorHandler handle it.
@@ -84,6 +102,7 @@ pub struct RingBufferController<T: 'static + TransferDescriptorHandler> {
     handler: Mutex<T>,
     event_loop: Arc<EventLoop>,
     event: Event,
+    dequeue_all: AtomicBool,
 }
 
 impl<T: 'static + TransferDescriptorHandler> Display for RingBufferController<T> {
@@ -112,6 +131,7 @@ where
             handler: Mutex::new(handler),
             event_loop: event_loop.clone(),
             event: evt,
+            dequeue_all: AtomicBool::new(false),
         });
         let event_handler: Arc<dyn EventHandler> = controller.clone();
         event_loop
@@ -150,6 +170,17 @@ where
         xhci_trace!("{}: set consumer cycle state: {}", self.name, state);
         // Fast because this should only happen during xhci setup.
         self.lock_ring_buffer().set_consumer_cycle_state(state);
+    }
+
+    /// Set whether every transfer descriptor the guest has queued is dequeued on each event
+    /// instead of just the first one.
+    ///
+    /// An isochronous ring is drained ahead because a packet that reaches the host after its
+    /// service interval is simply lost: real hardware walks the whole ring as frames tick, and
+    /// handing the backend one descriptor at a time and waiting for its completion cannot keep an
+    /// audio or video stream fed. Bulk, interrupt and control rings keep one descriptor per event.
+    pub fn set_dequeue_all(&self, enabled: bool) {
+        self.dequeue_all.store(enabled, Ordering::Relaxed);
     }
 
     /// Start the ring buffer.
@@ -203,11 +234,19 @@ where
     fn on_event(&self) -> anyhow::Result<()> {
         // `self.event` triggers ring buffer controller to run.
         self.event.wait().context("cannot read from event")?;
+        let dequeue_all = self.dequeue_all.load(Ordering::Relaxed);
         let mut state = self.state.lock();
 
         match *state {
             RingBufferState::Stopped => return Ok(()),
             RingBufferState::Stopping => {
+                // Reaching Stopped releases the stop callback, which is the guest's answer that
+                // nothing is outstanding any more. A drained-ahead ring has several descriptors in
+                // flight at once, so hold that answer back until the handler is done with all of
+                // them; each of their completions signals us again.
+                if dequeue_all && !self.handler.lock().is_quiesced() {
+                    return Ok(());
+                }
                 debug!("xhci: {}: stopping ring buffer controller", self.name);
                 *state = RingBufferState::Stopped;
                 self.stop_callback.lock().clear();
@@ -224,8 +263,14 @@ where
         let transfer_descriptor = match transfer_descriptor {
             Some(t) => t,
             None => {
-                *state = RingBufferState::Stopped;
-                self.stop_callback.lock().clear();
+                // An empty ring is not a quiescent one while descriptors dequeued ahead are still
+                // in flight: parking in Stopped here would both release the stop callback early
+                // and let a later `stop()` take its `already stopped` path without cancelling
+                // them. Stay Running and let their completions bring us back.
+                if !dequeue_all || self.handler.lock().is_quiesced() {
+                    *state = RingBufferState::Stopped;
+                    self.stop_callback.lock().clear();
+                }
                 return Ok(());
             }
         };
@@ -233,7 +278,41 @@ where
         let event = self.event.try_clone().context("cannot clone event")?;
         self.handler
             .lock()
-            .handle_transfer_descriptor(transfer_descriptor, event)
+            .handle_transfer_descriptor(transfer_descriptor, event)?;
+
+        if dequeue_all {
+            // Keep handing descriptors off until the ring runs dry. The state is deliberately left
+            // Running in here: only the first dequeue of an event may park the controller, so an
+            // empty ring on the next completion still stops it and a doorbell restarts it.
+            let mut dequeued: usize = 1;
+            loop {
+                if dequeued >= MAX_DEQUEUE_PER_EVENT {
+                    // Whatever is left stays on the ring. Signal ourselves so it is picked up on
+                    // the next pass with `state` released in between, giving the rest of the event
+                    // loop -- and any vcpu blocked on a doorbell -- a turn.
+                    self.event.signal().context("cannot signal event")?;
+                    break;
+                }
+
+                let transfer_descriptor = self
+                    .lock_ring_buffer()
+                    .dequeue_transfer_descriptor()
+                    .context("cannot dequeue transfer descriptor")?;
+
+                let transfer_descriptor = match transfer_descriptor {
+                    Some(t) => t,
+                    None => break,
+                };
+
+                let event = self.event.try_clone().context("cannot clone event")?;
+                self.handler
+                    .lock()
+                    .handle_transfer_descriptor(transfer_descriptor, event)?;
+                dequeued += 1;
+            }
+        }
+
+        Ok(())
     }
 }
 

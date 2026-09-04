@@ -956,6 +956,11 @@ impl DeviceSlot {
             .map_err(Error::CreateTransferController)?;
             trc.set_dequeue_pointer(tr_dequeue_pointer);
             trc.set_consumer_cycle_state(endpoint_context.get_dequeue_cycle_state());
+            // Endpoint context types 1 (Isoch Out) and 5 (Isoch In): an isochronous ring has to be
+            // drained ahead of the completions, or the stream underruns. Streams are bulk only, so
+            // the branch above never needs this.
+            let endpoint_type = endpoint_context.get_endpoint_type();
+            trc.set_dequeue_all(endpoint_type == 1 || endpoint_type == 5);
             TransferRingControllers::Endpoint(trc)
         };
         self.set_trcs(transfer_ring_index, Some(trcs));

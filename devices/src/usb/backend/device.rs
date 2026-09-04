@@ -131,6 +131,23 @@ impl BackendDevice for BackendDeviceType {
         )
     }
 
+    fn build_isochronous_transfer(
+        &mut self,
+        ep_addr: u8,
+        transfer_buffer: TransferBuffer,
+        packet_lengths: &[u32],
+    ) -> Result<BackendTransferType> {
+        multi_dispatch!(
+            self,
+            BackendDeviceType,
+            HostDevice FidoDevice,
+            build_isochronous_transfer,
+            ep_addr,
+            transfer_buffer,
+            packet_lengths
+        )
+    }
+
     fn get_control_transfer_state(&mut self) -> Arc<RwLock<ControlTransferState>> {
         multi_dispatch!(
             self,
@@ -692,7 +709,15 @@ impl BackendDeviceType {
                         Err(e) => {
                             error!("fail to submit transfer {:?}", e);
                             *state = XhciTransferState::Completed;
-                            TransferStatus::NoDevice
+                            // A refused isochronous URB costs one frame, not the device. usbfs
+                            // rejects a packet longer than the alt setting it currently has
+                            // selected, which a guest produces just by ringing the doorbell
+                            // before its SET_INTERFACE has landed; reporting NoDevice for that
+                            // would detach the port out from under a live stream.
+                            match xhci_transfer.get_transfer_type() {
+                                Ok(XhciTransferType::Isochronous) => TransferStatus::Completed,
+                                _ => TransferStatus::NoDevice,
+                            }
                         }
                         Ok(canceller) => {
                             let cancel_callback = Box::new(move || match canceller.cancel() {
@@ -785,6 +810,14 @@ pub trait BackendDevice: Sync + Send {
         &mut self,
         ep_addr: u8,
         transfer_buffer: TransferBuffer,
+    ) -> Result<BackendTransferType>;
+    /// Requests the backend to build a backend-specific isochronous transfer request. Each entry
+    /// of `packet_lengths` describes one isochronous packet within `transfer_buffer`.
+    fn build_isochronous_transfer(
+        &mut self,
+        ep_addr: u8,
+        transfer_buffer: TransferBuffer,
+        packet_lengths: &[u32],
     ) -> Result<BackendTransferType>;
 
     /// Returns the `ControlTransferState` for the given backend device.
