@@ -592,6 +592,8 @@ pub enum CrossPlatformDevicesCommands {
     Block(device::BlockOptions),
     #[cfg(feature = "gpu")]
     Gpu(device::GpuOptions),
+    #[cfg(all(unix, feature = "media"))]
+    Media(device::MediaOptions),
     #[cfg(feature = "net")]
     Net(device::NetOptions),
     #[cfg(feature = "audio")]

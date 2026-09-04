@@ -7,6 +7,8 @@ mod connection;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 mod handler;
+#[cfg(all(unix, feature = "media"))]
+pub mod media;
 #[cfg(feature = "net")]
 mod net;
 #[cfg(feature = "audio")]
@@ -24,6 +26,12 @@ pub use gpu::run_gpu_device;
 pub use gpu::Options as GpuOptions;
 pub use handler::VhostBackendReqConnectionState;
 pub use handler::VhostUserDevice;
+#[cfg(all(unix, feature = "media"))]
+pub use media::run_media_device;
+#[cfg(all(unix, feature = "media"))]
+pub use media::MediaBackendParams;
+#[cfg(all(unix, feature = "media"))]
+pub use media::Options as MediaOptions;
 #[cfg(feature = "net")]
 pub use net::run_net_device;
 #[cfg(feature = "net")]

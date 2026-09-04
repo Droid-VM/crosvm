@@ -32,6 +32,8 @@ use crosvm::config::Config;
 use devices::virtio::vhost::user::device::run_block_device;
 #[cfg(feature = "gpu")]
 use devices::virtio::vhost::user::device::run_gpu_device;
+#[cfg(all(unix, feature = "media"))]
+use devices::virtio::vhost::user::device::run_media_device;
 #[cfg(feature = "net")]
 use devices::virtio::vhost::user::device::run_net_device;
 #[cfg(feature = "audio")]
@@ -558,6 +560,8 @@ fn start_device(opts: cmdline::DeviceCommand) -> std::result::Result<(), ()> {
             CrossPlatformDevicesCommands::Block(cfg) => run_block_device(cfg),
             #[cfg(feature = "gpu")]
             CrossPlatformDevicesCommands::Gpu(cfg) => run_gpu_device(cfg),
+            #[cfg(all(unix, feature = "media"))]
+            CrossPlatformDevicesCommands::Media(cfg) => run_media_device(cfg),
             #[cfg(feature = "net")]
             CrossPlatformDevicesCommands::Net(cfg) => run_net_device(cfg),
             #[cfg(feature = "audio")]
