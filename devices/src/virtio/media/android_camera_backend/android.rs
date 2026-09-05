@@ -153,10 +153,16 @@ const FRAME_WAIT: Duration = Duration::from_millis(50);
 /// this long. The interval in force is [`stall_report`], which scales it by what the guest asked
 /// for -- a 54-second exposure delivers one frame a minute, and that is not a stall (D38).
 const STALL_REPORT: Duration = Duration::from_secs(2);
-/// How many capture results to wait for before deciding whether the camera echoed a mode the
-/// guest asked for: the request pipeline is about three frames deep (B7-controls 17.4), so an
-/// immediate comparison would always read the previous value.
-const ECHO_AFTER: u32 = 6;
+/// How many capture results a mode the guest asked for may go unseen in the *requests* coming
+/// back before the wait is given up and the set reported as never having reached the camera at
+/// all. A second at 30 fps: the pipeline is a handful of frames deep (B7-controls §17.4,
+/// B8 §6(a)), so anything this far out is not latency but a lost entry -- ours to fix.
+///
+/// The comparison itself is not counted out: it happens on the first result whose own request
+/// carries the value (`CaptureResult::requested_awb_mode`). Counting results instead was D47 --
+/// six of them is inside the window in which the new request is still working its way through
+/// the HAL, so a mode set mid-stream was called "dropped" while the next results echoed it.
+const ECHO_DEADLINE: u32 = 30;
 /// How long `STREAMON` waits for the capture thread to report that the camera opened. Generous:
 /// a cold `cameraserver` on a loaded phone takes hundreds of milliseconds, and the guest's own
 /// ioctl is what is being held. Past it the wait is given up rather than the worker parked.
@@ -553,7 +559,7 @@ impl CameraBackend for AndroidCameraBackend {
                 let (mut initial, triggers, asked) =
                     build_update(&id, &facts, &geometry, &mut applied, &request.controls);
                 if !asked.is_empty() {
-                    *echo.lock().unwrap_or_else(|e| e.into_inner()) = asked;
+                    echo.lock().unwrap_or_else(|e| e.into_inner()).ask(asked);
                 }
                 initial = initial.fps_range(request.fps.0 as i32, request.fps.1 as i32);
                 applied.fps_min = request.fps.0;
@@ -800,6 +806,13 @@ struct Applied {
     /// The bottom of the frame-rate range in force, frames per second: the slowest the camera
     /// may deliver under automatic exposure. Zero until a range has been set.
     fps_min: u32,
+    /// `CONTROL_ZOOM_RATIO` in hundredths, as the guest last set it: the region log says which
+    /// zoom the coordinates it prints were converted under (D39).
+    zoom: u32,
+    /// Whether a scene other than `None` is in force, so `CONTROL_MODE` is `UseSceneMode`.
+    scene_active: bool,
+    /// Whether the "a scene disables the individual 3A modes" warning has been said once.
+    scene_mask_warned: bool,
 }
 
 impl Default for Applied {
@@ -811,6 +824,10 @@ impl Default for Applied {
             iso_value: 100,
             flash: FlashLed::Off,
             fps_min: 0,
+            // 1.00x: no zoom, which is what a request carries until one is set.
+            zoom: 100,
+            scene_active: false,
+            scene_mask_warned: false,
         }
     }
 }
@@ -876,11 +893,15 @@ fn build_update(
     geometry: &Geometry,
     applied: &mut Applied,
     controls: &[CameraControl],
-) -> (RequestUpdate, Vec<AfTrigger>, ModeEcho) {
+) -> (RequestUpdate, Vec<AfTrigger>, Asked) {
     let mut update = RequestUpdate::new();
     let mut triggers = Vec::new();
-    let mut echo = ModeEcho::default();
+    let mut echo = Asked::default();
     let mut ae_changed = false;
+    let mut awb_changed = false;
+    // The region sets of this submission, logged after the loop so the zoom ratio printed with
+    // them is the one in force when they were sent, however the two were ordered (D39).
+    let mut region_sets: Vec<(&'static str, &[Region], Vec<Area>)> = Vec::new();
     let areas = |regions: &[Region]| -> Vec<Area> {
         regions.iter().filter_map(|r| geometry.area_of(r)).collect()
     };
@@ -891,7 +912,10 @@ fn build_update(
                 update = update.fps_range(*min as i32, *max as i32);
             }
             // Hundredths to the ratio.
-            CameraControl::Zoom(v) => update = update.zoom_ratio(*v as f32 / 100.0),
+            CameraControl::Zoom(v) => {
+                applied.zoom = *v;
+                update = update.zoom_ratio(*v as f32 / 100.0);
+            }
             CameraControl::ExposureMode(mode) => {
                 applied.exposure = *mode;
                 ae_changed = true;
@@ -920,6 +944,7 @@ fn build_update(
                 match facts.awb.iter().find(|(p, _)| p == preset) {
                     Some(&(_, mode)) => {
                         echo.awb = Some(mode);
+                        awb_changed = true;
                         update = update.awb_mode(mode);
                     }
                     None => warn!("camera {}: no Camera2 mode for {:?}", id, preset),
@@ -947,10 +972,12 @@ fn build_update(
             CameraControl::SceneMode(scene) => {
                 match facts.scenes.iter().find(|(s, _)| s == scene) {
                     Some(&(SceneMode::None, mode)) => {
+                        applied.scene_active = false;
                         echo.scene = Some((mode, ControlMode::Auto));
                         update = update.control_mode(ControlMode::Auto).scene_mode(mode);
                     }
                     Some(&(_, mode)) => {
+                        applied.scene_active = true;
                         echo.scene = Some((mode, ControlMode::UseSceneMode));
                         update = update
                             .control_mode(ControlMode::UseSceneMode)
@@ -974,14 +1001,45 @@ fn build_update(
                 });
             }
             CameraControl::AfTrigger(trigger) => triggers.push(*trigger),
-            CameraControl::AeRegions(regions) => update = update.ae_regions(&areas(regions)),
-            CameraControl::AfRegions(regions) => update = update.af_regions(&areas(regions)),
-            CameraControl::AwbRegions(regions) => update = update.awb_regions(&areas(regions)),
+            CameraControl::AeRegions(regions) => {
+                let areas = areas(regions);
+                region_sets.push(("AE", regions, areas.clone()));
+                update = update.ae_regions(&areas);
+            }
+            CameraControl::AfRegions(regions) => {
+                let areas = areas(regions);
+                region_sets.push(("AF", regions, areas.clone()));
+                update = update.af_regions(&areas);
+            }
+            CameraControl::AwbRegions(regions) => {
+                let areas = areas(regions);
+                region_sets.push(("AWB", regions, areas.clone()));
+                update = update.awb_regions(&areas);
+            }
             // Reported by this backend, never set through it.
             CameraControl::AfStatus(_)
             | CameraControl::AeState(_)
             | CameraControl::ActivePhysicalId(_) => {}
         }
+    }
+    for (what, regions, areas) in region_sets {
+        log_regions(id, what, geometry, applied.zoom, regions, &areas);
+    }
+    // "When set to USE_SCENE_MODE ... the individual controls in ACAMERA_CONTROL_* are mostly
+    // disabled, and the camera device implements one of the scene mode ... settings as it
+    // wishes"; a scene other than FACE_PRIORITY "will disable ACAMERA_CONTROL_AE_MODE,
+    // ACAMERA_CONTROL_AWB_MODE, and ACAMERA_CONTROL_AF_MODE while in use"
+    // (`NdkCameraMetadataTags.h`, ACAMERA_CONTROL_MODE :1197-1206, ACAMERA_CONTROL_SCENE_MODE
+    // :1229-1233). So a white balance or an exposure set under a scene is the camera's to
+    // ignore, and the guest is told once why what it set is not what the result reports.
+    if applied.scene_active && (awb_changed || ae_changed) && !applied.scene_mask_warned {
+        applied.scene_mask_warned = true;
+        warn!(
+            "camera {}: a scene mode is in force (CONTROL_MODE USE_SCENE_MODE), under which \
+             Camera2 lets the camera own the white balance and the exposure -- what this set \
+             asks for may be ignored until scene_mode is set back to 0 (None)",
+            id
+        );
     }
     if ae_changed {
         let (ae, flash) = applied.ae();
@@ -996,80 +1054,237 @@ fn build_update(
     (update, triggers, echo)
 }
 
+/// One line per `*_REGIONS` set: the rectangles the guest sent, in its own
+/// `REGION_SCALE`ths-of-the-frame units, and where [`Geometry::area_of`] put them in the
+/// sensor's active array (D39).
+///
+/// This is the only place the conversion is visible from outside: a guest that taps to focus
+/// has no way of telling a region that landed where it meant from one that landed in a corner,
+/// and neither has an acceptance run ("the host log shows active-array coordinates",
+/// M4-acceptance A2 item 8). The zoom ratio is printed with it because it is what the
+/// coordinates mean -- from API 30 the active array is post-zoom
+/// (`NdkCameraMetadataTags.h`, ACAMERA_CONTROL_AE_REGIONS :663-670) -- and not because
+/// [`Geometry::area_of`] scales by it, which it deliberately does not.
+fn log_regions(
+    id: &str,
+    what: &str,
+    geometry: &Geometry,
+    zoom_hundredths: u32,
+    regions: &[Region],
+    areas: &[Area],
+) {
+    let guest: Vec<String> = regions
+        .iter()
+        .filter(|r| r.is_set())
+        .map(|r| format!("[{},{} {}x{} w{}]", r.x, r.y, r.width, r.height, r.weight))
+        .collect();
+    let zoom = zoom_hundredths as f32 / 100.0;
+    if guest.is_empty() {
+        info!(
+            "camera {}: {} regions cleared -- the camera meters as it likes (zoom {:.2}x)",
+            id, what, zoom
+        );
+        return;
+    }
+    let Some(active) = geometry.active_array else {
+        warn!(
+            "camera {}: {} regions {} cannot be converted: this camera reports no active array, \
+             so the entry is not sent",
+            id,
+            what,
+            guest.join(" ")
+        );
+        return;
+    };
+    let sensor: Vec<String> = areas
+        .iter()
+        .map(|a| {
+            format!(
+                "[{},{}..{},{} w{}]",
+                a.xmin, a.ymin, a.xmax, a.ymax, a.weight
+            )
+        })
+        .collect();
+    info!(
+        "camera {}: {} regions: guest {} of {} in the {}x{} frame -> active array {} \
+         (array {}x{} at {},{}, zoom {:.2}x)",
+        id,
+        what,
+        guest.join(" "),
+        REGION_SCALE,
+        geometry.width,
+        geometry.height,
+        sensor.join(" "),
+        active.width,
+        active.height,
+        active.left,
+        active.top,
+        zoom
+    );
+}
+
 /// The three request entries a HAL may take or silently drop, as one submission asked for
-/// them, and how many capture results have come back since (D36).
+/// them (D36), and what became of each.
 ///
 /// `AUTO_N_PRESET_WHITE_BALANCE`, `COLORFX` and `SCENE_MODE` are accepted by the device, mapped
 /// to a Camera2 mode and submitted without an error, and on 5566 they change nothing in the
 /// pixels (B7-controls 10.2, 12.2). A capture result carries the values the camera *used*, so
 /// comparing the two says which half is at fault: an echoed value that changes nothing is the
-/// HAL's business, a value the result does not carry is ours. The verdict is logged once per
-/// set rather than per result.
+/// HAL's business, a value the camera never ran is ours.
+///
+/// The comparison is made against the **request the result came with**, not against a count of
+/// results (D47): a repeating request submitted mid-stream reaches the sensor a few frames
+/// later, and until it does, every result is an older capture that legitimately carries the old
+/// value. So each mode waits for the first result whose own request carries what was asked for
+/// -- that result is the camera's answer -- and is then reported once and forgotten.
 #[derive(Default)]
 struct ModeEcho {
-    awb: Option<AwbMode>,
-    effect: Option<EffectMode>,
-    /// The scene, and the `CONTROL_MODE` it needs to have any effect at all.
-    scene: Option<(android_camera::SceneMode, ControlMode)>,
-    /// Results seen since the set; the comparison waits [`ECHO_AFTER`] of them.
+    asked: Asked,
+    /// Results seen since the set, for [`ECHO_DEADLINE`].
     results: u32,
+    /// Which modes have already had a mismatch reported as a warning, so a guest that sets one
+    /// every second gets one warning per control and not one per set.
+    warned: Warned,
 }
 
-impl ModeEcho {
+/// What one submission asked of the three modes.
+#[derive(Default, Clone, Copy)]
+struct Asked {
+    awb: Option<AwbMode>,
+    effect: Option<EffectMode>,
+    /// The scene, and the `CONTROL_MODE` it needs to have any effect at all: a scene applies
+    /// only under `UseSceneMode`, and under `UseSceneMode` the individual 3A modes are "mostly
+    /// disabled" and the camera picks its own (`NdkCameraMetadataTags.h`, `ACAMERA_CONTROL_MODE`
+    /// :1197-1206 and `ACAMERA_CONTROL_SCENE_MODE` :1229-1233).
+    scene: Option<(android_camera::SceneMode, ControlMode)>,
+}
+
+impl Asked {
     fn is_empty(&self) -> bool {
         self.awb.is_none() && self.effect.is_none() && self.scene.is_none()
     }
+}
 
-    /// What the result says against what was asked for, one clause per mode, or `None` when
-    /// nothing was asked for.
-    fn verdict(&self, result: &CaptureResult<'_>) -> Option<String> {
-        if self.is_empty() {
-            return None;
-        }
+/// One flag per control, so [`ModeEcho`] can warn once about each.
+#[derive(Default, Clone, Copy)]
+struct Warned {
+    awb: bool,
+    effect: bool,
+    scene: bool,
+}
+
+/// Which of the three a verdict is about, so it can be warned about once.
+#[derive(Clone, Copy)]
+enum Mode {
+    Awb,
+    Effect,
+    Scene,
+}
+
+/// What became of one mode, and how it should be said.
+enum Echo {
+    /// The camera ran the entry and reported it back.
+    Echoed(String),
+    /// The camera ran the entry and reported a different value: the HAL substituted its own.
+    Dropped(Mode, String),
+    /// No request carrying the value came back within [`ECHO_DEADLINE`] results: the entry
+    /// never reached the camera, which is this backend's bug and not the HAL's.
+    NeverSent(String),
+}
+
+impl ModeEcho {
+    /// Take a new submission's asks, keeping the "already warned" flags: they belong to the
+    /// stream, not to one set.
+    fn ask(&mut self, asked: Asked) {
+        self.asked = asked;
+        self.results = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.asked.is_empty()
+    }
+
+    /// Read `result` for every mode still waiting, and answer with what can be said now. A mode
+    /// whose request has not come back yet is left pending and says nothing.
+    fn poll(&mut self, result: &CaptureResult<'_>) -> Vec<Echo> {
+        self.results = self.results.saturating_add(1);
+        let expired = self.results >= ECHO_DEADLINE;
         let mut out = Vec::new();
-        if let Some(want) = self.awb {
-            let got = result.awb_mode();
-            out.push(format!(
-                "AWB_MODE {:?} -> {:?} ({})",
-                want,
-                got,
-                if got == Some(want) {
-                    "echoed"
-                } else {
-                    "dropped"
-                }
-            ));
+
+        if let Some(want) = self.asked.awb {
+            // The entry is on the request this result was taken with: whatever the result says
+            // is the camera's answer to it.
+            if result.requested_awb_mode() == Some(want) {
+                let got = result.awb_mode();
+                out.push(Echo::verdict(
+                    Mode::Awb,
+                    got == Some(want),
+                    format!("AWB_MODE {:?} -> {:?}", want, got),
+                ));
+                self.asked.awb = None;
+            } else if expired {
+                out.push(Echo::NeverSent(format!("AWB_MODE {want:?}")));
+                self.asked.awb = None;
+            }
         }
-        if let Some(want) = self.effect {
-            let got = result.effect_mode();
-            out.push(format!(
-                "EFFECT_MODE {:?} -> {:?} ({})",
-                want,
-                got,
-                if got == Some(want) {
-                    "echoed"
-                } else {
-                    "dropped"
-                }
-            ));
+        if let Some(want) = self.asked.effect {
+            if result.requested_effect_mode() == Some(want) {
+                let got = result.effect_mode();
+                out.push(Echo::verdict(
+                    Mode::Effect,
+                    got == Some(want),
+                    format!("EFFECT_MODE {:?} -> {:?}", want, got),
+                ));
+                self.asked.effect = None;
+            } else if expired {
+                out.push(Echo::NeverSent(format!("EFFECT_MODE {want:?}")));
+                self.asked.effect = None;
+            }
         }
-        if let Some((want, mode)) = self.scene {
-            let got = result.scene_mode();
-            let got_mode = result.control_mode();
-            out.push(format!(
-                "SCENE_MODE {:?} -> {:?}, CONTROL_MODE {:?} -> {:?} ({})",
-                want,
-                got,
-                mode,
-                got_mode,
-                if got == Some(want) && got_mode == Some(mode) {
-                    "echoed"
-                } else {
-                    "dropped"
-                }
-            ));
+        if let Some((want, mode)) = self.asked.scene {
+            if result.requested_scene_mode() == Some(want)
+                && result.requested_control_mode() == Some(mode)
+            {
+                let (got, got_mode) = (result.scene_mode(), result.control_mode());
+                out.push(Echo::verdict(
+                    Mode::Scene,
+                    got == Some(want) && got_mode == Some(mode),
+                    format!(
+                        "SCENE_MODE {:?} -> {:?}, CONTROL_MODE {:?} -> {:?}",
+                        want, got, mode, got_mode
+                    ),
+                ));
+                self.asked.scene = None;
+            } else if expired {
+                out.push(Echo::NeverSent(format!(
+                    "SCENE_MODE {want:?} under CONTROL_MODE {mode:?}"
+                )));
+                self.asked.scene = None;
+            }
         }
-        Some(out.join("; "))
+        out
+    }
+
+    /// Whether this mismatch is the first of its control, and remember that it was said.
+    fn first_warning(&mut self, mode: Mode) -> bool {
+        let flag = match mode {
+            Mode::Awb => &mut self.warned.awb,
+            Mode::Effect => &mut self.warned.effect,
+            Mode::Scene => &mut self.warned.scene,
+        };
+        let first = !*flag;
+        *flag = true;
+        first
+    }
+}
+
+impl Echo {
+    fn verdict(mode: Mode, echoed: bool, what: String) -> Echo {
+        if echoed {
+            Echo::Echoed(what)
+        } else {
+            Echo::Dropped(mode, what)
+        }
     }
 }
 
@@ -1094,7 +1309,7 @@ fn apply_controls(
         );
     }
     if !asked.is_empty() {
-        *echo.lock().unwrap_or_else(|e| e.into_inner()) = asked;
+        echo.lock().unwrap_or_else(|e| e.into_inner()).ask(asked);
     }
     fire_triggers(id, camera, &triggers);
 }
@@ -1157,20 +1372,43 @@ fn result_listener(
 ) -> ResultListener {
     let last = Mutex::new(LastReported::default());
     Box::new(move |result: &CaptureResult<'_>| {
-        // What the camera did with the last set of the three modes it may ignore (D36): read
-        // out of the result a few frames after the set, said once, and then forgotten.
+        // What the camera did with the last set of the three modes it may ignore (D36): each is
+        // read out of the first result whose own request carries it -- the camera's answer to
+        // that entry -- said once, and then forgotten.
         {
             let mut echo = echo.lock().unwrap_or_else(|e| e.into_inner());
             if !echo.is_empty() {
-                echo.results += 1;
-                if echo.results >= ECHO_AFTER {
-                    if let Some(verdict) = echo.verdict(result) {
-                        info!(
-                            "camera {}: mode echo after {} results: {}",
-                            id, ECHO_AFTER, verdict
-                        );
+                for verdict in echo.poll(result) {
+                    match verdict {
+                        Echo::Echoed(what) => {
+                            info!("camera {}: mode echo: {} (echoed)", id, what)
+                        }
+                        // The camera ran the entry and answered with something else. It is not
+                        // an error -- the guest's set was accepted and the stream goes on -- but
+                        // the value the guest reads back through V4L2 is then not the one the
+                        // camera is using, which is worth a warning rather than a log line
+                        // (D36 advisory, D47).
+                        Echo::Dropped(mode, what) => {
+                            if echo.first_warning(mode) {
+                                warn!(
+                                    "camera {}: {} -- the camera took the request entry and used \
+                                     its own value; the guest reads back what it set (D36 \
+                                     advisory). Further mismatches of this control are logged, \
+                                     not warned",
+                                    id, what
+                                );
+                            } else {
+                                info!("camera {}: mode echo: {} (dropped)", id, what);
+                            }
+                        }
+                        // No request carrying it came back at all: the entry never reached the
+                        // camera, which would be this backend's bug.
+                        Echo::NeverSent(what) => warn!(
+                            "camera {}: {} never appeared in a capture request within {} results \
+                             -- the entry did not reach the camera",
+                            id, what, ECHO_DEADLINE
+                        ),
                     }
-                    *echo = ModeEcho::default();
                 }
             }
         }
