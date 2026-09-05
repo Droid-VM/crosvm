@@ -215,12 +215,29 @@ fn cmd_list() -> Result<(), String> {
                     .join(", ")
             }
         );
+        // Every size, each with the minimum frame duration reported for it and the frame rate
+        // that duration allows. These two lists are what the V4L2 camera device answers
+        // `ENUM_FRAMESIZES` and `ENUM_FRAMEINTERVALS` from, and M4's acceptance is asked to
+        // record both, so all of it is printed: this used to stop after 8 sizes and 4 durations
+        // and the rest could only be inferred from the guest (defect D20).
+        let duration_of = |size: &(i32, i32)| {
+            c.yuv_min_frame_durations
+                .iter()
+                .find(|(s, _)| s == size)
+                .map(|&(_, ns)| ns)
+        };
         println!("    YUV_420_888 sizes   {}", c.yuv_sizes.len());
-        for (w, h) in c.yuv_sizes.iter().take(8) {
-            println!("      {}x{}", w, h);
-        }
-        if c.yuv_sizes.len() > 8 {
-            println!("      ... and {} more", c.yuv_sizes.len() - 8);
+        for size in &c.yuv_sizes {
+            let (w, h) = *size;
+            match duration_of(size) {
+                Some(ns) if ns > 0 => {
+                    let fps = 1e9 / ns as f64;
+                    println!("      {}x{}: {} ns ({:.1} fps max)", w, h, ns, fps)
+                }
+                // A duration of zero or less is not a rate; say so rather than divide by it.
+                Some(ns) => println!("      {}x{}: {} ns (not a rate)", w, h, ns),
+                None => println!("      {}x{}: (no min frame duration reported)", w, h),
+            }
         }
         println!(
             "    fps ranges          {}",
@@ -234,13 +251,25 @@ fn cmd_list() -> Result<(), String> {
                     .join(", ")
             }
         );
-        // The V4L2 device caps ENUM_FRAMEINTERVALS at each size by these.
+        // The V4L2 device caps ENUM_FRAMEINTERVALS at each size by these. They are printed with
+        // the sizes above; the two lists come from different metadata keys, so a duration for a
+        // size that is not an output size is worth seeing on its own.
+        let orphans: Vec<_> = c
+            .yuv_min_frame_durations
+            .iter()
+            .filter(|(size, _)| !c.yuv_sizes.contains(size))
+            .collect();
         println!(
-            "    min frame durations {} for YUV_420_888",
-            c.yuv_min_frame_durations.len()
+            "    min frame durations {} for YUV_420_888{}",
+            c.yuv_min_frame_durations.len(),
+            if orphans.is_empty() {
+                " (all shown with the sizes above)"
+            } else {
+                ""
+            }
         );
-        for ((w, h), ns) in c.yuv_min_frame_durations.iter().take(4) {
-            println!("      {}x{}: {} ns ({:.1} fps max)", w, h, ns, 1e9 / *ns as f64);
+        for ((w, h), ns) in orphans {
+            println!("      {}x{}: {} ns -- no such output size", w, h, ns);
         }
     }
     Ok(())
