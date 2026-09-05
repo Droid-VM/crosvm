@@ -38,6 +38,8 @@ use devices::virtio::device_constants::video::VideoBackendType;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoDeviceType;
 #[cfg(feature = "media")]
+use devices::virtio::media::MediaDeviceSupport;
+#[cfg(feature = "media")]
 use devices::virtio::media::MediaPool;
 use devices::virtio::ipc_memory_mapper::create_ipc_mapper;
 use devices::virtio::ipc_memory_mapper::CreateIpcMapperRet;
@@ -561,12 +563,14 @@ pub fn create_virtio_snd_device(
     snd_params: SndParameters,
     snd_device_tube: Tube,
     worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
 ) -> DeviceResult {
     if snd_params.uid.is_some() {
         return create_unprivileged_virtio_snd_device(
             protection_type,
             snd_params,
             worker_process_pids,
+            helper_pid_labels,
         );
     }
     let backend = snd_params.backend;
@@ -621,10 +625,14 @@ pub fn create_virtio_snd_device(
 /// The guest cannot tell this apart from the in-process device: vhost-user moves the virtqueue
 /// handling to the other side of a socket, but the device the guest enumerates is the same one.
 /// See `device_helper` for why the backend cannot simply stay here.
+///
+/// The child's pid is labelled the way the media helper's is, so a snd helper that dies is a
+/// logged crash rather than a stray child waved through (`logs/vpu_wp/M3.md` §9 item 3).
 fn create_unprivileged_virtio_snd_device(
     protection_type: ProtectionType,
     mut snd_params: SndParameters,
     worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
 ) -> DeviceResult {
     // The backend process builds its own feature set out of nothing but these parameters, and the
     // frontend below can only mask against what the backend offers -- so the one thing the backend
@@ -646,8 +654,21 @@ fn create_unprivileged_virtio_snd_device(
     let (vmm_end, pid) =
         crate::crosvm::sys::linux::device_helper::launch("snd", config, uid, gid, supp_gids)
             .context("failed to launch the unprivileged snd backend")?;
-    // So that the child exiting is not reported as a device crashing.
+    // So that the child exiting cleanly is not reported as a device crashing, and anything else
+    // is, under a name.
     worker_process_pids.insert(pid);
+    helper_pid_labels.insert(pid as u32, "snd helper".to_string());
+    // This child exec'd /proc/self/exe too, so `ps` calls it `exe`; the same line the media
+    // helper gets (D14).
+    info!(
+        "launched snd helper: pid {}, uid {}, gid {}, backend {}, card_index {}",
+        pid,
+        uid,
+        gid,
+        // The `backend=` spelling the command line uses, not `Debug`'s `Sys(AAUDIO)`.
+        String::from(snd_params.backend),
+        snd_params.card_index,
+    );
 
     let connection = vmm_end
         .try_into()
@@ -1279,10 +1300,12 @@ pub fn register_video_device(
 /// does (`VPU_DESIGN.md` §6); `mem` is then what the host-accessible windows are computed from,
 /// and the helper's pid is recorded so its exit is judged and logged as one of ours.
 ///
-/// `simple`, `loopback` and `camera` exist today; the camera only in a helper, because the
-/// camera service refuses uid 0 (design §7.1), so `kind=camera` without `uid=` is refused here.
-/// The other kinds are refused by name, so a command line written for a later milestone fails
-/// to start rather than starting something else.
+/// Which kinds exist and where is [`MediaDeviceKind::support`]'s table, and it is consulted
+/// before `uid=` decides where the device is built: a kind nothing implements is refused here,
+/// by name, so a command line written for a later milestone fails to start rather than starting
+/// a helper that refuses it on the far side of a socket (B4 §7.1, defect D15). `kind=camera`
+/// exists in the helper alone -- the camera service refuses uid 0 (design §7.1) -- so without
+/// `uid=` it is refused here too.
 #[cfg(feature = "media")]
 pub fn create_virtio_media_device(
     protection_type: ProtectionType,
@@ -1294,6 +1317,13 @@ pub fn create_virtio_media_device(
 ) -> DeviceResult {
     use devices::virtio::media::create_virtio_media_loopback_device;
     use devices::virtio::media::create_virtio_media_simple_capture_device;
+
+    // The kind before the uid. A kind nothing implements must be refused before anything is
+    // launched, or `uid=` sends it to a helper that refuses it by name on its own stderr while
+    // the error the VMM reports is `failed to get features: ... Connection reset by peer` (D15).
+    if config.kind.support() == MediaDeviceSupport::Unimplemented {
+        bail!("{}", config.kind.unimplemented_message());
+    }
 
     if config.uid.is_some() {
         return create_unprivileged_virtio_media_device(
@@ -1314,6 +1344,7 @@ pub fn create_virtio_media_device(
             config.card.as_deref().unwrap_or("droidvm loopback"),
             pool,
         ),
+        // `HelperOnly`, and this call has no uid.
         MediaDeviceKind::Camera => {
             bail!(
                 "--virtio-media kind=camera needs uid=<app uid>: the camera device runs in a \
@@ -1321,12 +1352,10 @@ pub fn create_virtio_media_device(
                  from the real uid and refuses root (VPU_DESIGN.md §7.1)"
             )
         }
+        // Refused above, before the uid was looked at; kept so the match stays exhaustive and
+        // says the same thing if the table ever changes.
         MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
-            bail!(
-                "--virtio-media kind={:?} is not implemented yet (only simple, loopback and \
-                 camera are)",
-                config.kind
-            )
+            bail!("{}", config.kind.unimplemented_message())
         }
     };
 
@@ -1363,10 +1392,10 @@ fn create_unprivileged_virtio_media_device(
     let gid = config.gid.unwrap_or(uid);
     let pool = pool.ok_or_else(|| {
         anyhow!(
-            "--virtio-media kind={:?},uid={} runs the device in a helper process, which serves \
+            "--virtio-media kind={},uid={} runs the device in a helper process, which serves \
              MMAP buffers from the media_host pool only, and this VM has no such pool: add \
              --pre-alloc media-host-mb=<MiB> (VPU_DESIGN.md §6.2)",
-            config.kind,
+            config.kind.as_str(),
             uid
         )
     })?;
@@ -1406,6 +1435,20 @@ fn create_unprivileged_virtio_media_device(
     // is, under a name.
     worker_process_pids.insert(pid);
     helper_pid_labels.insert(pid as u32, "media helper".to_string());
+    // The child exec'd /proc/self/exe, so its `comm` is `exe` and no `ps` will ever show what it
+    // is: this line is the only place a running helper is named (B4 §5.1, defect D14). Find it
+    // later by cmdline, not by name -- `deploy/vpu/README.md` has the one-liner.
+    info!(
+        "launched media helper: pid {}, uid {}, gid {}, kind {}, card {}, pool_gpa {:#x}, {} \
+         access window(s)",
+        pid,
+        uid,
+        gid,
+        config.kind.as_str(),
+        config.card.as_deref().unwrap_or("<default>"),
+        pool_gpa,
+        params.access_windows.len(),
+    );
 
     let connection = vmm_end
         .try_into()

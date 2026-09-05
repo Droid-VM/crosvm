@@ -2851,15 +2851,18 @@ pub struct RunCommand {
     ///         device --simple-media-device makes; loopback is a
     ///         memory-to-memory device copying every OUTPUT buffer
     ///         into a CAPTURE buffer, for testing guest-owned and
-    ///         host-owned buffers together. camera, decoder and
-    ///         encoder parse but are not implemented yet.
+    ///         host-owned buffers together. camera is a host
+    ///         camera over the Camera2 NDK and needs uid=;
+    ///         decoder and encoder parse but are not
+    ///         implemented yet.
     ///     card=NAME - V4L2 card name shown to the guest (31
     ///         bytes at most).
     ///     camera_id=ID - Host camera to expose (camera).
     ///     role=(main,aux) - Camera role (camera).
     ///     uid=INT - Run the backend in its own process under
-    ///         this host uid, as --virtio-snd does (camera,
-    ///         decoder, encoder).
+    ///         this host uid, as --virtio-snd does. Any kind
+    ///         may use it; camera requires it, because
+    ///         cameraserver refuses uid 0.
     ///     gid=INT - Group for that process. Defaults to uid.
     pub virtio_media: Vec<MediaDeviceConfig>,
 

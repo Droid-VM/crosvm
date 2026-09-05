@@ -852,9 +852,10 @@ pub use devices::virtio::media::MediaDeviceKind;
 
 /// One `--virtio-media KEY=VALUE,...` device (`VPU_DESIGN.md` §3.5).
 ///
-/// Every kind parses; only `simple` and `loopback` can be created today, the others fail at
-/// device creation with a "not implemented yet" error rather than silently making something
-/// else. Keys are `snake_case` on the command line, like `--virtio-snd`'s.
+/// Every kind parses; which of them can be created, and whether in the VMM or in a helper, is
+/// [`MediaDeviceKind::support`]'s table, and a kind nothing implements fails at device creation
+/// with a "not implemented yet" error rather than silently making something else. Keys are
+/// `snake_case` on the command line, like `--virtio-snd`'s.
 #[cfg(feature = "media")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
 #[serde(deny_unknown_fields)]
