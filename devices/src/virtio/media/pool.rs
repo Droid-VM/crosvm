@@ -95,34 +95,46 @@ pub fn pool_handle_at(mem: &GuestMemory, gpa: u64) -> anyhow::Result<MediaPoolHa
     })
 }
 
-/// What a helper asks the VMM's pool server ([`MediaPool::spawn_server`]). One request at a time,
-/// synchronous, no ids: the helper's allocator blocks on the answer, and it is the only writer on
-/// its tube.
+/// What a helper asks the VMM's pool server ([`MediaPool::spawn_server`]). One request at a
+/// time, synchronous; `id` is the client's own counter, echoed by the server's answer, so that
+/// the reply to a request whose caller has already timed out is recognisably stale -- the next
+/// round trip drains it and resyncs instead of poisoning the connection (R8-4).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PoolRequest {
     /// Carve `len` bytes (page-rounded by the VMM) out of the pool for this helper.
-    Reserve { len: u64 },
+    Reserve { id: u64, len: u64 },
     /// Give the reservation at `offset` back. An offset this helper does not own is logged by
     /// the VMM and ignored -- the space stays allocated to whoever owns it.
-    Release { offset: u64 },
+    Release { id: u64, offset: u64 },
     /// Give back every reservation this helper's lease still holds -- `Release` for the lot.
     /// Sent by the backend when its device is torn down (a virtio reset), belt and braces under
     /// the allocator's own per-offset `Release`s (R8-3); the lease itself stays alive and
     /// serving.
-    ReleaseAll,
+    ReleaseAll { id: u64 },
 }
 
-/// The VMM's answer to one [`PoolRequest`].
+/// The VMM's answer to one [`PoolRequest`], carrying that request's `id` back.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PoolResponse {
     /// `Reserve` succeeded: the buffer's offset in the pool's offset space.
-    Reserved { offset: u64 },
-    /// `Release` was processed (whether or not the offset was this helper's to free; a foreign
-    /// offset is the VMM's error line, not the helper's problem to handle).
-    Released,
+    Reserved { id: u64, offset: u64 },
+    /// `Release`/`ReleaseAll` was processed (whether or not the offsets were this helper's to
+    /// free; a foreign offset is the VMM's error line, not the helper's problem to handle).
+    Released { id: u64 },
     /// `Reserve` failed with this errno -- `ENOMEM` when the pool is full, `EINVAL` for a
     /// zero or absurd length.
-    Errno(i32),
+    Errno { id: u64, errno: i32 },
+}
+
+impl PoolResponse {
+    /// The id of the request this answers.
+    fn id(&self) -> u64 {
+        match self {
+            PoolResponse::Reserved { id, .. }
+            | PoolResponse::Released { id }
+            | PoolResponse::Errno { id, .. } => *id,
+        }
+    }
 }
 
 /// How long a helper waits for the VMM to answer one pool request. The VMM's server thread does
@@ -130,6 +142,12 @@ pub enum PoolResponse {
 /// this long means the VMM is gone or wedged, and the helper's allocation fails with `EIO`
 /// rather than blocking a REQBUFS forever (the F5 rule: every wait bounded, by a named const).
 pub const POOL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many queued stale answers one pool round trip will drain before giving up on its own.
+/// A stale answer exists only where an earlier request timed out (its reply arrived after the
+/// caller stopped waiting), so the queue can never outgrow the number of timeouts survived;
+/// the bound keeps the drain loop finite whatever the far end does.
+const STALE_ANSWER_DRAIN_BOUND: u32 = 32;
 
 /// One process's own whole-pool mapping: the mapping half of the old allocator, without the
 /// offset-space bookkeeping (which lives in the VMM's [`MediaPoolAllocator`] alone).
@@ -560,24 +578,24 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
             }
         };
         let response = match request {
-            PoolRequest::Reserve { len } => match lease.reserve(len) {
-                Ok(offset) => PoolResponse::Reserved { offset },
-                Err(errno) => PoolResponse::Errno(errno),
+            PoolRequest::Reserve { id, len } => match lease.reserve(len) {
+                Ok(offset) => PoolResponse::Reserved { id, offset },
+                Err(errno) => PoolResponse::Errno { id, errno },
             },
-            PoolRequest::Release { offset } => {
+            PoolRequest::Release { id, offset } => {
                 // A foreign or unallocated offset was logged (and refused) by the pool; the
                 // helper gets its ack either way, because there is nothing it could do
                 // differently and the reservation books are already right.
                 let _ = lease.unreserve(offset);
                 log_pool_usage(lease, card);
-                PoolResponse::Released
+                PoolResponse::Released { id }
             }
-            PoolRequest::ReleaseAll => {
+            PoolRequest::ReleaseAll { id } => {
                 // `release_owner` without dropping the lease: everything this helper holds goes
                 // back (the reclaim line says how much), and the connection keeps serving.
                 let _ = lease.release_all();
                 log_pool_usage(lease, card);
-                PoolResponse::Released
+                PoolResponse::Released { id }
             }
         };
         if let Err(e) = tube.send(&response) {
@@ -683,21 +701,30 @@ impl Drop for PoolBufferAllocator {
     }
 }
 
-/// A helper's connection to the VMM's pool server: the tube, this process's whole-pool mapping,
-/// and one flag that poisons the connection once it has missed an answer.
+/// A helper's connection to the VMM's pool server: the tube (with the request counter, behind
+/// one lock for the whole round trip), this process's whole-pool mapping, and one flag that
+/// marks the connection gone for good.
 ///
 /// Shared (behind an `Arc`) between the backend -- which keeps it across device resets, the way
 /// the in-VMM pool outlives its leases -- and the [`RemotePoolAllocator`] of the device
 /// currently running.
 pub struct RemotePool {
-    tube: Tube,
+    /// Locked across send+recv: the protocol has one outstanding request per connection, and
+    /// holding the lock for the whole round trip is what makes a second caller wait for its
+    /// turn instead of reading the first caller's answer (R8-5 -- the invariant is the mutex,
+    /// not a comment about thread counts).
+    conn: Mutex<PoolConnection>,
     mapped: MappedPool,
-    /// Set when a request timed out or the tube broke. The protocol is synchronous with no ids,
-    /// so after a missed answer the two sides are out of step -- a late `Reserved` would be read
-    /// as the answer to the *next* request -- and the only safe thing left is to fail
-    /// everything. The VMM sweeps this helper's reservations when the tube closes, i.e. when
-    /// this process exits.
+    /// Set only when the tube reports `Disconnected`: the VMM's end is closed and no request
+    /// can ever be answered again. A timeout does NOT set it -- the request ids let the next
+    /// round trip drain the late answer and resync (R8-4).
     dead: AtomicBool,
+}
+
+/// The lock-protected half of [`RemotePool`]: the tube and the id for the next request.
+struct PoolConnection {
+    tube: Tube,
+    next_id: u64,
 }
 
 impl RemotePool {
@@ -727,45 +754,62 @@ impl RemotePool {
             size >> 20
         );
         Ok(Arc::new(RemotePool {
-            tube,
+            conn: Mutex::new(PoolConnection { tube, next_id: 0 }),
             mapped,
             dead: AtomicBool::new(false),
         }))
     }
 
-    /// One synchronous round trip to the VMM. Any failure -- a send or recv error, a timeout --
-    /// marks the connection dead and is `EIO`: the VMM is gone or wedged, and no later answer
-    /// could be matched to its request.
-    fn request(&self, request: &PoolRequest) -> Result<PoolResponse, i32> {
+    /// One synchronous round trip to the VMM: `build` is given this request's fresh id. A send
+    /// error or a timeout is `EIO` for this request alone -- the connection survives, and the
+    /// next round trip drains whatever late answers the timeout left queued (their ids give
+    /// them away) and resyncs (R8-4). Only `Disconnected` -- the VMM's end closed for good --
+    /// marks the connection dead.
+    fn request(&self, build: impl FnOnce(u64) -> PoolRequest) -> Result<PoolResponse, i32> {
         if self.dead.load(Ordering::Acquire) {
             return Err(libc::EIO);
         }
-        if let Err(e) = self.tube.send(request) {
+        let mut conn = self.conn.lock();
+        let id = conn.next_id;
+        conn.next_id += 1;
+        if let Err(e) = conn.tube.send(&build(id)) {
             error!("virtio-media: cannot reach the VMM's pool server: {e}");
-            self.dead.store(true, Ordering::Release);
             return Err(libc::EIO);
         }
-        match self.tube.recv() {
-            Ok(response) => Ok(response),
-            Err(e) => {
-                error!(
-                    "virtio-media: no answer from the VMM's pool server within {} s: {e}",
-                    POOL_RPC_TIMEOUT.as_secs()
-                );
-                self.dead.store(true, Ordering::Release);
-                Err(libc::EIO)
+        for _ in 0..STALE_ANSWER_DRAIN_BOUND {
+            match conn.tube.recv::<PoolResponse>() {
+                Ok(response) if response.id() == id => return Ok(response),
+                Ok(stale) => {
+                    // The answer to a request whose caller timed out earlier: drained, and the
+                    // loop keeps waiting for this request's own answer -- resync, not poison.
+                    info!("virtio-media: draining a stale pool answer ({stale:?})");
+                }
+                Err(TubeError::Disconnected) => {
+                    error!("virtio-media: the VMM's pool server closed the connection");
+                    self.dead.store(true, Ordering::Release);
+                    return Err(libc::EIO);
+                }
+                Err(e) => {
+                    error!(
+                        "virtio-media: no answer from the VMM's pool server within {} s: {e}",
+                        POOL_RPC_TIMEOUT.as_secs()
+                    );
+                    return Err(libc::EIO);
+                }
             }
         }
+        error!(
+            "virtio-media: {STALE_ANSWER_DRAIN_BOUND} stale pool answers in a row; giving up \
+             on this request"
+        );
+        Err(libc::EIO)
     }
 
-    /// An answer that is not what the request asked for: the two sides are out of step (see
-    /// [`RemotePool::dead`]), so the connection is poisoned.
+    /// An answer that is not the shape its request asked for. Cannot happen between one binary
+    /// pair (`/proc/self/exe` both sides); logged and `EIO`, and the connection survives -- only
+    /// a closed tube is terminal.
     fn out_of_step(&self, response: &PoolResponse) -> i32 {
-        error!(
-            "virtio-media: the VMM's pool server is out of step (unexpected {response:?}); \
-             giving up on the connection"
-        );
-        self.dead.store(true, Ordering::Release);
+        error!("virtio-media: the VMM's pool server is out of step (unexpected {response:?})");
         libc::EIO
     }
 
@@ -775,8 +819,8 @@ impl RemotePool {
     /// buffer retired inside the device crate, say -- so a guest that resets its media device in
     /// a loop cannot drain the VM-wide pool (R8-3). The lease stays alive and serving.
     pub fn release_all(&self) {
-        match self.request(&PoolRequest::ReleaseAll) {
-            Ok(PoolResponse::Released) => {}
+        match self.request(|id| PoolRequest::ReleaseAll { id }) {
+            Ok(PoolResponse::Released { .. }) => {}
             Ok(other) => {
                 let _ = self.out_of_step(&other);
             }
@@ -821,8 +865,8 @@ impl RemotePoolAllocator {
     /// guest's STREAMOFF/REQBUFS(0) must not fail over a bookkeeping line, and if the VMM is
     /// really gone this process is about to be swept whole anyway.
     fn give_back(&mut self, offset: u64) {
-        match self.pool.request(&PoolRequest::Release { offset }) {
-            Ok(PoolResponse::Released) => {}
+        match self.pool.request(|id| PoolRequest::Release { id, offset }) {
+            Ok(PoolResponse::Released { .. }) => {}
             Ok(other) => {
                 let _ = self.pool.out_of_step(&other);
             }
@@ -838,8 +882,8 @@ impl RemotePoolAllocator {
 
 impl VirtioMediaBufferAllocator for RemotePoolAllocator {
     fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
-        match self.pool.request(&PoolRequest::Reserve { len })? {
-            PoolResponse::Reserved { offset } => {
+        match self.pool.request(|id| PoolRequest::Reserve { id, len })? {
+            PoolResponse::Reserved { offset, .. } => {
                 match self.pool.mapped.buffer_at(offset, len) {
                     Ok(buffer) => {
                         self.outstanding.insert(offset);
@@ -855,7 +899,7 @@ impl VirtioMediaBufferAllocator for RemotePoolAllocator {
                     }
                 }
             }
-            PoolResponse::Errno(errno) => Err(errno),
+            PoolResponse::Errno { errno, .. } => Err(errno),
             other => Err(self.pool.out_of_step(&other)),
         }
     }
@@ -891,8 +935,8 @@ impl Drop for RemotePoolAllocator {
             outstanding.len()
         );
         for offset in outstanding {
-            match self.pool.request(&PoolRequest::Release { offset }) {
-                Ok(PoolResponse::Released) => {}
+            match self.pool.request(|id| PoolRequest::Release { id, offset }) {
+                Ok(PoolResponse::Released { .. }) => {}
                 Ok(other) => {
                     let _ = self.pool.out_of_step(&other);
                     break;
@@ -1232,10 +1276,15 @@ mod tests {
             waited >= TEST_RPC_TIMEOUT && waited < TEST_RPC_TIMEOUT * 10,
             "the wait was bounded by the RPC timeout, not forever: {waited:?}"
         );
-        // Out of step is for good: the next request fails at once, without waiting again.
+        // A timeout is not terminal (R8-4): the next request tries the connection again -- and
+        // waits out its own bound against the still-wedged VMM -- instead of failing at once
+        // off a poisoned flag.
         let again = Instant::now();
         assert_eq!(client.allocate(page).err(), Some(libc::EIO));
-        assert!(again.elapsed() < TEST_RPC_TIMEOUT);
+        assert!(
+            again.elapsed() >= TEST_RPC_TIMEOUT,
+            "the second request tried the wire again rather than failing off a flag"
+        );
         drop(wedged_vmm);
 
         // Gone: the far end is closed, and a fresh client fails without waiting out the bound.
@@ -1249,6 +1298,39 @@ mod tests {
             .buffer_at(0, page)
             .unwrap();
         client.release(orphan);
+    }
+
+    /// An answer that arrives after its caller timed out must not poison the connection: the
+    /// request ids let the next round trip recognise it as stale, drain it, and read its own
+    /// answer (R8-4). Before ids, one slow answer made the device EIO for the life of the VM.
+    #[test]
+    fn a_late_answer_is_drained_and_the_next_request_succeeds() {
+        let page = pagesize() as u64;
+        let shm = SafeDescriptor::from(SharedMemory::new("media_pool_test", POOL_SIZE).unwrap());
+        let pool = MediaPool::new(handle_over(&shm)).unwrap();
+        let (vmm, helper) = Tube::pair().unwrap();
+        let mut client = remote_client(&shm, helper, "decoder");
+
+        // Nobody is serving yet: the first request waits out its bound and fails.
+        assert_eq!(client.allocate(page).err(), Some(libc::EIO));
+
+        // The wedged VMM catches up: it reads the request it was sitting on and answers it --
+        // an answer nobody is waiting for any more -- and only then starts serving properly.
+        let late: PoolRequest = vmm.recv().unwrap();
+        let PoolRequest::Reserve { id, .. } = late else {
+            panic!("expected the timed-out Reserve, got {late:?}");
+        };
+        vmm.send(&PoolResponse::Reserved { id, offset: 0 }).unwrap();
+        let server = pool.spawn_server("decoder", vmm).unwrap();
+
+        // The next request drains the stale answer by its id and gets its own: resync, not
+        // poison, and the pool's books stay right.
+        let buffer = client.allocate(page).unwrap();
+        assert_eq!(used(&pool), page);
+        client.release(buffer);
+        assert_eq!(used(&pool), 0);
+        drop(client);
+        server.join().unwrap();
     }
 
     /// A helper-side device teardown -- a virtio reset -- returns its space while the process
