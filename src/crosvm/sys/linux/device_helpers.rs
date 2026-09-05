@@ -664,7 +664,7 @@ fn create_unprivileged_virtio_snd_device(
         serde_json::to_string(&snd_params).context("failed to serialise snd parameters")?;
 
     let (vmm_end, pid) =
-        crate::crosvm::sys::linux::device_helper::launch("snd", config, uid, gid, supp_gids)
+        crate::crosvm::sys::linux::device_helper::launch("snd", config, uid, gid, supp_gids, None)
             .context("failed to launch the unprivileged snd backend")?;
     // So that the child exiting cleanly is not reported as a device crashing, and anything else
     // is, under a name.
@@ -1326,7 +1326,6 @@ pub fn create_virtio_media_device(
     protection_type: ProtectionType,
     config: &MediaDeviceConfig,
     pool: Option<MediaPool>,
-    pool_slice: Option<(u64, u64)>,
     mem: &GuestMemory,
     worker_process_pids: &mut BTreeSet<Pid>,
     helper_pid_labels: &mut BTreeMap<u32, String>,
@@ -1346,7 +1345,6 @@ pub fn create_virtio_media_device(
             protection_type,
             config,
             pool,
-            pool_slice,
             mem,
             worker_process_pids,
             helper_pid_labels,
@@ -1402,12 +1400,19 @@ pub fn create_virtio_media_device(
 /// The helper's `GuestMemory` has no purposes and is never marked protected, so it is told, from
 /// this VMM's memory, which guest-physical windows the host may touch; everything it maps for a
 /// guest scatter-gather list is checked against them first (`HostAccessPolicy::Windows`).
+///
+/// The helper maps the pool but never allocates from it: the offset space stays with the VMM's
+/// one allocator (a private allocator per helper is D49's aliasing; a static slice per helper
+/// was F12's fix and starved a 4K decode), and the helper reserves and releases offsets over a
+/// `Tube` whose child end travels as `--pool-fd`. The VMM's end goes to a `media pool <card>`
+/// thread holding that helper's lease ([`MediaPool::spawn_server`]): when the helper exits or
+/// dies, the tube's EOF ends the thread and the lease's drop sweeps every reservation the
+/// helper still held back into the pool.
 #[cfg(feature = "media")]
 fn create_unprivileged_virtio_media_device(
     protection_type: ProtectionType,
     config: &MediaDeviceConfig,
     pool: Option<MediaPool>,
-    pool_slice: Option<(u64, u64)>,
     mem: &GuestMemory,
     worker_process_pids: &mut BTreeSet<Pid>,
     helper_pid_labels: &mut BTreeMap<u32, String>,
@@ -1442,7 +1447,6 @@ fn create_unprivileged_virtio_media_device(
         role: config.role.clone(),
         allow_sw: config.allow_sw,
         pool_gpa,
-        pool_slice,
         access_windows: host_accessible_windows(mem, protection_type.isolates_memory())
             .into_iter()
             .map(|window| (window.start, window.end - window.start + 1))
@@ -1452,6 +1456,14 @@ fn create_unprivileged_virtio_media_device(
     let config_json =
         serde_json::to_string(&params).context("failed to serialise media parameters")?;
 
+    // The helper's line to the VMM's pool allocator. The child end travels by number as
+    // `--pool-fd` (CLOEXEC cleared in `launch`, exactly like the vhost-user socket) and is
+    // dropped here once the child holds it, so the child dying leaves no copy behind and the
+    // server thread's recv sees a clean EOF.
+    let (pool_server_end, pool_helper_end) =
+        base::Tube::pair().context("failed to create the media pool tube pair")?;
+    let pool_helper_fd = pool_helper_end.as_raw_descriptor();
+
     // No supplementary groups: nothing a media device needs is granted by group membership, and
     // crosvm's own groups are root's.
     let (vmm_end, pid) = crate::crosvm::sys::linux::device_helper::launch(
@@ -1460,8 +1472,20 @@ fn create_unprivileged_virtio_media_device(
         uid,
         gid,
         Vec::new(),
+        Some(pool_helper_fd),
     )
     .context("failed to launch the unprivileged media backend")?;
+    drop(pool_helper_end);
+    // The card name the pool's log lines use -- the exhaustion line names who asked, the sweep
+    // thread is found in `ps -T` by it. When `card=` was not given this is the kind's name,
+    // which can differ from the default card string the helper serves; both name the same
+    // device.
+    let pool_card = config
+        .card
+        .clone()
+        .unwrap_or_else(|| config.kind.as_str().to_string());
+    pool.spawn_server(&pool_card, pool_server_end)
+        .context("failed to start the media pool server thread")?;
     // So that the child exiting cleanly is not reported as a device crashing, and anything else
     // is, under a name.
     worker_process_pids.insert(pid);
@@ -1471,17 +1495,14 @@ fn create_unprivileged_virtio_media_device(
     // later by cmdline, not by name -- `deploy/vpu/README.md` has the one-liner.
     info!(
         "launched media helper: pid {}, uid {}, gid {}, kind {}, card {}, pool_gpa {:#x}, pool \
-         slice {}, {} access window(s), log level {}",
+         served by the VMM over fd {}, {} access window(s), log level {}",
         pid,
         uid,
         gid,
         config.kind.as_str(),
         config.card.as_deref().unwrap_or("<default>"),
         pool_gpa,
-        match pool_slice {
-            Some((start, len)) => format!("{:#x}+{:#x}", start, len),
-            None => "whole pool".to_string(),
-        },
+        pool_helper_fd,
         params.access_windows.len(),
         // What the helper was actually started at. A `debug!` in a backend only reaches the log
         // when this says so, and until D57 it always said `info` (VPU_DESIGN.md §6.2).

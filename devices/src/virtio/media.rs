@@ -86,6 +86,7 @@ use crate::virtio::media::kill::KillSignal;
 use crate::virtio::media::kill::Wakeup;
 pub use crate::virtio::media::pool::MediaPool;
 use crate::virtio::media::pool::PoolBufferAllocator;
+use crate::virtio::media::pool::RemotePoolAllocator;
 use crate::virtio::DeviceType;
 use crate::virtio::Interrupt;
 use crate::virtio::Queue;
@@ -370,6 +371,11 @@ pub enum BufferAllocator {
     Memfd(MemFdAllocator),
     /// DroidVM: slices of the VM-wide `media_host` pool the guest maps as a whole.
     Pool(PoolBufferAllocator),
+    /// DroidVM, in a helper process: the same pool, but every offset is reserved and released
+    /// by the VMM's allocator over the helper's `--pool-fd` tube -- a separate process cannot
+    /// share [`MediaPool`]'s allocator, and a private one aliases the other devices' buffers
+    /// (D49).
+    RemotePool(RemotePoolAllocator),
 }
 
 impl VirtioMediaBufferAllocator for BufferAllocator {
@@ -377,6 +383,7 @@ impl VirtioMediaBufferAllocator for BufferAllocator {
         match self {
             BufferAllocator::Memfd(memfd) => memfd.allocate(len),
             BufferAllocator::Pool(pool) => pool.allocate(len),
+            BufferAllocator::RemotePool(pool) => pool.allocate(len),
         }
     }
 
@@ -384,6 +391,7 @@ impl VirtioMediaBufferAllocator for BufferAllocator {
         match self {
             BufferAllocator::Memfd(memfd) => memfd.release(buf),
             BufferAllocator::Pool(pool) => pool.release(buf),
+            BufferAllocator::RemotePool(pool) => pool.release(buf),
         }
     }
 }

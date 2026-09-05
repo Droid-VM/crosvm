@@ -25,7 +25,11 @@
 //!   itself, so a bad entry is `EFAULT` to the guest rather than a `SIGBUS` here.
 //! * It serves `MMAP` buffers from the pool only. The frontend forwards a shared-memory BAR to the
 //!   GPU alone, so the `Bar` shape is not available out of process, and the VMM refuses `uid=`
-//!   without a pool rather than start a device with no usable buffers.
+//!   without a pool rather than start a device with no usable buffers. It also never *allocates*
+//!   from the pool: the offset space belongs to the VMM's one allocator (a private allocator here
+//!   would alias the other media devices' buffers, D49), and every buffer's offset is reserved
+//!   and released over the `--pool-fd` tube the VMM handed this process
+//!   ([`crate::virtio::media::pool::RemotePoolAllocator`]).
 //!
 //! The device itself, its worker thread, and every trait implementation it is built from are the
 //! in-VMM ones (`crate::virtio::media`); the two queues arrive one `start_queue` at a time and
@@ -43,6 +47,7 @@ use anyhow::bail;
 use anyhow::Context;
 use base::error;
 use base::warn;
+use base::Tube;
 use base::WaitContext;
 use base::WorkerThread;
 use hypervisor::ProtectionType;
@@ -66,13 +71,14 @@ use crate::virtio::device_constants::media::QUEUE_SIZES;
 use crate::virtio::media::card_str;
 use crate::virtio::media::guest_buf::HostAccessPolicy;
 use crate::virtio::media::pool::pool_handle_at;
+use crate::virtio::media::pool::RemotePool;
+use crate::virtio::media::pool::RemotePoolAllocator;
 use crate::virtio::media::start_worker;
 use crate::virtio::media::BufferAllocator;
 use crate::virtio::media::EventQueue;
 use crate::virtio::media::GuestMemoryMapper;
 use crate::virtio::media::HostMapper;
 use crate::virtio::media::MediaDeviceKind;
-use crate::virtio::media::MediaPool;
 use crate::virtio::vhost::user::device::handler::Error as DeviceError;
 use crate::virtio::vhost::user::device::handler::VhostUserDevice;
 use crate::virtio::Queue;
@@ -101,16 +107,11 @@ pub struct MediaBackendParams {
     #[serde(default)]
     pub allow_sw: bool,
     /// Guest-physical base of the `media_host` pool. The region that starts here in the memory
-    /// table the frontend sends is the pool; `MMAP` buffers are carved out of it.
+    /// table the frontend sends is the pool; `MMAP` buffers live in it, at offsets the VMM's
+    /// allocator hands this process over the `--pool-fd` tube (a helper has no pool allocator
+    /// of its own: a private allocator over the shared window aliases the other devices'
+    /// buffers -- D49).
     pub pool_gpa: u64,
-    /// This device's `(offset, len)` slice of the pool's offset space
-    /// (`media::pool::carve_slices`). Each helper is a separate process with its own allocator
-    /// over the shared window, so without a slice every helper hands out offset 0, 0x1000, ...
-    /// and one device's buffers alias another's (D49: the encoder's coded frames scribbled the
-    /// camera's raw buffers). `None` -- an old VMM, or a VM with one media device -- is the
-    /// whole pool.
-    #[serde(default)]
-    pub pool_slice: Option<(u64, u64)>,
     /// `(guest-physical base, size)` of every window the host may touch: the pools, the swiotlb
     /// region, shared RAM -- everything but memory lent to a protected guest. A scatter-gather
     /// entry outside all of them is `EFAULT`. For an unprotected VM this is every region.
@@ -138,8 +139,13 @@ pub struct MediaBackend<D, F> {
     avail_features: u64,
     /// `params.access_windows`, checked once.
     windows: Vec<AddressRange>,
-    /// The `media_host` pool, found in the memory table at the first `start_queue`.
-    pool: Option<MediaPool>,
+    /// The `--pool-fd` tube, until the first `start_queue` turns it into `pool`.
+    pool_tube: Option<Tube>,
+    /// The connection to the VMM's pool allocator plus this process's own mapping of the pool,
+    /// built when the pool is found in the memory table at the first `start_queue` and kept
+    /// across resets (the pool is the VM's; a later `SET_MEM_TABLE` describes the same memfd
+    /// again).
+    pool: Option<Arc<RemotePool>>,
     /// Queues handed over and not yet running (both must be here before the worker starts),
     /// or handed back by a stopped worker and not yet returned to the frontend.
     queues: [Option<Queue>; 2],
@@ -158,6 +164,7 @@ where
     pub fn new(
         params: MediaBackendParams,
         config: VirtioMediaDeviceConfig,
+        pool_tube: Tube,
         create_device: F,
     ) -> anyhow::Result<Self> {
         let windows = params
@@ -184,6 +191,7 @@ where
             create_device: Arc::new(create_device),
             avail_features,
             windows,
+            pool_tube: Some(pool_tube),
             pool: None,
             queues: [None, None],
             running: None,
@@ -195,14 +203,17 @@ where
     fn start(&mut self, mem: GuestMemory) -> anyhow::Result<()> {
         // The pool is looked for in the memory table the first time a queue starts, because
         // that is the first time there is a memory table. It is the VM's, so it outlives every
-        // reset; a later `SET_MEM_TABLE` describes the same memfd again.
+        // reset; a later `SET_MEM_TABLE` describes the same memfd again. The `--pool-fd` tube
+        // becomes the pool connection here, and stays for the life of the process.
         if self.pool.is_none() {
             let handle = pool_handle_at(&mem, self.params.pool_gpa)
                 .context("the media_host pool is not in the memory table")?;
-            self.pool = Some(
-                MediaPool::with_slice(handle, self.params.pool_slice)
-                    .context("cannot set up the media_host pool")?,
-            );
+            let tube = self
+                .pool_tube
+                .take()
+                .context("the --pool-fd tube is gone but the pool was never set up")?;
+            self.pool =
+                Some(RemotePool::new(tube, handle).context("cannot set up the media_host pool")?);
         }
         let pool = self.pool.as_ref().expect("pool was just set");
 
@@ -214,7 +225,10 @@ where
 
         let guest_mapper =
             GuestMemoryMapper::with_policy(mem, HostAccessPolicy::Windows(self.windows.clone()));
-        let allocator = BufferAllocator::Pool(pool.lease(card_str(&self.config.card)));
+        let allocator = BufferAllocator::RemotePool(RemotePoolAllocator::new(
+            Arc::clone(pool),
+            card_str(&self.config.card),
+        ));
         let wait_ctx = WaitContext::new().context("cannot create the worker's wait context")?;
         // The device is built on the worker thread (see the module documentation): only the
         // factory and the parts it is handed cross threads, never the device.
@@ -336,7 +350,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+mod media_backend_params_tests {
     use super::*;
 
     /// The parameters the VMM writes are the parameters the helper reads: every field survives
@@ -351,7 +365,6 @@ mod tests {
             role: Some("main".into()),
             allow_sw: true,
             pool_gpa: 0x1_4000_0000,
-            pool_slice: Some((0x40_0000, 0x80_0000)),
             access_windows: vec![(0x1_4000_0000, 0x1000_0000), (0x9000_0000, 0x40_0000)],
             access_platform: true,
         };
@@ -370,10 +383,6 @@ mod tests {
             (None, None, None)
         );
         assert_eq!(minimal.pool_gpa, 4096);
-        assert_eq!(
-            minimal.pool_slice, None,
-            "an old VMM's JSON means the whole pool"
-        );
         assert_eq!(minimal.access_windows, vec![(4096, 8192)]);
         assert!(!minimal.access_platform);
         assert!(!minimal.allow_sw);
@@ -387,5 +396,15 @@ mod tests {
         )
         .is_err());
         assert!(serde_json::from_str::<MediaBackendParams>(r#"{"kind":"simple"}"#).is_err());
+
+        // The F12 slice handoff is gone: since M8 the VMM allocates for every helper over the
+        // `--pool-fd` tube, and `pool_slice` is not a key any more. `deny_unknown_fields` makes
+        // a mixed pair -- an M8 helper exec'd by a pre-M8 VMM's JSON -- fail loudly at launch
+        // instead of quietly serving buffers nobody carved out for it. (The pair cannot really
+        // diverge -- both sides are /proc/self/exe -- so loud is all this needs to be.)
+        assert!(serde_json::from_str::<MediaBackendParams>(
+            r#"{"kind":"simple","pool_gpa":4096,"pool_slice":[0,4096],"access_windows":[[4096,8192]]}"#
+        )
+        .is_err());
     }
 }

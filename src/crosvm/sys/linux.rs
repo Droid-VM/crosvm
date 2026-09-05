@@ -97,8 +97,6 @@ use devices::virtio::device_constants::video::VideoDeviceType;
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 use devices::virtio::gpu::EventDevice;
 #[cfg(feature = "media")]
-use devices::virtio::media::pool::carve_slices;
-#[cfg(feature = "media")]
 use devices::virtio::media::MediaPool;
 #[cfg(target_arch = "x86_64")]
 use devices::virtio::memory_mapper::MemoryMapper;
@@ -1156,17 +1154,20 @@ fn create_virtio_devices(
         let media_devices: Vec<&MediaDeviceConfig> =
             cfg.virtio_media.iter().chain(simple.iter()).collect();
 
-        // The `media_host` pool, when the VM has one, is created once and shared by every media
-        // device: the offsets it hands out are what the guest maps, so two allocators over the
-        // same window would alias each other's buffers (VPU_DESIGN.md §2.2, review B2). One dup
-        // of the descriptor and one host mapping for the whole VM.
+        // The `media_host` pool, when the VM has one, is created once and its allocator is the
+        // only allocator over the window, for every media device of the VM: the offsets it
+        // hands out are what the guest maps, so two allocators over the same window would alias
+        // each other's buffers (VPU_DESIGN.md §2.2, review B2, D49's band of noise --
+        // logs/vpu_wp/F12-encoder.md). One dup of the descriptor and one host mapping for the
+        // whole VM.
         //
-        // A device with `uid=` runs in a helper process, which cannot share this allocator: it
-        // rebuilds the pool from its own memory table and allocates on its own. So the offset
-        // space is carved up here, one slice per helper (the in-VMM devices together keep one
-        // more), and each helper is told its slice. Before that, three helpers over one window
-        // each handed out offset 0 first, and the encoder's coded-frame writes landed inside
-        // the camera's raw buffers -- D49's band of noise (logs/vpu_wp/F12-encoder.md).
+        // A device with `uid=` runs in a helper process, which cannot share the allocator's
+        // lock -- so it does not allocate at all: `create_unprivileged_virtio_media_device`
+        // gives each helper a tube (`--pool-fd`) served by a VMM thread that owns that helper's
+        // lease, and the helper reserves and releases offsets through it. (F12 first fixed D49
+        // by carving static per-helper slices; M8 replaced the slices with this, so a 4K
+        // decode's ~190 MiB CAPTURE set can have the pool while the other devices are idle
+        // instead of hitting its 128 MiB slice.)
         let handle = if media_devices.is_empty() {
             None
         } else {
@@ -1183,52 +1184,16 @@ fn create_virtio_devices(
                 None => None,
             }
         };
-        let (pool, helper_slices) = match handle {
-            None => (None, vec![None; media_devices.len()]),
-            Some(handle) => {
-                // The decoder weighs double: its CAPTURE queue holds a decoded-frame queue in
-                // pool memory, where the camera and the encoder keep a handful of frames.
-                let mut weights: Vec<u64> = media_devices
-                    .iter()
-                    .map(|c| match (c.uid, c.kind) {
-                        (None, _) => 0,
-                        (Some(_), MediaDeviceKind::Decoder) => 2,
-                        (Some(_), _) => 1,
-                    })
-                    .collect();
-                let helpers = weights.iter().filter(|w| **w > 0).count();
-                let in_vmm = media_devices.len() - helpers;
-                if in_vmm > 0 {
-                    weights.push(1);
-                }
-                let allocators = helpers + usize::from(in_vmm > 0);
-                if allocators > 1 {
-                    let mut slices = carve_slices(handle.size, &weights);
-                    let vmm_slice = if in_vmm > 0 { slices.pop() } else { None };
-                    let helper_slices = slices
-                        .into_iter()
-                        .zip(&weights)
-                        .map(|(slice, w)| (*w > 0).then_some(slice))
-                        .collect();
-                    (
-                        Some(MediaPool::with_slice(handle, vmm_slice)?),
-                        helper_slices,
-                    )
-                } else {
-                    (
-                        Some(MediaPool::new(handle)?),
-                        vec![None; media_devices.len()],
-                    )
-                }
-            }
+        let pool = match handle {
+            None => None,
+            Some(handle) => Some(MediaPool::new(handle)?),
         };
 
-        for (media_cfg, pool_slice) in media_devices.into_iter().zip(helper_slices) {
+        for media_cfg in media_devices {
             devs.push(create_virtio_media_device(
                 cfg.protection_type,
                 media_cfg,
                 pool.clone(),
-                pool_slice,
                 vm.get_memory(),
                 worker_process_pids,
                 helper_pid_labels,
