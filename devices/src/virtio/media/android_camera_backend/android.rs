@@ -670,9 +670,30 @@ impl CameraBackend for AndroidCameraBackend {
     /// The V4L2 controls, from whichever session set them, to the stream opened last. A closed
     /// stream's thread has dropped its receiver and the send fails, which is "no stream" -- the
     /// values will come back in the next `StreamRequest` -- not an error.
+    ///
+    /// That drop is announced, because it is otherwise invisible: the guest's set succeeded, the
+    /// device stored the value, and nothing in the host log says the running camera never saw it.
+    /// A regions *clear* sent a moment after a capture ended is exactly that case, and it is what
+    /// D52 (B9-acceptance §7, §12) measured as "a clear logs nothing" -- the mid-stream clear
+    /// itself is logged by [`log_regions`], one `info!` like a set, whenever a stream is there to
+    /// take it.
     fn set_controls(&mut self, controls: &[CameraControl]) -> Result<(), i32> {
-        if let Some(commands) = &self.stream_commands {
-            let _ = commands.send(Command::Controls(controls.to_vec()));
+        let taken = match &self.stream_commands {
+            Some(commands) => commands.send(Command::Controls(controls.to_vec())).is_ok(),
+            None => false,
+        };
+        if !taken {
+            info!(
+                "camera {}: {} control(s) stored with no stream running, so nothing is applied \
+                 now; they are what the next stream opens with: {}",
+                self.info.id,
+                controls.len(),
+                controls
+                    .iter()
+                    .map(|c| format!("{:?}", c))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
         Ok(())
     }
