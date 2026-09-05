@@ -129,6 +129,15 @@ pub(super) const CODEC_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// thread that runs them. Nothing of the guest's is at stake by then (the FIFOs are already
 /// empty); the bound only keeps `REQBUFS(0)` / close from waiting on a wedged component.
 pub(super) const CODEC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Wall-clock ceiling on the D45 hold (D48). An `InputBufferDone` deferred behind the initial
+/// `SOURCE_CHANGE` is normally released the moment the codec asks for more input than the held
+/// buffers carried (`note_input_done` / the `InputAvailable` arm of `take_events`); this bound is
+/// the backstop, so a codec that neither announces nor asks for more cannot park a
+/// one-buffer-in-flight client forever. It is evaluated on every backend wake (the codec always
+/// bumps the session eventfd for an `InputAvailable` or a `FormatChanged`), and it is far longer
+/// than the ~57 ms a hardware decoder took to announce from a buffer it could parse (B9 §5.4), so
+/// it never trips the D45 ordering for a stream the codec can announce from.
+pub(super) const DEFERRED_INPUT_DONE_DEADLINE: Duration = Duration::from_millis(500);
 /// Floor of `KEY_MAX_INPUT_SIZE`, the codec's input buffer capacity. The device's own floor for
 /// an `OUTPUT` buffer is the same 1 MiB, so an ordinary access unit goes in whole.
 const MIN_INPUT_BUFFER_SIZE: usize = 1 << 20;
@@ -634,6 +643,10 @@ pub struct MediaCodecDecoderSession {
     /// buffer in its `OUTPUT` queue and does not take `POLLPRI|POLLERR` on the idle `CAPTURE`
     /// side (D45, the B8 `pollrace.py` measurement). Empty once the first `FormatChanged` is out.
     deferred_input_done: VecDeque<u32>,
+    /// When the current run of `deferred_input_done` began holding, for the
+    /// [`DEFERRED_INPUT_DONE_DEADLINE`] backstop (D48). `Some` exactly while a buffer is held;
+    /// reset to `None` on every release.
+    deferred_since: Option<Instant>,
     /// `CAPTURE` buffers lent by the device, oldest first.
     captures: VecDeque<OutputBuffer>,
     /// Outputs the codec delivered that no `CAPTURE` buffer has taken yet, and the format
@@ -679,6 +692,7 @@ impl MediaCodecDecoderSession {
             free_inputs: VecDeque::new(),
             pending: VecDeque::new(),
             deferred_input_done: VecDeque::new(),
+            deferred_since: None,
             captures: VecDeque::new(),
             held_outputs: VecDeque::new(),
             events: Vec::new(),
@@ -711,6 +725,7 @@ impl MediaCodecDecoderSession {
         self.dead = true;
         self.pending.clear();
         self.deferred_input_done.clear();
+        self.deferred_since = None;
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
@@ -752,9 +767,17 @@ impl MediaCodecDecoderSession {
     /// the stream's format is first announced the buffer stays outstanding, so a client polling
     /// for the event still has something in its `OUTPUT` queue and does not empty it and take
     /// `POLLPRI|POLLERR` on the still-idle `CAPTURE` side (D45, the B8 `pollrace.py` measurement
-    /// -- `POLLPRI` before `POLLOUT`). After the announcement the buffer goes back at once.
+    /// -- `POLLPRI` before `POLLOUT`). The hold is bounded three ways so it cannot deadlock a
+    /// one-buffer-in-flight client (D48): the announcement releases it ([`Self::announce`]); the
+    /// codec asking for more input than the held buffers carried releases it (the `InputAvailable`
+    /// arm of [`Self::take_events`]); and [`DEFERRED_INPUT_DONE_DEADLINE`] is the wall-clock
+    /// backstop ([`Self::release_deferred_input_done_if_stale`]). After the announcement the buffer
+    /// goes back at once.
     fn note_input_done(&mut self, index: u32) {
         if self.announced.is_none() {
+            if self.deferred_since.is_none() {
+                self.deferred_since = Some(Instant::now());
+            }
             self.deferred_input_done.push_back(index);
         } else {
             self.events.push(DecoderEvent::InputBufferDone(index));
@@ -767,6 +790,31 @@ impl MediaCodecDecoderSession {
     fn release_deferred_input_done(&mut self) {
         while let Some(index) = self.deferred_input_done.pop_front() {
             self.events.push(DecoderEvent::InputBufferDone(index));
+        }
+        self.deferred_since = None;
+    }
+
+    /// The D48 backstop: release the held `OUTPUT` buffers if the codec has held them past
+    /// [`DEFERRED_INPUT_DONE_DEADLINE`] without ever announcing. Evaluated on every backend wake.
+    /// The primary release ([`Self::note_input_done`]'s counterpart in the `InputAvailable` arm of
+    /// [`Self::take_events`]) fires first in every measured case; this only guards a codec that
+    /// went silent, so no one-buffer-in-flight client is ever parked forever.
+    fn release_deferred_input_done_if_stale(&mut self) {
+        if self.announced.is_some() || self.deferred_input_done.is_empty() {
+            return;
+        }
+        if self
+            .deferred_since
+            .is_some_and(|since| since.elapsed() >= DEFERRED_INPUT_DONE_DEADLINE)
+        {
+            warn!(
+                "decoder session {}: releasing {} held OUTPUT buffer(s) after {:?} without a \
+                 SOURCE_CHANGE -- the codec neither announced nor asked for more input (D48 backstop)",
+                self.id,
+                self.deferred_input_done.len(),
+                DEFERRED_INPUT_DONE_DEADLINE
+            );
+            self.release_deferred_input_done();
         }
     }
 
@@ -1264,6 +1312,7 @@ impl MediaCodecDecoderSession {
         // The guest takes its OUTPUT buffers back itself on the seek (`STREAMOFF(OUTPUT)`); any
         // still held behind an initial `SOURCE_CHANGE` (D45) are dropped, not reported late.
         self.deferred_input_done.clear();
+        self.deferred_since = None;
         self.eos_queued = false;
         self.eos_seen = false;
         self.parked = false;
@@ -1603,6 +1652,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
     fn stop(&mut self) {
         self.pending.clear();
         self.deferred_input_done.clear();
+        self.deferred_since = None;
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
@@ -1647,6 +1697,21 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                             );
                         }
                     }
+                    // D48: the codec is offering an input slot while nothing is staged to feed it
+                    // and it has announced nothing -- it has consumed every buffer we handed it
+                    // and wants more. That is the exact moment a one-buffer-in-flight client (a
+                    // stateful ffmpeg on an mp4, `v4l2-compliance -s`) must get its OUTPUT buffer
+                    // back, or it never queues the next. The `pending`-empty test is what keeps the
+                    // D45 hold intact during the initial fill: the slots the codec offers up front
+                    // arrive while the first buffer is still staged (`pending` non-empty), so this
+                    // does not fire, and the hold stands until the codec either announces
+                    // (`announce`, POLLPRI first) or, unable to, recycles a slot here with the FIFO
+                    // drained. A codec that can announce from the first buffer emits
+                    // `FormatChanged` before it recycles that slot (measured: POLLPRI at/before
+                    // POLLOUT, B9 §5.4), so D45's ordering holds for it.
+                    if self.announced.is_none() && self.pending.is_empty() {
+                        self.release_deferred_input_done();
+                    }
                     self.free_inputs.push_back(index);
                 }
                 CodecEvent::OutputAvailable { index, info } => {
@@ -1688,6 +1753,9 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                     self.pump_input();
                 }
             }
+            // The D48 wall-clock backstop: if the codec has held the initial buffers past the
+            // deadline without announcing and without asking for more input, release them anyway.
+            self.release_deferred_input_done_if_stale();
         }
         std::mem::take(&mut self.events)
     }
