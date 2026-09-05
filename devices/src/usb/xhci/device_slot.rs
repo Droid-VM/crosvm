@@ -331,6 +331,10 @@ pub struct DeviceSlot {
     mem: GuestMemory,
     enabled: AtomicBool,
     transfer_ring_controllers: Mutex<Vec<Option<TransferRingControllers>>>,
+    /// How often the host was asked to free an endpoint's streams; the tests have no backend
+    /// device to observe the call on.
+    #[cfg(test)]
+    host_streams_freed: std::sync::atomic::AtomicUsize,
 }
 
 impl DeviceSlot {
@@ -348,6 +352,8 @@ impl DeviceSlot {
         DeviceSlot {
             slot_id,
             port_id: PortId::new(),
+            #[cfg(test)]
+            host_streams_freed: std::sync::atomic::AtomicUsize::new(0),
             dcbaap,
             hub,
             interrupter,
@@ -670,29 +676,53 @@ impl DeviceSlot {
             }
         };
 
-        let mut added = Vec::new();
+        // Spec 4.6.6: a rejected command leaves the Output Device Context as it was. So every
+        // Input Endpoint Context this command adds is read and checked before any endpoint is
+        // dropped, any context copied or any host stream allocated; after this loop the only
+        // thing left to fail is the host itself.
+        let mut to_add = Vec::new();
+        for device_context_index in 1..DCI_INDEX_END {
+            if !input_control_context.add_context_flag(device_context_index) {
+                continue;
+            }
+            let endpoint_context =
+                match self.read_input_endpoint_context(input_context_ptr, device_context_index) {
+                    Ok(endpoint_context) => endpoint_context,
+                    Err(e) => return unbacked_input_context(e),
+                };
+            match self.check_endpoint_context(device_context_index, &endpoint_context) {
+                Ok(stream_contexts) => {
+                    to_add.push((device_context_index, endpoint_context, stream_contexts))
+                }
+                Err(code) => return Ok(code),
+            }
+        }
+
+        // Drops and adds on different endpoints are independent, and on the same endpoint the
+        // drop comes first (Linux issues Drop + Add for a stream endpoint it reconfigures).
         for device_context_index in 1..DCI_INDEX_END {
             if input_control_context.drop_context_flag(device_context_index) {
                 self.drop_one_endpoint(device_context_index)?;
             }
-            if input_control_context.add_context_flag(device_context_index) {
-                let code = match self.copy_context(input_context_ptr, device_context_index) {
-                    Ok(()) => self.add_one_endpoint(device_context_index)?,
-                    Err(e @ Error::ReadGuestMemory(_)) | Err(e @ Error::BadInputContextAddr(_)) => {
-                        unbacked_input_context(e)?
-                    }
-                    Err(e) => return Err(e),
-                };
-                if code != TrbCompletionCode::Success {
-                    // Spec 4.6.6: a failed command leaves the Output Device Context as it was, so
-                    // take back what this command added and keep the slot state.
-                    for dci in added {
-                        self.drop_one_endpoint(dci)?;
-                    }
-                    return Ok(code);
+        }
+        let mut added = Vec::new();
+        for (device_context_index, endpoint_context, stream_contexts) in to_add {
+            let code = self.add_one_endpoint(
+                device_context_index,
+                endpoint_context,
+                stream_contexts.as_deref(),
+            )?;
+            if code != TrbCompletionCode::Success {
+                // The host would not give this endpoint its streams. The rejected endpoint's
+                // Output Endpoint Context was never written; take back what this command added
+                // and keep the slot state. An endpoint this command dropped stays dropped: its
+                // rings are gone, and the guest's next Configure Endpoint puts them back.
+                for dci in added {
+                    self.drop_one_endpoint(dci)?;
                 }
-                added.push(device_context_index);
+                return Ok(code);
             }
+            added.push(device_context_index);
         }
 
         if trb.get_deconfigure() {
@@ -1074,6 +1104,16 @@ impl DeviceSlot {
             .map_err(Error::WriteGuestMemory)?;
 
         match &trcs[stream_id as usize - 1] {
+            Some(_) if stream_context_type != 1 => {
+                // The guest took the stream back: its Stream Context now says Not Valid (Table
+                // 6-13), so its ring goes and a doorbell on it is ignored like on any other Not
+                // Valid stream.
+                debug!(
+                    "device slot {}: endpoint {} stream {} made Not Valid (stream context type {}) by set tr dequeue pointer",
+                    self.slot_id, endpoint_id, stream_id, stream_context_type
+                );
+                self.set_stream_trc(index, stream_id, None);
+            }
             Some(trc) => {
                 trc.set_dequeue_pointer(ptr);
                 trc.set_consumer_cycle_state(dequeue_cycle_state);
@@ -1085,7 +1125,7 @@ impl DeviceSlot {
                 );
                 let trc =
                     self.create_stream_trc(endpoint_id, stream_id, ptr, dequeue_cycle_state)?;
-                self.set_stream_trc(index, stream_id, trc);
+                self.set_stream_trc(index, stream_id, Some(trc));
             }
             None => {
                 debug!(
@@ -1097,11 +1137,12 @@ impl DeviceSlot {
         Ok(TrbCompletionCode::Success)
     }
 
-    /// Puts a ring behind stream `stream_id` of endpoint index `i`, which must hold streams.
-    fn set_stream_trc(&self, i: usize, stream_id: u16, trc: Arc<TransferRingController>) {
+    /// Puts a ring (or none) behind stream `stream_id` of endpoint index `i`, which must hold
+    /// streams.
+    fn set_stream_trc(&self, i: usize, stream_id: u16, trc: Option<Arc<TransferRingController>>) {
         let mut trcs = self.transfer_ring_controllers.lock();
         if let Some(TransferRingControllers::Stream(trcs)) = &mut trcs[i] {
-            trcs[stream_id as usize - 1] = Some(trc);
+            trcs[stream_id as usize - 1] = trc;
         }
     }
 
@@ -1114,14 +1155,7 @@ impl DeviceSlot {
             // Endpoint's USBDEVFS_ALLOC_STREAMS fails with EINVAL and the guest never gets
             // its endpoint back after a controller reset or a slot disable.
             if let Some(TransferRingControllers::Stream(_)) = self.get_trcs(i) {
-                if let Err(e) = self.free_host_streams((i + 1) as u8) {
-                    warn!(
-                        "device slot {}: endpoint {}: cannot free host streams: {}",
-                        self.slot_id,
-                        i + 1,
-                        e
-                    );
-                }
+                self.free_host_streams((i + 1) as u8);
             }
             self.set_trcs(i, None);
         }
@@ -1190,9 +1224,23 @@ impl DeviceSlot {
     }
 
     /// Hands the host's streams for an endpoint back. A failure is logged and otherwise
-    /// ignored: the device may simply be gone, and there is nothing else to do with it.
-    fn free_host_streams(&self, device_context_index: u8) -> Result<()> {
-        if let Some(port) = self.hub.get_port(self.port_id.get()?) {
+    /// ignored: the device may simply be gone, or the slot may have lost its port to a
+    /// controller reset the guest did not follow up, and there is nothing else to do with it.
+    fn free_host_streams(&self, device_context_index: u8) {
+        #[cfg(test)]
+        self.host_streams_freed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let port_id = match self.port_id.get() {
+            Ok(port_id) => port_id,
+            Err(e) => {
+                warn!(
+                    "device slot {}: endpoint {}: no port to free host streams on: {}",
+                    self.slot_id, device_context_index, e
+                );
+                return;
+            }
+        };
+        if let Some(port) = self.hub.get_port(port_id) {
             if let Some(backend_device) = port.backend_device().as_mut() {
                 if let Err(e) = backend_device
                     .lock()
@@ -1205,110 +1253,159 @@ impl DeviceSlot {
                 }
             }
         }
-        Ok(())
     }
 
-    /// Adds the endpoint whose context the command just copied into the Output Device Context.
-    /// A context the guest got wrong is a completion code (spec 4.6.6); `Err` is for the host
-    /// side only.
-    fn add_one_endpoint(self: &Arc<Self>, device_context_index: u8) -> Result<TrbCompletionCode> {
-        xhci_trace!(
-            "adding one endpoint, device context index {}",
-            device_context_index
-        );
-        let mut device_context = self.get_device_context()?;
-        let transfer_ring_index = (device_context_index - 1) as usize;
-        let endpoint_context = &mut device_context.endpoint_context[transfer_ring_index];
-        let max_pstreams = endpoint_context.get_max_primary_streams();
-        let tr_dequeue_pointer = endpoint_context.get_tr_dequeue_pointer().get_gpa();
-        let endpoint_type = endpoint_context.get_endpoint_type();
-        let reject = |code: TrbCompletionCode, why: &str| -> Result<TrbCompletionCode> {
+    /// The Input Endpoint Context of `device_context_index` in the Input Context at
+    /// `input_context_ptr`.
+    fn read_input_endpoint_context(
+        &self,
+        input_context_ptr: GuestAddress,
+        device_context_index: u8,
+    ) -> Result<EndpointContext> {
+        self.mem
+            .read_obj_from_addr(
+                input_context_ptr
+                    .checked_add(
+                        (device_context_index as u64 + 1) * DEVICE_CONTEXT_ENTRY_SIZE as u64,
+                    )
+                    .ok_or(Error::BadInputContextAddr(input_context_ptr))?,
+            )
+            .map_err(Error::ReadGuestMemory)
+    }
+
+    /// What Configure Endpoint validates in an Input Endpoint Context (spec 4.6.6), before the
+    /// command touches anything: a context the guest got wrong is a completion code. For an
+    /// endpoint with streams the result carries its Stream Context Array as read now.
+    fn check_endpoint_context(
+        &self,
+        device_context_index: u8,
+        endpoint_context: &EndpointContext,
+    ) -> std::result::Result<Option<Vec<Option<(GuestAddress, bool)>>>, TrbCompletionCode> {
+        let reject = |code: TrbCompletionCode, why: &str| {
             warn!(
                 "device slot {}: endpoint {}: {}: {:?}",
                 self.slot_id, device_context_index, why, code
             );
-            Ok(code)
+            Err(code)
         };
+        let endpoint_type = endpoint_context.get_endpoint_type();
         if endpoint_type == 0 {
             return reject(TrbCompletionCode::ParameterError, "EP Type is Not Valid");
         }
-        let trcs = if max_pstreams > 0 {
-            if !valid_max_pstreams(max_pstreams) {
-                return reject(
-                    TrbCompletionCode::ParameterError,
-                    &format!("MaxPStreams {} exceeds MaxPSASize", max_pstreams),
-                );
-            }
-            if endpoint_type != 2 && endpoint_type != 6 {
-                // Stream is only supported on a bulk endpoint
-                return reject(
-                    TrbCompletionCode::ParameterError,
-                    &format!("streams on EP Type {}", endpoint_type),
-                );
-            }
-            if endpoint_context.get_linear_stream_array() != 1 {
-                // We only support Linear Stream Context Array for now
-                return reject(
-                    TrbCompletionCode::ParameterError,
-                    "secondary stream arrays (LSA = 0) are not supported",
-                );
-            }
-            let stream_contexts =
-                match read_stream_contexts(&self.mem, tr_dequeue_pointer, max_pstreams) {
-                    Ok(stream_contexts) => stream_contexts,
-                    Err(code) => return reject(code, "cannot read the stream context array"),
-                };
-            let trcs = self.create_stream_trcs(&stream_contexts, device_context_index)?;
+        let max_pstreams = endpoint_context.get_max_primary_streams();
+        if max_pstreams == 0 {
+            return Ok(None);
+        }
+        if !valid_max_pstreams(max_pstreams) {
+            return reject(
+                TrbCompletionCode::ParameterError,
+                &format!("MaxPStreams {} exceeds MaxPSASize", max_pstreams),
+            );
+        }
+        if endpoint_type != 2 && endpoint_type != 6 {
+            // Stream is only supported on a bulk endpoint
+            return reject(
+                TrbCompletionCode::ParameterError,
+                &format!("streams on EP Type {}", endpoint_type),
+            );
+        }
+        if endpoint_context.get_linear_stream_array() != 1 {
+            // We only support Linear Stream Context Array for now
+            return reject(
+                TrbCompletionCode::ParameterError,
+                "secondary stream arrays (LSA = 0) are not supported",
+            );
+        }
+        match read_stream_contexts(
+            &self.mem,
+            endpoint_context.get_tr_dequeue_pointer().get_gpa(),
+            max_pstreams,
+        ) {
+            Ok(stream_contexts) => Ok(Some(stream_contexts)),
+            Err(code) => reject(code, "cannot read the stream context array"),
+        }
+    }
 
-            if let Some(TransferRingControllers::Stream(_)) = self.get_trcs(transfer_ring_index) {
-                // Added again without a drop in between: the host still holds the streams of
-                // the last time, and would answer a second allocation with EINVAL.
-                warn!(
-                    "device slot {}: endpoint {} already has host streams, freeing them first",
-                    self.slot_id, device_context_index
-                );
-                self.free_host_streams(device_context_index)?;
-            }
-            if let Some(port) = self.hub.get_port(self.port_id.get()?) {
-                if let Some(backend_device) = port.backend_device().as_mut() {
-                    let streams = 1 << (max_pstreams + 1);
-                    // Subtracting 1 is to ignore Stream ID 0
-                    if let Err(e) = backend_device
-                        .lock()
-                        .alloc_streams(Self::endpoint_address(device_context_index), streams - 1)
-                    {
-                        return reject(
-                            TrbCompletionCode::ResourceError,
-                            &format!("cannot allocate {} host streams: {}", streams - 1, e),
-                        );
+    /// Adds an endpoint from an Input Endpoint Context `check_endpoint_context` passed, with
+    /// `stream_contexts` for one with streams. The context reaches the Output Device Context
+    /// only once the endpoint has its rings and its host streams (spec 4.6.6: a rejected command
+    /// leaves the Output Device Context as it was); a host that will not give the streams is a
+    /// completion code, `Err` is for the host side only.
+    fn add_one_endpoint(
+        self: &Arc<Self>,
+        device_context_index: u8,
+        mut endpoint_context: EndpointContext,
+        stream_contexts: Option<&[Option<(GuestAddress, bool)>]>,
+    ) -> Result<TrbCompletionCode> {
+        xhci_trace!(
+            "adding one endpoint, device context index {}",
+            device_context_index
+        );
+        let transfer_ring_index = (device_context_index - 1) as usize;
+        let tr_dequeue_pointer = endpoint_context.get_tr_dequeue_pointer().get_gpa();
+        let endpoint_type = endpoint_context.get_endpoint_type();
+        if let Some(TransferRingControllers::Stream(_)) = self.get_trcs(transfer_ring_index) {
+            // Added again without a drop in between, with or without streams this time: the
+            // host still holds the streams of the last time, and would answer a second
+            // allocation with EINVAL.
+            warn!(
+                "device slot {}: endpoint {} already has host streams, freeing them first",
+                self.slot_id, device_context_index
+            );
+            self.free_host_streams(device_context_index);
+        }
+        let trcs = match stream_contexts {
+            Some(stream_contexts) => {
+                let trcs = self.create_stream_trcs(stream_contexts, device_context_index)?;
+                if let Some(port) = self.hub.get_port(self.port_id.get()?) {
+                    if let Some(backend_device) = port.backend_device().as_mut() {
+                        // One host stream per array entry; entry 0 is not a stream.
+                        let streams = stream_contexts.len() as u16;
+                        if let Err(e) = backend_device
+                            .lock()
+                            .alloc_streams(Self::endpoint_address(device_context_index), streams)
+                        {
+                            warn!(
+                                "device slot {}: endpoint {}: cannot allocate {} host streams: {}: {:?}",
+                                self.slot_id,
+                                device_context_index,
+                                streams,
+                                e,
+                                TrbCompletionCode::ResourceError
+                            );
+                            return Ok(TrbCompletionCode::ResourceError);
+                        }
                     }
                 }
+                trcs
             }
-            trcs
-        } else {
-            let trc = TransferRingController::new(
-                self.mem.clone(),
-                self.hub
-                    .get_port(self.port_id.get()?)
-                    .ok_or(Error::GetPort(self.port_id.get()?))?,
-                self.event_loop.clone(),
-                self.interrupter.clone(),
-                self.slot_id,
-                device_context_index,
-                Arc::downgrade(self),
-                None,
-            )
-            .map_err(Error::CreateTransferController)?;
-            trc.set_dequeue_pointer(tr_dequeue_pointer);
-            trc.set_consumer_cycle_state(endpoint_context.get_dequeue_cycle_state());
-            // Endpoint context types 1 (Isoch Out) and 5 (Isoch In): an isochronous ring has to be
-            // drained ahead of the completions, or the stream underruns. Streams are bulk only, so
-            // the branch above never needs this.
-            trc.set_dequeue_all(endpoint_type == 1 || endpoint_type == 5);
-            TransferRingControllers::Endpoint(trc)
+            None => {
+                let trc = TransferRingController::new(
+                    self.mem.clone(),
+                    self.hub
+                        .get_port(self.port_id.get()?)
+                        .ok_or(Error::GetPort(self.port_id.get()?))?,
+                    self.event_loop.clone(),
+                    self.interrupter.clone(),
+                    self.slot_id,
+                    device_context_index,
+                    Arc::downgrade(self),
+                    None,
+                )
+                .map_err(Error::CreateTransferController)?;
+                trc.set_dequeue_pointer(tr_dequeue_pointer);
+                trc.set_consumer_cycle_state(endpoint_context.get_dequeue_cycle_state());
+                // Endpoint context types 1 (Isoch Out) and 5 (Isoch In): an isochronous ring has
+                // to be drained ahead of the completions, or the stream underruns. Streams are
+                // bulk only, so the branch above never needs this.
+                trc.set_dequeue_all(endpoint_type == 1 || endpoint_type == 5);
+                TransferRingControllers::Endpoint(trc)
+            }
         };
         self.set_trcs(transfer_ring_index, Some(trcs));
+        let mut device_context = self.get_device_context()?;
         endpoint_context.set_endpoint_state(EndpointState::Running);
+        device_context.endpoint_context[transfer_ring_index] = endpoint_context;
         self.set_device_context(device_context)?;
         Ok(TrbCompletionCode::Success)
     }
@@ -1318,7 +1415,7 @@ impl DeviceSlot {
         let mut device_context = self.get_device_context()?;
         let endpoint_context = &mut device_context.endpoint_context[endpoint_index];
         if endpoint_context.get_max_primary_streams() > 0 {
-            self.free_host_streams(device_context_index)?;
+            self.free_host_streams(device_context_index);
         }
         self.set_trcs(endpoint_index, None);
         endpoint_context.set_endpoint_state(EndpointState::Disabled);
@@ -1582,21 +1679,21 @@ pub(super) mod test_util {
                 .unwrap();
         }
 
-        /// An Input Context that adds `dci` as a bulk endpoint (IN for odd, OUT for even)
-        /// with a primary Stream Context Array of `2^(max_pstreams+1)` entries at
-        /// `STREAM_CONTEXT_ARRAY`.
-        pub fn write_stream_endpoint_input_context(&self, dci: u8, max_pstreams: u8) {
+        /// An Input Context with these Input Control Context flags and `ep` as the Input
+        /// Endpoint Context of `dci`.
+        pub fn write_input_context(
+            &self,
+            drop_flags: u32,
+            add_flags: u32,
+            dci: u8,
+            ep: EndpointContext,
+        ) {
             let mut icc = InputControlContext::new();
-            icc.set_add_context_flags(1 << dci);
+            icc.set_drop_context_flags(drop_flags);
+            icc.set_add_context_flags(add_flags);
             self.mem
                 .write_obj_at_addr(icc, GuestAddress(INPUT_CONTEXT))
                 .unwrap();
-            let mut ep = EndpointContext::new();
-            ep.set_endpoint_type(if dci % 2 == 1 { 6 } else { 2 });
-            ep.set_max_packet_size(1024);
-            ep.set_max_primary_streams(max_pstreams);
-            ep.set_linear_stream_array(1);
-            ep.set_tr_dequeue_pointer(DequeuePtr::new(GuestAddress(STREAM_CONTEXT_ARRAY)));
             self.mem
                 .write_obj_at_addr(
                     ep,
@@ -1605,6 +1702,20 @@ pub(super) mod test_util {
                     ),
                 )
                 .unwrap();
+        }
+
+        /// An Input Context that adds `dci` as a bulk endpoint (IN for odd, OUT for even)
+        /// with a primary Stream Context Array of `2^(max_pstreams+1)` entries at
+        /// `STREAM_CONTEXT_ARRAY`.
+        pub fn write_stream_endpoint_input_context(&self, dci: u8, max_pstreams: u8) {
+            self.write_input_context(0, 1 << dci, dci, stream_endpoint_context(dci, max_pstreams));
+        }
+
+        /// How often the slot asked the host to free an endpoint's streams.
+        pub fn host_streams_freed(&self) -> usize {
+            self.slot()
+                .host_streams_freed
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         /// Stream Contexts `valid` initialised (SCT = 1, ring at `STREAM_RING + 0x100 * id`,
@@ -1666,6 +1777,28 @@ pub(super) mod test_util {
 
     pub fn stream_context_addr(stream_id: u16) -> GuestAddress {
         GuestAddress(STREAM_CONTEXT_ARRAY + stream_id as u64 * STREAM_CONTEXT_SIZE as u64)
+    }
+
+    /// A bulk Endpoint Context for `dci` (IN for odd, OUT for even) without streams, its ring at
+    /// `STREAM_RING`.
+    pub fn bulk_endpoint_context(dci: u8) -> EndpointContext {
+        let mut ep = EndpointContext::new();
+        ep.set_endpoint_type(if dci % 2 == 1 { 6 } else { 2 });
+        ep.set_max_packet_size(1024);
+        ep.set_tr_dequeue_pointer(DequeuePtr::new(GuestAddress(STREAM_RING)));
+        ep.set_dequeue_cycle_state(true);
+        ep
+    }
+
+    /// A bulk Endpoint Context for `dci` with a primary Stream Context Array of
+    /// `2^(max_pstreams+1)` entries at `STREAM_CONTEXT_ARRAY`.
+    pub fn stream_endpoint_context(dci: u8, max_pstreams: u8) -> EndpointContext {
+        let mut ep = bulk_endpoint_context(dci);
+        ep.set_max_primary_streams(max_pstreams);
+        ep.set_linear_stream_array(1);
+        ep.set_tr_dequeue_pointer(DequeuePtr::new(GuestAddress(STREAM_CONTEXT_ARRAY)));
+        ep.set_dequeue_cycle_state(false);
+        ep
     }
 
     pub fn stream_ring(stream_id: u16) -> GuestAddress {
@@ -1933,6 +2066,161 @@ mod tests {
         );
         f.set_endpoint_state(3, EndpointState::Stopped);
         f
+    }
+
+    #[test]
+    fn a_rejected_add_leaves_the_output_endpoint_context_alone() {
+        let f = stopped_stream_endpoint();
+        let before = f.endpoint_context(3);
+        // The guest re-adds the endpoint with a Stream Context Array it did not back with
+        // memory. Spec 4.6.6: the Output Device Context stays as it was.
+        let mut ep = stream_endpoint_context(3, 3);
+        ep.set_tr_dequeue_pointer(DequeuePtr::new(GuestAddress(0x1_0000_0000)));
+        f.write_input_context(0, 1 << 3, 3, ep);
+
+        let code = f
+            .slot()
+            .configure_endpoint(&f.configure_endpoint_trb())
+            .unwrap();
+        assert_eq!(code, TrbCompletionCode::ParameterError);
+        assert_eq!(f.endpoint_context(3).as_bytes(), before.as_bytes());
+        assert_eq!(
+            stream_trcs(&f.slot(), 3)
+                .iter()
+                .filter(|t| t.is_some())
+                .count(),
+            8
+        );
+        assert_eq!(f.host_streams_freed(), 0);
+
+        // So the endpoint still stops through the array it really has, instead of an Err from
+        // the bogus one taking the command ring down.
+        f.set_endpoint_state(3, EndpointState::Running);
+        let completed = Arc::new(Mutex::new(None));
+        let done = completed.clone();
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, move |code| {
+                *done.lock() = Some(code);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(*completed.lock(), Some(TrbCompletionCode::Success));
+        assert_eq!(
+            f.stream_context(1).get_tr_dequeue_pointer().get_gpa(),
+            stream_ring(1)
+        );
+        assert!(!f.fail_handle.failed());
+    }
+
+    #[test]
+    fn a_rejected_add_does_not_drop_the_endpoint_first() {
+        let f = stopped_stream_endpoint();
+        // Linux reconfigures a stream endpoint with Drop + Add in one command; here the Add
+        // asks for more streams than the controller has, so nothing may happen to the endpoint.
+        f.write_input_context(1 << 3, 1 << 3, 3, stream_endpoint_context(3, 5));
+
+        let code = f
+            .slot()
+            .configure_endpoint(&f.configure_endpoint_trb())
+            .unwrap();
+        assert_eq!(code, TrbCompletionCode::ParameterError);
+        assert_eq!(
+            stream_trcs(&f.slot(), 3)
+                .iter()
+                .filter(|t| t.is_some())
+                .count(),
+            8
+        );
+        let ep = f.endpoint_context(3);
+        assert_eq!(ep.get_endpoint_state().unwrap(), EndpointState::Stopped);
+        assert_eq!(ep.get_max_primary_streams(), 3);
+        assert_eq!(f.host_streams_freed(), 0);
+    }
+
+    #[test]
+    fn readding_a_stream_endpoint_without_streams_frees_the_host_streams() {
+        let f = stopped_stream_endpoint();
+        // Add only, no Drop: the endpoint turns into a plain bulk endpoint, and the host's
+        // streams have to go with the rings or the next allocation gets EINVAL.
+        f.write_input_context(0, 1 << 3, 3, bulk_endpoint_context(3));
+
+        let code = f
+            .slot()
+            .configure_endpoint(&f.configure_endpoint_trb())
+            .unwrap();
+        assert_eq!(code, TrbCompletionCode::Success);
+        assert_eq!(f.host_streams_freed(), 1);
+        match f.slot().get_trcs(2) {
+            Some(TransferRingControllers::Endpoint(trc)) => {
+                assert_eq!(trc.get_dequeue_pointer(), GuestAddress(STREAM_RING));
+            }
+            _ => panic!("DCI 3 must be a plain endpoint now"),
+        }
+        let ep = f.endpoint_context(3);
+        assert_eq!(ep.get_max_primary_streams(), 0);
+        assert_eq!(ep.get_endpoint_state().unwrap(), EndpointState::Running);
+    }
+
+    #[test]
+    fn readding_a_stream_endpoint_with_streams_frees_the_host_streams_first() {
+        let f = stopped_stream_endpoint();
+        f.write_stream_endpoint_input_context(3, 3);
+
+        let code = f
+            .slot()
+            .configure_endpoint(&f.configure_endpoint_trb())
+            .unwrap();
+        assert_eq!(code, TrbCompletionCode::Success);
+        assert_eq!(f.host_streams_freed(), 1);
+        assert_eq!(stream_trcs(&f.slot(), 3).len(), 15);
+    }
+
+    #[test]
+    fn deconfiguring_a_slot_that_lost_its_port_is_not_an_error() {
+        let f = stopped_stream_endpoint();
+        // A controller reset took the port away; the guest goes on with its stale Output
+        // Device Context. Its mistake is not the command ring's death.
+        f.slot().port_id.reset();
+        let mut trb = f.configure_endpoint_trb();
+        trb.set_deconfigure(true);
+
+        let code = f.slot().configure_endpoint(&trb).unwrap();
+        assert_eq!(code, TrbCompletionCode::Success);
+        assert!(f.slot().get_trcs(2).is_none());
+        assert_eq!(f.host_streams_freed(), 1);
+        assert_eq!(
+            f.device_context().slot_context.get_slot_state().unwrap(),
+            DeviceSlotState::Addressed
+        );
+    }
+
+    #[test]
+    fn reset_frees_the_host_streams_of_every_stream_endpoint() {
+        let f = stopped_stream_endpoint();
+        f.slot().reset();
+        assert_eq!(f.host_streams_freed(), 1);
+        assert!(f.slot().get_trcs(2).is_none());
+    }
+
+    #[test]
+    fn set_tr_dequeue_with_a_not_valid_type_takes_the_stream_ring_away() {
+        let f = stopped_stream_endpoint();
+
+        let code = f
+            .slot()
+            .set_tr_dequeue_ptr(3, 2, 0, stream_ring(2).0, true)
+            .unwrap();
+        assert_eq!(code, TrbCompletionCode::Success);
+        assert_eq!(f.stream_context(2).get_stream_context_type(), 0);
+        let trcs = stream_trcs(&f.slot(), 3);
+        assert!(trcs[1].is_none());
+        assert_eq!(trcs.iter().filter(|t| t.is_some()).count(), 7);
+
+        // A doorbell on it is now ignored like on any other Not Valid stream.
+        f.set_endpoint_state(3, EndpointState::Running);
+        assert!(!f.slot().ring_doorbell(3, 2).unwrap());
+        assert!(f.slot().ring_doorbell(3, 1).unwrap());
+        assert!(!f.fail_handle.failed());
     }
 
     #[test]
