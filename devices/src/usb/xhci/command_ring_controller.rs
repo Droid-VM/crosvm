@@ -363,13 +363,20 @@ impl CommandRingTrbHandler {
         let slot_id = trb.get_slot_id();
         let endpoint_id = trb.get_endpoint_id();
         let stream_id = trb.get_stream_id();
+        let stream_context_type = trb.get_stream_context_type();
         // See Set TR Dequeue Pointer Trb in spec.
         let dequeue_ptr = trb.get_dequeue_ptr().get_gpa().offset();
         let dequeue_cycle_state = trb.get_dequeue_cycle_state();
         let completion_code = {
             if valid_slot_id(slot_id) {
                 self.slot(slot_id)?
-                    .set_tr_dequeue_ptr(endpoint_id, stream_id, dequeue_ptr, dequeue_cycle_state)
+                    .set_tr_dequeue_ptr(
+                        endpoint_id,
+                        stream_id,
+                        stream_context_type,
+                        dequeue_ptr,
+                        dequeue_cycle_state,
+                    )
                     .map_err(Error::SetDequeuePointer)?
             } else {
                 error!("stop endpoint trb has invalid slot id {}", slot_id);
