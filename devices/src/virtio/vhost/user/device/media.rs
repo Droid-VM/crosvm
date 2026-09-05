@@ -29,7 +29,11 @@
 //!
 //! The device itself, its worker thread, and every trait implementation it is built from are the
 //! in-VMM ones (`crate::virtio::media`); the two queues arrive one `start_queue` at a time and
-//! the worker starts once both are here.
+//! the worker starts once both are here. The device is built *on* the worker thread, by the
+//! factory the backend was given, so a device that is not `Send` -- the camera, whose NDK
+//! handles must stay on the thread that made them -- is created, driven and dropped on one
+//! thread (`logs/vpu_wp/M3.md` §6 item 1); the price is that a factory that fails is a log line
+//! and a device that never answers, rather than a `start_queue` error.
 
 pub mod sys;
 
@@ -80,7 +84,7 @@ use crate::virtio::Writer;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaBackendParams {
-    /// Which device to be. Only `simple` and `loopback` exist today.
+    /// Which device to be. `simple`, `loopback` and `camera` exist today.
     pub kind: MediaDeviceKind,
     /// The V4L2 card name (`--virtio-media card=`); each kind has a default.
     #[serde(default)]
@@ -116,7 +120,8 @@ struct Running {
 pub struct MediaBackend<D, F> {
     params: MediaBackendParams,
     config: VirtioMediaDeviceConfig,
-    create_device: F,
+    /// Shared with each worker thread, which calls it once to build its device.
+    create_device: Arc<F>,
     avail_features: u64,
     /// `params.access_windows`, checked once.
     windows: Vec<AddressRange>,
@@ -131,8 +136,11 @@ pub struct MediaBackend<D, F> {
 
 impl<D, F> MediaBackend<D, F>
 where
-    D: VirtioMediaDevice<Reader, Writer> + Send + 'static,
-    F: Fn(EventQueue, GuestMemoryMapper, HostMapper, BufferAllocator) -> anyhow::Result<D>,
+    D: VirtioMediaDevice<Reader, Writer> + 'static,
+    F: Fn(EventQueue, GuestMemoryMapper, HostMapper, BufferAllocator) -> anyhow::Result<D>
+        + Send
+        + Sync
+        + 'static,
 {
     pub fn new(
         params: MediaBackendParams,
@@ -160,7 +168,7 @@ where
         Ok(MediaBackend {
             params,
             config,
-            create_device,
+            create_device: Arc::new(create_device),
             avail_features,
             windows,
             pool: None,
@@ -192,11 +200,16 @@ where
             GuestMemoryMapper::with_policy(mem, HostAccessPolicy::Windows(self.windows.clone()));
         let allocator = BufferAllocator::Pool(pool.lease(card_str(&self.config.card)));
         let wait_ctx = WaitContext::new().context("cannot create the worker's wait context")?;
-        let device = (self.create_device)(event_queue, guest_mapper, HostMapper::Pool, allocator)
-            .context("cannot create the media device")?;
+        // The device is built on the worker thread (see the module documentation): only the
+        // factory and the parts it is handed cross threads, never the device.
+        let create_device = Arc::clone(&self.create_device);
+        let create = move || {
+            create_device(event_queue, guest_mapper, HostMapper::Pool, allocator)
+                .context("cannot create the media device")
+        };
 
         self.running = Some(Running {
-            thread: start_worker(move || Ok(device), cmd_queue, wait_ctx, kill_signal),
+            thread: start_worker(create, cmd_queue, wait_ctx, kill_signal),
             event_queue: shared_event_queue,
         });
         Ok(())
@@ -224,8 +237,11 @@ where
 
 impl<D, F> VhostUserDevice for MediaBackend<D, F>
 where
-    D: VirtioMediaDevice<Reader, Writer> + Send + 'static,
-    F: Fn(EventQueue, GuestMemoryMapper, HostMapper, BufferAllocator) -> anyhow::Result<D>,
+    D: VirtioMediaDevice<Reader, Writer> + 'static,
+    F: Fn(EventQueue, GuestMemoryMapper, HostMapper, BufferAllocator) -> anyhow::Result<D>
+        + Send
+        + Sync
+        + 'static,
 {
     fn max_queue_num(&self) -> usize {
         QUEUE_SIZES.len()
