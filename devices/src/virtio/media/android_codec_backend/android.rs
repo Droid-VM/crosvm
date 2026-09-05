@@ -51,13 +51,24 @@
 //!   memory) go as `BUFFER_FLAG_CODEC_CONFIG`.
 //! * A decoded output is copied into the next lent `CAPTURE` buffer as tightly packed NV12 of the
 //!   announced coded size (`tight_nv12_rows` over the buffer's `MediaImage2`, written through the
-//!   raw pointer -- never a slice over guest-visible memory), then released to the codec. With no
-//!   `CAPTURE` buffer lent, or none large enough, the output index is held, not released, until one
-//!   arrives.
+//!   raw pointer -- never a slice over guest-visible memory), then released to the codec. The luma
+//!   rows are `width` bytes at a `width` stride (the device's `bytesperline`); the chroma rows are
+//!   `2 * ceil(width / 2)` bytes at that stride, which is what the device's `sizeimage` counts for
+//!   an odd width (review-m6 R6-10). With no `CAPTURE` buffer lent, or none large enough, the
+//!   output index is held, not released, until one arrives.
+//! * A mid-stream resolution change is announced only once every output before it is out, then the
+//!   last lent `CAPTURE` buffer goes back empty with `V4L2_BUF_FLAG_LAST` right behind the
+//!   `SOURCE_CHANGE` (the kernel's order; a GStreamer client waits for that buffer before it
+//!   renegotiates, review-m6 R6-2), and the session stops writing (`parked`) until the client
+//!   restarts the `CAPTURE` queue or sends `V4L2_DEC_CMD_START`: the frames of the new size the
+//!   codec goes on producing are held for the restart, never written into a buffer the client is
+//!   taking back. The device supplies the `LAST` buffer itself when none is lent here.
 //! * Seek ([`VideoDecoderBackendSession::flush`]) is `AMediaCodec_flush` then `start` (the async
-//!   rule); every pending input and held output is dropped. Drain is an empty `END_OF_STREAM`
-//!   input; the output that carries the flag becomes the guest's `LAST` buffer. After an EOS the
-//!   codec accepts no input until it is flushed, which the next `decode` does.
+//!   rule); every pending input and held output is dropped, a held format change is announced again
+//!   after the restart. Drain is an empty `END_OF_STREAM` input; the output that carries the flag
+//!   becomes the guest's `LAST` buffer -- only while that drain is in flight: a stale
+//!   `END_OF_STREAM` delivered after a flush ends nothing (review-m6 R6-3). After an EOS the codec
+//!   accepts no input until it is flushed, which the next `decode` does.
 
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -395,8 +406,23 @@ pub(super) fn choose<'a>(
     Some((chosen, passed_over))
 }
 
+/// The height maximum a codec honours together with its width maximum. The store's two ranges
+/// are each true at the other's *minimum*: on 5566 `8192 x 8192` is really `8192 x 4320`
+/// (`getSupportedHeightsFor(max width)`, B5 §5.1 item 4), and a frame the codec cannot take
+/// must not pass `S_FMT` to fail at `STREAMON` out of `configure` (B5 follow-up 6, review-m7
+/// R7-5). Held to what holds at the maximum width: landscape frames keep the full width, and a
+/// portrait frame past it (4320 x 8192) is refused up front, which `configure` would have
+/// refused later anyway. `None` when the store publishes no such range, or a rectangle.
+pub(super) fn honest_height_max(v: &android_codec::VideoCaps) -> Option<i32> {
+    match v.heights_at_max_width {
+        Some((_, hi)) if hi > 0 && hi < v.heights.1 => Some(hi),
+        _ => None,
+    }
+}
+
 /// `ENUM_FRAMESIZES` for a codec: the store's width / height ranges with the alignment as the
-/// step, or a documented fallback when the platform publishes none.
+/// step (the height held to `honest_height_max`), or a documented fallback when the platform
+/// publishes none.
 fn size_ranges(info: &CodecInfo, fourcc: PixelFormat) -> (SizeRange, SizeRange) {
     let range = |lo: i32, hi: i32, step: i32| {
         let lo = lo.max(1) as u32;
@@ -404,10 +430,23 @@ fn size_ranges(info: &CodecInfo, fourcc: PixelFormat) -> (SizeRange, SizeRange) 
         SizeRange::new(lo, hi, step.max(1) as u32)
     };
     match &info.video {
-        Some(v) => (
-            range(v.widths.0, v.widths.1, v.width_alignment),
-            range(v.heights.0, v.heights.1, v.height_alignment),
-        ),
+        Some(v) => {
+            let height_max = match honest_height_max(v) {
+                Some(hi) => {
+                    info!(
+                        "decoder: {} ({}) takes {} x {} at most, not {} x {}: the height is \
+                         published as {}..{}",
+                        fourcc, info.name, v.widths.1, hi, v.widths.1, v.heights.1, v.heights.0, hi
+                    );
+                    hi
+                }
+                None => v.heights.1,
+            };
+            (
+                range(v.widths.0, v.widths.1, v.width_alignment),
+                range(v.heights.0, height_max, v.height_alignment),
+            )
+        }
         None => {
             warn!(
                 "decoder: {} ({}) publishes no video capabilities; offering {}..{} step {} \
@@ -590,6 +629,10 @@ pub struct MediaCodecDecoderSession {
     eos_queued: bool,
     /// The `END_OF_STREAM` output was delivered as `LAST`.
     eos_seen: bool,
+    /// A mid-stream resolution change was announced and the client has not restarted the
+    /// decoder yet: no output is written into a lent `CAPTURE` buffer (the module doc). Cleared
+    /// by `STREAMOFF(CAPTURE)`, `V4L2_DEC_CMD_START`, a seek and a stop.
+    parked: bool,
     /// The codec is gone (error, timeout); the device has been or is being told.
     dead: bool,
     input_capacity: Option<usize>,
@@ -624,6 +667,7 @@ impl MediaCodecDecoderSession {
             events: Vec::new(),
             eos_queued: false,
             eos_seen: false,
+            parked: false,
             dead: false,
             input_capacity: None,
             layout_logged: false,
@@ -780,14 +824,15 @@ impl MediaCodecDecoderSession {
         }
     }
 
-    /// Copy every held output into a lent `CAPTURE` buffer that can take it.
+    /// Copy every held output into a lent `CAPTURE` buffer that can take it -- unless a
+    /// resolution change has parked the session, in which case the outputs wait for the restart.
     fn pump_output(&mut self) {
         // The codec is taken out of `self` for the duration: `output_buffer` borrows it, and the
         // helpers below need `self`. It goes back at the end, dead or not, so `stop` can stop it.
         let Some(mut codec) = self.codec.take() else {
             return;
         };
-        while !self.dead {
+        while !self.dead && !self.parked {
             let (index, info) = match self.held_outputs.front() {
                 Some(Held::Output { index, info }) => (*index, *info),
                 Some(Held::Format(_)) => {
@@ -800,7 +845,12 @@ impl MediaCodecDecoderSession {
                 }
                 None => break,
             };
-            let is_eos = info.flags & BUFFER_FLAG_END_OF_STREAM != 0;
+            // The flag means the end of the stream only while the drain that asked for it is
+            // in flight: a callback the NDK looper had queued before a flush is delivered after
+            // it with the *pre-flush* `BufferInfo`, and an `END_OF_STREAM` in there would end the
+            // guest's decode at its first seek (review-m6 R6-3). `eos_queued` is cleared by the
+            // flush, so a stale flag is a plain frame.
+            let is_eos = self.eos_queued && info.flags & BUFFER_FLAG_END_OF_STREAM != 0;
             let is_config = info.flags & BUFFER_FLAG_CODEC_CONFIG != 0;
             if info.size <= 0 || is_config {
                 // Nothing to copy. An empty EOS is the guest's empty LAST buffer, which needs a
@@ -816,10 +866,15 @@ impl MediaCodecDecoderSession {
                 let Some(capture) = self.captures.pop_front() else {
                     break;
                 };
-                if let Err(e) = codec.release_output(index) {
-                    self.refused_index("output", index, &e);
-                }
                 self.held_outputs.pop_front();
+                if let Err(e) = codec.release_output(index) {
+                    // The codec never handed this index out since the last flush: whatever the
+                    // event says, it is not the drain's answer. The buffer stays lent for the
+                    // real one.
+                    self.refused_index("output", index, &e);
+                    self.captures.push_front(capture);
+                    continue;
+                }
                 self.finish_frame(capture.index, 0, info, true);
                 continue;
             }
@@ -871,13 +926,18 @@ impl MediaCodecDecoderSession {
                 image.width as usize,
                 image.height as usize,
             );
+            // The chroma rows are `2 * ceil(cw / 2)` bytes wide, one byte more than the luma
+            // stride for an odd width, as `nv12_size` counts them and `tight_nv12_rows` hands
+            // them out (review-m6 R6-10): `ceil(h / 2)` of them end at
+            // `chroma_base + ceil(ch / 2) * chroma_stride <= need`.
+            let chroma_stride = 2 * cw.div_ceil(2);
             let chroma_base = cw * canvas.1 as usize;
             let mut row = 0usize;
             let copied = tight_nv12_rows(&image, src, |bytes| {
                 let (at, width) = if row < h {
                     (row * cw, w)
                 } else {
-                    (chroma_base + (row - h) * cw, cw)
+                    (chroma_base + (row - h) * chroma_stride, chroma_stride)
                 };
                 let n = bytes.len().min(width);
                 // SAFETY: `at + n <= need <= capture.len`, and the device lends `len` writable
@@ -1025,6 +1085,7 @@ impl MediaCodecDecoderSession {
         if self.announced == Some(announced) {
             return;
         }
+        let was_announced = self.announced.is_some();
         self.announced = Some(announced);
         self.format_changes += 1;
         info!(
@@ -1046,6 +1107,42 @@ impl MediaCodecDecoderSession {
             visible_rect: Rect::new(visible.0, visible.1, visible.2, visible.3),
             min_capture_buffers: MIN_CAPTURE_BUFFERS,
         });
+        // A change the codec parsed mid-stream is the kernel's "Dynamic Resolution Change": the
+        // last CAPTURE buffer of the old resolution goes back with `V4L2_BUF_FLAG_LAST` -- empty,
+        // which the interface allows -- right behind the event, the order it documents (step 1
+        // the event, step 2 the buffer) and the order both clients need: GStreamer's and
+        // ffmpeg's poll loops both look at `POLLPRI` before `POLLIN`, and a `LAST` buffer that
+        // reached the guest a wake-up before its event would be taken for a plain frame by both.
+        // The fork turns `is_last` into the flag, and into `EOS` only while a `V4L2_DEC_CMD_STOP`
+        // drain is in flight, so this ends no stream (review-m6 R6-2). With no CAPTURE buffer
+        // lent the device answers the next one the guest queues. Either way the decoder is now
+        // stopped: nothing more is written into a lent buffer until the client restarts it
+        // (`parked`), so the first frames of the new size wait for buffers the client sized for
+        // them instead of landing in ones it is about to take back. `finish_frame` is not used:
+        // it records an EOS, and the codec was not drained.
+        if from == "codec" && was_announced {
+            self.parked = true;
+            match self.captures.pop_front() {
+                Some(capture) => {
+                    info!(
+                        "decoder session {}: CAPTURE buffer {} is the empty LAST buffer of the \
+                         old size; decoding is parked until the CAPTURE restart",
+                        self.id, capture.index
+                    );
+                    self.events.push(DecoderEvent::FrameDecoded {
+                        index: capture.index,
+                        bytesused: 0,
+                        timestamp: timeval_from(0),
+                        is_last: true,
+                    });
+                }
+                None => info!(
+                    "decoder session {}: no CAPTURE buffer lent to mark LAST; the device answers \
+                     the next one queued; decoding is parked until the CAPTURE restart",
+                    self.id
+                ),
+            }
+        }
     }
 
     /// `onAsyncFormatChanged`: the stream's size, from the output format.
@@ -1109,13 +1206,21 @@ impl MediaCodecDecoderSession {
         let Some(codec) = self.codec.take() else {
             return Ok(());
         };
-        // Whatever the codec delivered is void after the flush: not released, just forgotten. A
-        // format change held back in there goes with it; if the size really changed, the first
-        // picture after the restart announces it (`canvas_for`).
-        self.held_outputs.clear();
+        // Whatever the codec delivered is void after the flush: not released, just forgotten --
+        // except the last format change held back in there, which is announced again once the
+        // codec is back, or the size it carried (and its crop) would be lost to a seek that
+        // raced it: `canvas_for` re-announces only a picture *larger* than what was announced
+        // (review-m6 R6-15). `announce` dedups, so a change that changes nothing costs nothing.
+        let mut held_format = None;
+        for entry in self.held_outputs.drain(..) {
+            if let Held::Format(format) = entry {
+                held_format = Some(format);
+            }
+        }
         self.free_inputs.clear();
         self.eos_queued = false;
         self.eos_seen = false;
+        self.parked = false;
         self.refused = 0;
         self.stale = 0;
         let id = self.id;
@@ -1126,6 +1231,9 @@ impl MediaCodecDecoderSession {
         }) {
             Some((codec, Ok(()))) => {
                 self.codec = Some(codec);
+                if let Some(format) = held_format {
+                    self.handle_format(format);
+                }
                 Ok(())
             }
             Some((codec, Err(e))) => {
@@ -1203,8 +1311,13 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         let created = bounded("decoder", id, "start", CODEC_START_TIMEOUT, move || {
             let mut codec = Codec::create_by_name(&name)?;
             // Every callback bumps the device session's eventfd once it has queued its event:
-            // that is the whole wake-up path, no thread in between.
-            codec.set_wake_hook(Box::new(move || sink.signal()));
+            // that is the whole wake-up path, no thread in between -- so a codec that will not
+            // take the hook is a session nothing would ever wake (review-m6 R6-17).
+            if !codec.set_wake_hook(Box::new(move || sink.signal())) {
+                return Err(CodecError::Event(
+                    "the codec already had a wake hook; nothing would wake the session".into(),
+                ));
+            }
             codec.configure(&format, false)?;
             codec.start()?;
             Ok::<Codec, CodecError>(codec)
@@ -1241,7 +1354,16 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                 );
                 Err(errno_for(&e))
             }
-            None => Err(libc::ETIMEDOUT),
+            // The codec is still being built on a detached thread: a second `STREAMON` must
+            // not build another next to it, so the session ends, as `bounded`'s message says
+            // (review-m6 R6-12).
+            None => {
+                self.fail(format!(
+                    "{} did not start within {:?}",
+                    chosen.name, CODEC_START_TIMEOUT
+                ));
+                Err(libc::ETIMEDOUT)
+            }
         }
     }
 
@@ -1284,38 +1406,57 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
     fn clear_capture_buffers(&mut self) -> IoctlResult<()> {
         // STREAMOFF(CAPTURE): every lent buffer goes back unfilled, and so must every frame
         // report that has not reached the device yet, or a buffer lent again after this call
-        // could be returned as decoded with nothing in it. The frames the codec still holds are
-        // the client's discarded ones (a reallocation is under way): released, not kept.
+        // could be returned as decoded with nothing in it. Of the outputs the codec still holds,
+        // the ones before a format change it has not announced yet are frames of a size the
+        // client is walking away from: released. Everything from the last held format change
+        // on is kept -- the first frames of the new size, which a stopped decoder would only
+        // decode after the restart (the kernel loses no frame at a resolution change), and the
+        // usual case after `announce` parked the session -- and the format changes in between
+        // are announced now, with the device woken for them (review-m6 R6-5).
         let lent = self.captures.len();
         self.captures.clear();
         self.events
             .retain(|e| !matches!(e, DecoderEvent::FrameDecoded { .. }));
-        let mut held = 0;
+        let mut released = 0;
         let mut formats = Vec::new();
-        for entry in std::mem::take(&mut self.held_outputs) {
-            match entry {
-                Held::Output { index, .. } => {
-                    held += 1;
-                    if let Some(codec) = self.codec.as_mut() {
-                        if let Err(e) = codec.release_output(index) {
-                            warn!(
-                                "decoder session {}: releasing output {} on STREAMOFF(CAPTURE): {}",
-                                self.id, index, e
-                            );
+        let last_format = self
+            .held_outputs
+            .iter()
+            .rposition(|h| matches!(h, Held::Format(_)));
+        if let Some(at) = last_format {
+            for entry in self.held_outputs.drain(..=at) {
+                match entry {
+                    Held::Output { index, .. } => {
+                        released += 1;
+                        if let Some(codec) = self.codec.as_mut() {
+                            if let Err(e) = codec.release_output(index) {
+                                warn!(
+                                    "decoder session {}: releasing output {} on STREAMOFF(CAPTURE): {}",
+                                    self.id, index, e
+                                );
+                            }
                         }
                     }
+                    Held::Format(format) => formats.push(format),
                 }
-                // A format change the discarded frames were holding back is announced now.
-                Held::Format(format) => formats.push(format),
             }
         }
+        let before = self.events.len();
         for format in formats {
             self.handle_format(format);
         }
+        // Whatever parked the session, the client is restarting the CAPTURE queue.
+        self.parked = false;
+        if self.events.len() > before {
+            self.sink.signal();
+        }
         info!(
             "decoder session {}: CAPTURE cleared: {} lent buffer(s) returned, {} held output(s) \
-             released",
-            self.id, lent, held
+             released, {} kept for the restart",
+            self.id,
+            lent,
+            released,
+            self.held_outputs.len()
         );
         Ok(())
     }
@@ -1377,12 +1518,37 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         Ok(())
     }
 
+    fn resume(&mut self) {
+        // V4L2_DEC_CMD_START: the client answered a resolution change without reallocating (or
+        // restarts after a drain). The frames held since the announcement go into the buffers
+        // still lent, and the ones the device lends from now on.
+        if self.dead {
+            return;
+        }
+        if self.parked {
+            info!(
+                "decoder session {}: DEC_CMD_START: decoding on at the announced size, {} held \
+                 output(s) waiting",
+                self.id,
+                self.held_outputs.len()
+            );
+        }
+        self.parked = false;
+        let before = self.events.len();
+        self.pump_output();
+        self.pump_input();
+        if self.events.len() > before {
+            self.sink.signal();
+        }
+    }
+
     fn stop(&mut self) {
         self.pending.clear();
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
         self.events.clear();
+        self.parked = false;
         if let Some(codec) = self.codec.take() {
             let name = codec.name().to_string();
             self.stop_codec(codec);
