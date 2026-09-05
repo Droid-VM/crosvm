@@ -522,9 +522,10 @@ impl MediaPool {
     ) -> anyhow::Result<std::thread::JoinHandle<()>> {
         let mut lease = self.lease(card.to_string());
         let mut name = card.to_string();
-        if let Err(e) = tube.set_send_timeout(Some(POOL_RPC_TIMEOUT)) {
-            error!("virtio-media: cannot bound the pool server's send: {e}");
-        }
+        // A socket whose send cannot be bounded is a socket the VM must not start a device on:
+        // it would be the one unbounded wait in a design that promises none (R8-8, the F5 rule).
+        tube.set_send_timeout(Some(POOL_RPC_TIMEOUT))
+            .with_context(|| format!("cannot bound the pool server's send for \"{card}\""))?;
         std::thread::Builder::new()
             .name(format!("media pool {card}"))
             .spawn(move || {
@@ -739,6 +740,9 @@ pub struct RemotePool {
     /// not a comment about thread counts).
     conn: Mutex<PoolConnection>,
     mapped: MappedPool,
+    /// The effective RPC bound (5 s shipped, milliseconds under test), for the timeout error
+    /// line (R8-9).
+    timeout: Duration,
     /// Set only when the tube reports `Disconnected`: the VMM's end is closed and no request
     /// can ever be answered again. A timeout does NOT set it -- the request ids let the next
     /// round trip drain the late answer and resync (R8-4).
@@ -752,18 +756,20 @@ struct PoolConnection {
 }
 
 impl RemotePool {
-    /// Wrap the helper's `--pool-fd` tube and map the pool this process found at `pool_gpa`
-    /// ([`pool_handle_at`]). Bounds every send and recv on the tube by [`POOL_RPC_TIMEOUT`],
+    /// Wrap the helper's `--pool-fd` tube over its own mapping of the pool ([`MappedPool::new`]
+    /// on the handle [`pool_handle_at`] found -- built by the caller *before* the tube is
+    /// consumed, so a mapping failure leaves the tube alone and the VMM does not read a live
+    /// helper as gone, R8-11). Bounds every send and recv on the tube by [`POOL_RPC_TIMEOUT`],
     /// and introduces the device by its actual card string ([`PoolRequest::Hello`], R8-6).
-    pub fn new(tube: Tube, pool: MediaPoolHandle, card: String) -> anyhow::Result<Arc<Self>> {
-        Self::with_timeout(tube, pool, card, POOL_RPC_TIMEOUT)
+    pub fn new(tube: Tube, mapped: MappedPool, card: String) -> anyhow::Result<Arc<Self>> {
+        Self::with_timeout(tube, mapped, card, POOL_RPC_TIMEOUT)
     }
 
     /// [`RemotePool::new`] with the timeout injectable, for tests that want a dead VMM to be
     /// noticed in milliseconds rather than seconds.
     pub fn with_timeout(
         tube: Tube,
-        pool: MediaPoolHandle,
+        mapped: MappedPool,
         card: String,
         timeout: Duration,
     ) -> anyhow::Result<Arc<Self>> {
@@ -771,8 +777,7 @@ impl RemotePool {
             .context("cannot bound the pool tube's recv")?;
         tube.set_send_timeout(Some(timeout))
             .context("cannot bound the pool tube's send")?;
-        let (gpa, size) = (pool.gpa, pool.size);
-        let mapped = MappedPool::new(pool)?;
+        let (gpa, size) = (mapped.pool.gpa, mapped.pool.size);
         // Fire and forget, best effort: the one message with no answer. A failure here is a
         // broken tube that every later request will report for itself.
         if let Err(e) = tube.send(&PoolRequest::Hello { card }) {
@@ -787,6 +792,7 @@ impl RemotePool {
         Ok(Arc::new(RemotePool {
             conn: Mutex::new(PoolConnection { tube, next_id: 0 }),
             mapped,
+            timeout,
             dead: AtomicBool::new(false),
         }))
     }
@@ -822,8 +828,8 @@ impl RemotePool {
                 }
                 Err(e) => {
                     error!(
-                        "virtio-media: no answer from the VMM's pool server within {} s: {e}",
-                        POOL_RPC_TIMEOUT.as_secs()
+                        "virtio-media: no answer from the VMM's pool server within {:?}: {e}",
+                        self.timeout
                     );
                     return Err(libc::EIO);
                 }
@@ -1207,9 +1213,13 @@ mod tests {
 
     /// A remote client over `fd`'s pool, its RPC bound shortened for the tests.
     fn remote_client(fd: &SafeDescriptor, tube: Tube, card: &str) -> RemotePoolAllocator {
-        let pool =
-            RemotePool::with_timeout(tube, handle_over(fd), card.to_string(), TEST_RPC_TIMEOUT)
-                .unwrap();
+        let pool = RemotePool::with_timeout(
+            tube,
+            MappedPool::new(handle_over(fd)).unwrap(),
+            card.to_string(),
+            TEST_RPC_TIMEOUT,
+        )
+        .unwrap();
         RemotePoolAllocator::new(pool, card.to_string())
     }
 
@@ -1383,9 +1393,13 @@ mod tests {
         let pool = MediaPool::new(handle_over(&shm)).unwrap();
         let (vmm, helper) = Tube::pair().unwrap();
         let server = pool.spawn_server("decoder", vmm).unwrap();
-        let remote =
-            RemotePool::with_timeout(helper, handle_over(&shm), "decoder".to_string(), TEST_RPC_TIMEOUT)
-                .unwrap();
+        let remote = RemotePool::with_timeout(
+            helper,
+            MappedPool::new(handle_over(&shm)).unwrap(),
+            "decoder".to_string(),
+            TEST_RPC_TIMEOUT,
+        )
+        .unwrap();
         let mut client = RemotePoolAllocator::new(Arc::clone(&remote), "decoder".to_string());
 
         // Four buffers outstanding -- still mmap'ed by the guest, say -- when the device resets.
@@ -1413,7 +1427,11 @@ mod tests {
         drop((a, b));
         assert_eq!(used(&pool), 2 * page);
         remote.release_all();
-        assert_eq!(used(&pool), 0, "ReleaseAll returned everything, lease intact");
+        assert_eq!(
+            used(&pool),
+            0,
+            "ReleaseAll returned everything, lease intact"
+        );
         let again = next.allocate(page).unwrap();
         next.release(again);
 
@@ -1443,9 +1461,13 @@ mod tests {
             gpa: 0x1_0000_0000,
             size: 2 * page,
         };
-        let remote =
-            RemotePool::with_timeout(helper, small, "decoder".to_string(), TEST_RPC_TIMEOUT)
-                .unwrap();
+        let remote = RemotePool::with_timeout(
+            helper,
+            MappedPool::new(small).unwrap(),
+            "decoder".to_string(),
+            TEST_RPC_TIMEOUT,
+        )
+        .unwrap();
         let mut client = RemotePoolAllocator::new(remote, "decoder".to_string());
 
         let first = client.allocate(page).unwrap();
