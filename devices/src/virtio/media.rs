@@ -488,6 +488,16 @@ impl GuestMemoryRange for GuestBufferImport {
     fn as_mut_ptr(&mut self) -> *mut u8 {
         GuestBufferImport::as_mut_ptr(self)
     }
+
+    /// The trait's default is `usize::MAX`, "no bound I can state"; this one can state it, for
+    /// both shapes an import takes. A `GuestArenaMapping` answers the length it mapped and a
+    /// `GuestShadowMapping` the length of the vector it copied into, and both are the sum of the
+    /// scatter-gather entries the ioctl layer actually read -- which is the number a device needs
+    /// (review-m4 R2: the guest's `length` field and the list it sizes are two separate things
+    /// the guest chooses).
+    fn len(&self) -> usize {
+        GuestBufferImport::len(self)
+    }
 }
 
 /// Implements `VirtioMediaGuestMemoryMapper` on a `GuestMemory` and a `HostAccessPolicy`.
