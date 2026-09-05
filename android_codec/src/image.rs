@@ -63,6 +63,8 @@ pub enum ImageError {
         needed: usize,
         available: usize,
     },
+    #[error("plane {plane} reaches {below} bytes before the start of the buffer")]
+    BelowStart { plane: usize, below: i64 },
     #[error("image has no pixels ({0}x{1})")]
     Empty(u32, u32),
 }
@@ -172,6 +174,21 @@ impl MediaImage2 {
         (p.offset as i64 + rows + cols + 1) as usize
     }
 
+    /// The lowest byte plane `i` reaches, as a signed offset: below zero when a negative
+    /// increment walks the plane off the start of the buffer, which `plane_end` alone cannot
+    /// see (it clamps that axis to the offset) and which the row walks below would turn into an
+    /// out-of-range index rather than a refusal (review-m6 R6-9).
+    fn plane_start(&self, i: usize) -> i64 {
+        let (w, h) = self.plane_dims(i);
+        if w == 0 || h == 0 {
+            return 0;
+        }
+        let p = &self.planes[i];
+        let rows = ((h as i64 - 1) * p.row_inc as i64).min(0);
+        let cols = ((w as i64 - 1) * p.col_inc as i64).min(0);
+        p.offset as i64 + rows + cols
+    }
+
     /// The same layout with every plane offset reduced by plane 0's, for the case where
     /// `AMediaCodec_getOutputBuffer` has already advanced the pointer past `mPlane[0].mOffset`
     /// (the framework's `CCodecBuffers::handleImageData` calls `setRange(mPlane[0].mOffset, ..)`,
@@ -270,6 +287,13 @@ impl MediaImage2 {
 
     fn check_bounds(&self, available: usize) -> Result<(), ImageError> {
         for plane in 0..3 {
+            let start = self.plane_start(plane);
+            if start < 0 {
+                return Err(ImageError::BelowStart {
+                    plane,
+                    below: -start,
+                });
+            }
             let needed = self.plane_end(plane);
             if needed > available {
                 return Err(ImageError::OutOfBounds {
@@ -672,6 +696,48 @@ mod tests {
             tight_nv12(&yuv422, &src, &mut dst),
             Err(ImageError::NotSubsampled420(_))
         ));
+    }
+
+    /// A bottom-up layout (negative row increment) is walked when its offsets account for it,
+    /// and refused -- never indexed past the start of the buffer -- when they do not
+    /// (review-m6 R6-9).
+    #[test]
+    fn a_bottom_up_layout_is_walked_or_refused_never_indexed_below_zero() {
+        let (image, src) = nv12_6x4_padded();
+        // Flipped: every plane starts at its last row and walks up.
+        let mut flipped = image;
+        flipped.planes[0].offset = 3 * 8;
+        flipped.planes[0].row_inc = -8;
+        for plane in 1..3 {
+            flipped.planes[plane].offset += 8;
+            flipped.planes[plane].row_inc = -8;
+        }
+        let mut dst = Vec::new();
+        tight_nv12(&flipped, &src, &mut dst).unwrap();
+        let want = expected_6x4();
+        assert_eq!(dst.len(), want.len());
+        assert_eq!(&dst[..6], &want[18..24], "luma rows come out bottom-up");
+        assert_eq!(&dst[18..24], &want[..6]);
+        assert_eq!(&dst[24..30], &want[30..36], "and so do the chroma rows");
+        assert_eq!(&dst[30..36], &want[24..30]);
+
+        // The same increments with the offsets left at the top walk off the buffer's start.
+        let mut bad = image;
+        bad.planes[0].row_inc = -8;
+        let err = tight_nv12(&bad, &src, &mut dst).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ImageError::BelowStart {
+                    plane: 0,
+                    below: 24
+                }
+            ),
+            "{err}"
+        );
+        let mut count = 0;
+        assert!(tight_nv12_rows(&bad, &src, |_| count += 1).is_err());
+        assert_eq!(count, 0, "nothing is emitted for a refused layout");
     }
 
     #[test]

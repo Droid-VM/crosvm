@@ -1179,7 +1179,7 @@ impl MediaCodecEncoderSession {
 
     /// `onAsyncOutputAvailable`: copy the output out of the codec and give the buffer back,
     /// then hold what it was for a `CAPTURE` buffer.
-    fn take_output(&mut self, codec: &Codec, index: i32, info: BufferInfo) {
+    fn take_output(&mut self, codec: &mut Codec, index: i32, info: BufferInfo) {
         let is_eos = info.flags & BUFFER_FLAG_END_OF_STREAM != 0;
         let is_config = info.flags & BUFFER_FLAG_CODEC_CONFIG != 0;
         let key = info.flags & BUFFER_FLAG_KEY_FRAME != 0;
@@ -1783,7 +1783,7 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
     }
 
     fn take_events(&mut self) -> Vec<EncoderEvent> {
-        if let Some(codec) = self.codec.take() {
+        if let Some(mut codec) = self.codec.take() {
             for event in codec.take_events() {
                 match event {
                     CodecEvent::InputAvailable(index) => {
@@ -1813,7 +1813,7 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
                         self.free_inputs.push_back(index);
                     }
                     CodecEvent::OutputAvailable { index, info } => {
-                        self.take_output(&codec, index, info);
+                        self.take_output(&mut codec, index, info);
                     }
                     CodecEvent::FormatChanged(format) => {
                         info!(
