@@ -673,13 +673,16 @@ fn create_unprivileged_virtio_snd_device(
     // This child exec'd /proc/self/exe too, so `ps` calls it `exe`; the same line the media
     // helper gets (D14).
     info!(
-        "launched snd helper: pid {}, uid {}, gid {}, backend {}, card_index {}",
+        "launched snd helper: pid {}, uid {}, gid {}, backend {}, card_index {}, log level {}",
         pid,
         uid,
         gid,
         // The `backend=` spelling the command line uses, not `Debug`'s `Sys(AAUDIO)`.
         String::from(snd_params.backend),
         snd_params.card_index,
+        // What the helper was actually started at. A `debug!` in a backend only reaches the log
+        // when this says so, and until D57 it always said `info` (VPU_DESIGN.md §6.2).
+        crate::crosvm::sys::linux::device_helper::vmm_log_filter(),
     );
 
     let connection = vmm_end
@@ -1468,7 +1471,7 @@ fn create_unprivileged_virtio_media_device(
     // later by cmdline, not by name -- `deploy/vpu/README.md` has the one-liner.
     info!(
         "launched media helper: pid {}, uid {}, gid {}, kind {}, card {}, pool_gpa {:#x}, pool \
-         slice {}, {} access window(s)",
+         slice {}, {} access window(s), log level {}",
         pid,
         uid,
         gid,
@@ -1480,6 +1483,9 @@ fn create_unprivileged_virtio_media_device(
             None => "whole pool".to_string(),
         },
         params.access_windows.len(),
+        // What the helper was actually started at. A `debug!` in a backend only reaches the log
+        // when this says so, and until D57 it always said `info` (VPU_DESIGN.md §6.2).
+        crate::crosvm::sys::linux::device_helper::vmm_log_filter(),
     );
 
     // `VhostUserFrontend::new` below is the vhost-user handshake: `set_owner`, `get_features`,
