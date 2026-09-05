@@ -186,6 +186,40 @@ impl MediaImage2 {
         out
     }
 
+    /// The layout a codec that publishes no `image-data` is assumed to use: NV12 at `stride`
+    /// bytes per row with the chroma plane `slice_height` rows down (the `stride` /
+    /// `slice-height` idiom of the output format, `MediaCodec_sanity_test.cpp:357`).
+    pub fn semiplanar(width: u32, height: u32, stride: u32, slice_height: u32) -> MediaImage2 {
+        let mut image = MediaImage2 {
+            image_type: MEDIA_IMAGE_TYPE_YUV,
+            num_planes: 3,
+            width,
+            height,
+            bit_depth: 8,
+            bit_depth_allocated: 8,
+            planes: Default::default(),
+        };
+        image.planes[0] = PlaneInfo {
+            offset: 0,
+            col_inc: 1,
+            row_inc: stride as i32,
+            horiz_subsampling: 1,
+            vert_subsampling: 1,
+        };
+        image.planes[1] = PlaneInfo {
+            offset: stride * slice_height,
+            col_inc: 2,
+            row_inc: stride as i32,
+            horiz_subsampling: 2,
+            vert_subsampling: 2,
+        };
+        image.planes[2] = PlaneInfo {
+            offset: stride * slice_height + 1,
+            ..image.planes[1]
+        };
+        image
+    }
+
     /// Classify the chroma planes.
     pub fn chroma_layout(&self) -> ChromaLayout {
         if self.num_planes < 3 {
@@ -262,26 +296,44 @@ pub fn nv12_size(width: usize, height: usize) -> usize {
 /// This is the one copy the decoder device makes per frame (design 7.2, CAPTURE format policy):
 /// a memcpy per row when the source is already NV12, a byte swap per pair for NV21, an
 /// interleave for planar sources, and the generic `offset + x*colInc + y*rowInc` walk for
-/// anything else.
+/// anything else. [`tight_nv12_rows`] is the same walk handing out one row at a time, for a
+/// destination that is not a `Vec` -- the decoder device writes through a raw pointer into a
+/// buffer the guest also maps.
 pub fn tight_nv12(image: &MediaImage2, src: &[u8], dst: &mut Vec<u8>) -> Result<(), ImageError> {
+    dst.clear();
+    dst.reserve(nv12_size(image.width as usize, image.height as usize));
+    tight_nv12_rows(image, src, |row| dst.extend_from_slice(row))
+}
+
+/// Walk `src` as `image` describes it and hand `emit` every row of the tight NV12 picture, in
+/// order: `height` luma rows of `width` bytes, then `ceil(height / 2)` chroma rows of
+/// `2 * ceil(width / 2)` interleaved Cb/Cr bytes. A row the source already holds in that shape is
+/// passed as a slice of `src` (the NV12 fast path); any other row is assembled in a scratch
+/// buffer first. Nothing is emitted if the layout is refused.
+pub fn tight_nv12_rows(
+    image: &MediaImage2,
+    src: &[u8],
+    mut emit: impl FnMut(&[u8]),
+) -> Result<(), ImageError> {
     image.check_yuv420()?;
     image.check_bounds(src.len())?;
 
     let w = image.width as usize;
     let h = image.height as usize;
     let (cw, ch) = image.plane_dims(1);
-    dst.clear();
-    dst.reserve(nv12_size(w, h));
+    let mut row_buf: Vec<u8> = Vec::new();
 
     let y = &image.planes[0];
     for row in 0..h {
         let start = (y.offset as i64 + row as i64 * y.row_inc as i64) as usize;
         if y.col_inc == 1 {
-            dst.extend_from_slice(&src[start..start + w]);
+            emit(&src[start..start + w]);
         } else {
+            row_buf.clear();
             for col in 0..w {
-                dst.push(src[(start as i64 + col as i64 * y.col_inc as i64) as usize]);
+                row_buf.push(src[(start as i64 + col as i64 * y.col_inc as i64) as usize]);
             }
+            emit(&row_buf);
         }
     }
 
@@ -291,30 +343,35 @@ pub fn tight_nv12(image: &MediaImage2, src: &[u8], dst: &mut Vec<u8>) -> Result<
         ChromaLayout::Nv12 => {
             for row in 0..ch {
                 let start = (u.offset as i64 + row as i64 * u.row_inc as i64) as usize;
-                dst.extend_from_slice(&src[start..start + 2 * cw]);
+                emit(&src[start..start + 2 * cw]);
             }
         }
         ChromaLayout::Nv21 => {
             for row in 0..ch {
                 let start = (v.offset as i64 + row as i64 * v.row_inc as i64) as usize;
+                row_buf.clear();
                 for pair in src[start..start + 2 * cw].chunks_exact(2) {
-                    dst.push(pair[1]);
-                    dst.push(pair[0]);
+                    row_buf.push(pair[1]);
+                    row_buf.push(pair[0]);
                 }
+                emit(&row_buf);
             }
         }
         ChromaLayout::Planar => {
             for row in 0..ch {
                 let us = (u.offset as i64 + row as i64 * u.row_inc as i64) as usize;
                 let vs = (v.offset as i64 + row as i64 * v.row_inc as i64) as usize;
+                row_buf.clear();
                 for col in 0..cw {
-                    dst.push(src[us + col]);
-                    dst.push(src[vs + col]);
+                    row_buf.push(src[us + col]);
+                    row_buf.push(src[vs + col]);
                 }
+                emit(&row_buf);
             }
         }
         ChromaLayout::Other => {
             for row in 0..ch {
+                row_buf.clear();
                 for col in 0..cw {
                     let ui = u.offset as i64
                         + row as i64 * u.row_inc as i64
@@ -322,9 +379,10 @@ pub fn tight_nv12(image: &MediaImage2, src: &[u8], dst: &mut Vec<u8>) -> Result<
                     let vi = v.offset as i64
                         + row as i64 * v.row_inc as i64
                         + col as i64 * v.col_inc as i64;
-                    dst.push(src[ui as usize]);
-                    dst.push(src[vi as usize]);
+                    row_buf.push(src[ui as usize]);
+                    row_buf.push(src[vi as usize]);
                 }
+                emit(&row_buf);
             }
         }
     }
@@ -614,5 +672,39 @@ mod tests {
             tight_nv12(&yuv422, &src, &mut dst),
             Err(ImageError::NotSubsampled420(_))
         ));
+    }
+
+    #[test]
+    fn tight_nv12_rows_hands_out_luma_then_chroma_rows() {
+        let (image, src) = nv12_6x4_padded();
+        let mut rows: Vec<Vec<u8>> = Vec::new();
+        tight_nv12_rows(&image, &src, |row| rows.push(row.to_vec())).unwrap();
+        // 4 luma rows of 6, then 2 chroma rows of 6 (2 * ceil(6 / 2)).
+        assert_eq!(rows.len(), 6);
+        assert!(rows.iter().all(|r| r.len() == 6));
+        assert_eq!(rows.concat(), expected_6x4());
+        // The same walk on a refused layout emits nothing.
+        let mut count = 0;
+        let mut rgb = image;
+        rgb.image_type = MEDIA_IMAGE_TYPE_RGB;
+        assert!(tight_nv12_rows(&rgb, &src, |_| count += 1).is_err());
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn semiplanar_is_the_stride_slice_height_idiom() {
+        let image = MediaImage2::semiplanar(1280, 720, 1280, 736);
+        assert_eq!(image.chroma_layout(), ChromaLayout::Nv12);
+        assert_eq!(image.planes[0].row_inc, 1280);
+        assert_eq!(image.planes[1].offset, 1280 * 736);
+        assert_eq!(image.planes[2].offset, 1280 * 736 + 1);
+        assert_eq!(image.plane_dims(1), (640, 360));
+        // A buffer of exactly stride * (slice height + half) holds it.
+        assert_eq!(image.required_size(), 1280 * 736 + 359 * 1280 + 639 * 2 + 2);
+        // And the 6x4 padded picture, described this way, repacks the same.
+        let (_, src) = nv12_6x4_padded();
+        let mut dst = Vec::new();
+        tight_nv12(&MediaImage2::semiplanar(6, 4, 8, 6), &src, &mut dst).unwrap();
+        assert_eq!(dst, expected_6x4());
     }
 }
