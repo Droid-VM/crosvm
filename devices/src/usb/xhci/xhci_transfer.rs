@@ -259,6 +259,11 @@ impl XhciTransferManager {
         self.stopped.lock().take()
     }
 
+    /// Keeps the earliest of the transfers this stop cancelled. That the ring may rewind to it
+    /// leans on an invariant this code does not check: a USB pipe completes in order and usbfs
+    /// reaps in completion order, so every transfer that really completed did so ahead of the
+    /// earliest cancelled one -- the descriptors at and behind the rewind point are exactly the
+    /// unfinished ones, and none that already reported success is run again.
     fn record_stopped(&self, stopped: StoppedTransfer) {
         let mut earliest = self.stopped.lock();
         let is_earlier = match earliest.as_ref() {
@@ -396,8 +401,16 @@ impl XhciTransfer {
         match status {
             TransferStatus::NoDevice => {
                 info!("xhci: device disconnected, detaching from port");
-                // If the device is gone, we don't need to send transfer completion event, cause we
-                // are going to destroy everything related to this device anyway.
+                // No Transfer Event -- the guest learns of the disconnect through the port. The
+                // ring is still signalled: a Stop Endpoint waiting on this transfer (its
+                // discarded URBs are reaped -ENODEV, not -ENOENT, when the device disappears
+                // under the stop) parks only when the completion is signalled, and the Stop
+                // Endpoint Command Completion -- with every command behind it, the Disable Slot
+                // for this very disconnect included -- waits on that. On a running ring the
+                // signal just wakes it to find the backend gone.
+                self.transfer_completion_event
+                    .signal()
+                    .map_err(Error::WriteCompletionEvent)?;
                 return match self.port.detach() {
                     Ok(()) => Ok(()),
                     // It's acceptable for the port to be already disconnected
@@ -549,9 +562,11 @@ impl XhciTransfer {
         let mut last_data_trb = None;
         let mut in_progress = None;
         for atrb in &self.transfer_trbs {
+            // The TRB types that advance the EDTLA (spec 4.11.5.2): Normal, Data Stage and
+            // Isoch. A Setup Stage TRB moves its 8 bytes outside the data path and does not.
             let carries_data = matches!(
                 atrb.trb.get_trb_type().map_err(Error::TrbType)?,
-                TrbType::Normal | TrbType::SetupStage | TrbType::DataStage | TrbType::Isoch
+                TrbType::Normal | TrbType::DataStage | TrbType::Isoch
             );
             if !carries_data {
                 continue;
@@ -723,14 +738,44 @@ mod tests {
             assert_eq!(
                 td.completion_code,
                 TrbCompletionCode::StoppedLengthInvalid,
-                "{:?}",
-                ty
+                "{ty:?}"
             );
             assert_eq!(td.trb_pointer, 0x2000);
             assert_eq!(td.residual, 0);
             assert_eq!(td.first_trb, GuestAddress(0x2000));
             assert!(td.cycle);
         }
+    }
+
+    /// A transfer reaped after the device disconnected (-ENODEV) sends no Transfer Event, but
+    /// its ring is still signalled: a Stop Endpoint waiting on it parks only on that signal,
+    /// and the command ring dequeues nothing more until the stop is answered.
+    #[test]
+    fn a_no_device_completion_still_signals_the_ring() {
+        let f = Fixture::new();
+        let manager = XhciTransferManager::default();
+        let signal = base::Event::new().unwrap();
+        let transfer = manager.create_transfer(
+            f.mem.clone(),
+            f.port(),
+            f.interrupter.clone(),
+            super::super::test_util::SLOT_ID,
+            3,
+            normal_td(0x2000, &[0x100]),
+            signal.try_clone().unwrap(),
+            None,
+        );
+        transfer
+            .on_transfer_complete(&TransferStatus::NoDevice, 0)
+            .unwrap();
+        assert_eq!(
+            signal
+                .wait_timeout(std::time::Duration::from_millis(200))
+                .unwrap(),
+            base::EventWaitResult::Signaled,
+            "the ring a stop is waiting on must be signalled even though the device is gone"
+        );
+        assert_eq!(manager.take_stopped(), None, "not the descriptor in progress");
     }
 
     /// Several transfers cancelled by one stop (a drained-ahead ring): the ring is left at the

@@ -517,7 +517,9 @@ impl BackendDeviceType {
             match *state {
                 XhciTransferState::Cancelled => {
                     // What the device sent before the URB was unlinked is the guest's: the
-                    // Stopped event reports the data stage as moved that far.
+                    // Stopped event reports the data stage as moved that far. A control
+                    // transfer's buffer is always a `Vector` (the Completed arm below treats
+                    // `Dma` as unreachable), so the `if let` filters nothing real out.
                     let actual_length = t.actual_length();
                     if direction == ControlRequestDataPhaseTransferDirection::DeviceToHost {
                         if let (TransferBuffer::Vector(v), Some(buffer)) = (t.buffer(), &buffer) {

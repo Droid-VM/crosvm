@@ -88,19 +88,36 @@ impl EventHandler for UsbUtilEventHandler {
 /// hardware, where a TD that completes as the endpoint stops is not the one in progress.
 /// Reported as cancelled instead, it was a TD with neither a completion nor a Stopped event;
 /// Windows re-queued it after its watchdog and waited on a device that had already answered.
+///
+/// One consequence of completions keeping their status: a STALL reaped while a Stop Endpoint
+/// is under way takes the ordinary Stalled arm and halts the endpoint mid-stop. That is not a
+/// data race -- reaps, command handling and the context writes all run on the one xhci event
+/// loop -- but the halt parks the ring, which answers the stop with Success while the Endpoint
+/// Context says Halted; hardware, where the stall landed first, would have answered Context
+/// State Error (4.6.9). The guest sees the Halted state and recovers through Reset Endpoint,
+/// as it would on hardware.
 pub fn update_transfer_state(
     xhci_transfer: &Arc<XhciTransfer>,
     status: TransferStatus,
 ) -> Result<()> {
     let mut state = xhci_transfer.state().lock();
 
-    if status == TransferStatus::Cancelled {
-        *state = XhciTransferState::Cancelled;
-        return Ok(());
-    }
-
-    match *state {
-        XhciTransferState::Cancelling | XhciTransferState::Submitted { .. } => {
+    match (status, &*state) {
+        // -ENOENT can only come from our own discard: the URB really was unlinked. The state
+        // is `Cancelling` then (`try_cancel` sets it before the ioctl), or still `Submitted`
+        // for a backend that cancels without the ring's involvement (a fido timeout).
+        (
+            TransferStatus::Cancelled,
+            XhciTransferState::Cancelling | XhciTransferState::Submitted { .. },
+        ) => {
+            *state = XhciTransferState::Cancelled;
+        }
+        (TransferStatus::Cancelled, _) => {
+            error!("xhci transfer state is invalid");
+            *state = XhciTransferState::Cancelled;
+            return Err(Error::BadXhciTransferState);
+        }
+        (_, XhciTransferState::Cancelling | XhciTransferState::Submitted { .. }) => {
             *state = XhciTransferState::Completed;
         }
         _ => {
@@ -149,6 +166,20 @@ mod tests {
 
         // Only a URB the kernel unlinked (-ENOENT) was really cancelled.
         let t = cancelling_transfer(&f);
+        update_transfer_state(&t, TransferStatus::Cancelled).unwrap();
+        assert!(matches!(*t.state().lock(), XhciTransferState::Cancelled));
+
+        // A backend that cancels without the ring's involvement (a fido timeout) reaps a
+        // still-Submitted transfer as cancelled.
+        let t = f.transfer(
+            &XhciTransferManager::default(),
+            3,
+            normal_td(0x2000, &[0x100]),
+        );
+        *t.state().lock() = XhciTransferState::Submitted {
+            cancel_callback: Box::new(|| ()),
+        };
+        let t = Arc::new(t);
         update_transfer_state(&t, TransferStatus::Cancelled).unwrap();
         assert!(matches!(*t.state().lock(), XhciTransferState::Cancelled));
     }
