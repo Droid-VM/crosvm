@@ -33,6 +33,8 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::process::ExitCode;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -126,6 +128,19 @@ impl Args {
             Some(v) => v.parse().map(Some).map_err(|e| format!("{flag}: {e}")),
             None => Ok(None),
         }
+    }
+
+    /// An `i32` that may be written as `MediaCodecConstants.h` writes it: `0x1000` as well as
+    /// `4096` (`--profile`, `--level`; `logs/vpu_wp/B5-acceptance.md` D25).
+    fn parse_int_opt(&self, flag: &str) -> Result<Option<i32>, String> {
+        let Some(v) = self.get(flag) else {
+            return Ok(None);
+        };
+        let parsed = match v.strip_prefix("0x").or_else(|| v.strip_prefix("0X")) {
+            Some(hex) => i32::from_str_radix(hex, 16),
+            None => v.parse(),
+        };
+        parsed.map(Some).map_err(|e| format!("{flag}: {e}"))
     }
 
     fn size(&self, default: (i32, i32)) -> Result<(i32, i32), String> {
@@ -304,6 +319,8 @@ fn cmd_list(args: &Args) -> Result<(), String> {
         ..ListOptions::default()
     };
     let started = Instant::now();
+    // From here on this process must leave through `_exit` (see `main`, D24).
+    STORE_WALKED.store(true, Ordering::Relaxed);
     let list = android_codec::list_codecs(&opts).map_err(|e| e.to_string())?;
     let took = started.elapsed();
     if args.has("--json") {
@@ -1002,8 +1019,8 @@ fn encoder_config(args: &Args, mime: &str, w: i32, h: i32) -> Result<EncoderConf
         frame_rate: args.parse_or("--fps", 30.0f32)?,
         i_frame_interval_s: args.parse_or("--gop", 1)?,
         bitrate_mode,
-        profile: args.parse_opt("--profile")?,
-        level: args.parse_opt("--level")?,
+        profile: args.parse_int_opt("--profile")?,
+        level: args.parse_int_opt("--level")?,
     })
 }
 
@@ -1470,11 +1487,13 @@ fn run() -> Result<(), String> {
     if let Some(uid) = args.parse_opt::<u32>("--uid")? {
         drop_to_uid(uid)?;
     }
+    // The two banner lines go to stderr, so that `list --json > f.json` is a document a JSON
+    // reader accepts (D25).
     // SAFETY: getuid takes no arguments and cannot fail.
-    println!("running as uid {}", unsafe { libc::getuid() });
+    eprintln!("running as uid {}", unsafe { libc::getuid() });
     android_codec::ensure_loaded().map_err(|e| e.to_string())?;
     let missing = android_codec::missing_symbols().map_err(|e| e.to_string())?;
-    println!(
+    eprintln!(
         "libmediandk loaded; {} optional (API 36) symbols missing{}",
         missing.len(),
         if missing.is_empty() {
@@ -1494,12 +1513,29 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Set once `list` has walked `AMediaCodecStore`. The Store's file-scope
+/// `std::vector<AMediaCodecInfo>` is destroyed by `__cxa_finalize` at `exit()`, after the
+/// allocator arena it lives in is gone, and the process dies with SIGSEGV inside `libmediandk`
+/// (`logs/vpu_wp/B5-acceptance.md` D24: `list` printed everything and returned 139). So a process
+/// that has walked the Store leaves through `_exit`, which runs no destructor.
+static STORE_WALKED: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
+    let code = match run() {
+        Ok(()) => 0,
         Err(e) => {
             eprintln!("codec_probe: {e}");
-            ExitCode::FAILURE
+            1
         }
+    };
+    if STORE_WALKED.load(Ordering::Relaxed) {
+        // Nothing buffered may be lost on the way out: stdout is line-buffered and the JSON
+        // document's last line has no newline of its own.
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: `_exit` takes an exit code and does not return; every thread of this process
+        // is expendable at this point.
+        unsafe { libc::_exit(code) };
     }
+    ExitCode::from(code as u8)
 }
