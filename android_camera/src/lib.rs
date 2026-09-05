@@ -875,7 +875,11 @@ pub struct Camera {
     /// `signal_raw`.
     _listener: Box<AImageReaderImageListener>,
     _device_callbacks: Box<ACameraDeviceStateCallbacks>,
-    /// What `_device_callbacks.context` points at; dropped after the device is closed.
+    /// What `_device_callbacks.context` points at; dropped after the device is closed. That no
+    /// state callback runs *after* `ACameraDevice_close` returns is **[unverified]**: the header
+    /// promises only that the device is removed from memory and that touching it then crashes
+    /// (`NdkCameraDevice.h:173-184`), so the guarantee this order relies on comes from AOSP's
+    /// `CameraDevice` destructor stopping its looper, not from the NDK contract (review-m4 R6).
     _state: Box<StateContext>,
     _session_callbacks: Box<ACameraCaptureSessionStateCallbacks>,
     signal: Arc<FrameSignal>,
@@ -930,6 +934,11 @@ impl Drop for OpenGuard {
                 ACaptureSessionOutput_free(self.output);
             }
             if !self.reader.is_null() {
+                // "Set this to NULL if the application no longer needs to listen to new images"
+                // (`NdkImageReader.h:311-312`): the reader's own callback thread is told to stop
+                // before the box holding its context can go anywhere (the android-camera survey's
+                // open item (d)).
+                AImageReader_setImageListener(self.reader, null_mut());
                 AImageReader_delete(self.reader);
             }
             if !self.signal_raw.is_null() {
@@ -937,7 +946,8 @@ impl Drop for OpenGuard {
             }
         }
         // The boxes (callback structs, state context) and the manager drop with the guard, after
-        // the handles that referenced them are gone.
+        // the handles that referenced them are gone -- on every path, because each box is moved
+        // into the guard before the call that registers it and could fail.
     }
 }
 
@@ -946,8 +956,8 @@ impl Camera {
     ///
     /// `max_images` is how many frames may be held by the caller at once; the camera stalls when
     /// they are all outstanding, so it is the queue depth a V4L2 `REQBUFS` would ask for. Keep it
-    /// at 3 or more if [`Camera::next_frame_latest`] is to discard anything (`NdkImageReader.h`:
-    /// with fewer than two free slots it cannot).
+    /// at 3 or more if [`Camera::next_frame_latest`] is to discard anything
+    /// (`NdkImageReader.h:239-245`, NDK r29: with fewer than two free slots it cannot).
     pub fn open(id: &str, width: i32, height: i32, max_images: i32) -> Result<Camera> {
         Self::open_with(id, width, height, max_images, None)
     }
@@ -1017,16 +1027,20 @@ impl Camera {
             )
         })?;
 
-        let mut listener = Box::new(AImageReaderImageListener {
+        // Into the guard *before* the call that registers it: a failing
+        // `AImageReader_setImageListener` must not drop the box the reader may already point at
+        // (review-m4 R6). Same rule for the two boxes below.
+        g.listener = Some(Box::new(AImageReaderImageListener {
             context: g.signal_raw as *mut c_void,
             on_image_available: Some(on_image_available),
-        });
+        }));
+        let listener_ptr: *mut AImageReaderImageListener =
+            g.listener.as_mut().expect("just set").as_mut();
         check_media("AImageReader_setImageListener", unsafe {
-            // SAFETY: reader is live, and the listener box outlives it (dropped after
-            // AImageReader_delete, in Camera::drop or in the guard).
-            AImageReader_setImageListener(g.reader, listener.as_mut() as *mut _)
+            // SAFETY: reader is live, and the listener box is the guard's, so it is freed only
+            // after AImageReader_delete -- in Camera::drop or in OpenGuard::drop, on every path.
+            AImageReader_setImageListener(g.reader, listener_ptr)
         })?;
-        g.listener = Some(listener);
 
         let mut window: *mut ANativeWindow = null_mut();
         // SAFETY: reader is live; the window it returns is owned by the reader.
@@ -1034,26 +1048,24 @@ impl Camera {
             AImageReader_getWindow(g.reader, &mut window)
         })?;
 
-        let state = Box::new(StateContext { listener: on_state });
-        let mut device_callbacks = Box::new(ACameraDeviceStateCallbacks {
-            context: state.as_ref() as *const StateContext as *mut c_void,
+        g.state = Some(Box::new(StateContext { listener: on_state }));
+        let state_ptr = g.state.as_ref().expect("just set").as_ref() as *const StateContext;
+        g.device_callbacks = Some(Box::new(ACameraDeviceStateCallbacks {
+            context: state_ptr as *mut c_void,
             on_disconnected: Some(on_device_disconnected),
             on_error: Some(on_device_error),
             on_client_shared_access_priority_changed: None,
-        });
+        }));
+        let callbacks_ptr: *mut ACameraDeviceStateCallbacks =
+            g.device_callbacks.as_mut().expect("just set").as_mut();
         // SAFETY: all four arguments are live for the call; device is written only on success.
         // This is the call that fails with ERROR_PERMISSION_DENIED when the real uid resolves to
-        // no package or to one without CAMERA.
+        // no package or to one without CAMERA. Both boxes already belong to the guard, so a
+        // failure here closes the device the NDK may have written into `g.device` *before* the
+        // context its callbacks point at is freed, instead of after it (review-m4 R6).
         check("ACameraManager_openCamera", unsafe {
-            ACameraManager_openCamera(
-                manager_ptr,
-                c_id.as_ptr(),
-                device_callbacks.as_mut() as *mut _,
-                &mut g.device,
-            )
+            ACameraManager_openCamera(manager_ptr, c_id.as_ptr(), callbacks_ptr, &mut g.device)
         })?;
-        g.state = Some(state);
-        g.device_callbacks = Some(device_callbacks);
 
         // SAFETY: window belongs to the live reader; output written only on success.
         check("ACaptureSessionOutput_create", unsafe {
@@ -1275,6 +1287,8 @@ impl Drop for Camera {
             ACameraOutputTarget_free(self.target);
             ACaptureSessionOutputContainer_free(self.container);
             ACaptureSessionOutput_free(self.output);
+            // As in `OpenGuard::drop`: unregister before delete (`NdkImageReader.h:311-312`).
+            AImageReader_setImageListener(self.reader, null_mut());
             AImageReader_delete(self.reader);
             drop(Arc::from_raw(self.signal_raw));
         }
