@@ -1734,6 +1734,11 @@ pub(crate) mod test_util {
             self.hub.get_port(PORT_ID).unwrap()
         }
 
+        /// The fixture's event loop, for a test that builds its own ring controller on it.
+        pub fn event_loop(&self) -> Arc<EventLoop> {
+            self.event_loop.clone()
+        }
+
         /// A transfer of `td` on `endpoint_id` of slot 1, made by `manager`.
         pub fn transfer(
             &self,

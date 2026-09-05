@@ -83,6 +83,12 @@ pub trait TransferDescriptorHandler {
         true
     }
 
+    /// Tells the handler whether its ring is drained ahead (`set_dequeue_all`): every queued
+    /// descriptor is handed to it at once, so a stop sweeps many descriptors, of which exactly
+    /// one -- the earliest unfinished -- is reported through `finish_stop`. A handler that does
+    /// not track its descriptors' fates has nothing to do with this.
+    fn set_drained_ahead(&self, _enabled: bool) {}
+
     /// Called once, when a ring that was Stopping parks, before the stop callback is released.
     /// A handler that had a descriptor in progress reports it here -- a transfer ring sends its
     /// Stopped Transfer Event (spec 4.6.9), which therefore precedes the Stop Endpoint Command
@@ -215,6 +221,9 @@ where
     /// audio or video stream fed. Bulk, interrupt and control rings keep one descriptor per event.
     pub fn set_dequeue_all(&self, enabled: bool) {
         self.dequeue_all.store(enabled, Ordering::Relaxed);
+        // The handler sweeps many descriptors on a stop of such a ring and must report exactly
+        // one of them; it can only know that if it is told what kind of ring it serves.
+        self.handler.lock().set_drained_ahead(enabled);
     }
 
     /// The descriptor the last stop left the ring at (spec 4.6.9), for the context write-back

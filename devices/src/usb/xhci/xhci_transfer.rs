@@ -6,6 +6,7 @@ use std::cmp::min;
 use std::fmt;
 use std::fmt::Display;
 use std::mem;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -174,6 +175,10 @@ pub struct XhciTransferManager {
     stopped: Arc<Mutex<Option<StoppedTransfer>>>,
     /// Creation order of the transfers, so the earliest of several cancelled ones is known.
     next_seq: Arc<AtomicU64>,
+    /// Whether the ring these transfers come from is drained ahead (`set_dequeue_all`: an
+    /// isochronous ring). A stop of such a ring sweeps every transfer in flight, and the swept
+    /// set is reported with one Stopped event, not a completion per descriptor.
+    drained_ahead: Arc<AtomicBool>,
 }
 
 impl XhciTransferManager {
@@ -184,7 +189,14 @@ impl XhciTransferManager {
             device_slot,
             stopped: Arc::new(Mutex::new(None)),
             next_seq: Arc::new(AtomicU64::new(0)),
+            drained_ahead: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Tells the manager its transfers belong to a drained-ahead ring; the ring controller
+    /// forwards its `set_dequeue_all` here through the handler.
+    pub fn set_drained_ahead(&self, enabled: bool) {
+        self.drained_ahead.store(enabled, Ordering::Relaxed);
     }
 
     /// Build a new XhciTransfer. Endpoint id is the id in xHCI device slot.
@@ -390,6 +402,13 @@ impl XhciTransfer {
     /// get stream id.
     pub fn get_stream_id(&self) -> Option<u16> {
         self.stream_id
+    }
+
+    /// Whether this transfer's ring is drained ahead (`set_dequeue_all`: an isochronous ring).
+    /// A stop of such a ring sweeps every transfer in flight at once, and the swept set is
+    /// reported with one Stopped event for the earliest of them, not per transfer.
+    pub fn on_drained_ahead_ring(&self) -> bool {
+        self.manager.drained_ahead.load(Ordering::Relaxed)
     }
 
     /// This functions should be invoked when transfer is completed (or failed).

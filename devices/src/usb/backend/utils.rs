@@ -88,6 +88,8 @@ impl EventHandler for UsbUtilEventHandler {
 /// hardware, where a TD that completes as the endpoint stops is not the one in progress.
 /// Reported as cancelled instead, it was a TD with neither a completion nor a Stopped event;
 /// Windows re-queued it after its watchdog and waited on a device that had already answered.
+/// The exception is a drained-ahead (isochronous) ring, where a stop sweeps many URBs at once
+/// and most have already landed: those stay `Cancelled` -- see the match arm below.
 ///
 /// One consequence of completions keeping their status: a STALL reaped while a Stop Endpoint
 /// is under way takes the ordinary Stalled arm and halts the endpoint mid-stop. That is not a
@@ -116,6 +118,24 @@ pub fn update_transfer_state(
             error!("xhci transfer state is invalid");
             *state = XhciTransferState::Cancelled;
             return Err(Error::BadXhciTransferState);
+        }
+        // On a drained-ahead (isochronous) ring the completed-keeps-its-completion rule above
+        // does not apply: such a ring keeps many URBs in flight, and an isochronous URB
+        // completes as its service interval passes whether or not the guest still wants the
+        // frame, so most of the URBs a Stop Endpoint sweeps have already landed when their
+        // discard is issued (usbfs answers it EINVAL and reaps them with their real status).
+        // Completing each of them would send the guest -- which has unlinked every one of those
+        // descriptors -- a burst of Transfer Events for TRBs it no longer expects, one per
+        // swept descriptor. They are part of the stopped set instead: the ring reports the
+        // earliest of them with the single Stopped event the spec promises for the descriptor
+        // in progress (4.6.9) when it parks, and the bytes the device did move still reach the
+        // guest through the cancelled arm's buffer copy and the Stopped event's residual. A
+        // device that disappeared under the stop is not a stop outcome: NoDevice keeps its
+        // ordinary path, so the port detaches.
+        (status, XhciTransferState::Cancelling)
+            if status != TransferStatus::NoDevice && xhci_transfer.on_drained_ahead_ring() =>
+        {
+            *state = XhciTransferState::Cancelled;
         }
         (_, XhciTransferState::Cancelling | XhciTransferState::Submitted { .. }) => {
             *state = XhciTransferState::Completed;
@@ -182,5 +202,51 @@ mod tests {
         let t = Arc::new(t);
         update_transfer_state(&t, TransferStatus::Cancelled).unwrap();
         assert!(matches!(*t.state().lock(), XhciTransferState::Cancelled));
+    }
+
+    /// A drained-ahead (isochronous) ring: a URB the stop swept but whose discard lost the
+    /// race -- it had landed, usbfs answered the discard EINVAL and reaped it with its real
+    /// status -- is part of the stopped set: `Cancelled`, so the parked ring reports one
+    /// Stopped event for the earliest swept descriptor instead of a completion per TD. Only
+    /// the device's disappearance keeps its own path (the port must detach), and a URB reaped
+    /// with no stop under way completes like any other.
+    #[test]
+    fn a_swept_urb_that_landed_on_a_drained_ring_is_part_of_the_stopped_set() {
+        let f = Fixture::new();
+        let manager = XhciTransferManager::default();
+        manager.set_drained_ahead(true);
+        for status in [
+            TransferStatus::Completed,
+            TransferStatus::Error,
+            TransferStatus::Stalled,
+        ] {
+            let t = f.transfer(&manager, 3, normal_td(0x2000, &[0x100]));
+            *t.state().lock() = XhciTransferState::Cancelling;
+            let t = Arc::new(t);
+            update_transfer_state(&t, status).unwrap();
+            assert!(
+                matches!(*t.state().lock(), XhciTransferState::Cancelled),
+                "a swept URB joins the stopped set whatever status it was reaped with"
+            );
+        }
+
+        // The device disappearing under the stop is not a stop outcome.
+        let t = f.transfer(&manager, 3, normal_td(0x2000, &[0x100]));
+        *t.state().lock() = XhciTransferState::Cancelling;
+        let t = Arc::new(t);
+        update_transfer_state(&t, TransferStatus::NoDevice).unwrap();
+        assert!(
+            matches!(*t.state().lock(), XhciTransferState::Completed),
+            "NoDevice keeps its path so the port detaches"
+        );
+
+        // No stop under way: the drained-ahead ring's URB completes normally.
+        let t = f.transfer(&manager, 3, normal_td(0x2000, &[0x100]));
+        *t.state().lock() = XhciTransferState::Submitted {
+            cancel_callback: Box::new(|| ()),
+        };
+        let t = Arc::new(t);
+        update_transfer_state(&t, TransferStatus::Completed).unwrap();
+        assert!(matches!(*t.state().lock(), XhciTransferState::Completed));
     }
 }
