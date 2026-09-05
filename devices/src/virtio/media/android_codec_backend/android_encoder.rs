@@ -69,9 +69,11 @@
 //!
 //! The two that change while the codec runs are forwarded as `setParameters`:
 //! `V4L2_CID_MPEG_VIDEO_BITRATE` as `video-bitrate`, `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME` as
-//! `request-sync` (applied right before the next frame is queued, so it lands on the frame the
-//! guest meant when frames are waiting for an input slot). Everything else goes into `configure`
-//! when the codec is created, from the `EncoderConfig` the device gathers.
+//! `request-sync`, applied at once: the next frame the component processes is the keyframe,
+//! which is the frame a kernel driver's control lands on too, and not necessarily the frame the
+//! guest queues next when frames are waiting for an input slot (`logs/vpu_wp/M7-backend.md` §10
+//! item 3). Everything else goes into `configure` when the codec is created, from the
+//! `EncoderConfig` the device gathers.
 
 use std::collections::VecDeque;
 use std::time::Duration;
@@ -145,6 +147,7 @@ use super::android::bounded;
 use super::android::choose;
 use super::android::errno_for;
 use super::android::has_feature;
+use super::android::honest_height_max;
 use super::android::is_hardware;
 use super::android::pts_from;
 use super::android::timeval_from;
@@ -391,10 +394,11 @@ struct InputLayout {
 }
 
 impl InputLayout {
-    /// Bytes the padded frame occupies: what `queueInputBuffer` is given as the size.
+    /// Bytes the padded frame occupies: what `queueInputBuffer` is given as the size. The chroma
+    /// plane is `ceil(slice_height / 2)` rows of `stride`: half a row more than `luma / 2` for
+    /// an odd slice height, which `pack_frame` writes and the bound must count (review-m7 R7-6).
     fn frame_size(&self) -> usize {
-        let luma = self.stride * self.slice_height;
-        luma + luma / 2
+        self.stride * self.slice_height + self.stride * self.slice_height.div_ceil(2)
     }
 }
 
@@ -463,6 +467,23 @@ unsafe fn pack_frame(
     let chroma_rows = h.div_ceil(2);
     let chroma_w = 2 * w.div_ceil(2);
     let chroma_dst = layout.stride * layout.slice_height;
+    // The bound the raw-pointer copies below rely on, stated on its own rather than derived
+    // from `needed` (review-m7 R7-6): the last chroma row written ends at
+    // `chroma_dst + (chroma_rows - 1) * stride + chroma_w`, and `chroma_w` may exceed the stride
+    // by one for an odd width at an odd stride. `input_layout` refuses an odd stride, so this
+    // is a check on the arithmetic, not a path.
+    let chroma_end = chroma_dst + (chroma_rows - 1) * layout.stride + chroma_w;
+    if chroma_w > layout.stride || chroma_end > dst.len() {
+        return Err(format!(
+            "the {}x{} picture's chroma rows ({} bytes at a {} stride) do not fit the codec's \
+             {}-byte input buffer",
+            w,
+            h,
+            chroma_w,
+            layout.stride,
+            dst.len()
+        ));
+    }
 
     for row in 0..h {
         // SAFETY: `src` holds `nv12_size(cw, ch)` bytes (checked above); this row of the luma
@@ -719,9 +740,24 @@ fn describe(info: &CodecInfo, fourcc: PixelFormat, mime: &str) -> (CodedFormat, 
             } else {
                 (v.bitrates.0.max(1), v.bitrates.1.max(v.bitrates.0.max(1)))
             };
+            // The rectangle the codec honours, not the store's two ranges as if independent:
+            // `8192 x 8192` on 5566 is `8192 x 4320` (B5 §5.1 item 4, follow-up 6; review-m7
+            // R7-5). A frame past it is refused by `S_FMT` here instead of by `configure` at
+            // `STREAMON`, with no word about which dimension was wrong.
+            let height_max = match honest_height_max(v) {
+                Some(hi) => {
+                    info!(
+                        "encoder: {} ({}) takes {} x {} at most, not {} x {}: the height is \
+                         published as {}..{}",
+                        fourcc, info.name, v.widths.1, hi, v.widths.1, v.heights.1, v.heights.0, hi
+                    );
+                    hi
+                }
+                None => v.heights.1,
+            };
             (
                 size(v.widths.0, v.widths.1, v.width_alignment),
-                size(v.heights.0, v.heights.1, v.height_alignment),
+                size(v.heights.0, height_max, v.height_alignment),
                 frame_rate,
                 bitrate,
             )
@@ -902,12 +938,23 @@ struct Started {
 /// stride falls back to the width as the framework's own client does
 /// (`MediaCodec_sanity_test.cpp:357`); the slice height does not: its absence means the chroma
 /// offset is not a whole number of strides, so the `Y[stride * slice_height]` packing would be
-/// wrong (design §7.3, `android_codec::InputLayout`).
+/// wrong (design §7.3, `android_codec::InputLayout`). An odd stride is refused too (a 4:2:0
+/// chroma row is two bytes per sample pair, so `stride / 2` planes and `chroma_w <= stride`
+/// both need it even), and so is an odd slice height for a planar layout, whose Cr plane sits
+/// `stride / 2 * slice_height / 2` bytes into the chroma area (review-m7 R7-6).
+///
+/// A read-back of `COLOR_FormatYUV420Flexible` says nothing about the layout. It is taken as
+/// semi-planar only for a vendor hardware codec, on the strength of B5 §5.4 (byte-identical
+/// bitstreams from `SemiPlanar` and `Flexible` on `c2.qti.avc.encoder`); for anything else --
+/// the software `c2.android.*` encoders, whose flexible layout is I420 planar (B5 follow-up 5)
+/// -- it is refused rather than guessed, since a wrong guess is a stream with its chroma
+/// scrambled that only a visual check finds (review-m7 R7-9).
 fn input_layout(
     format: &MediaFormat,
     requested: i32,
     width: u32,
     height: u32,
+    vendor_hardware: bool,
 ) -> Result<InputLayout, String> {
     let color_format = format.get_i32(keys::COLOR_FORMAT).unwrap_or(requested);
     let semiplanar = match color_format {
@@ -915,10 +962,16 @@ fn input_layout(
         | COLOR_FORMAT_YUV420_PACKED_SEMI_PLANAR
         | COLOR_QCOM_FORMAT_YUV420_SEMI_PLANAR => true,
         COLOR_FORMAT_YUV420_PLANAR | COLOR_FORMAT_YUV420_PACKED_PLANAR => false,
-        // Read back as flexible: the component takes the semi-planar layout it was asked for
-        // (`logs/vpu_wp/B5-acceptance.md` §5.4: byte-identical bitstreams from the two on
-        // `c2.qti.avc.encoder`).
-        COLOR_FORMAT_YUV420_FLEXIBLE => true,
+        COLOR_FORMAT_YUV420_FLEXIBLE if vendor_hardware => true,
+        COLOR_FORMAT_YUV420_FLEXIBLE => {
+            return Err(format!(
+                "reads its input back as {}, which says nothing about the layout, and it is not \
+                 a vendor hardware codec whose flexible layout is known to be semi-planar (input \
+                 format: {})",
+                color_format_name(color_format),
+                format
+            ))
+        }
         other => {
             return Err(format!(
                 "wants input color-format {}, which is neither semi-planar nor planar 4:2:0 \
@@ -940,6 +993,13 @@ fn input_layout(
         return Err(format!(
             "publishes stride {} and slice-height {} for a {}x{} picture (input format: {})",
             stride, slice_height, width, height, format
+        ));
+    }
+    if stride % 2 != 0 || (!semiplanar && slice_height % 2 != 0) {
+        return Err(format!(
+            "publishes an odd stride {} or, for a planar layout, an odd slice-height {} (input \
+             format: {}), which no 4:2:0 packing can honour",
+            stride, slice_height, format
         ));
     }
     Ok(InputLayout {
@@ -988,10 +1048,10 @@ pub struct MediaCodecEncoderSession {
     joined_headers: Option<Vec<u8>>,
     /// For the device, in order.
     events: Vec<EncoderEvent>,
-    /// An `END_OF_STREAM` input is queued: the codec takes no more input until a flush.
+    /// An `END_OF_STREAM` input is queued: the codec takes no more input until a flush. Also
+    /// the only state under which an `END_OF_STREAM` output means anything: the flag on a
+    /// callback delivered after a flush is stale (review-m7 R7-1).
     eos_queued: bool,
-    /// The `END_OF_STREAM` output was delivered as `LAST`.
-    eos_seen: bool,
     /// The codec is gone (error, timeout); the device has been or is being told.
     dead: bool,
     input_capacity: Option<usize>,
@@ -1030,7 +1090,6 @@ impl MediaCodecEncoderSession {
             joined_headers: None,
             events: Vec::new(),
             eos_queued: false,
-            eos_seen: false,
             dead: false,
             input_capacity: None,
             first_pts: None,
@@ -1069,8 +1128,10 @@ impl MediaCodecEncoderSession {
     /// A refused input or output index. A null buffer (`CodecError::Null` from `getInputBuffer`
     /// / `getOutputBuffer`) is a stale index -- a callback the NDK looper had queued before a
     /// flush and delivered after it (D23) -- and is skipped: counted for the flush line, a debug
-    /// line, never a session error. Anything else is the codec refusing an index it handed out,
-    /// tolerated up to [`MAX_REFUSED_INDICES`] per flush.
+    /// line, never a session error. Anything else is the codec refusing an index it handed out
+    /// (`queueInputBuffer`, or `releaseOutputBuffer` for an output with no bytes to fetch first,
+    /// which is how a stale empty `END_OF_STREAM` shows), tolerated up to
+    /// [`MAX_REFUSED_INDICES`] per flush.
     fn refused_index(&mut self, what: &str, index: i32, e: &CodecError) {
         if matches!(e, CodecError::Null(_)) {
             self.stale += 1;
@@ -1179,8 +1240,17 @@ impl MediaCodecEncoderSession {
 
     /// `onAsyncOutputAvailable`: copy the output out of the codec and give the buffer back,
     /// then hold what it was for a `CAPTURE` buffer.
+    ///
+    /// The `END_OF_STREAM` flag means the end of the stream only while the drain that asked for
+    /// it is in flight: a callback the NDK looper had queued before a flush is delivered after
+    /// it with the *pre-flush* `BufferInfo`, and the ordinary empty EOS output never touches
+    /// `getOutputBuffer`, so D23's null-index skip cannot see it -- taken at its word it would
+    /// end the guest's encode at the first resume after a drain (review-m7 R7-1). So the flag
+    /// counts only under `eos_queued`, and an empty output whose index the codec will not
+    /// release either was never handed out since the flush: the whole event is dropped.
     fn take_output(&mut self, codec: &mut Codec, index: i32, info: BufferInfo) {
-        let is_eos = info.flags & BUFFER_FLAG_END_OF_STREAM != 0;
+        let eos_flagged = info.flags & BUFFER_FLAG_END_OF_STREAM != 0;
+        let is_eos = self.eos_queued && eos_flagged;
         let is_config = info.flags & BUFFER_FLAG_CODEC_CONFIG != 0;
         let key = info.flags & BUFFER_FLAG_KEY_FRAME != 0;
         let size = info.size.max(0) as usize;
@@ -1197,6 +1267,16 @@ impl MediaCodecEncoderSession {
         };
         if let Err(e) = codec.release_output(index) {
             self.refused_index("output", index, &e);
+            if bytes.is_empty() {
+                return;
+            }
+        }
+        if eos_flagged && !is_eos {
+            debug!(
+                "encoder session {}: END_OF_STREAM on output {} with no drain in flight ignored \
+                 (a callback from before a flush)",
+                self.id, index
+            );
         }
         let pts_us = info.presentation_time_us;
         if is_config {
@@ -1216,8 +1296,18 @@ impl MediaCodecEncoderSession {
     }
 
     /// The stream headers (`BUFFER_FLAG_CODEC_CONFIG`: SPS/PPS, VPS/SPS/PPS), placed as the
-    /// device's `V4L2_CID_MPEG_VIDEO_HEADER_MODE` says.
+    /// device's `V4L2_CID_MPEG_VIDEO_HEADER_MODE` says. An empty one -- which no codec should
+    /// produce -- is dropped: as a `CAPTURE` buffer of its own it would be a `bytesused == 0`
+    /// buffer, which ffmpeg's dequeue loop reads as the end of the stream (review-m7 R7-14).
     fn take_headers(&mut self, bytes: Vec<u8>, pts_us: i64) {
+        if bytes.is_empty() {
+            warn!(
+                "encoder session {}: an empty CODEC_CONFIG output from {}; ignored",
+                self.id,
+                self.codec_name()
+            );
+            return;
+        }
         let pts_us = self.first_pts.unwrap_or(pts_us);
         info!(
             "encoder session {}: stream headers: {} bytes, {}",
@@ -1329,7 +1419,6 @@ impl MediaCodecEncoderSession {
                 is_last,
             });
             if is_last {
-                self.eos_seen = true;
                 info!(
                     "encoder session {}: EOS reached after {} coded frames ({} bytes in the LAST \
                      buffer)",
@@ -1346,7 +1435,6 @@ impl MediaCodecEncoderSession {
         };
         self.free_inputs.clear();
         self.eos_queued = false;
-        self.eos_seen = false;
         self.refused = 0;
         self.stale = 0;
         let id = self.id;
@@ -1487,9 +1575,17 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
             let mut format = format;
             let mut codec = Codec::create_by_name(&name)?;
             // Every callback bumps the device session's eventfd once it has queued its event:
-            // that is the whole wake-up path, no thread in between.
+            // that is the whole wake-up path, no thread in between -- so a codec that will not
+            // take the hook is a session nothing would ever wake (review-m6 R6-17).
+            let no_hook = || {
+                CodecError::Event(
+                    "the codec already had a wake hook; nothing would wake the session".into(),
+                )
+            };
             let hook = sink.clone();
-            codec.set_wake_hook(Box::new(move || hook.signal()));
+            if !codec.set_wake_hook(Box::new(move || hook.signal())) {
+                return Err(no_hook());
+            }
             let color_format = match codec.configure(&format, true) {
                 Ok(()) => COLOR_FORMAT_YUV420_SEMI_PLANAR,
                 Err(first) => {
@@ -1504,7 +1600,9 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
                     );
                     drop(codec);
                     codec = Codec::create_by_name(&name)?;
-                    codec.set_wake_hook(Box::new(move || sink.signal()));
+                    if !codec.set_wake_hook(Box::new(move || sink.signal())) {
+                        return Err(no_hook());
+                    }
                     format.set_i32(keys::COLOR_FORMAT, COLOR_FORMAT_YUV420_FLEXIBLE);
                     codec.configure(&format, true)?;
                     COLOR_FORMAT_YUV420_FLEXIBLE
@@ -1525,6 +1623,7 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
                     started.color_format,
                     width,
                     height,
+                    chosen.vendor && chosen.hardware,
                 ) {
                     Ok(layout) => layout,
                     Err(why) => {
@@ -1590,7 +1689,6 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
                 self.held_outputs.clear();
                 self.joined_headers = None;
                 self.eos_queued = false;
-                self.eos_seen = false;
                 self.input_capacity = None;
                 self.first_pts = None;
                 self.refused = 0;
@@ -1611,7 +1709,16 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
                 );
                 Err(errno_for(&e))
             }
-            None => Err(libc::ETIMEDOUT),
+            // The codec is still being built on a detached thread: a second `STREAMON` must
+            // not build another next to it, so the session ends, as `bounded`'s message says
+            // (review-m6 R6-12's shape).
+            None => {
+                self.fail(format!(
+                    "{} did not start within {:?}",
+                    chosen.name, CODEC_START_TIMEOUT
+                ));
+                Err(libc::ETIMEDOUT)
+            }
         }
     }
 
@@ -1759,7 +1866,6 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
             .retain(|e| matches!(e, EncoderEvent::InputBufferDone(_) | EncoderEvent::Error(_)));
         self.layout = None;
         self.eos_queued = false;
-        self.eos_seen = false;
         self.input_capacity = None;
         self.first_pts = None;
         if let Some(codec) = self.codec.take() {
