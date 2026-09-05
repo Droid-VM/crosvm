@@ -8,6 +8,7 @@ mod command_ring_controller;
 mod device_slot;
 mod event_ring;
 mod interrupter;
+mod intr_moderation_handler;
 mod intr_resample_handler;
 mod ring_buffer;
 mod ring_buffer_controller;
@@ -43,6 +44,7 @@ use crate::usb::xhci::device_slot::DeviceSlots;
 use crate::usb::xhci::device_slot::Error as DeviceSlotError;
 use crate::usb::xhci::interrupter::Error as InterrupterError;
 use crate::usb::xhci::interrupter::Interrupter;
+use crate::usb::xhci::intr_moderation_handler::IntrModerationHandler;
 use crate::usb::xhci::intr_resample_handler::IntrResampleHandler;
 use crate::usb::xhci::ring_buffer_stop_cb::RingBufferStopCallback;
 use crate::usb::xhci::usb_hub::UsbHub;
@@ -62,6 +64,8 @@ pub enum Error {
     CloneResampleEvent(base::Error),
     #[error("failed to create command ring controller: {0}")]
     CreateCommandRingController(CommandRingControllerError),
+    #[error("failed to create interrupter: {0}")]
+    CreateInterrupter(InterrupterError),
     #[error("failed to enable interrupter: {0}")]
     EnableInterrupter(InterrupterError),
     #[error("failed to get device slot: {0}")]
@@ -78,6 +82,8 @@ pub enum Error {
     SetupEventRing(InterrupterError),
     #[error("failed to start event loop: {0}")]
     StartEventLoop(UtilsError),
+    #[error("failed to start interrupt moderation handler")]
+    StartModerationHandler,
     #[error("failed to start backend provider: {0}")]
     StartProvider(BackendProviderError),
     #[error("failed to start resample handler")]
@@ -101,6 +107,8 @@ pub struct Xhci {
     #[allow(dead_code)]
     intr_resample_handler: Arc<IntrResampleHandler>,
     #[allow(dead_code)]
+    intr_moderation_handler: Arc<IntrModerationHandler>,
+    #[allow(dead_code)]
     device_provider: Box<dyn XhciBackendDeviceProvider>,
 }
 
@@ -120,7 +128,9 @@ impl Xhci {
             .get_trigger()
             .try_clone()
             .map_err(Error::CloneIrqEvent)?;
-        let interrupter = Arc::new(Mutex::new(Interrupter::new(mem.clone(), irq_evt, &regs)));
+        let interrupter = Arc::new(Mutex::new(
+            Interrupter::new(mem.clone(), irq_evt, &regs).map_err(Error::CreateInterrupter)?,
+        ));
         let event_loop = Arc::new(event_loop);
         let irq_resample_evt = interrupt_evt
             .get_resample()
@@ -129,6 +139,9 @@ impl Xhci {
         let intr_resample_handler =
             IntrResampleHandler::start(&event_loop, interrupter.clone(), irq_resample_evt)
                 .ok_or(Error::StartResampleHandler)?;
+        let intr_moderation_handler =
+            IntrModerationHandler::start(&event_loop, interrupter.clone())
+                .ok_or(Error::StartModerationHandler)?;
         let hub = Arc::new(UsbHub::new(&regs, interrupter.clone()));
 
         let mut device_provider = device_provider;
@@ -155,6 +168,7 @@ impl Xhci {
             fail_handle,
             regs,
             intr_resample_handler,
+            intr_moderation_handler,
             interrupter,
             command_ring_controller,
             device_slots,
