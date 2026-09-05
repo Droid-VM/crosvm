@@ -428,6 +428,16 @@ impl VideoDecoderBackend for MediaCodecDecoderBackend {
 // The session
 // ---------------------------------------------------------------------------------------------
 
+/// What the codec delivered and the session has not passed on yet, in delivery order: an output
+/// buffer, or a format change. A format change is announced only once every output delivered
+/// before it has gone to the guest -- a mid-stream resolution change arrives between the last
+/// old-size frame and the first new-size one, and an old frame must not be laid out for the
+/// new size.
+enum Held {
+    Output { index: i32, info: BufferInfo },
+    Format(Option<MediaFormat>),
+}
+
 /// A bitstream buffer waiting for a codec input slot, or the end of the stream.
 enum PendingInput {
     Bitstream {
@@ -555,8 +565,9 @@ pub struct MediaCodecDecoderSession {
     pending: VecDeque<PendingInput>,
     /// `CAPTURE` buffers lent by the device, oldest first.
     captures: VecDeque<OutputBuffer>,
-    /// Output indices the codec delivered that no `CAPTURE` buffer has taken yet.
-    held_outputs: VecDeque<(i32, BufferInfo)>,
+    /// Outputs the codec delivered that no `CAPTURE` buffer has taken yet, and the format
+    /// changes in between them.
+    held_outputs: VecDeque<Held>,
     /// For the device, in order.
     events: Vec<DecoderEvent>,
     /// An `END_OF_STREAM` input is queued: the codec takes no more input until a flush.
@@ -743,8 +754,17 @@ impl MediaCodecDecoderSession {
             return;
         };
         while !self.dead {
-            let Some(&(index, info)) = self.held_outputs.front() else {
-                break;
+            let (index, info) = match self.held_outputs.front() {
+                Some(Held::Output { index, info }) => (*index, *info),
+                Some(Held::Format(_)) => {
+                    // Every output before it is out: the new size can be announced.
+                    let Some(Held::Format(format)) = self.held_outputs.pop_front() else {
+                        unreachable!("checked above");
+                    };
+                    self.handle_format(format);
+                    continue;
+                }
+                None => break,
             };
             let is_eos = info.flags & BUFFER_FLAG_END_OF_STREAM != 0;
             let is_config = info.flags & BUFFER_FLAG_CODEC_CONFIG != 0;
@@ -1055,7 +1075,9 @@ impl MediaCodecDecoderSession {
         let Some(codec) = self.codec.take() else {
             return Ok(());
         };
-        // Whatever the codec delivered is void after the flush: not released, just forgotten.
+        // Whatever the codec delivered is void after the flush: not released, just forgotten. A
+        // format change held back in there goes with it; if the size really changed, the first
+        // picture after the restart announces it (`canvas_for`).
         self.held_outputs.clear();
         self.free_inputs.clear();
         self.eos_queued = false;
@@ -1233,18 +1255,28 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         self.captures.clear();
         self.events
             .retain(|e| !matches!(e, DecoderEvent::FrameDecoded { .. }));
-        let held = self.held_outputs.len();
-        if let Some(codec) = self.codec.as_ref() {
-            for (index, _) in self.held_outputs.drain(..) {
-                if let Err(e) = codec.release_output(index) {
-                    warn!(
-                        "decoder session {}: releasing output {} on STREAMOFF(CAPTURE): {}",
-                        self.id, index, e
-                    );
+        let mut held = 0;
+        let mut formats = Vec::new();
+        for entry in std::mem::take(&mut self.held_outputs) {
+            match entry {
+                Held::Output { index, .. } => {
+                    held += 1;
+                    if let Some(codec) = self.codec.as_ref() {
+                        if let Err(e) = codec.release_output(index) {
+                            warn!(
+                                "decoder session {}: releasing output {} on STREAMOFF(CAPTURE): {}",
+                                self.id, index, e
+                            );
+                        }
+                    }
                 }
+                // A format change the discarded frames were holding back is announced now.
+                Held::Format(format) => formats.push(format),
             }
         }
-        self.held_outputs.clear();
+        for format in formats {
+            self.handle_format(format);
+        }
         info!(
             "decoder session {}: CAPTURE cleared: {} lent buffer(s) returned, {} held output(s) \
              released",
@@ -1345,9 +1377,15 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                     self.free_inputs.push_back(index);
                 }
                 CodecEvent::OutputAvailable { index, info } => {
-                    self.held_outputs.push_back((index, info));
+                    self.held_outputs.push_back(Held::Output { index, info });
                 }
-                CodecEvent::FormatChanged(format) => self.handle_format(format),
+                CodecEvent::FormatChanged(format) => {
+                    if self.held_outputs.is_empty() {
+                        self.handle_format(format);
+                    } else {
+                        self.held_outputs.push_back(Held::Format(format));
+                    }
+                }
                 CodecEvent::Error {
                     status,
                     action_code,
