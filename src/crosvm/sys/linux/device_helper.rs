@@ -73,19 +73,26 @@ pub(crate) fn vmm_log_filter() -> String {
     }
 }
 
-/// Spawns `crosvm [--log-level <filter>] device <subcommand> --fd N --config-json <params_json>`
-/// as `uid`:`gid` with exactly `supp_gids` as supplementary groups, and returns the VMM's end of
-/// the connection along with the child's pid.
+/// Spawns `crosvm [--log-level <filter>] device <subcommand> --fd N --config-json <params_json>
+/// [--pool-fd M]` as `uid`:`gid` with exactly `supp_gids` as supplementary groups, and returns
+/// the VMM's end of the connection along with the child's pid.
 ///
 /// `params_json` is whatever the subcommand's `--config-json` expects; the caller serialises it,
 /// and must strip anything that would make the child try to spawn a backend of its own. The log
 /// filter is whatever `set_vmm_log_filter` recorded, and is omitted if nothing did (D57).
+///
+/// `pool_fd` is a second descriptor for the child, inherited by number exactly like the
+/// vhost-user socket (its CLOEXEC is cleared here): media's tube to the VMM's `media_host` pool
+/// allocator. The caller keeps its own end and its own copy of this one -- dropping the copy
+/// after the spawn is the caller's job, so that the child's death is an EOF and not a
+/// half-open socket the VMM itself keeps alive.
 pub fn launch(
     subcommand: &str,
     params_json: String,
     uid: u32,
     gid: u32,
     supp_gids: Vec<u32>,
+    pool_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(UnixStream, Pid)> {
     let (vmm_end, backend_end) = UnixStream::pair()
         .with_context(|| format!("failed to create the {subcommand} socketpair"))?;
@@ -93,6 +100,10 @@ pub fn launch(
     // The child is handed this fd by number, so it has to survive the exec.
     clear_cloexec(backend_fd)
         .with_context(|| format!("failed to clear CLOEXEC on the {subcommand} socket"))?;
+    if let Some(pool_fd) = pool_fd {
+        clear_cloexec(pool_fd)
+            .with_context(|| format!("failed to clear CLOEXEC on the {subcommand} pool fd"))?;
+    }
 
     // Build everything the child needs before forking, the group list included: after the fork
     // there is only one thread, and anything that takes an allocator lock another thread was
@@ -117,6 +128,9 @@ pub fn launch(
         .arg(&fd_arg)
         .arg("--config-json")
         .arg(&params_json);
+    if let Some(pool_fd) = pool_fd {
+        command.arg("--pool-fd").arg(pool_fd.to_string());
+    }
 
     // SAFETY: the closure runs between fork and exec, and calls only async-signal-safe libc
     // functions. It allocates nothing -- every argument was formatted above.
