@@ -98,7 +98,16 @@ pub trait TransferDescriptorHandler {
     /// drained-ahead ring) it is the earliest; the later ones stay on the ring behind it. `None`
     /// leaves the ring where it is. A halted ring is never asked: its failing descriptor was
     /// already reported.
-    fn finish_stop(&self) -> anyhow::Result<Option<StoppedTd>> {
+    ///
+    /// `stop_event_claim` is the one Stopped event the Stop Endpoint command behind this stop
+    /// may emit across several rings (the stream rings of one endpoint, spec 4.12.1.1: one
+    /// stream is current): a handler with a descriptor in progress emits only if it claims the
+    /// flag first, still rewinds when it does not, and says in `StoppedTd::reported` which it
+    /// was. Without a claim -- a ring alone on its endpoint -- it always emits.
+    fn finish_stop(
+        &self,
+        _stop_event_claim: Option<&Arc<AtomicBool>>,
+    ) -> anyhow::Result<Option<StoppedTd>> {
         Ok(None)
     }
 }
@@ -111,6 +120,10 @@ pub struct StoppedTd {
     pub first_trb: GuestAddress,
     pub cycle: bool,
     pub bytes: u32,
+    /// Whether this ring's stop emitted the Stopped Transfer Event. A ring alone on its
+    /// endpoint always reports; of a stream endpoint's rings exactly one does per Stop
+    /// Endpoint command, and only that stream's context gets a Stopped EDTLA.
+    pub reported: bool,
 }
 
 /// Upper bound on the descriptors one `on_event` hands off when the whole ring is drained. A ring
@@ -136,6 +149,9 @@ pub struct RingBufferController<T: 'static + TransferDescriptorHandler> {
     /// The descriptor the last stop left the ring at; `None` when it stopped with nothing in
     /// progress, or has run since.
     stopped: Mutex<Option<StoppedTd>>,
+    /// The claim on the one Stopped event of the Stop Endpoint command under way, shared with
+    /// the endpoint's other stream rings; `None` on a ring alone on its endpoint.
+    stop_event_claim: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl<T: 'static + TransferDescriptorHandler> Display for RingBufferController<T> {
@@ -167,6 +183,7 @@ where
             dequeue_all: AtomicBool::new(false),
             halt_requested: AtomicBool::new(false),
             stopped: Mutex::new(None),
+            stop_event_claim: Mutex::new(None),
         });
         let event_handler: Arc<dyn EventHandler> = controller.clone();
         event_loop
@@ -233,14 +250,40 @@ where
         *self.stopped.lock()
     }
 
+    /// Hands this ring the claim on the one Stopped event its Stop Endpoint command may emit
+    /// (spec 4.12.1.1: an endpoint with streams has one current stream, so its stop reports one
+    /// TD in progress, not one per ring). Call before `stop`, with the same claim for every
+    /// ring the command stops; the first ring to finish its stop with a descriptor in progress
+    /// takes it, the others rewind silently. The claim is consumed when the stop finishes and
+    /// dropped by the next `start`, so it never outlives its command.
+    pub fn set_stop_event_claim(&self, claim: Arc<AtomicBool>) {
+        *self.stop_event_claim.lock() = Some(claim);
+    }
+
+    /// The claim the last `set_stop_event_claim` left, for tests of the stop plumbing.
+    #[cfg(test)]
+    pub(crate) fn stop_event_claim_for_test(&self) -> Option<Arc<AtomicBool>> {
+        self.stop_event_claim.lock().clone()
+    }
+
+    /// Plants a stopped-descriptor record as a finished stop would have, for tests of the
+    /// context write-back.
+    #[cfg(test)]
+    pub(crate) fn set_stopped_td_for_test(&self, td: Option<StoppedTd>) {
+        *self.stopped.lock() = td;
+    }
+
     /// Start the ring buffer.
     pub fn start(&self) {
         xhci_trace!("start {}", self.name);
         // A doorbell after the guest reset a halted endpoint means run; a halt that has not been
         // acted on yet is stale.
         self.halt_requested.store(false, Ordering::SeqCst);
-        // So is where the last stop left the ring: it is about to move.
+        // So is where the last stop left the ring: it is about to move. A claim a stop set
+        // without consuming (the ring was already parked) belongs to that finished command,
+        // not to whatever stops this run.
         *self.stopped.lock() = None;
+        *self.stop_event_claim.lock() = None;
         let mut state = self.state.lock();
         if *state != RingBufferState::Running {
             *state = RingBufferState::Running;
@@ -320,10 +363,13 @@ where
     /// with `state` held; the caller releases the stop callbacks afterwards, so the Transfer
     /// Event precedes the Stop Endpoint Command Completion (spec 4.6.9).
     fn finish_stop_and_park(&self, state: &mut RingBufferState) -> anyhow::Result<()> {
+        // The claim is this stop's alone: taken however the handler answers, so a later stop
+        // of this ring -- one that set no claim of its own -- reports as a lone ring again.
+        let stop_event_claim = self.stop_event_claim.lock().take();
         let stopped = self
             .handler
             .lock()
-            .finish_stop()
+            .finish_stop(stop_event_claim.as_ref())
             .context("cannot finish stop")?;
         if let Some(td) = &stopped {
             debug!(
@@ -682,6 +728,7 @@ mod tests {
         quiesced: Arc<AtomicBool>,
         rewind: Arc<Mutex<Option<StoppedTd>>>,
         order: Arc<Mutex<Vec<&'static str>>>,
+        seen_claims: Arc<Mutex<Vec<Option<Arc<AtomicBool>>>>>,
     }
 
     impl TrackedHandler {
@@ -696,6 +743,7 @@ mod tests {
                 quiesced: quiesced.clone(),
                 rewind: rewind.clone(),
                 order: order.clone(),
+                seen_claims: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -715,8 +763,12 @@ mod tests {
             self.quiesced.load(Ordering::SeqCst)
         }
 
-        fn finish_stop(&self) -> anyhow::Result<Option<StoppedTd>> {
+        fn finish_stop(
+            &self,
+            stop_event_claim: Option<&Arc<AtomicBool>>,
+        ) -> anyhow::Result<Option<StoppedTd>> {
             self.order.lock().push("stopped");
+            self.seen_claims.lock().push(stop_event_claim.cloned());
             Ok(*self.rewind.lock())
         }
     }
@@ -785,6 +837,7 @@ mod tests {
             first_trb: GuestAddress(0x100),
             cycle: false,
             bytes: 0x40,
+            reported: true,
         };
         *rewind.lock() = Some(stopped);
         let o = order.clone();
@@ -847,6 +900,7 @@ mod tests {
             first_trb: GuestAddress(0x110),
             cycle: false,
             bytes: 0,
+            reported: true,
         };
         *rewind.lock() = Some(stopped);
         done1.signal().unwrap();
@@ -908,6 +962,7 @@ mod tests {
             first_trb: GuestAddress(0x100),
             cycle: false,
             bytes: 0,
+            reported: true,
         });
 
         controller.halt();
@@ -1017,6 +1072,7 @@ mod tests {
             first_trb: GuestAddress(0x100),
             cycle: false,
             bytes: 0x20,
+            reported: true,
         };
         *rewind.lock() = Some(stopped);
         let o = order.clone();
@@ -1108,6 +1164,113 @@ mod tests {
         j.join().unwrap();
     }
 
+    /// A stream ring whose stop lost the endpoint's one Stopped event to a sibling ring still
+    /// rewinds to its descriptor in progress, and the record of it says it went unreported, so
+    /// the context write-back skips its Stopped EDTLA.
+    #[test]
+    fn a_lost_claim_rewind_is_applied_and_recorded_unreported() {
+        let (tx, rx) = channel();
+        let mem = setup_mem();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let rewind = Arc::new(Mutex::new(None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let controller = RingBufferController::new_with_handler(
+            "".to_string(),
+            mem,
+            l.clone(),
+            TrackedHandler::new(tx, &quiesced, &rewind, &order),
+        )
+        .unwrap();
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (first, complete) = rx.recv().unwrap();
+        assert_eq!(first, 1);
+
+        // A sibling stream ring won the claim: this ring's handler answers with an
+        // unreported rewind.
+        let stopped = StoppedTd {
+            first_trb: GuestAddress(0x100),
+            cycle: false,
+            bytes: 0x40,
+            reported: false,
+        };
+        *rewind.lock() = Some(stopped);
+        let o = order.clone();
+        controller.stop(RingBufferStopCallback::new(move || {
+            o.lock().push("callback")
+        }));
+        complete.signal().unwrap();
+        wait_for(|| order.lock().len() == 2);
+        assert_eq!(*order.lock(), vec!["stopped", "callback"]);
+        assert_eq!(
+            controller.get_dequeue_pointer(),
+            GuestAddress(0x100),
+            "the silent ring rewinds all the same"
+        );
+        assert_eq!(controller.stopped_td(), Some(stopped));
+        l.stop();
+        j.join().unwrap();
+    }
+
+    /// The claim set before a stop is handed to the handler exactly once, when that stop
+    /// finishes; a later stop that set none passes none, and a stale claim -- set for a stop
+    /// that never asked the handler -- is dropped by the next doorbell.
+    #[test]
+    fn the_stop_event_claim_reaches_the_handler_once_and_a_restart_drops_a_stale_one() {
+        let (tx, rx) = channel();
+        let mem = setup_mem();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let rewind = Arc::new(Mutex::new(None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let handler = TrackedHandler::new(tx, &quiesced, &rewind, &order);
+        let seen_claims = handler.seen_claims.clone();
+        let controller =
+            RingBufferController::new_with_handler("".to_string(), mem, l.clone(), handler)
+                .unwrap();
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (first, complete) = rx.recv().unwrap();
+        assert_eq!(first, 1);
+
+        let claim = Arc::new(AtomicBool::new(false));
+        controller.set_stop_event_claim(claim.clone());
+        controller.stop(RingBufferStopCallback::new(|| {}));
+        complete.signal().unwrap();
+        wait_for(|| seen_claims.lock().len() == 1);
+        match &seen_claims.lock()[0] {
+            Some(seen) => assert!(Arc::ptr_eq(seen, &claim), "the very claim that was set"),
+            None => panic!("the stop's claim must reach the handler"),
+        }
+
+        // The claim went with that stop: the next one, with none of its own, is a lone ring's.
+        controller.start();
+        let (next, complete) = rx.recv().unwrap();
+        assert_eq!(next, 5);
+        controller.stop(RingBufferStopCallback::new(|| {}));
+        complete.signal().unwrap();
+        wait_for(|| seen_claims.lock().len() == 2);
+        assert!(seen_claims.lock()[1].is_none());
+
+        // A claim set for a stop that never asked the handler is stale once the ring runs
+        // again (its command was answered): the doorbell drops it.
+        controller.set_stop_event_claim(Arc::new(AtomicBool::new(false)));
+        controller.start();
+        let (next, complete) = rx.recv().unwrap();
+        assert_eq!(next, 1);
+        controller.stop(RingBufferStopCallback::new(|| {}));
+        complete.signal().unwrap();
+        wait_for(|| seen_claims.lock().len() == 3);
+        assert!(seen_claims.lock()[2].is_none());
+        l.stop();
+        j.join().unwrap();
+    }
+
     /// Software moving the ring (Set TR Dequeue Pointer) invalidates the record of where the
     /// last stop left it: a later stop of the then-idle ring must not report it, nor write its
     /// Stopped EDTLA back.
@@ -1136,6 +1299,7 @@ mod tests {
             first_trb: GuestAddress(0x100),
             cycle: false,
             bytes: 0x20,
+            reported: true,
         });
         controller.stop(RingBufferStopCallback::new(|| {}));
         assert!(controller.stopped_td().is_some());

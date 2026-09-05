@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -89,14 +91,28 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
 
     /// The earliest transfer this stop cancelled is the descriptor in progress: its Stopped
     /// Transfer Event goes out now, ahead of the Command Completion the parked ring releases,
-    /// and the ring is left at its first TRB.
-    fn finish_stop(&self) -> anyhow::Result<Option<StoppedTd>> {
+    /// and the ring is left at its first TRB. On a stream endpoint the Stop Endpoint command
+    /// generates ONE such event across all its rings (spec 4.12.1.1: the endpoint has one
+    /// current stream, whose TD is the TD in progress; Windows' USBXHCI verifier discards a
+    /// second as "duplicate Stopped Transfer Events" and strands its URB): the first ring to
+    /// get here with a cancelled descriptor takes `stop_event_claim` and emits, every other
+    /// rewinds silently and reports no Stopped EDTLA.
+    fn finish_stop(
+        &self,
+        stop_event_claim: Option<&Arc<AtomicBool>>,
+    ) -> anyhow::Result<Option<StoppedTd>> {
         let stopped = match self.transfer_manager.take_stopped() {
             Some(stopped) => stopped,
             None => return Ok(None),
         };
+        let reported = match stop_event_claim {
+            Some(claim) => claim
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok(),
+            None => true,
+        };
         debug!(
-            "xhci: slot {} endpoint {} stream {:?}: descriptor at {:#x} stopped at trb {:#x}, {} bytes moved, {} left ({:?})",
+            "xhci: slot {} endpoint {} stream {:?}: descriptor at {:#x} stopped at trb {:#x}, {} bytes moved, {} left ({:?}){}",
             self.slot_id,
             self.endpoint_id,
             self.stream_id,
@@ -104,24 +120,32 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
             stopped.trb_pointer,
             stopped.bytes,
             stopped.residual,
-            stopped.completion_code
+            stopped.completion_code,
+            if reported {
+                ""
+            } else {
+                "; rewound silently, the Stopped event went to another stream ring"
+            }
         );
-        self.interrupter
-            .lock()
-            .send_transfer_event_trb(
-                stopped.completion_code,
-                stopped.trb_pointer,
-                stopped.residual,
-                // ED is clear: the pointer is the TRB in progress, not an Event Data value.
-                false,
-                self.slot_id,
-                self.endpoint_id,
-            )
-            .context("cannot send stopped transfer event")?;
+        if reported {
+            self.interrupter
+                .lock()
+                .send_transfer_event_trb(
+                    stopped.completion_code,
+                    stopped.trb_pointer,
+                    stopped.residual,
+                    // ED is clear: the pointer is the TRB in progress, not an Event Data value.
+                    false,
+                    self.slot_id,
+                    self.endpoint_id,
+                )
+                .context("cannot send stopped transfer event")?;
+        }
         Ok(Some(StoppedTd {
             first_trb: stopped.first_trb,
             cycle: stopped.cycle,
             bytes: stopped.bytes,
+            reported,
         }))
     }
 }
@@ -193,7 +217,7 @@ mod tests {
             stream_id: None,
         };
         assert_eq!(
-            handler.finish_stop().unwrap(),
+            handler.finish_stop(None).unwrap(),
             None,
             "nothing was in flight"
         );
@@ -213,11 +237,12 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            handler.finish_stop().unwrap(),
+            handler.finish_stop(None).unwrap(),
             Some(StoppedTd {
                 first_trb: GuestAddress(0x2000),
                 cycle: true,
                 bytes: 0x150,
+                reported: true,
             })
         );
         let events = f.transfer_events();
@@ -233,7 +258,7 @@ mod tests {
         assert_eq!(event.get_slot_id(), SLOT_ID);
         assert_eq!(event.get_endpoint_id(), 3);
 
-        assert_eq!(handler.finish_stop().unwrap(), None, "reported once");
+        assert_eq!(handler.finish_stop(None).unwrap(), None, "reported once");
         assert_eq!(f.transfer_events().len(), 1);
         assert!(!f.fail_handle.failed());
     }
@@ -294,11 +319,12 @@ mod tests {
 
         // The ring parks: one Stopped event, for TD 2, and the ring is left at it.
         assert_eq!(
-            handler.finish_stop().unwrap(),
+            handler.finish_stop(None).unwrap(),
             Some(StoppedTd {
                 first_trb: GuestAddress(0x2010),
                 cycle: true,
                 bytes: 0x40,
+                reported: true,
             })
         );
         let events = f.transfer_events();
@@ -318,7 +344,129 @@ mod tests {
         );
         assert_eq!(events[1].get_trb_pointer(), 0x2010);
         assert_eq!(events[1].get_trb_transfer_length(), 0xc0);
-        assert_eq!(handler.finish_stop().unwrap(), None, "reported once");
+        assert_eq!(handler.finish_stop(None).unwrap(), None, "reported once");
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A handler for one stream ring of the endpoint under test, with its own manager, the
+    /// way `TransferRingController::new` builds one per Stream Context.
+    fn stream_handler(f: &Fixture, stream_id: u16) -> TransferRingTrbHandler {
+        TransferRingTrbHandler {
+            mem: f.mem.clone(),
+            port: f.port(),
+            interrupter: f.interrupter.clone(),
+            slot_id: SLOT_ID,
+            endpoint_id: 3,
+            transfer_manager: XhciTransferManager::default(),
+            stream_id: Some(stream_id),
+        }
+    }
+
+    /// A Stop Endpoint on a stream endpoint found two stream rings with a TD in flight (run4
+    /// cycle 1: the stream-3 TD was queued in the same millisecond as the stop). One Stopped
+    /// event goes out for the whole endpoint -- the first ring to finish claims it -- and the
+    /// other ring rewinds silently, its record marked unreported so its Stream Context keeps
+    /// its Stopped EDTLA.
+    #[test]
+    fn a_stream_endpoint_stop_reports_one_stopped_event_across_its_rings() {
+        let f = Fixture::new();
+        let h2 = stream_handler(&f, 2);
+        let h3 = stream_handler(&f, 3);
+        f.transfer(&h2.transfer_manager, 3, normal_td(0x2000, &[0x100]))
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x40)
+            .unwrap();
+        f.transfer(&h3.transfer_manager, 3, normal_td(0x3000, &[0x200]))
+            .on_transfer_complete(&TransferStatus::Cancelled, 0)
+            .unwrap();
+
+        let claim = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            h2.finish_stop(Some(&claim)).unwrap(),
+            Some(StoppedTd {
+                first_trb: GuestAddress(0x2000),
+                cycle: true,
+                bytes: 0x40,
+                reported: true,
+            }),
+            "the first ring to finish claims the event"
+        );
+        assert_eq!(
+            h3.finish_stop(Some(&claim)).unwrap(),
+            Some(StoppedTd {
+                first_trb: GuestAddress(0x3000),
+                cycle: true,
+                bytes: 0,
+                reported: false,
+            }),
+            "the other ring still rewinds, silently"
+        );
+
+        let events = f.transfer_events();
+        assert_eq!(events.len(), 1, "one Stopped event per Stop Endpoint command");
+        assert_eq!(
+            events[0].get_completion_code().unwrap(),
+            TrbCompletionCode::Stopped
+        );
+        assert_eq!(events[0].get_trb_pointer(), 0x2000);
+        assert_eq!(events[0].get_trb_transfer_length(), 0xc0);
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A stream whose TD completed before the cancel keeps its completion event and does not
+    /// consume the endpoint's one Stopped event: the claim is left for a ring that really had
+    /// a TD in progress.
+    #[test]
+    fn a_stream_that_completed_before_the_cancel_leaves_the_claim_to_one_that_did_not() {
+        let f = Fixture::new();
+        let h2 = stream_handler(&f, 2);
+        let h3 = stream_handler(&f, 3);
+        // Stream 2's TD landed before the cancel: its ordinary completion event went out.
+        let mut td = normal_td(0x2000, &[0x100]);
+        td[0].trb
+            .cast_mut::<NormalTrb>()
+            .unwrap()
+            .set_interrupt_on_completion(1);
+        f.transfer(&h2.transfer_manager, 3, td)
+            .on_transfer_complete(&TransferStatus::Completed, 0x100)
+            .unwrap();
+        // Stream 3's was cancelled with 0x80 of its 0x200 moved.
+        f.transfer(&h3.transfer_manager, 3, normal_td(0x3000, &[0x200]))
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x80)
+            .unwrap();
+
+        let claim = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            h2.finish_stop(Some(&claim)).unwrap(),
+            None,
+            "nothing was in progress on stream 2"
+        );
+        assert!(
+            !claim.load(Ordering::SeqCst),
+            "a ring with nothing cancelled must not consume the claim"
+        );
+        assert_eq!(
+            h3.finish_stop(Some(&claim)).unwrap(),
+            Some(StoppedTd {
+                first_trb: GuestAddress(0x3000),
+                cycle: true,
+                bytes: 0x80,
+                reported: true,
+            })
+        );
+
+        let events = f.transfer_events();
+        assert_eq!(events.len(), 2, "one Success and one Stopped");
+        assert_eq!(
+            events[0].get_completion_code().unwrap(),
+            TrbCompletionCode::Success
+        );
+        assert_eq!(events[0].get_trb_pointer(), 0x2000);
+        assert_eq!(
+            events[1].get_completion_code().unwrap(),
+            TrbCompletionCode::Stopped
+        );
+        assert_eq!(events[1].get_trb_pointer(), 0x3000);
+        assert_eq!(events[1].get_trb_transfer_length(), 0x180);
         assert!(!f.fail_handle.failed());
     }
 

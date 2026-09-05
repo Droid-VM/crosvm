@@ -852,6 +852,14 @@ impl DeviceSlot {
     /// callback, once every ring has actually stopped and been left at the descriptor it was
     /// executing (spec 4.6.9), right before the Command Completion. Read before the stop, as it
     /// used to be, the pointer was the one past that descriptor.
+    ///
+    /// On a stream endpoint the command generates exactly ONE Stopped Transfer Event however
+    /// many stream rings had a TD in flight (spec 4.12.1.1: the endpoint has one current
+    /// stream, and 4.6.9 promises one event for the TD in progress): the rings share one claim
+    /// on it, the first to finish its stop with a cancelled TD emits, and every other rewinds
+    /// silently -- its Stream Context still gets its pointer and DCS, but no event and no
+    /// Stopped EDTLA. Windows' USBXHCI discards a second Stopped event as a duplicate and
+    /// strands the URB it reported (run4: 16 s on the UAS data-in endpoint's cold attach).
     pub fn stop_endpoint<
         C: FnMut(TrbCompletionCode) -> std::result::Result<(), ()> + 'static + Send,
     >(
@@ -867,6 +875,18 @@ impl DeviceSlot {
         let index = endpoint_id - 1;
         let mut device_context = self.get_device_context()?;
         let endpoint_context = &mut device_context.endpoint_context[index as usize];
+        // Spec 4.6.9: the command is valid only on a Running endpoint; hardware answers any
+        // other state with a Context State Error. Without this a second Stop Endpoint issued
+        // before the first completes would re-arm a fresh claim onto rings still Stopping under
+        // the first command and could report a second Stopped event.
+        if endpoint_context
+            .get_endpoint_state()
+            .map_err(Error::GetEndpointState)?
+            != EndpointState::Running
+        {
+            error!("endpoint at index {} is not running", index);
+            return cb(TrbCompletionCode::ContextStateError).map_err(|_| Error::CallbackFailed);
+        }
         // The callback's last clone lives until the endpoint state below is in guest memory, so
         // a ring that stops at once answers after it, like one that stops later. The closures
         // hold their rings weakly: a ring keeps its stop callback until it parks, and must not
@@ -917,14 +937,25 @@ impl DeviceSlot {
                                     *stream_id,
                                     trc.get_dequeue_pointer(),
                                     trc.get_consumer_cycle_state(),
-                                    trc.stopped_td().map(|td| td.bytes),
+                                    // The Stopped EDTLA goes to the one stream whose ring
+                                    // emitted the Stopped event (6.2.4.1: the stream that left
+                                    // the Move Data state mid-TD); a silently rewound ring's
+                                    // entry keeps the guest's value.
+                                    trc.stopped_td()
+                                        .filter(|td| td.reported)
+                                        .map(|td| td.bytes),
                                 )?;
                             }
                         }
                         cb(TrbCompletionCode::Success).map_err(|_| Error::CallbackFailed)
                     },
                 ));
+                // This command's one Stopped event, whichever ring finishes with a cancelled
+                // TD first: set on every ring before its stop, so no ring can park ahead of
+                // its own claim.
+                let stop_event_claim = Arc::new(AtomicBool::new(false));
                 for trc in trcs.iter().flatten() {
+                    trc.set_stop_event_claim(stop_event_claim.clone());
                     trc.stop(auto_cb.clone());
                 }
                 Some(auto_cb)
@@ -1967,6 +1998,7 @@ mod tests {
 
     use super::test_util::*;
     use super::*;
+    use crate::usb::xhci::ring_buffer_controller::StoppedTd;
 
     fn stream_context(sct: u8, ring: u64, dcs: bool) -> StreamContext {
         let mut ctx = StreamContext::new();
@@ -2589,6 +2621,161 @@ mod tests {
             f.stream_context(1).get_tr_dequeue_pointer().get_gpa(),
             stream_ring(1)
         );
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// The stop cancelled a TD on two stream rings; only the one that won the command's one
+    /// Stopped event carries a Stopped EDTLA into its Stream Context -- the silently rewound
+    /// ring's entry keeps the guest's value, though its pointer and DCS are written back.
+    #[test]
+    fn stop_endpoint_writes_stopped_edtla_only_for_the_stream_that_reported() {
+        let f = stopped_stream_endpoint();
+        f.set_endpoint_state(3, EndpointState::Running);
+        for stream_id in [2u16, 3] {
+            let mut sc = f.stream_context(stream_id);
+            sc.set_stopped_edtla(0x1234);
+            f.set_stream_context(stream_id, sc);
+        }
+        // What the rings' stops record: stream 2's won the claim and emitted, stream 3's lost
+        // and rewound silently.
+        let trcs = stream_trcs(&f.slot(), 3);
+        trcs[1].as_ref().unwrap().set_stopped_td_for_test(Some(StoppedTd {
+            first_trb: stream_ring(2),
+            cycle: true,
+            bytes: 0x150,
+            reported: true,
+        }));
+        trcs[2].as_ref().unwrap().set_stopped_td_for_test(Some(StoppedTd {
+            first_trb: stream_ring(3),
+            cycle: true,
+            bytes: 0x99,
+            reported: false,
+        }));
+
+        let completed = Arc::new(Mutex::new(None));
+        let done = completed.clone();
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, move |code| {
+                *done.lock() = Some(code);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(*completed.lock(), Some(TrbCompletionCode::Success));
+
+        assert_eq!(
+            f.stream_context(2).get_stopped_edtla(),
+            0x150,
+            "the reporting stream gets its Stopped EDTLA"
+        );
+        assert_eq!(
+            f.stream_context(3).get_stopped_edtla(),
+            0x1234,
+            "the silent stream keeps the guest's"
+        );
+        for stream_id in [2u16, 3] {
+            assert_eq!(
+                f.stream_context(stream_id).get_tr_dequeue_pointer().get_gpa(),
+                stream_ring(stream_id),
+                "stream {stream_id}: the position is written back either way"
+            );
+            assert!(f.stream_context(stream_id).get_dequeue_cycle_state());
+        }
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A Stop Endpoint on a stream endpoint arms every populated ring with one shared claim on
+    /// the command's one Stopped event, before any ring stops.
+    #[test]
+    fn stop_endpoint_hands_every_stream_ring_one_shared_stop_event_claim() {
+        let f = stopped_stream_endpoint();
+        f.set_endpoint_state(3, EndpointState::Running);
+        let completed = Arc::new(Mutex::new(None));
+        let done = completed.clone();
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, move |code| {
+                *done.lock() = Some(code);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(*completed.lock(), Some(TrbCompletionCode::Success));
+
+        let trcs = stream_trcs(&f.slot(), 3);
+        let claim = trcs[0]
+            .as_ref()
+            .unwrap()
+            .stop_event_claim_for_test()
+            .expect("the stop must arm stream 1");
+        for (i, trc) in trcs.iter().enumerate() {
+            if let Some(trc) = trc {
+                let c = trc
+                    .stop_event_claim_for_test()
+                    .unwrap_or_else(|| panic!("stream {} was not armed", i + 1));
+                assert!(
+                    Arc::ptr_eq(&c, &claim),
+                    "stream {} must share the command's one claim",
+                    i + 1
+                );
+            }
+        }
+        assert!(
+            !claim.load(Ordering::SeqCst),
+            "no ring had a TD in flight: the event goes unclaimed"
+        );
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// Spec 4.6.9: Stop Endpoint is valid only on a Running endpoint -- hardware answers any
+    /// other state with a Context State Error. An endpoint already Stopped (what a
+    /// spec-violating second stop, sent before the first completed, would find) is left alone:
+    /// no ring is armed with a claim, so no second Stopped event can follow.
+    #[test]
+    fn stop_endpoint_of_a_not_running_endpoint_is_a_context_state_error() {
+        let f = stopped_stream_endpoint();
+        let completed = Arc::new(Mutex::new(None));
+        let done = completed.clone();
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, move |code| {
+                *done.lock() = Some(code);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(*completed.lock(), Some(TrbCompletionCode::ContextStateError));
+        for (i, trc) in stream_trcs(&f.slot(), 3).iter().enumerate() {
+            if let Some(trc) = trc {
+                assert!(
+                    trc.stop_event_claim_for_test().is_none(),
+                    "stream {} must not be armed by a rejected stop",
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(
+            f.endpoint_context(3).get_endpoint_state().unwrap(),
+            EndpointState::Stopped
+        );
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A plain endpoint has no sibling rings to share its Stopped event with: its stop sets no
+    /// claim, and its lone ring reports as before.
+    #[test]
+    fn stop_endpoint_without_streams_sets_no_claim() {
+        let f = Fixture::new();
+        f.write_input_context(0, 1 << 3, 3, bulk_endpoint_context(3));
+        assert_eq!(
+            f.slot()
+                .configure_endpoint(&f.configure_endpoint_trb())
+                .unwrap(),
+            TrbCompletionCode::Success
+        );
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, |_| Ok(()))
+            .unwrap();
+        let trc = match f.slot().get_trcs(2) {
+            Some(TransferRingControllers::Endpoint(trc)) => trc,
+            _ => panic!("DCI 3 must be a plain endpoint"),
+        };
+        assert!(trc.stop_event_claim_for_test().is_none());
         assert!(!f.fail_handle.failed());
     }
 
