@@ -97,6 +97,8 @@ use devices::virtio::device_constants::video::VideoDeviceType;
 #[cfg(any(feature = "gpu", feature = "vnc"))]
 use devices::virtio::gpu::EventDevice;
 #[cfg(feature = "media")]
+use devices::virtio::media::pool::carve_slices;
+#[cfg(feature = "media")]
 use devices::virtio::media::MediaPool;
 #[cfg(target_arch = "x86_64")]
 use devices::virtio::memory_mapper::MemoryMapper;
@@ -1158,11 +1160,18 @@ fn create_virtio_devices(
         // device: the offsets it hands out are what the guest maps, so two allocators over the
         // same window would alias each other's buffers (VPU_DESIGN.md §2.2, review B2). One dup
         // of the descriptor and one host mapping for the whole VM.
-        let pool = if media_devices.is_empty() {
+        //
+        // A device with `uid=` runs in a helper process, which cannot share this allocator: it
+        // rebuilds the pool from its own memory table and allocates on its own. So the offset
+        // space is carved up here, one slice per helper (the in-VMM devices together keep one
+        // more), and each helper is told its slice. Before that, three helpers over one window
+        // each handed out offset 0 first, and the encoder's coded-frame writes landed inside
+        // the camera's raw buffers -- D49's band of noise (logs/vpu_wp/F12-encoder.md).
+        let handle = if media_devices.is_empty() {
             None
         } else {
             match MediaPoolHandle::from_guest_memory(vm.get_memory()) {
-                Some(handle) => Some(MediaPool::new(handle)?),
+                Some(handle) => Some(handle),
                 None if hypervisor_is_gunyah(cfg) => {
                     // No silent fallback to the shared-memory BAR here: on Gunyah it would not
                     // fit next to the GPU's, and the guest would find a device with no usable
@@ -1174,12 +1183,52 @@ fn create_virtio_devices(
                 None => None,
             }
         };
+        let (pool, helper_slices) = match handle {
+            None => (None, vec![None; media_devices.len()]),
+            Some(handle) => {
+                // The decoder weighs double: its CAPTURE queue holds a decoded-frame queue in
+                // pool memory, where the camera and the encoder keep a handful of frames.
+                let mut weights: Vec<u64> = media_devices
+                    .iter()
+                    .map(|c| match (c.uid, c.kind) {
+                        (None, _) => 0,
+                        (Some(_), MediaDeviceKind::Decoder) => 2,
+                        (Some(_), _) => 1,
+                    })
+                    .collect();
+                let helpers = weights.iter().filter(|w| **w > 0).count();
+                let in_vmm = media_devices.len() - helpers;
+                if in_vmm > 0 {
+                    weights.push(1);
+                }
+                let allocators = helpers + usize::from(in_vmm > 0);
+                if allocators > 1 {
+                    let mut slices = carve_slices(handle.size, &weights);
+                    let vmm_slice = if in_vmm > 0 { slices.pop() } else { None };
+                    let helper_slices = slices
+                        .into_iter()
+                        .zip(&weights)
+                        .map(|(slice, w)| (*w > 0).then_some(slice))
+                        .collect();
+                    (
+                        Some(MediaPool::with_slice(handle, vmm_slice)?),
+                        helper_slices,
+                    )
+                } else {
+                    (
+                        Some(MediaPool::new(handle)?),
+                        vec![None; media_devices.len()],
+                    )
+                }
+            }
+        };
 
-        for media_cfg in media_devices {
+        for (media_cfg, pool_slice) in media_devices.into_iter().zip(helper_slices) {
             devs.push(create_virtio_media_device(
                 cfg.protection_type,
                 media_cfg,
                 pool.clone(),
+                pool_slice,
                 vm.get_memory(),
                 worker_process_pids,
                 helper_pid_labels,
