@@ -1476,20 +1476,23 @@ fn create_unprivileged_virtio_media_device(
     )
     .context("failed to launch the unprivileged media backend")?;
     drop(pool_helper_end);
-    // The card name the pool's log lines use -- the exhaustion line names who asked, the sweep
-    // thread is found in `ps -T` by it. When `card=` was not given this is the kind's name,
-    // which can differ from the default card string the helper serves; both name the same
-    // device.
+    // The child exists from here on, so it is recorded and labelled BEFORE anything below can
+    // fail out of this function (R8-10): a clean exit is then never reported as a device
+    // crashing, anything else is reported under a name, and a failed server-thread spawn
+    // cannot leave an unlabelled orphan no reaper knows.
+    worker_process_pids.insert(pid);
+    helper_pid_labels.insert(pid as u32, "media helper".to_string());
+    // The card name the pool's log lines and server thread start under: `card=` when given,
+    // else the kind's name. The helper's Hello then replaces it with the default card string
+    // the device actually serves (`droidvm decoder`, `camera <id>`, ...), so the VMM's pool
+    // lines end up naming what the guest's `v4l2-ctl --info` shows; this launch's log line
+    // below keeps kind + card for the mapping between the two spellings.
     let pool_card = config
         .card
         .clone()
         .unwrap_or_else(|| config.kind.as_str().to_string());
     pool.spawn_server(&pool_card, pool_server_end)
         .context("failed to start the media pool server thread")?;
-    // So that the child exiting cleanly is not reported as a device crashing, and anything else
-    // is, under a name.
-    worker_process_pids.insert(pid);
-    helper_pid_labels.insert(pid as u32, "media helper".to_string());
     // The child exec'd /proc/self/exe, so its `comm` is `exe` and no `ps` will ever show what it
     // is: this line is the only place a running helper is named (B4 §5.1, defect D14). Find it
     // later by cmdline, not by name -- `deploy/vpu/README.md` has the one-liner.
