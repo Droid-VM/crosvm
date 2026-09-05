@@ -195,6 +195,18 @@ where
         }
     }
 
+    /// Park the ring because its endpoint just halted on an error. Hardware executes nothing
+    /// more from a halted ring until software resets the endpoint and rings the doorbell, so the
+    /// descriptors the guest queued behind the failed one must stay where they are. Nothing is in
+    /// flight any more (the failing descriptor is the one completing), so any stop the guest is
+    /// waiting on is answered now.
+    pub fn halt(&self) {
+        xhci_trace!("halt {}", self.name);
+        let mut state = self.state.lock();
+        *state = RingBufferState::Stopped;
+        self.stop_callback.lock().clear();
+    }
+
     /// Stop the ring buffer asynchronously.
     pub fn stop(&self, callback: RingBufferStopCallback) {
         xhci_trace!("stop {}", self.name);
@@ -425,6 +437,61 @@ mod tests {
         assert_eq!(rx.recv().unwrap(), 4);
         assert_eq!(rx.recv().unwrap(), 5);
         assert_eq!(rx.recv().unwrap(), 6);
+        l.stop();
+        j.join().unwrap();
+    }
+
+    /// Hands each descriptor's completion event back to the test instead of signalling it, so
+    /// the test decides when a transfer "completes".
+    struct HeldHandler {
+        sender: Sender<(i32, Event)>,
+    }
+
+    impl TransferDescriptorHandler for HeldHandler {
+        fn handle_transfer_descriptor(
+            &self,
+            descriptor: TransferDescriptor,
+            complete_event: Event,
+        ) -> anyhow::Result<()> {
+            let first = descriptor[0].trb.get_parameter() as i32;
+            self.sender.send((first, complete_event)).unwrap();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn halt_parks_the_ring_until_the_next_doorbell() {
+        let (tx, rx) = channel();
+        let mem = setup_mem();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let controller = RingBufferController::new_with_handler(
+            "".to_string(),
+            mem,
+            l.clone(),
+            HeldHandler { sender: tx },
+        )
+        .unwrap();
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (first, complete) = rx.recv().unwrap();
+        assert_eq!(first, 1);
+
+        // The endpoint halts on this descriptor: park the ring, then let the completion arrive.
+        // The descriptor queued behind it (5, 6) must stay on the ring.
+        controller.halt();
+        complete.signal().unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a halted ring must not hand out the next descriptor"
+        );
+
+        // Software resets the endpoint and rings the doorbell: the ring resumes where it was.
+        controller.start();
+        let (next, _) = rx.recv().unwrap();
+        assert_eq!(next, 5);
         l.stop();
         j.join().unwrap();
     }

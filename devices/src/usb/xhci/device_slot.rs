@@ -814,11 +814,18 @@ impl DeviceSlot {
     }
 
     /// Set transfer ring dequeue pointer.
+    ///
+    /// The command carries the consumer cycle state to use at the new pointer (spec 6.4.3.9,
+    /// DCS): software is free to point the ring anywhere, including past a link TRB it never let
+    /// the controller walk, or at a freshly initialised ring, and the cycle it hands over is the
+    /// only way to know which TRBs there are its. Keeping the old cycle state would make a valid
+    /// TRB at the new pointer look unowned and the ring look empty.
     pub fn set_tr_dequeue_ptr(
         &self,
         endpoint_id: u8,
         stream_id: u16,
         ptr: u64,
+        dequeue_cycle_state: bool,
     ) -> Result<TrbCompletionCode> {
         if !valid_endpoint_id(endpoint_id) {
             error!("trb indexing wrong endpoint id");
@@ -828,9 +835,11 @@ impl DeviceSlot {
         match self.get_trc(index, stream_id) {
             Some(trc) => {
                 trc.set_dequeue_pointer(GuestAddress(ptr));
+                trc.set_consumer_cycle_state(dequeue_cycle_state);
                 let mut ctx = self.get_device_context()?;
                 ctx.endpoint_context[index]
                     .set_tr_dequeue_pointer(DequeuePtr::new(GuestAddress(ptr)));
+                ctx.endpoint_context[index].set_dequeue_cycle_state(dequeue_cycle_state);
                 self.set_device_context(ctx)?;
                 Ok(TrbCompletionCode::Success)
             }
@@ -1057,9 +1066,14 @@ impl DeviceSlot {
         let index = endpoint_id - 1;
         let mut device_context = self.get_device_context()?;
         let endpoint_context = &mut device_context.endpoint_context[index as usize];
+        // A halted endpoint processes no more TRBs until software resets it and rings the
+        // doorbell again (spec 4.8.3): park the ring here, or the controller would carry on
+        // executing whatever the guest had queued behind the failed TD and answer the retries the
+        // guest issues after its Set TR Dequeue Pointer twice.
         match self.get_trcs(index as usize) {
             Some(trcs) => match trcs {
                 TransferRingControllers::Endpoint(trc) => {
+                    trc.halt();
                     endpoint_context
                         .set_tr_dequeue_pointer(DequeuePtr::new(trc.get_dequeue_pointer()));
                     endpoint_context.set_dequeue_cycle_state(trc.get_consumer_cycle_state());
@@ -1072,6 +1086,7 @@ impl DeviceSlot {
                         .read_obj_from_addr(stream_context_array_addr)
                         .map_err(Error::ReadGuestMemory)?;
                     for (i, trc) in trcs.iter().enumerate() {
+                        trc.halt();
                         stream_context_array.stream_contexts[i + 1]
                             .set_tr_dequeue_pointer(DequeuePtr::new(trc.get_dequeue_pointer()));
                         stream_context_array.stream_contexts[i + 1]
