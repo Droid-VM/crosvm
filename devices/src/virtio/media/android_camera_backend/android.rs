@@ -86,7 +86,10 @@ use virtio_media::devices::camera::FrameSize;
 use virtio_media::devices::camera::StreamRequest;
 
 /// Fewest `AImage`s the reader may hold: `AImageReader_acquireLatestImage` needs two free slots
-/// besides the one being copied to discard anything (`NdkImageReader.h`).
+/// besides the one being copied to discard anything (`NdkImageReader.h:239-245` in NDK r29 --
+/// "calling ... with less than two images of margin, that is (maxImages - currentAcquiredImages
+/// < 2) will not discard as expected"). The thread holds one image, so 2 would already do; 3 is
+/// the conservative choice.
 const MIN_READER_DEPTH: u32 = 3;
 /// Most: the capture thread holds one image at a time and copies it out, so depth beyond a few
 /// only buys the HAL slack, at a gralloc buffer of a frame each.
@@ -437,6 +440,8 @@ fn capture_loop(
     let mut empties: VecDeque<EmptyBuffer> = VecDeque::new();
     let mut sequence = 0u32;
     let mut dropped = 0u64;
+    // Discarded since the last frame was handed over; see where `sequence` is set.
+    let mut dropped_since_delivery = 0u32;
     let mut stalled = Duration::ZERO;
 
     let fail = |why: String| {
@@ -461,7 +466,10 @@ fn capture_loop(
             // comes, so let it go (and keep the reader from backing up), then wait on the
             // commands rather than on the camera so a buffer or a Stop is seen at once.
             match camera.next_frame_latest(Duration::ZERO) {
-                Ok(Some(_frame)) => dropped += 1,
+                Ok(Some(_frame)) => {
+                    dropped += 1;
+                    dropped_since_delivery = dropped_since_delivery.saturating_add(1);
+                }
                 Ok(None) => (),
                 Err(e) => return fail(format!("acquiring a frame failed: {e}")),
             }
@@ -496,6 +504,13 @@ fn capture_loop(
             Ok(bytes) => bytes,
             Err(why) => return fail(why),
         };
+        // V4L2 counts `sequence` from the start of streaming, gaps included: a guest detects
+        // frame loss by the jump, and `ffmpeg -f v4l2` and `v4l2src` both look for it. So the
+        // numbers of the frames discarded above are skipped rather than reused (review-m4 R8).
+        // Frames `AImageReader_acquireLatestImage` itself dropped inside `next_frame_latest` are
+        // not counted -- the NDK does not say how many there were.
+        sequence = sequence.wrapping_add(dropped_since_delivery);
+        dropped_since_delivery = 0;
         let _ = filled.send(FilledBuffer {
             index: buffer.index,
             bytesused,
@@ -583,6 +598,16 @@ fn copy_frame(
                     first.row_stride, w
                 ));
             }
+            // The union of the two plane ranges is one region only because each covers at
+            // least one byte: with an empty plane the first byte would be outside both and
+            // `available` would describe memory this code may not read (review-m4 R10).
+            if u.is_empty() || v.is_empty() {
+                return Err(format!(
+                    "interleaved chroma with an empty plane (u {} bytes, v {} bytes)",
+                    u.len(),
+                    v.len()
+                ));
+            }
             let start = first.as_ptr() as usize;
             let end = (u.as_ptr() as usize + u.len()).max(v.as_ptr() as usize + v.len());
             let available = end.saturating_sub(start);
@@ -593,7 +618,9 @@ fn copy_frame(
                 let have = w.min(available.saturating_sub(offset));
                 let dst_row = (h + row) * stride;
                 // SAFETY: `offset + have <= available`, so the source bytes are inside the
-                // region the two planes span; the destination row is inside the buffer.
+                // region the two planes span, and the one byte past them the NV21 tail may read
+                // is taken only when it is inside it too; the destination row is inside the
+                // buffer.
                 unsafe {
                     let src_row = src.add(offset);
                     if layout == YuvLayout::Nv12 {
@@ -605,10 +632,15 @@ fn copy_frame(
                             *out.add(dst_row + 2 * pair) = *src_row.add(2 * pair + 1);
                             *out.add(dst_row + 2 * pair + 1) = *src_row.add(2 * pair);
                         }
-                        // An odd trailing byte is a Cr with no Cb beside it: it is the second
-                        // byte of the last pair in NV12 order, and the Cb before it is neutral.
+                        // An odd row ends on a Cb slot in NV12 order (`have - 1` is even), and
+                        // its sample sits one byte further into the source than the pairs
+                        // above, NV21 being Cr,Cb. Take it when the region really holds it --
+                        // it does for every row but, possibly, the last -- and pad only when it
+                        // does not (review-m4 R9).
                         if have % 2 == 1 {
-                            *out.add(dst_row + have - 1) = 0x80;
+                            let cb = offset + have;
+                            *out.add(dst_row + have - 1) =
+                                if cb < available { *src.add(cb) } else { 0x80 };
                         }
                     }
                     if have < w {
