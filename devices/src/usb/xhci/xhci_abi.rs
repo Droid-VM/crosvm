@@ -32,6 +32,10 @@ const TRB_SIZE: usize = 16;
 // Size of segment table.
 const SEGMENT_TABLE_SIZE: usize = 16;
 
+/// Size of one Stream Context (spec 6.2.4.1); a Stream Context Array is `2^(MaxPStreams+1)` of
+/// them back to back.
+pub const STREAM_CONTEXT_SIZE: usize = 16;
+
 /// All kinds of trb.
 #[bitfield]
 #[bits = 6]
@@ -70,10 +74,17 @@ pub enum TrbCompletionCode {
     TransactionError = 4,
     TrbError = 5,
     StallError = 6,
+    ResourceError = 7,
+    BandwidthError = 8,
     NoSlotsAvailableError = 9,
+    InvalidStreamTypeError = 10,
     SlotNotEnabledError = 11,
+    EndpointNotEnabledError = 12,
     ShortPacket = 13,
+    ParameterError = 17,
     ContextStateError = 19,
+    Stopped = 26,
+    InvalidStreamIdError = 34,
 }
 
 /// State of device slot.
@@ -944,5 +955,6 @@ mod tests {
             std::mem::size_of::<DeviceContext>(),
             32 * DEVICE_CONTEXT_ENTRY_SIZE
         );
+        assert_eq!(std::mem::size_of::<StreamContext>(), STREAM_CONTEXT_SIZE);
     }
 }

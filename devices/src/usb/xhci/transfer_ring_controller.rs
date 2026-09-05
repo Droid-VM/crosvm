@@ -26,7 +26,11 @@ pub type TransferRingController = RingBufferController<TransferRingTrbHandler>;
 #[derive(Clone)]
 pub enum TransferRingControllers {
     Endpoint(Arc<TransferRingController>),
-    Stream(Vec<Arc<TransferRingController>>),
+    /// One entry per primary Stream Context, index = stream id - 1, length
+    /// 2^(MaxPStreams+1) - 1. `None` is a Not Valid Stream Context (spec 6.2.4.1, Table 6-13):
+    /// the guest only initialises the streams it opened, and a doorbell on any other is an
+    /// error at use, not at Configure Endpoint.
+    Stream(Vec<Option<Arc<TransferRingController>>>),
 }
 
 pub type TransferRingControllerError = RingBufferControllerError;
@@ -89,8 +93,15 @@ impl TransferRingController {
         device_slot: Weak<DeviceSlot>,
         stream_id: Option<u16>,
     ) -> Result<Arc<TransferRingController>, TransferRingControllerError> {
+        let name = match stream_id {
+            Some(stream_id) => format!(
+                "transfer ring slot_{} ep_{} stream_{}",
+                slot_id, endpoint_id, stream_id
+            ),
+            None => format!("transfer ring slot_{} ep_{}", slot_id, endpoint_id),
+        };
         RingBufferController::new_with_handler(
-            format!("transfer ring slot_{} ep_{}", slot_id, endpoint_id),
+            name,
             mem.clone(),
             event_loop,
             TransferRingTrbHandler {
