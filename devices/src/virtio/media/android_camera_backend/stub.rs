@@ -75,4 +75,9 @@ impl CameraBackend for AndroidCameraBackend {
     ) -> Result<AndroidCameraStream, i32> {
         Err(libc::ENODEV)
     }
+
+    /// No stream ever runs here, so there is nothing to apply to.
+    fn set_controls(&mut self, _controls: &[CameraControl]) -> Result<(), i32> {
+        Ok(())
+    }
 }
