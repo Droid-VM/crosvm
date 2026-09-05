@@ -5,6 +5,7 @@
 use std::time::Duration;
 use std::time::Instant;
 
+use base::debug;
 use base::Clock;
 use base::Error as SysError;
 use base::Event;
@@ -40,6 +41,8 @@ pub enum Error {
     ArmModerationTimer(SysError),
     #[error("cannot cast trb: {0}")]
     CastTrb(TrbError),
+    #[error("cannot disarm interrupt moderation timer: {0}")]
+    ClearModerationTimer(SysError),
     #[error("cannot create interrupt moderation timer: {0}")]
     CreateModerationTimer(SysError),
     #[error("cannot send interrupt: {0}")]
@@ -57,6 +60,7 @@ type Result<T> = std::result::Result<T, Error>;
 /// See spec 4.17 for interrupters. Controller can send an event back to guest kernel driver
 /// through interrupter.
 pub struct Interrupter {
+    mem: GuestMemory,
     interrupt_evt: Event,
     usbsts: Register<u32>,
     iman: Register<u32>,
@@ -83,6 +87,7 @@ impl Interrupter {
         let clock = Clock::new();
         let moderation_timer = Timer::new().map_err(Error::CreateModerationTimer)?;
         Ok(Interrupter {
+            mem: mem.clone(),
             interrupt_evt: irq_evt,
             usbsts: regs.usbsts.clone(),
             iman: regs.iman.clone(),
@@ -105,6 +110,27 @@ impl Interrupter {
         &self.moderation_timer
     }
 
+    /// Host controller reset (USBCMD.HCRST, spec 4.2): everything behind the interrupter registers
+    /// goes back to its power-on state. The event ring is uninitialized again until the guest
+    /// programs ERSTSZ, ERSTBA and ERDP, so an event raised in between -- the hub re-announcing its
+    /// ports as part of the same reset -- waits in PORTSC instead of being written into the ring
+    /// the previous owner of the controller set up (the firmware's, once the kernel has taken over
+    /// and that memory is the kernel's). The registers themselves belong to the caller.
+    pub fn reset(&mut self) -> Result<()> {
+        xhci_trace!("interrupter reset");
+        self.moderation_timer
+            .clear()
+            .map_err(Error::ClearModerationTimer)?;
+        self.moderation_timer_armed = false;
+        self.event_handler_busy = false;
+        self.enabled = false;
+        self.moderation_interval = 4000;
+        self.moderation_counter = 0;
+        self.event_ring = EventRing::new(self.mem.clone());
+        self.last_interrupt_time = self.clock.now();
+        Ok(())
+    }
+
     /// The moderation window has ended: deliver whatever the window held back.
     pub fn on_moderation_timer(&mut self) -> Result<()> {
         self.moderation_timer
@@ -123,6 +149,26 @@ impl Interrupter {
     fn add_event(&mut self, trb: Trb) -> Result<()> {
         self.event_ring.add_event(trb).map_err(Error::AddEvent)?;
         self.interrupt_if_needed()
+    }
+
+    /// Add the completion event of a command or transfer the guest issued.
+    ///
+    /// A guest with no event ring has reset the controller (HCRST) while this completion was on
+    /// its way: a transfer ring parks the moment its last completion is signalled, before the
+    /// event is written, and a command completing on a transfer ring can land after the reset
+    /// as well. The guest has given up everything the event could tell it, so the event is
+    /// dropped. Failing the controller for it, as any other event ring error does, would turn a
+    /// benign race into a dead xHCI. A port change is not handled here: the hub keeps it in
+    /// PORTSC itself.
+    fn add_completion_event(&mut self, trb: Trb) -> Result<()> {
+        match self.event_ring.add_event(trb) {
+            Ok(()) => self.interrupt_if_needed(),
+            Err(EventRingError::Uninitialized) => {
+                debug!("xhci: completion event dropped: the guest has no event ring");
+                Ok(())
+            }
+            Err(e) => Err(Error::AddEvent(e)),
+        }
     }
 
     /// Send port status change trb for port.
@@ -154,7 +200,7 @@ impl Interrupter {
         ctrb.set_trb_type(TrbType::CommandCompletionEvent);
         ctrb.set_vf_id(0);
         ctrb.set_slot_id(slot_id);
-        self.add_event(trb)
+        self.add_completion_event(trb)
     }
 
     /// Send transfer event trb.
@@ -176,7 +222,7 @@ impl Interrupter {
         event_trb.set_trb_type(TrbType::TransferEvent);
         event_trb.set_endpoint_id(endpoint_id);
         event_trb.set_slot_id(slot_id);
-        self.add_event(trb)
+        self.add_completion_event(trb)
     }
 
     /// Enable/Disable this interrupter.
@@ -368,6 +414,90 @@ mod tests {
         assert!(intr.moderation_timer_armed);
         thread::sleep(Duration::from_millis(12));
         intr.on_moderation_timer().unwrap();
+        assert!(signaled(&irq));
+    }
+
+    #[test]
+    fn reset_returns_event_ring_to_uninitialized() {
+        let (mut intr, irq) = interrupter();
+        intr.set_moderation(32000, 0).unwrap();
+        intr.send_port_status_change_trb(1).unwrap();
+        assert!(signaled(&irq));
+        // A second event inside the window: the ring holds it and the timer is armed.
+        intr.set_event_ring_dequeue_pointer(GuestAddress(SEGMENT_BASE + TRB_SIZE), false)
+            .unwrap();
+        intr.send_port_status_change_trb(2).unwrap();
+        assert!(!intr.event_ring_is_empty());
+        assert!(intr.moderation_timer_armed);
+
+        // HCRST: the guest's event ring is forgotten, nothing is pending, nothing is armed.
+        intr.reset().unwrap();
+        assert!(intr.event_ring_is_empty());
+        assert!(!intr.moderation_timer_armed);
+        assert!(!intr.enabled);
+        assert!(!intr.event_handler_busy);
+        assert_eq!(intr.moderation_interval, 4000);
+        assert!(
+            matches!(
+                intr.send_port_status_change_trb(3),
+                Err(Error::AddEvent(EventRingError::Uninitialized))
+            ),
+            "an event after reset must find no event ring, as before the guest set one up"
+        );
+        assert!(
+            !matches!(
+                irq.wait_timeout(Duration::from_millis(20)).unwrap(),
+                EventWaitResult::Signaled
+            ),
+            "no interrupt after reset"
+        );
+
+        // The guest sets the ring up again and events flow as on a fresh controller.
+        intr.set_event_ring_seg_table_size(1).unwrap();
+        intr.set_event_ring_seg_table_base_addr(GuestAddress(0x8))
+            .unwrap();
+        intr.set_event_ring_dequeue_pointer(GuestAddress(SEGMENT_BASE), false)
+            .unwrap();
+        intr.set_enabled(true).unwrap();
+        intr.send_port_status_change_trb(3).unwrap();
+        assert!(signaled(&irq));
+    }
+
+    /// A completion that reaches the interrupter after a reset -- a transfer ring parks before
+    /// its event is written, so a reset can slip in between -- has no ring to go to and is
+    /// dropped; it must not fail the controller. A port change keeps failing here: the hub
+    /// handles that one itself.
+    #[test]
+    fn completion_events_without_an_event_ring_are_dropped() {
+        let (mut intr, irq) = interrupter();
+        intr.reset().unwrap();
+        intr.set_enabled(true).unwrap();
+        intr.send_transfer_event_trb(TrbCompletionCode::Success, 0x1000, 0, false, 1, 1)
+            .unwrap();
+        intr.send_command_completion_trb(TrbCompletionCode::Success, 1, GuestAddress(0x2000))
+            .unwrap();
+        assert!(matches!(
+            intr.send_port_status_change_trb(1),
+            Err(Error::AddEvent(EventRingError::Uninitialized))
+        ));
+        assert!(intr.event_ring_is_empty());
+        assert!(
+            !matches!(
+                irq.wait_timeout(Duration::from_millis(20)).unwrap(),
+                EventWaitResult::Signaled
+            ),
+            "nothing to interrupt for"
+        );
+
+        // With a ring, the same completions are delivered.
+        intr.set_event_ring_seg_table_size(1).unwrap();
+        intr.set_event_ring_seg_table_base_addr(GuestAddress(0x8))
+            .unwrap();
+        intr.set_event_ring_dequeue_pointer(GuestAddress(SEGMENT_BASE), false)
+            .unwrap();
+        intr.send_transfer_event_trb(TrbCompletionCode::Success, 0x1000, 0, false, 1, 1)
+            .unwrap();
+        assert!(!intr.event_ring_is_empty());
         assert!(signaled(&irq));
     }
 }

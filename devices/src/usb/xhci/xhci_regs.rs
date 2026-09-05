@@ -319,11 +319,15 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
     );
     mmio.add_register(dnctrl.clone());
 
+    // CRCR resets to 0 (spec 5.4.5): pointer 0, RCS 0 and, above all, CRR 0. It used to reset
+    // to 9 = RCS | CRR, so the command ring read as running from power-on and the guest's very
+    // first CRCR write was refused; only USBCMD R/S=0 ever cleared it. CRR is not guest-writeable
+    // (bit 3 is out of the mask): the controller alone sets it, from doorbell 0.
     let crcr = register!(
         name: "crcr",
         ty: u64,
         offset: 0x38,
-        reset_value: 9,
+        reset_value: 0,
         guest_writeable_mask: 0xFFFFFFFFFFFFFFC7,
         guest_write_1_to_clear_mask: 0,
     );

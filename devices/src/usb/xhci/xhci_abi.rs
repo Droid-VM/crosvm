@@ -83,6 +83,7 @@ pub enum TrbCompletionCode {
     ShortPacket = 13,
     ParameterError = 17,
     ContextStateError = 19,
+    CommandRingStopped = 24,
     Stopped = 26,
     InvalidStreamIdError = 34,
 }

@@ -209,23 +209,14 @@ impl DeviceSlots {
         Ok(())
     }
 
-    /// Stop all device slots and reset them.
-    pub fn stop_all_and_reset<C: FnMut() + 'static + Send>(&self, mut callback: C) {
-        info!("xhci: stopping all device slots and resetting host hub");
-        let slots = self.slots.clone();
-        let hub = self.hub.clone();
-        let auto_callback = RingBufferStopCallback::new(fallible_closure(
-            self.fail_handle.clone(),
-            move || -> std::result::Result<(), usb_hub::Error> {
-                for slot in &slots {
-                    slot.reset();
-                }
-                hub.reset()?;
-                callback();
-                Ok(())
-            },
-        ));
-        self.stop_all(auto_callback);
+    /// Reset every device slot and the host hub: the slot half of a host controller reset. Only
+    /// once every transfer ring is stopped -- run it from the callback given to `stop_all`.
+    pub fn reset_all(&self) -> std::result::Result<(), usb_hub::Error> {
+        info!("xhci: resetting all device slots and the host hub");
+        for slot in &self.slots {
+            slot.reset();
+        }
+        self.hub.reset()
     }
 
     /// Stop all devices. The auto callback will be executed when all trc is stopped. It could
@@ -419,8 +410,13 @@ impl DeviceSlot {
     }
 
     fn set_trcs(&self, i: usize, trc: Option<TransferRingControllers>) {
-        let mut trcs = self.transfer_ring_controllers.lock();
-        trcs[i] = trc;
+        let old = {
+            let mut trcs = self.transfer_ring_controllers.lock();
+            std::mem::replace(&mut trcs[i], trc)
+        };
+        // The old ring goes with the lock released: its drop takes it off the event loop and
+        // runs whatever stop callback it still held, and neither may find this slot locked.
+        drop(old);
     }
 
     fn trc_len(&self) -> usize {

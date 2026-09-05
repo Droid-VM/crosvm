@@ -12,7 +12,6 @@ use std::sync::MutexGuard;
 use anyhow::Context;
 use base::debug;
 use base::error;
-use base::info;
 use base::Error as SysError;
 use base::Event;
 use base::EventType;
@@ -221,19 +220,28 @@ where
         xhci_trace!("stop {}", self.name);
         let mut state = self.state.lock();
         if *state == RingBufferState::Stopped {
-            info!("xhci: {} is already stopped", self.name);
+            debug!("xhci: {} is already stopped", self.name);
             return;
         }
         // Only wait when there is something to wait for. A ring that is Running but idle (the
         // guest rang the doorbell and nothing was queued, or a descriptor was answered without a
         // completion signal) has no completion coming to move it to Stopped, and the guest's Stop
         // Endpoint command would never be answered.
-        let handler = self.handler.lock();
-        if handler.stop() && !handler.is_quiesced() {
+        let pending = {
+            let handler = self.handler.lock();
+            handler.stop() && !handler.is_quiesced()
+        };
+        if pending {
             *state = RingBufferState::Stopping;
             self.stop_callback.lock().push(callback);
         } else {
+            // Parked here rather than from `on_event`, so the stops already waiting on this
+            // ring -- it was Stopping, its last transfer completed and signalled, and the
+            // completion has not been dispatched yet -- are answered now, ahead of this one
+            // (`callback` drops last, on return). A Stopped ring never keeps a callback: one
+            // left behind would fire whenever the ring is dropped, wherever that happens.
             *state = RingBufferState::Stopped;
+            self.stop_callback.lock().clear();
         }
     }
 }
@@ -520,6 +528,128 @@ mod tests {
         controller.start();
         let (next, _) = rx.recv().unwrap();
         assert_eq!(next, 5);
+        l.stop();
+        j.join().unwrap();
+    }
+
+    /// The command ring's shape: a handler that tracks nothing across a descriptor (the trait's
+    /// default `stop` and `is_quiesced`), so a ring that is Running with nothing to wait for
+    /// stops the moment it is asked -- a host controller reset must not hang on it -- and the
+    /// pointer set afterwards is where the next start runs from.
+    #[test]
+    fn stop_of_an_idle_running_ring_completes_at_once_and_restarts_from_the_new_pointer() {
+        let (tx, rx) = channel();
+        let mem = setup_mem();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let controller = RingBufferController::new_with_handler(
+            "".to_string(),
+            mem,
+            l.clone(),
+            HeldHandler { sender: tx },
+        )
+        .unwrap();
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (first, _held) = rx.recv().unwrap();
+        assert_eq!(first, 1);
+
+        // Running, and the handler reports nothing to wait for: the stop callback fires before
+        // `stop` returns, on this thread.
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        controller.stop(RingBufferStopCallback::new(move || {
+            flag.store(true, Ordering::SeqCst);
+        }));
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "stopping an idle ring must complete synchronously"
+        );
+
+        // The guest programs a new ring (CRCR after HCRST) and rings the doorbell.
+        controller.set_dequeue_pointer(GuestAddress(0x300));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (next, _) = rx.recv().unwrap();
+        assert_eq!(next, 5, "the restarted ring must run from the new pointer");
+        l.stop();
+        j.join().unwrap();
+    }
+
+    /// A transfer ring's shape: the handler reports whether a transfer is still in flight, and
+    /// the test decides.
+    struct TrackedHandler {
+        sender: Sender<(i32, Event)>,
+        quiesced: Arc<AtomicBool>,
+    }
+
+    impl TransferDescriptorHandler for TrackedHandler {
+        fn handle_transfer_descriptor(
+            &self,
+            descriptor: TransferDescriptor,
+            complete_event: Event,
+        ) -> anyhow::Result<()> {
+            let first = descriptor[0].trb.get_parameter() as i32;
+            self.sender.send((first, complete_event)).unwrap();
+            Ok(())
+        }
+
+        fn is_quiesced(&self) -> bool {
+            self.quiesced.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A ring that is Stopping (a Stop Endpoint waits on it) whose transfer has completed but
+    /// whose completion has not been dispatched yet is asked to stop again (HCRST). It parks
+    /// at once -- and answers the stop it already held, in order, before the new one. Before
+    /// the fix the first callback stayed in the parked ring and fired whenever the ring was
+    /// dropped, from under the slot lock during the reset.
+    #[test]
+    fn stop_of_a_stopping_ring_that_went_quiet_answers_every_waiting_stop() {
+        let (tx, rx) = channel();
+        let mem = setup_mem();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let quiesced = Arc::new(AtomicBool::new(true));
+        let controller = RingBufferController::new_with_handler(
+            "".to_string(),
+            mem,
+            l.clone(),
+            TrackedHandler {
+                sender: tx,
+                quiesced: quiesced.clone(),
+            },
+        )
+        .unwrap();
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (first, _held) = rx.recv().unwrap();
+        assert_eq!(first, 1);
+
+        // In flight: the first stop waits.
+        quiesced.store(false, Ordering::SeqCst);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let o = order.clone();
+        controller.stop(RingBufferStopCallback::new(move || {
+            o.lock().push("endpoint")
+        }));
+        assert!(
+            order.lock().is_empty(),
+            "a stop with a transfer in flight must wait"
+        );
+
+        // The transfer completes (the completion is not dispatched: nothing signals the ring)
+        // and a reset asks the ring to stop again.
+        quiesced.store(true, Ordering::SeqCst);
+        let o = order.clone();
+        controller.stop(RingBufferStopCallback::new(move || o.lock().push("reset")));
+        assert_eq!(
+            *order.lock(),
+            vec!["endpoint", "reset"],
+            "both stops are answered before `stop` returns, the older one first"
+        );
         l.stop();
         j.join().unwrap();
     }
