@@ -26,22 +26,60 @@
 //!
 //! The child inherits nothing else: crosvm's descriptors are `CLOEXEC` by construction, so the
 //! socket is the one it gets, by number. Everything else it needs travels as JSON in argv.
+//!
+//! One thing that does *not* travel by itself is the log level. crosvm's syslog reads no
+//! environment variable -- `base::syslog`'s `LogConfig` defaults its filter to `"info"` and only
+//! the `--log-level` argument moves it -- and a helper is a fresh `exec` of `/proc/self/exe`, so
+//! without help every backend runs pinned at `info` however the VMM was started. That made every
+//! `debug!` in a helper dead weight on a shipped build: defect D57, which cost the D37
+//! investigation its device-side instrument (`logs/vpu_wp/B10-acceptance.md` §7, §13). The VMM
+//! records its own filter when it initialises its logger (`sys::linux::main::init_log`) and
+//! `launch` replays it here, so `crosvm --log-level debug run ...` gives its snd and media
+//! helpers the same level.
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::OnceLock;
 
 use anyhow::Context;
 use anyhow::Result;
 use base::Pid;
 
-/// Spawns `crosvm device <subcommand> --fd N --config-json <params_json>` as `uid`:`gid` with
-/// exactly `supp_gids` as supplementary groups, and returns the VMM's end of the connection along
-/// with the child's pid.
+/// The VMM's own `--log-level`, as parsed into `LogConfig`'s filter.
+///
+/// Set once, by the VMM, before any device is created; read by `launch`. A `OnceLock` rather than
+/// a parameter because every caller of `launch` is several layers below the command line, and
+/// because a helper process never sets it -- it has no children of its own.
+static VMM_LOG_FILTER: OnceLock<String> = OnceLock::new();
+
+/// Records the log filter the VMM was started with, so helpers can be started at the same level.
+///
+/// Idempotent and never fatal: a second call (or a call in a process that is itself a helper) is
+/// dropped, because the level a helper should run at is the one the VMM asked for first.
+pub(crate) fn set_vmm_log_filter(filter: String) {
+    let _ = VMM_LOG_FILTER.set(filter);
+}
+
+/// The filter a helper launched now would be started at, for the launch log lines.
+///
+/// `"info (default)"` when nothing was recorded, because that is what the child will apply and
+/// the distinction -- inherited or fallen back to -- is the whole of D57.
+pub(crate) fn vmm_log_filter() -> String {
+    match VMM_LOG_FILTER.get() {
+        Some(filter) => filter.clone(),
+        None => "info (default)".to_string(),
+    }
+}
+
+/// Spawns `crosvm [--log-level <filter>] device <subcommand> --fd N --config-json <params_json>`
+/// as `uid`:`gid` with exactly `supp_gids` as supplementary groups, and returns the VMM's end of
+/// the connection along with the child's pid.
 ///
 /// `params_json` is whatever the subcommand's `--config-json` expects; the caller serialises it,
-/// and must strip anything that would make the child try to spawn a backend of its own.
+/// and must strip anything that would make the child try to spawn a backend of its own. The log
+/// filter is whatever `set_vmm_log_filter` recorded, and is omitted if nothing did (D57).
 pub fn launch(
     subcommand: &str,
     params_json: String,
@@ -63,6 +101,15 @@ pub fn launch(
     let parent_pid = std::process::id();
 
     let mut command = Command::new("/proc/self/exe");
+    // `--log-level` is a *top-level* crosvm option, so it has to precede the `device` subcommand;
+    // argh stops taking global options once a subcommand name appears. The filter travels as one
+    // argv element, which keeps a compound filter (`"info,base=debug"`) intact -- there is no
+    // shell here, and crosvm's own arg preprocessing only splits `--flag=value`, which this is
+    // not. If the VMM never recorded a filter -- a unit test, or a path that launches a helper
+    // before `init_log` -- nothing is passed and the child keeps the `info` default (D57).
+    if let Some(filter) = VMM_LOG_FILTER.get() {
+        command.arg("--log-level").arg(filter);
+    }
     command
         .arg("device")
         .arg(subcommand)
