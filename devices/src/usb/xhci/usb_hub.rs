@@ -11,6 +11,7 @@ use sync::Mutex;
 use thiserror::Error;
 use usb_util::DeviceSpeed;
 
+use super::event_ring::Error as EventRingError;
 use super::interrupter::Error as InterrupterError;
 use super::interrupter::Interrupter;
 use super::xhci_backend_device::BackendType;
@@ -176,9 +177,7 @@ impl UsbPort {
                 | PORTSC_PORT_ENABLED_DISABLED_CHANGE,
         );
         self.usbsts.set_bits(USB_STS_PORT_CHANGE_DETECT);
-        self.interrupter
-            .lock()
-            .send_port_status_change_trb(self.port_id)
+        self.post_port_change()
     }
 
     /// Inform the guest kernel that device has been detached.
@@ -188,9 +187,30 @@ impl UsbPort {
             .set_bits(PORTSC_CONNECT_STATUS_CHANGE | PORTSC_PORT_ENABLED_DISABLED_CHANGE);
         self.portsc.clear_bits(PORTSC_CURRENT_CONNECT_STATUS);
         self.usbsts.set_bits(USB_STS_PORT_CHANGE_DETECT);
-        self.interrupter
+        self.post_port_change()
+    }
+
+    /// Post the Port Status Change Event for a change already recorded in PORTSC.
+    ///
+    /// A device plugged in before the guest has set up its event ring is not an error: the
+    /// change bits stay set in PORTSC and USBSTS.PCD, and every xHCI driver reads them when it
+    /// brings the root hub up, exactly as for a device present at power-on. Failing the attach
+    /// here used to take the whole controller down.
+    fn post_port_change(&self) -> std::result::Result<(), InterrupterError> {
+        match self
+            .interrupter
             .lock()
             .send_port_status_change_trb(self.port_id)
+        {
+            Err(InterrupterError::AddEvent(EventRingError::Uninitialized)) => {
+                info!(
+                    "usb_hub: port {} changed before the guest set up its event ring; the change waits in PORTSC",
+                    self.port_id
+                );
+                Ok(())
+            }
+            other => other,
+        }
     }
 }
 
