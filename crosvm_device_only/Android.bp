@@ -67,6 +67,7 @@ rust_binary {
         "libacpi_tables",
         "libandroid_audio",
         "libandroid_camera",
+        "libandroid_codec",
         "libanyhow",
         "libarch",
         "libargh",

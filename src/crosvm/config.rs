@@ -871,6 +871,11 @@ pub struct MediaDeviceConfig {
     /// `main` or `aux` (`kind=camera`).
     #[serde(default)]
     pub role: Option<String>,
+    /// Offer the platform's software codecs as well as its hardware ones (`kind=decoder`,
+    /// `kind=encoder`; `VPU_DESIGN.md` §7.4). Off by default: a guest asking for a "hardware"
+    /// decoder should get one.
+    #[serde(default)]
+    pub allow_sw: bool,
     /// Run the device's backend in its own process under this host uid, the way `--virtio-snd`
     /// does, because the host's camera and codec services decide from the real uid. Unset keeps
     /// the device in the VMM's process. Only meaningful for `camera`, `decoder` and `encoder`.
@@ -905,6 +910,15 @@ mod media_device_config_tests {
         for kind in ["decoder", "encoder"] {
             assert!(from_key_values::<MediaDeviceConfig>(&format!("kind={kind}")).is_ok());
         }
+        let cfg: MediaDeviceConfig =
+            from_key_values("kind=decoder,allow_sw=true,uid=10123").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Decoder);
+        assert!(cfg.allow_sw);
+        assert!(
+            !from_key_values::<MediaDeviceConfig>("kind=decoder")
+                .unwrap()
+                .allow_sw
+        );
 
         // `kind` is required, and a key that is not one of ours is an error, not ignored.
         assert!(from_key_values::<MediaDeviceConfig>("card=x").is_err());
