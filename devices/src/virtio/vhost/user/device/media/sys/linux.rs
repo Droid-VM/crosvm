@@ -134,7 +134,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
         }
         MediaDeviceKind::Decoder => leave_after_codec_store(
             "decoder",
-            (|| {
+            (|| -> anyhow::Result<()> {
                 use virtio_media::devices::VideoDecoder;
 
                 // As the camera: the codec store is read here, once, before the frontend is spoken
@@ -168,12 +168,12 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
                         ))
                     },
                 )?;
-                ex.run_until(conn.run_backend(backend, &ex))
+                ex.run_until(conn.run_backend(backend, &ex))?
             })(),
         ),
         MediaDeviceKind::Encoder => leave_after_codec_store(
             "encoder",
-            (|| {
+            (|| -> anyhow::Result<()> {
                 use virtio_media::devices::VideoEncoder;
 
                 // The decoder's shape, for the encoders (design §7.3): one walk of the codec store,
@@ -203,7 +203,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
                         ))
                     },
                 )?;
-                ex.run_until(conn.run_backend(backend, &ex))
+                ex.run_until(conn.run_backend(backend, &ex))?
             })(),
         ),
     }
