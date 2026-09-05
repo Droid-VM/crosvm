@@ -184,9 +184,10 @@ const FALLBACK_BITRATE: (i32, i32) = (1, 100_000_000);
 /// `AMediaCodecInfo_FEATURE_QpBounds`: the codec honours `KEY_VIDEO_QP_MIN` / `_MAX`.
 const FEATURE_QP_BOUNDS: &str = "qp-bounds";
 
-/// The AV1 fourcc: offered only with `allow_sw` (`logs/vpu_wp/M7-crate.md` §8 item 1:
+/// The AV1 fourcc `AV01` (`V4L2_PIX_FMT_AV1`, D54): offered only with `allow_sw`
+/// (`logs/vpu_wp/M7-crate.md` §8 item 1:
 /// `v4l2-compliance` does not know AV1 as a stateful-encoder format and would fail two tests).
-const AV10: PixelFormat = PixelFormat::from_fourcc(b"AV10");
+const AV01: PixelFormat = PixelFormat::from_fourcc(b"AV01");
 
 // ---------------------------------------------------------------------------------------------
 // MediaCodec <-> V4L2 value maps
@@ -566,7 +567,7 @@ impl MediaCodecEncoderBackend {
     /// the codec store's lazily built tables, which have no lock: call it once, from one thread,
     /// after the uid drop (design §7.2, §7.3).
     ///
-    /// Software encoders are left out unless `allow_sw`, and so is AV1 (`AV10`) altogether; a
+    /// Software encoders are left out unless `allow_sw`, and so is AV1 (`AV01`) altogether; a
     /// format with no eligible encoder is simply not offered. A platform with no eligible
     /// encoder at all still gets its device, with no coded format (`ENUM_FMT` lists nothing and
     /// the device refuses every session with `ENODEV`): a helper that exits is a VM that does
@@ -601,7 +602,7 @@ impl MediaCodecEncoderBackend {
         let mut codecs = Vec::new();
         for (fourcc, mime) in CODED_FORMATS {
             let fourcc = PixelFormat::from_fourcc(fourcc);
-            if fourcc == AV10 && !allow_sw {
+            if fourcc == AV01 && !allow_sw {
                 info!(
                     "encoder: {} is offered only with allow_sw=true (v4l2-compliance does not \
                      know AV1 as a stateful-encoder format)",
