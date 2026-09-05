@@ -16,12 +16,33 @@
 //!  ────────────────────                      ────────────────────────────────────
 //!  give_empty(EmptyBuffer) ──commands──▶     Camera::open_with()      (STREAMON waits for this)
 //!  set_controls(..)        ──commands──▶     loop { next_frame_latest(); copy; }
+//!  (backend) set_controls  ──commands──▶       Controls -> one Camera::apply (+ AF trigger)
 //!  close()                 ──commands──▶     Stop -> drop(Camera) -> exit  (close() joins)
 //!  take_filled()           ◀──filled────     FilledBuffer per frame, then sink.signal()
-//!  take_events()           ◀──events────     Disconnected / Error, then sink.signal()
-//!                                            ▲
-//!                          binder thread ────┘ device-state callback (StateListener)
+//!  take_events()           ◀──events────     Disconnected / Error / Control, then sink.signal()
+//!                                            ▲                       ▲
+//!                          binder thread ────┘ device-state callback  │ capture-result callback
+//!                                              (StateListener)        (ResultListener)
 //! ```
+//!
+//! # Controls
+//!
+//! A V4L2 control set reaches the capture thread as one `Command::Controls` -- from the stream's
+//! `set_controls` (the frame rate, `S_PARM`) or the backend's (everything else, whichever session
+//! set it) -- and becomes one `Camera::apply`, i.e. one `setRepeatingRequest`, plus a one-shot
+//! capture for an AF trigger. The stream is opened with every control at its current value,
+//! written into the request before its first submission. The mapping from V4L2 to Camera2,
+//! with the units, is in [`build_update`]; the auto-exposure state machine that decides
+//! `AE_MODE` from the two V4L2 manual switches and the flash control is in [`Applied::ae`].
+//!
+//! # Capture results
+//!
+//! Every completed capture's metadata is read on the framework's callback thread
+//! ([`result_listener`]): the autofocus state, the auto-exposure state and the active physical
+//! lens are compared with what was last reported and, only when different, sent down the events
+//! channel as `CameraEvent::Control` with the sink bumped -- so thirty results a second become a
+//! handful of `V4L2_EVENT_CTRL`s. The applied zoom, exposure time and sensitivity are read too
+//! and kept for the log; in auto exposure they change every frame and are no control's value.
 //!
 //! Nothing here blocks the worker for long: `give_empty` and `set_controls` post to a channel
 //! and `take_*` drain one. Two waits remain, and both are the worker's:
@@ -62,28 +83,59 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::Duration;
 
+use std::sync::Mutex;
+
+use android_camera::AntibandingMode;
+use android_camera::Area;
+use android_camera::AwbMode;
 use android_camera::Camera;
 use android_camera::CameraError;
+use android_camera::CaptureResult;
+use android_camera::ControlMode;
 use android_camera::DeviceState;
+use android_camera::EffectMode;
 use android_camera::Frame;
 use android_camera::LensFacing;
+use android_camera::Rect;
+use android_camera::RequestUpdate;
+use android_camera::ResultListener;
 use android_camera::StateListener;
+use android_camera::VideoStabilizationMode;
 use android_camera::YuvLayout;
 use anyhow::bail;
 use anyhow::Context;
 use base::error;
 use base::info;
 use base::warn;
+use virtio_media::devices::camera::AeMode;
+use virtio_media::devices::camera::AeState;
+use virtio_media::devices::camera::AfMode;
+use virtio_media::devices::camera::AfTrigger;
 use virtio_media::devices::camera::CameraBackend;
 use virtio_media::devices::camera::CameraControl;
 use virtio_media::devices::camera::CameraEvent;
 use virtio_media::devices::camera::CameraInfo;
 use virtio_media::devices::camera::CameraStream;
 use virtio_media::devices::camera::CaptureSink;
+use virtio_media::devices::camera::ColorEffect;
 use virtio_media::devices::camera::EmptyBuffer;
+use virtio_media::devices::camera::ExposureBias;
+use virtio_media::devices::camera::ExposureMode;
 use virtio_media::devices::camera::FilledBuffer;
+use virtio_media::devices::camera::FlashLed;
 use virtio_media::devices::camera::FrameSize;
+use virtio_media::devices::camera::IsoMode;
+use virtio_media::devices::camera::MaxRegions;
+use virtio_media::devices::camera::PowerLine;
+use virtio_media::devices::camera::Region;
+use virtio_media::devices::camera::SceneMode;
 use virtio_media::devices::camera::StreamRequest;
+use virtio_media::devices::camera::WhiteBalance;
+use virtio_media::devices::camera::AF_STATUS_BUSY;
+use virtio_media::devices::camera::AF_STATUS_FAILED;
+use virtio_media::devices::camera::AF_STATUS_IDLE;
+use virtio_media::devices::camera::AF_STATUS_REACHED;
+use virtio_media::devices::camera::REGION_SCALE;
 
 /// Fewest `AImage`s the reader may hold: `AImageReader_acquireLatestImage` needs two free slots
 /// besides the one being copied to discard anything (`NdkImageReader.h:239-245` in NDK r29 --
@@ -109,6 +161,27 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Clone, Debug)]
 pub struct AndroidCameraBackend {
     info: CameraInfo,
+    /// The Camera2-side facts the capture thread needs beyond `info`.
+    facts: Facts,
+    /// The way to the stream opened last, for `set_controls`: `None` before the first stream;
+    /// after one closes the send fails, which is "no stream" and not an error.
+    stream_commands: Option<mpsc::Sender<Command>>,
+}
+
+/// What the Camera2 side knows that the crate's `CameraInfo` does not say.
+#[derive(Clone, Debug)]
+struct Facts {
+    /// The sensor's active array: the coordinate system of the regions.
+    active_array: Option<Rect>,
+    /// The AF mode `FOCUS_AUTO` set selects, and the one it cleared selects.
+    af_continuous: android_camera::AfMode,
+    af_single: android_camera::AfMode,
+    /// The V4L2 white-balance presets the camera has, with the Camera2 mode each stands for.
+    awb: Vec<(WhiteBalance, AwbMode)>,
+    /// The V4L2 colour effects the camera has, with the Camera2 effect each stands for.
+    effects: Vec<(ColorEffect, EffectMode)>,
+    /// The V4L2 scene modes the camera has, with the Camera2 scene each stands for.
+    scenes: Vec<(SceneMode, android_camera::SceneMode)>,
 }
 
 impl AndroidCameraBackend {
@@ -131,7 +204,7 @@ impl AndroidCameraBackend {
                 .or_else(|| cameras.first())
                 .context("this uid can see no camera at all")?,
         };
-        let info = describe(chosen);
+        let (info, facts) = describe(chosen);
         if info.sizes.is_empty() {
             bail!("camera {} offers no YUV_420_888 output size", info.id);
         }
@@ -146,12 +219,128 @@ impl AndroidCameraBackend {
             info.sizes[info.sizes.len() - 1].height,
             info.fps_ranges
         );
-        Ok(Self { info })
+        info!(
+            "camera {}: zoom {:?}, af {:?}, flash {}, ae {:?}, exposure {:?} ns, iso {:?}, \
+             bias {:?}, awb {:?}, antibanding {:?}, effects {:?}, scenes {:?}, stabilization {}, \
+             regions {:?}, active array {:?}, lenses {:?}",
+            info.id,
+            info.zoom_range,
+            info.af_modes,
+            info.flash,
+            info.ae_modes,
+            info.exposure_range_ns,
+            info.iso_range,
+            info.exposure_bias,
+            info.awb_modes,
+            info.antibanding,
+            info.effects,
+            info.scenes,
+            info.stabilization,
+            info.max_regions,
+            facts.active_array,
+            info.physical_ids
+        );
+        Ok(Self {
+            info,
+            facts,
+            stream_commands: None,
+        })
     }
 }
 
-/// The crate's view of a camera from the NDK's.
-fn describe(camera: &android_camera::CameraInfo) -> CameraInfo {
+/// Camera2's white-balance modes as V4L2 presets, where one exists (`Off` is manual white
+/// balance, which V4L2 does through separate gain controls this device does not offer).
+const AWB_MODES: [(AwbMode, WhiteBalance); 8] = [
+    (AwbMode::Auto, WhiteBalance::Auto),
+    (AwbMode::Incandescent, WhiteBalance::Incandescent),
+    (AwbMode::Fluorescent, WhiteBalance::Fluorescent),
+    (AwbMode::WarmFluorescent, WhiteBalance::FluorescentH),
+    (AwbMode::Daylight, WhiteBalance::Daylight),
+    (AwbMode::CloudyDaylight, WhiteBalance::Cloudy),
+    (AwbMode::Twilight, WhiteBalance::Horizon),
+    (AwbMode::Shade, WhiteBalance::Shade),
+];
+
+/// Camera2's colour effects as V4L2 ones, where one exists (posterize, whiteboard and
+/// blackboard have none).
+const EFFECT_MODES: [(EffectMode, ColorEffect); 6] = [
+    (EffectMode::Off, ColorEffect::None),
+    (EffectMode::Mono, ColorEffect::BlackWhite),
+    (EffectMode::Negative, ColorEffect::Negative),
+    (EffectMode::Solarize, ColorEffect::Solarization),
+    (EffectMode::Sepia, ColorEffect::Sepia),
+    (EffectMode::Aqua, ColorEffect::Aqua),
+];
+
+/// Camera2's scene modes as V4L2 ones, where one exists. Two Camera2 scenes share a V4L2 one
+/// twice (beach and snow; action and sports): the first listed here wins when both are
+/// offered.
+const SCENE_MODES: [(android_camera::SceneMode, SceneMode); 13] = [
+    (android_camera::SceneMode::Disabled, SceneMode::None),
+    (android_camera::SceneMode::Sports, SceneMode::Sports),
+    (android_camera::SceneMode::Action, SceneMode::Sports),
+    (android_camera::SceneMode::Portrait, SceneMode::Portrait),
+    (android_camera::SceneMode::Landscape, SceneMode::Landscape),
+    (android_camera::SceneMode::Night, SceneMode::Night),
+    (android_camera::SceneMode::Beach, SceneMode::BeachSnow),
+    (android_camera::SceneMode::Snow, SceneMode::BeachSnow),
+    (android_camera::SceneMode::Sunset, SceneMode::Sunset),
+    (android_camera::SceneMode::Fireworks, SceneMode::Fireworks),
+    (android_camera::SceneMode::Party, SceneMode::PartyIndoor),
+    (
+        android_camera::SceneMode::Candlelight,
+        SceneMode::CandleLight,
+    ),
+    (android_camera::SceneMode::Barcode, SceneMode::Text),
+];
+
+/// The crate's view of a camera from the NDK's, and the Camera2 facts kept beside it.
+fn describe(camera: &android_camera::CameraInfo) -> (CameraInfo, Facts) {
+    let af_modes: Vec<android_camera::AfMode> = camera
+        .af_modes
+        .iter()
+        .filter_map(|&m| android_camera::AfMode::from_u8(m))
+        .collect();
+    let has = |mode: android_camera::AfMode| af_modes.contains(&mode);
+    // What `FOCUS_AUTO` selects: continuous video first (the RECORD template's own), then
+    // continuous picture; cleared, the single-shot mode a trigger scans in, else off.
+    let af_continuous = if has(android_camera::AfMode::ContinuousVideo) {
+        android_camera::AfMode::ContinuousVideo
+    } else {
+        android_camera::AfMode::ContinuousPicture
+    };
+    let af_single = if has(android_camera::AfMode::Auto) {
+        android_camera::AfMode::Auto
+    } else if has(android_camera::AfMode::Macro) {
+        android_camera::AfMode::Macro
+    } else {
+        android_camera::AfMode::Off
+    };
+    let awb: Vec<(WhiteBalance, AwbMode)> = AWB_MODES
+        .iter()
+        .filter(|(mode, _)| camera.awb_modes.contains(&(*mode as u8)))
+        .map(|&(mode, preset)| (preset, mode))
+        .collect();
+    let effects: Vec<(ColorEffect, EffectMode)> = EFFECT_MODES
+        .iter()
+        .filter(|(mode, _)| camera.effects.contains(&(*mode as u8)))
+        .map(|&(mode, effect)| (effect, mode))
+        .collect();
+    let mut scenes: Vec<(SceneMode, android_camera::SceneMode)> = Vec::new();
+    for &(mode, scene) in SCENE_MODES.iter() {
+        if camera.scene_modes.contains(&(mode as u8)) && !scenes.iter().any(|(s, _)| *s == scene) {
+            scenes.push((scene, mode));
+        }
+    }
+    let regions = |n: i32| n.max(0) as u32;
+    let facts = Facts {
+        active_array: camera.active_array.filter(|r| r.width > 0 && r.height > 0),
+        af_continuous,
+        af_single,
+        awb,
+        effects,
+        scenes,
+    };
     let sizes = camera
         .yuv_sizes
         .iter()
@@ -174,12 +363,90 @@ fn describe(camera: &android_camera::CameraInfo) -> CameraInfo {
         .filter(|&&(min, max)| min > 0 && max >= min)
         .map(|&(min, max)| (min as u32, max as u32))
         .collect();
-    CameraInfo {
+    let info = CameraInfo {
         id: camera.id.clone(),
         name: format!("Camera {} ({:?})", camera.id, camera.facing),
         sizes,
         fps_ranges,
-    }
+        // Hundredths, rounded inward so every value offered is one the camera takes.
+        zoom_range: camera
+            .zoom_ratio_range
+            .map(|(lo, hi)| ((lo * 100.0).ceil() as u32, (hi * 100.0).floor() as u32))
+            .filter(|&(lo, hi)| lo > 0 && lo <= hi),
+        af_modes: af_modes
+            .iter()
+            .map(|m| match m {
+                android_camera::AfMode::Off => AfMode::Off,
+                android_camera::AfMode::Auto => AfMode::Auto,
+                android_camera::AfMode::Macro => AfMode::Macro,
+                android_camera::AfMode::ContinuousVideo => AfMode::ContinuousVideo,
+                android_camera::AfMode::ContinuousPicture => AfMode::ContinuousPicture,
+                android_camera::AfMode::Edof => AfMode::Edof,
+            })
+            .collect(),
+        flash: camera.flash_available,
+        ae_modes: camera
+            .ae_modes
+            .iter()
+            .filter_map(|&m| android_camera::AeMode::from_u8(m))
+            .filter_map(|m| match m {
+                android_camera::AeMode::Off => Some(AeMode::Off),
+                android_camera::AeMode::On => Some(AeMode::On),
+                android_camera::AeMode::OnAutoFlash => Some(AeMode::OnAutoFlash),
+                android_camera::AeMode::OnAlwaysFlash => Some(AeMode::OnAlwaysFlash),
+                android_camera::AeMode::OnAutoFlashRedeye => Some(AeMode::OnAutoFlashRedeye),
+                android_camera::AeMode::OnExternalFlash => Some(AeMode::OnExternalFlash),
+                android_camera::AeMode::OnLowLightBoostBrightnessPriority => None,
+            })
+            .collect(),
+        exposure_range_ns: camera
+            .exposure_time_range_ns
+            .filter(|&(lo, hi)| lo > 0 && lo <= hi)
+            .map(|(lo, hi)| (lo as u64, hi as u64)),
+        iso_range: camera
+            .sensitivity_range
+            .filter(|&(lo, hi)| lo > 0 && lo <= hi)
+            .map(|(lo, hi)| (lo as u32, hi as u32)),
+        exposure_bias: match (camera.ae_compensation_range, camera.ae_compensation_step) {
+            (Some((min, max)), Some((num, den))) if max > min && den > 0 && num != 0 => {
+                Some(ExposureBias {
+                    min,
+                    max,
+                    step_num: num,
+                    step_den: den,
+                })
+            }
+            _ => None,
+        },
+        awb_modes: facts.awb.iter().map(|&(preset, _)| preset).collect(),
+        antibanding: camera
+            .antibanding_modes
+            .iter()
+            .filter_map(|&m| AntibandingMode::from_u8(m))
+            .map(|m| match m {
+                AntibandingMode::Off => PowerLine::Disabled,
+                AntibandingMode::Hz50 => PowerLine::Hz50,
+                AntibandingMode::Hz60 => PowerLine::Hz60,
+                AntibandingMode::Auto => PowerLine::Auto,
+            })
+            .collect(),
+        effects: facts.effects.iter().map(|&(effect, _)| effect).collect(),
+        scenes: facts.scenes.iter().map(|&(scene, _)| scene).collect(),
+        stabilization: camera
+            .video_stabilization_modes
+            .contains(&(VideoStabilizationMode::On as u8)),
+        // Regions need the coordinate system they are converted into.
+        max_regions: match facts.active_array {
+            Some(_) => MaxRegions {
+                ae: regions(camera.max_regions.0),
+                awb: regions(camera.max_regions.1),
+                af: regions(camera.max_regions.2),
+            },
+            None => MaxRegions::default(),
+        },
+        physical_ids: camera.physical_ids.clone(),
+    };
+    (info, facts)
 }
 
 /// The errno a guest's `STREAMON` gets for a camera that would not open.
@@ -200,6 +467,7 @@ fn errno_for(e: &CameraError) -> i32 {
 }
 
 /// What the device asks of the capture thread.
+#[derive(Debug)]
 enum Command {
     Lend(EmptyBuffer),
     Controls(Vec<CameraControl>),
@@ -234,6 +502,8 @@ impl CameraBackend for AndroidCameraBackend {
         let (opened_tx, opened_rx) = mpsc::sync_channel::<Result<(), i32>>(1);
         let id = self.info.id.clone();
         let depth = request.buffers.clamp(MIN_READER_DEPTH, MAX_READER_DEPTH) as i32;
+        let facts = self.facts.clone();
+        self.stream_commands = Some(commands.clone());
 
         let thread_id = id.clone();
         let thread = thread::Builder::new()
@@ -256,12 +526,26 @@ impl CameraBackend for AndroidCameraBackend {
                         sink.signal();
                     })
                 };
+                let results = result_listener(id.clone(), events_tx.clone(), sink.clone());
+                // Every control at its current value, and the frame rate, go into the request
+                // before it is first submitted: the first frame is taken with them.
+                let geometry = Geometry {
+                    active_array: facts.active_array,
+                    width: request.width,
+                    height: request.height,
+                };
+                let mut applied = Applied::default();
+                let (mut initial, triggers) =
+                    build_update(&id, &facts, &geometry, &mut applied, &request.controls);
+                initial = initial.fps_range(request.fps.0 as i32, request.fps.1 as i32);
                 let mut camera = match Camera::open_with(
                     &id,
                     request.width as i32,
                     request.height as i32,
                     depth,
                     Some(listener),
+                    Some(results),
+                    &initial,
                 ) {
                     Ok(camera) => camera,
                     Err(e) => {
@@ -273,16 +557,10 @@ impl CameraBackend for AndroidCameraBackend {
                         return;
                     }
                 };
-                if let Err(e) = camera.set_fps_range(request.fps.0 as i32, request.fps.1 as i32) {
-                    // The range came from the camera's own list, so this should not happen; the
-                    // stream runs at the template's default rate rather than not at all.
-                    warn!(
-                        "camera {}: fps range {:?} refused, keeping the default: {}",
-                        id, request.fps, e
-                    );
-                }
+                fire_triggers(&id, &mut camera, &triggers);
                 info!(
-                    "camera {}: streaming {}x{} at {:?} fps, {} reader slots, latest-frame {}",
+                    "camera {}: streaming {}x{} at {:?} fps, {} reader slots, latest-frame {}, \
+                     {} controls applied, ae {:?}",
                     id,
                     request.width,
                     request.height,
@@ -292,7 +570,9 @@ impl CameraBackend for AndroidCameraBackend {
                         "on"
                     } else {
                         "unavailable"
-                    }
+                    },
+                    request.controls.len(),
+                    applied.ae()
                 );
                 let _ = opened_tx.send(Ok(()));
                 capture_loop(
@@ -304,6 +584,9 @@ impl CameraBackend for AndroidCameraBackend {
                     &sink,
                     request.width,
                     request.height,
+                    &facts,
+                    &geometry,
+                    &mut applied,
                 );
                 // `camera` drops here, on the thread that opened it, which gives it back to the
                 // platform.
@@ -326,12 +609,14 @@ impl CameraBackend for AndroidCameraBackend {
             }),
             Ok(Err(errno)) => {
                 // It failed to open, so it is on its way out and the join is bounded.
+                self.stream_commands = None;
                 join_capture_thread(&id, thread);
                 Err(errno)
             }
             // The thread died before it could say (a panic would have aborted the process; this
             // is the channel closing without a message).
             Err(RecvTimeoutError::Disconnected) => {
+                self.stream_commands = None;
                 join_capture_thread(&id, thread);
                 Err(libc::EIO)
             }
@@ -342,16 +627,28 @@ impl CameraBackend for AndroidCameraBackend {
                     id, OPEN_TIMEOUT
                 );
                 // Detached, not joined: whatever `Camera::open_with` is blocked in has no bound,
-                // so joining here would park the worker exactly as the unbounded wait did. The
-                // command sender is dropped instead, which disconnects the channel; whenever the
-                // open does return, the loop's first `try_recv` sees `Disconnected` and the
-                // thread exits, dropping its `Camera` -- the platform's only handback -- on the
-                // thread that opened it. It holds no lent buffer: nothing is lent until
-                // `STREAMON` has succeeded, and this one has not.
+                // so joining here would park the worker exactly as the unbounded wait did. Every
+                // command sender is dropped instead -- this one and the backend's copy for
+                // `set_controls` -- which disconnects the channel; whenever the open does return,
+                // the loop's first `try_recv` sees `Disconnected` and the thread exits, dropping
+                // its `Camera` -- the platform's only handback -- on the thread that opened it.
+                // It holds no lent buffer: nothing is lent until `STREAMON` has succeeded, and
+                // this one has not.
+                self.stream_commands = None;
                 drop(commands);
                 Err(libc::ETIMEDOUT)
             }
         }
+    }
+
+    /// The V4L2 controls, from whichever session set them, to the stream opened last. A closed
+    /// stream's thread has dropped its receiver and the send fails, which is "no stream" -- the
+    /// values will come back in the next `StreamRequest` -- not an error.
+    fn set_controls(&mut self, controls: &[CameraControl]) -> Result<(), i32> {
+        if let Some(commands) = &self.stream_commands {
+            let _ = commands.send(Command::Controls(controls.to_vec()));
+        }
+        Ok(())
     }
 }
 
@@ -411,18 +708,359 @@ impl Drop for AndroidCameraStream {
     }
 }
 
-/// Apply `controls` to the running camera. A refused control is logged, not fatal: the stream
-/// goes on as it was.
-fn apply_controls(id: &str, camera: &mut Camera, controls: &[CameraControl]) {
+/// The stream's geometry, for converting a guest's region into sensor coordinates.
+struct Geometry {
+    active_array: Option<Rect>,
+    width: u32,
+    height: u32,
+}
+
+impl Geometry {
+    /// `region` (stream-relative, in `REGION_SCALE`ths of the frame) as a Camera2 area in the
+    /// active array's coordinates; `None` for a region that is not set, or with no active array
+    /// to convert into.
+    ///
+    /// The frame is the active array cropped to the frame's aspect ratio about its centre --
+    /// the "additional crop resulted from the aspect ratio differences between the preview
+    /// stream and `SCALER_CROP_REGION`" the header describes (`NdkCameraMetadataTags.h`,
+    /// `ACAMERA_CONTROL_AE_REGIONS`, :655-662) -- since this device never sets
+    /// `SCALER_CROP_REGION` and it stays the whole array. Zoom needs no arithmetic here:
+    /// "Starting from API level 30, the coordinate system of activeArraySize ... is used to
+    /// represent post-zoomRatio field of view" (:663-670), so with `CONTROL_ZOOM_RATIO` the same
+    /// coordinates always mean the same place *in the frame*, which is what the guest tapped.
+    fn area_of(&self, region: &Region) -> Option<Area> {
+        if !region.is_set() {
+            return None;
+        }
+        let active = self.active_array?;
+        let (aw, ah) = (active.width as i64, active.height as i64);
+        let (sw, sh) = (self.width as i64, self.height as i64);
+        if aw <= 0 || ah <= 0 || sw <= 0 || sh <= 0 {
+            return None;
+        }
+        // The array cropped to the frame's aspect ratio, centred.
+        let (cw, ch) = if aw * sh > ah * sw {
+            (ah * sw / sh, ah)
+        } else {
+            (aw, aw * sh / sw)
+        };
+        let cx = active.left as i64 + (aw - cw) / 2;
+        let cy = active.top as i64 + (ah - ch) / 2;
+        let scale = REGION_SCALE as i64;
+        let x0 = region.x.min(REGION_SCALE) as i64;
+        let y0 = region.y.min(REGION_SCALE) as i64;
+        let x1 = (region.x as i64 + region.width as i64).min(scale);
+        let y1 = (region.y as i64 + region.height as i64).min(scale);
+        let xmin = cx + x0 * cw / scale;
+        let ymin = cy + y0 * ch / scale;
+        // Exclusive maxima, at least one pixel past the minima.
+        let xmax = (cx + x1 * cw / scale).max(xmin + 1);
+        let ymax = (cy + y1 * ch / scale).max(ymin + 1);
+        let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+        Some(Area {
+            xmin: clamp(xmin),
+            ymin: clamp(ymin),
+            xmax: clamp(xmax),
+            ymax: clamp(ymax),
+            weight: region.weight as i32,
+        })
+    }
+}
+
+/// What the capture thread last applied of the controls that share a Camera2 entry: the
+/// auto-exposure state machine's inputs (design §7.1, plan §3.1).
+#[derive(Debug, Clone, Copy)]
+struct Applied {
+    exposure: ExposureMode,
+    iso: IsoMode,
+    /// 100 µs units.
+    exposure_time: u32,
+    iso_value: u32,
+    flash: FlashLed,
+}
+
+impl Default for Applied {
+    fn default() -> Self {
+        Self {
+            exposure: ExposureMode::Auto,
+            iso: IsoMode::Auto,
+            exposure_time: 333,
+            iso_value: 100,
+            flash: FlashLed::Off,
+        }
+    }
+}
+
+impl Applied {
+    /// Whether the camera's auto-exposure is off: Camera2 has one switch, V4L2 two, and either
+    /// manual switch turns it off (and then both manual values apply).
+    fn manual(&self) -> bool {
+        self.exposure == ExposureMode::Manual || self.iso == IsoMode::Manual
+    }
+
+    /// The `AE_MODE` / `FLASH_MODE` pair for the current inputs -- the state machine:
+    ///
+    /// | `EXPOSURE_AUTO` | `ISO_SENSITIVITY_AUTO` | `FLASH_LED_MODE` | `AE_MODE` | `FLASH_MODE` | exposure time, sensitivity |
+    /// |---|---|---|---|---|---|
+    /// | Auto | Auto | Off | `ON` | `OFF` | the camera's |
+    /// | Auto | Auto | Torch | `ON` | `TORCH` | the camera's |
+    /// | Manual | any | Off / Torch | `OFF` | `OFF` / `TORCH` | written |
+    /// | any | Manual | Off / Torch | `OFF` | `OFF` / `TORCH` | written |
+    ///
+    /// `AE_MODE` is never one of the `ON_*_FLASH` modes: under those the 3A routine owns the
+    /// LED and overrides `FLASH_MODE` (plan §3.1), so auto-flash is not offered. `Flash` (fire
+    /// on strobe) is not a menu item the guest can select.
+    fn ae(&self) -> (android_camera::AeMode, android_camera::FlashMode) {
+        let ae = if self.manual() {
+            android_camera::AeMode::Off
+        } else {
+            android_camera::AeMode::On
+        };
+        let flash = match self.flash {
+            FlashLed::Torch => android_camera::FlashMode::Torch,
+            FlashLed::Off | FlashLed::Flash => android_camera::FlashMode::Off,
+        };
+        (ae, flash)
+    }
+}
+
+/// The request entries for `controls`, in the units Camera2 takes, plus the AF triggers to
+/// fire after they are applied. `applied` is updated as the state machine's inputs change.
+///
+/// A control this camera has no mapping for (a preset `describe` did not list) is logged and
+/// skipped, never refused: the guest's set is already committed by the time it gets here.
+fn build_update(
+    id: &str,
+    facts: &Facts,
+    geometry: &Geometry,
+    applied: &mut Applied,
+    controls: &[CameraControl],
+) -> (RequestUpdate, Vec<AfTrigger>) {
+    let mut update = RequestUpdate::new();
+    let mut triggers = Vec::new();
+    let mut ae_changed = false;
+    let areas = |regions: &[Region]| -> Vec<Area> {
+        regions.iter().filter_map(|r| geometry.area_of(r)).collect()
+    };
     for control in controls {
-        match *control {
+        match control {
             CameraControl::FpsRange(min, max) => {
-                if let Err(e) = camera.set_fps_range(min as i32, max as i32) {
-                    warn!("camera {}: fps range {}-{} refused: {}", id, min, max, e);
+                update = update.fps_range(*min as i32, *max as i32);
+            }
+            // Hundredths to the ratio.
+            CameraControl::Zoom(v) => update = update.zoom_ratio(*v as f32 / 100.0),
+            CameraControl::ExposureMode(mode) => {
+                applied.exposure = *mode;
+                ae_changed = true;
+            }
+            CameraControl::ExposureTime(v) => {
+                applied.exposure_time = *v;
+                ae_changed = true;
+            }
+            CameraControl::IsoMode(mode) => {
+                applied.iso = *mode;
+                ae_changed = true;
+            }
+            CameraControl::Iso(v) => {
+                applied.iso_value = *v;
+                ae_changed = true;
+            }
+            CameraControl::FlashLed(mode) => {
+                applied.flash = *mode;
+                ae_changed = true;
+            }
+            // Already in the camera's own steps.
+            CameraControl::ExposureBias(steps) => {
+                update = update.ae_compensation(*steps);
+            }
+            CameraControl::WhiteBalance(preset) => {
+                match facts.awb.iter().find(|(p, _)| p == preset) {
+                    Some(&(_, mode)) => update = update.awb_mode(mode),
+                    None => warn!("camera {}: no Camera2 mode for {:?}", id, preset),
+                }
+            }
+            CameraControl::PowerLine(mode) => {
+                update = update.antibanding_mode(match mode {
+                    PowerLine::Disabled => AntibandingMode::Off,
+                    PowerLine::Hz50 => AntibandingMode::Hz50,
+                    PowerLine::Hz60 => AntibandingMode::Hz60,
+                    PowerLine::Auto => AntibandingMode::Auto,
+                });
+            }
+            CameraControl::ColorEffect(effect) => {
+                match facts.effects.iter().find(|(e, _)| e == effect) {
+                    Some(&(_, mode)) => update = update.effect_mode(mode),
+                    None => warn!("camera {}: no Camera2 effect for {:?}", id, effect),
+                }
+            }
+            // A scene applies only under CONTROL_MODE USE_SCENE_MODE; `None` returns the
+            // control mode to AUTO, where the individual 3A modes rule.
+            CameraControl::SceneMode(scene) => {
+                match facts.scenes.iter().find(|(s, _)| s == scene) {
+                    Some(&(SceneMode::None, mode)) => {
+                        update = update.control_mode(ControlMode::Auto).scene_mode(mode);
+                    }
+                    Some(&(_, mode)) => {
+                        update = update
+                            .control_mode(ControlMode::UseSceneMode)
+                            .scene_mode(mode);
+                    }
+                    None => warn!("camera {}: no Camera2 scene for {:?}", id, scene),
+                }
+            }
+            CameraControl::Stabilization(on) => {
+                update = update.video_stabilization(if *on {
+                    VideoStabilizationMode::On
+                } else {
+                    VideoStabilizationMode::Off
+                });
+            }
+            CameraControl::FocusAuto(continuous) => {
+                update = update.af_mode(if *continuous {
+                    facts.af_continuous
+                } else {
+                    facts.af_single
+                });
+            }
+            CameraControl::AfTrigger(trigger) => triggers.push(*trigger),
+            CameraControl::AeRegions(regions) => update = update.ae_regions(&areas(regions)),
+            CameraControl::AfRegions(regions) => update = update.af_regions(&areas(regions)),
+            CameraControl::AwbRegions(regions) => update = update.awb_regions(&areas(regions)),
+            // Reported by this backend, never set through it.
+            CameraControl::AfStatus(_)
+            | CameraControl::AeState(_)
+            | CameraControl::ActivePhysicalId(_) => {}
+        }
+    }
+    if ae_changed {
+        let (ae, flash) = applied.ae();
+        update = update.ae_mode(ae).flash_mode(flash);
+        if applied.manual() {
+            // 100 µs to ns; the ISO number as is.
+            update = update
+                .exposure_time_ns(applied.exposure_time as i64 * 100_000)
+                .sensitivity(applied.iso_value as i32);
+        }
+    }
+    (update, triggers)
+}
+
+/// Apply `controls` to the running camera in one submission, then fire any AF trigger. A
+/// refused set is logged, not fatal: the stream goes on as it was.
+fn apply_controls(
+    id: &str,
+    camera: &mut Camera,
+    facts: &Facts,
+    geometry: &Geometry,
+    applied: &mut Applied,
+    controls: &[CameraControl],
+) {
+    let (update, triggers) = build_update(id, facts, geometry, applied, controls);
+    if let Err(e) = camera.apply(&update) {
+        warn!(
+            "camera {}: {} control(s) refused, the stream goes on as it was: {}",
+            id,
+            controls.len(),
+            e
+        );
+    }
+    fire_triggers(id, camera, &triggers);
+}
+
+/// The AF triggers of a set, each a one-shot capture.
+fn fire_triggers(id: &str, camera: &mut Camera, triggers: &[AfTrigger]) {
+    for trigger in triggers {
+        let result = camera.trigger_af(match trigger {
+            AfTrigger::Start => android_camera::AfTrigger::Start,
+            AfTrigger::Cancel => android_camera::AfTrigger::Cancel,
+        });
+        if let Err(e) = result {
+            warn!("camera {}: AF trigger {:?} refused: {}", id, trigger, e);
+        }
+    }
+}
+
+/// `CONTROL_AF_STATE` as the `V4L2_CID_AUTO_FOCUS_STATUS` mask.
+fn af_status_of(state: android_camera::AfState) -> u32 {
+    use android_camera::AfState;
+    match state {
+        AfState::Inactive => AF_STATUS_IDLE,
+        AfState::PassiveScan | AfState::ActiveScan => AF_STATUS_BUSY,
+        AfState::PassiveFocused | AfState::FocusedLocked => AF_STATUS_REACHED,
+        AfState::NotFocusedLocked | AfState::PassiveUnfocused => AF_STATUS_FAILED,
+    }
+}
+
+fn ae_state_of(state: android_camera::AeState) -> AeState {
+    match state {
+        android_camera::AeState::Inactive => AeState::Inactive,
+        android_camera::AeState::Searching => AeState::Searching,
+        android_camera::AeState::Converged => AeState::Converged,
+        android_camera::AeState::Locked => AeState::Locked,
+        android_camera::AeState::FlashRequired => AeState::FlashRequired,
+        android_camera::AeState::Precapture => AeState::Precapture,
+    }
+}
+
+/// What the result listener last reported, so it reports only changes.
+#[derive(Default)]
+struct LastReported {
+    af: Option<u32>,
+    ae: Option<AeState>,
+    lens: Option<String>,
+    zoom: Option<u32>,
+}
+
+/// The capture-result listener: runs on the framework's callback thread once per completed
+/// capture, reads the three states the guest can subscribe to, and sends each as a
+/// `CameraEvent::Control` only when it differs from the last one sent. The applied zoom is
+/// reported the same way, but only when it is not what the guest asked for (a clamp by the
+/// HAL): in that case the value the guest reads should be the camera's. Nothing here blocks:
+/// one uncontended lock, channel sends and an eventfd write.
+fn result_listener(
+    id: String,
+    events: mpsc::Sender<CameraEvent>,
+    sink: CaptureSink,
+) -> ResultListener {
+    let last = Mutex::new(LastReported::default());
+    Box::new(move |result: &CaptureResult<'_>| {
+        let mut changed: Vec<CameraControl> = Vec::new();
+        {
+            let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(status) = result.af_state().map(af_status_of) {
+                if last.af != Some(status) {
+                    last.af = Some(status);
+                    changed.push(CameraControl::AfStatus(status));
+                }
+            }
+            if let Some(state) = result.ae_state().map(ae_state_of) {
+                if last.ae != Some(state) {
+                    last.ae = Some(state);
+                    changed.push(CameraControl::AeState(state));
+                }
+            }
+            if let Some(lens) = result.active_physical_id() {
+                if last.lens.as_deref() != Some(lens.as_str()) {
+                    info!("camera {}: physical lens {} is active", id, lens);
+                    last.lens = Some(lens.clone());
+                    changed.push(CameraControl::ActivePhysicalId(lens));
+                }
+            }
+            if let Some(ratio) = result.zoom_ratio().filter(|r| r.is_finite() && *r > 0.0) {
+                let hundredths = (ratio * 100.0).round() as u32;
+                if last.zoom != Some(hundredths) {
+                    last.zoom = Some(hundredths);
+                    changed.push(CameraControl::Zoom(hundredths));
                 }
             }
         }
-    }
+        if !changed.is_empty() {
+            for control in changed {
+                let _ = events.send(CameraEvent::Control(control));
+            }
+            sink.signal();
+        }
+    })
 }
 
 /// The capture thread's loop: frames into lent buffers until told to stop or the camera fails.
@@ -436,6 +1074,9 @@ fn capture_loop(
     sink: &CaptureSink,
     width: u32,
     height: u32,
+    facts: &Facts,
+    geometry: &Geometry,
+    applied: &mut Applied,
 ) {
     let mut empties: VecDeque<EmptyBuffer> = VecDeque::new();
     let mut sequence = 0u32;
@@ -455,7 +1096,9 @@ fn capture_loop(
         loop {
             match commands.try_recv() {
                 Ok(Command::Lend(buffer)) => empties.push_back(buffer),
-                Ok(Command::Controls(controls)) => apply_controls(id, camera, &controls),
+                Ok(Command::Controls(controls)) => {
+                    apply_controls(id, camera, facts, geometry, applied, &controls)
+                }
                 Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
             }
@@ -475,7 +1118,9 @@ fn capture_loop(
             }
             match commands.recv_timeout(FRAME_WAIT) {
                 Ok(Command::Lend(buffer)) => empties.push_back(buffer),
-                Ok(Command::Controls(controls)) => apply_controls(id, camera, &controls),
+                Ok(Command::Controls(controls)) => {
+                    apply_controls(id, camera, facts, geometry, applied, &controls)
+                }
                 Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 Err(RecvTimeoutError::Timeout) => (),
             }
