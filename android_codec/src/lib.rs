@@ -570,6 +570,20 @@ pub const COLOR_FORMAT_YUV_P010: i32 = 54;
 pub const COLOR_FORMAT_SURFACE: i32 = 0x7F00_0789;
 pub const COLOR_QCOM_FORMAT_YUV420_SEMI_PLANAR: i32 = 0x7FA3_0C00;
 
+/// `COLOR_RANGE_*`, `COLOR_STANDARD_*` and `COLOR_TRANSFER_*` (`MediaCodecConstants.h:1036-1045`):
+/// the colour aspects an encoder is told under `"color-range"`, `"color-standard"` and
+/// `"color-transfer"`, which it writes into the stream's VUI.
+pub const COLOR_RANGE_FULL: i32 = 1;
+pub const COLOR_RANGE_LIMITED: i32 = 2;
+pub const COLOR_STANDARD_BT709: i32 = 1;
+pub const COLOR_STANDARD_BT601_PAL: i32 = 2;
+pub const COLOR_STANDARD_BT601_NTSC: i32 = 4;
+pub const COLOR_STANDARD_BT2020: i32 = 6;
+pub const COLOR_TRANSFER_LINEAR: i32 = 1;
+pub const COLOR_TRANSFER_SDR_VIDEO: i32 = 3;
+pub const COLOR_TRANSFER_ST2084: i32 = 6;
+pub const COLOR_TRANSFER_HLG: i32 = 7;
+
 /// `ABitrateMode` (`NdkMediaCodecInfo.h:655-660`) == `BITRATE_MODE_*`, writable straight into
 /// `"bitrate-mode"`.
 pub const BITRATE_MODE_CQ: i32 = 0;
@@ -651,6 +665,13 @@ pub mod keys {
     pub const COLOR_RANGE: &CStr = c"color-range";
     pub const COLOR_STANDARD: &CStr = c"color-standard";
     pub const COLOR_TRANSFER: &CStr = c"color-transfer";
+    /// Encoder configure keys with no `AMEDIAFORMAT_KEY_*` symbol, by their literal names
+    /// (`MediaCodecConstants.h:1123`, `:1143-1144`): headers again in front of every sync frame
+    /// (`KEY_PREPEND_HEADER_TO_SYNC_FRAMES`), and the quantiser bounds (`KEY_VIDEO_QP_MIN` /
+    /// `_MAX`, honoured by a codec with `FEATURE_QpBounds`).
+    pub const PREPEND_HEADER_TO_SYNC_FRAMES: &CStr = c"prepend-sps-pps-to-idr-frames";
+    pub const VIDEO_QP_MIN: &CStr = c"video-qp-min";
+    pub const VIDEO_QP_MAX: &CStr = c"video-qp-max";
     /// `AMEDIACODEC_KEY_*` for `setParameters` (`NdkMediaCodec.cpp:1142-1148`).
     pub const REQUEST_SYNC_FRAME: &CStr = c"request-sync";
     pub const VIDEO_BITRATE: &CStr = c"video-bitrate";
@@ -1790,15 +1811,30 @@ pub enum CodecEvent {
     },
 }
 
+/// The event queue and the generation it is at. A flush voids every buffer index the codec has
+/// handed out, so [`Codec::flush_and_restart`] bumps the generation under this lock and
+/// [`Shared::take`] hands out only events posted under the current one; an event a callback
+/// posted before the flush and this lock saw afterwards is dropped, counted, and never reaches
+/// the consumer (`logs/vpu_wp/B5-acceptance.md` D23). The stamp cannot catch a callback the NDK
+/// looper had already queued before the flush and delivers after the bump -- that one arrives
+/// with the new generation and a dead index, which is why a null `getInputBuffer` /
+/// `getOutputBuffer` on it is something a consumer skips, never a session error.
+struct EventQueue {
+    generation: u64,
+    events: VecDeque<(u64, CodecEvent)>,
+}
+
 /// What the callbacks write and the consumer reads. The callbacks run on the codec's own NDK
 /// looper thread, one at a time under the NDK's lock; each pushes one event and signals the
 /// eventfd, and nothing else ("no heavy duty task should be performed on callback thread",
 /// `NdkMediaCodec.h:506`).
 struct Shared {
-    queue: Mutex<VecDeque<CodecEvent>>,
+    queue: Mutex<EventQueue>,
     /// +1 per event: a device worker polls this next to its virtqueue events.
     event: Event,
     callbacks: AtomicU64,
+    /// Events dropped because a flush made their generation old (D23).
+    stale: AtomicU64,
     /// Run after every push, besides the eventfd above: a consumer that polls a descriptor of
     /// its own (the virtio-media decoder device, whose session eventfd is the device's) installs
     /// one that bumps it, and needs no thread of its own to forward the wake-up.
@@ -1811,11 +1847,26 @@ struct Shared {
 pub type WakeHook = Box<dyn Fn() + Send + Sync>;
 
 impl Shared {
+    fn new() -> Result<Shared> {
+        Ok(Shared {
+            queue: Mutex::new(EventQueue {
+                generation: 0,
+                events: VecDeque::new(),
+            }),
+            event: Event::new().map_err(|e| CodecError::Event(e.to_string()))?,
+            callbacks: AtomicU64::new(0),
+            stale: AtomicU64::new(0),
+            wake: OnceLock::new(),
+        })
+    }
+
+    /// Queue `ev`, stamped with the generation current at this moment, and wake the consumer.
     fn push(&self, ev: CodecEvent) {
-        self.queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push_back(ev);
+        {
+            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let generation = queue.generation;
+            queue.events.push_back((generation, ev));
+        }
         self.callbacks.fetch_add(1, Ordering::Relaxed);
         // A signal that fails (fd closed under us) leaves the event in the queue for the next
         // take; nothing to report from a foreign thread.
@@ -1823,6 +1874,43 @@ impl Shared {
         if let Some(wake) = self.wake.get() {
             wake();
         }
+    }
+
+    /// Every event of the current generation, oldest first; older ones are dropped and counted.
+    fn take(&self) -> Vec<CodecEvent> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let generation = queue.generation;
+        let mut stale = 0;
+        let out = queue
+            .events
+            .drain(..)
+            .filter_map(|(posted, ev)| {
+                if posted == generation {
+                    Some(ev)
+                } else {
+                    stale += 1;
+                    None
+                }
+            })
+            .collect();
+        if stale > 0 {
+            self.stale.fetch_add(stale, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Start a new generation: everything queued so far is void (their indices are), and so is
+    /// anything a callback posts before it observes the new generation, since it takes this lock
+    /// to post at all.
+    fn bump(&self) -> u64 {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.generation += 1;
+        let dropped = queue.events.len() as u64;
+        queue.events.clear();
+        if dropped > 0 {
+            self.stale.fetch_add(dropped, Ordering::Relaxed);
+        }
+        queue.generation
     }
 }
 
@@ -1928,12 +2016,7 @@ impl Codec {
         if ptr.is_null() {
             return Err(CodecError::Null(what));
         }
-        let shared = Arc::new(Shared {
-            queue: Mutex::new(VecDeque::new()),
-            event: Event::new().map_err(|e| CodecError::Event(e.to_string()))?,
-            callbacks: AtomicU64::new(0),
-            wake: OnceLock::new(),
-        });
+        let shared = Arc::new(Shared::new()?);
         let userdata = Arc::into_raw(shared.clone());
         let mut codec = Codec {
             ptr,
@@ -2001,15 +2084,32 @@ impl Codec {
         check("AMediaCodec_flush", unsafe { AMediaCodec_flush(self.ptr) })
     }
 
-    /// The async-mode seek: flush, drop every queued event (their buffer indices are void after
-    /// a flush), then `start` again so input buffers are offered afresh
-    /// (`NdkMediaCodec.h:485-490`). Events already posted to the NDK looper before the flush may
-    /// still arrive afterwards; a `queue_input` on such a stale index fails, and the caller
-    /// should treat that as "skip".
+    /// The async-mode seek: flush, start a new event generation (every buffer index the codec
+    /// handed out is void after a flush, so every event queued so far is dropped, and so is one a
+    /// callback posts before it sees the new generation), then `start` again so input buffers
+    /// are offered afresh (`NdkMediaCodec.h:485-490`). A callback the NDK looper had already
+    /// queued before the flush can still be delivered after this returns, stamped with the new
+    /// generation and carrying a dead index: `queue_input` / `output_buffer` on it return
+    /// [`CodecError::Null`], which a caller must skip -- never treat as a session error
+    /// (`logs/vpu_wp/B5-acceptance.md` D23).
     pub fn flush_and_restart(&mut self) -> Result<()> {
         self.flush()?;
-        self.take_events();
+        self.shared.bump();
         self.start()
+    }
+
+    /// The current event generation: bumped by every [`Self::flush_and_restart`].
+    pub fn generation(&self) -> u64 {
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
+    /// How many events were dropped so far because a flush made their generation old (D23).
+    pub fn stale_events(&self) -> u64 {
+        self.shared.stale.load(Ordering::Relaxed)
     }
 
     /// Copy `data` into input buffer `index` and queue it.
@@ -2156,14 +2256,10 @@ impl Codec {
         self.shared.wake.set(hook).is_ok()
     }
 
-    /// Everything queued so far, without waiting.
+    /// Everything queued so far under the current generation, without waiting; events an
+    /// earlier generation posted are dropped and counted in [`Self::stale_events`].
     pub fn take_events(&self) -> Vec<CodecEvent> {
-        self.shared
-            .queue
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .drain(..)
-            .collect()
+        self.shared.take()
     }
 
     /// Everything queued, waiting up to `timeout` for the first event. An empty result is a
@@ -2228,6 +2324,54 @@ mod tests {
         assert_eq!(level_table("video/hevc").len(), 26);
         assert_eq!(level_table("video/av01").len(), 24);
         assert_eq!(profile_table("audio/mp4a-latm").len(), 0);
+    }
+
+    /// D23: an event queued before a flush must never reach the consumer afterwards, whichever
+    /// side it came from, and one queued after it must. The queue is exercised directly: a
+    /// `Codec` needs the NDK, the generation logic does not.
+    #[test]
+    fn events_from_an_older_generation_are_dropped() {
+        let shared = Shared::new().unwrap();
+        assert_eq!(shared.take().len(), 0);
+
+        shared.push(CodecEvent::InputAvailable(1));
+        shared.push(CodecEvent::OutputAvailable {
+            index: 2,
+            info: BufferInfo::default(),
+        });
+        assert_eq!(shared.callbacks.load(Ordering::Relaxed), 2);
+        // The seek: both are void.
+        assert_eq!(shared.bump(), 1);
+        assert_eq!(shared.stale.load(Ordering::Relaxed), 2);
+        assert!(shared.take().is_empty());
+
+        // Posted under generation 1, taken under generation 1: delivered, in order.
+        shared.push(CodecEvent::InputAvailable(3));
+        shared.push(CodecEvent::InputAvailable(4));
+        let taken = shared.take();
+        assert!(
+            matches!(
+                taken[..],
+                [CodecEvent::InputAvailable(3), CodecEvent::InputAvailable(4)]
+            ),
+            "{taken:?}"
+        );
+
+        // An event that was stamped under the old generation but is still in the queue when
+        // the consumer looks after a bump is dropped by `take` too, and counted.
+        shared.push(CodecEvent::InputAvailable(5));
+        {
+            let mut queue = shared.queue.lock().unwrap();
+            queue.generation += 1;
+        }
+        shared.push(CodecEvent::InputAvailable(6));
+        let taken = shared.take();
+        assert!(
+            matches!(taken[..], [CodecEvent::InputAvailable(6)]),
+            "{taken:?}"
+        );
+        assert_eq!(shared.stale.load(Ordering::Relaxed), 3);
+        assert_eq!(shared.queue.lock().unwrap().generation, 2);
     }
 
     #[test]
