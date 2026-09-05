@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::io::Write;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
@@ -11,13 +12,16 @@ use anyhow::bail;
 use anyhow::Context;
 use argh::FromArgs;
 use base::error;
+use base::info;
 use base::RawDescriptor;
 use cros_async::Executor;
 
 use crate::virtio::media::android_camera_backend::AndroidCameraBackend;
 use crate::virtio::media::android_codec_backend::MediaCodecDecoderBackend;
+use crate::virtio::media::android_codec_backend::MediaCodecEncoderBackend;
 use crate::virtio::media::camera_config;
 use crate::virtio::media::decoder_config;
+use crate::virtio::media::encoder_config;
 use crate::virtio::media::loopback_config;
 use crate::virtio::media::simple_capture_config;
 use crate::virtio::media::MediaDeviceKind;
@@ -59,8 +63,8 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
 
     // One arm per device type: the backend is generic over the device it runs, so each kind is
     // its own instantiation. Which kinds exist is `MediaDeviceKind::support`'s table, the same
-    // one the VMM reads before it launches this process, and the refusal below is that table's
-    // wording -- so both sides refuse the same kinds with the same words (B4 §7.1, D15).
+    // one the VMM reads before it launches this process (B4 §7.1, D15). The two codec arms do
+    // not return: see `leave_after_codec_store`.
     match params.kind {
         MediaDeviceKind::Simple => {
             use virtio_media::devices::SimpleCaptureDevice;
@@ -128,44 +132,112 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
             )?;
             ex.run_until(conn.run_backend(backend, &ex))?
         }
-        MediaDeviceKind::Decoder => {
-            use virtio_media::devices::VideoDecoder;
+        MediaDeviceKind::Decoder => leave_after_codec_store(
+            "decoder",
+            (|| {
+                use virtio_media::devices::VideoDecoder;
 
-            // As the camera: the codec store is read here, once, before the frontend is spoken
-            // to, so a platform with no usable hardware decoder (or no media NDK) ends the
-            // helper now, by name; the codec itself is created at STREAMON(OUTPUT). The store's
-            // tables have no lock, which is why this is the one walk, on one thread, after the
-            // uid drop (design §7.2). The wait is bounded for the same reason the camera's is.
-            let allow_sw = params.allow_sw;
-            let decoder = enumerate_on_thread(
-                "media_codec_enum",
-                "codec enumeration",
-                "the codec store (media.player) is not responding to this uid",
-                move || MediaCodecDecoderBackend::new(allow_sw),
-            )?;
-            let card = params
-                .card
-                .clone()
-                .unwrap_or_else(|| "droidvm decoder".to_string());
-            let backend = MediaBackend::new(
-                params,
-                decoder_config(&card),
-                move |event_queue, guest_mapper, mapper, allocator| {
-                    Ok(VideoDecoder::new(
-                        decoder.clone(),
-                        event_queue,
-                        guest_mapper,
-                        mapper,
-                        allocator,
-                    ))
-                },
-            )?;
-            ex.run_until(conn.run_backend(backend, &ex))?
-        }
-        kind @ MediaDeviceKind::Encoder => {
-            bail!("{}", kind.unimplemented_message())
-        }
+                // As the camera: the codec store is read here, once, before the frontend is spoken
+                // to, so a platform with no media NDK (or a codec store that does not answer) ends
+                // the helper now, by name; the codec itself is created at STREAMON(OUTPUT). The
+                // store's tables have no lock, which is why this is the one walk, on one thread,
+                // after the uid drop (design §7.2). The wait is bounded for the same reason the
+                // camera's is. A platform with no usable decoder is not an error: the device is
+                // served with no coded format (A4 §10 item 2).
+                let allow_sw = params.allow_sw;
+                let decoder = enumerate_on_thread(
+                    "media_codec_enum",
+                    "codec enumeration",
+                    "the codec store (media.player) is not responding to this uid",
+                    move || MediaCodecDecoderBackend::new(allow_sw),
+                )?;
+                let card = params
+                    .card
+                    .clone()
+                    .unwrap_or_else(|| "droidvm decoder".to_string());
+                let backend = MediaBackend::new(
+                    params,
+                    decoder_config(&card),
+                    move |event_queue, guest_mapper, mapper, allocator| {
+                        Ok(VideoDecoder::new(
+                            decoder.clone(),
+                            event_queue,
+                            guest_mapper,
+                            mapper,
+                            allocator,
+                        ))
+                    },
+                )?;
+                ex.run_until(conn.run_backend(backend, &ex))
+            })(),
+        ),
+        MediaDeviceKind::Encoder => leave_after_codec_store(
+            "encoder",
+            (|| {
+                use virtio_media::devices::VideoEncoder;
+
+                // The decoder's shape, for the encoders (design §7.3): one walk of the codec store,
+                // with the profile and level probe on (in-process checks, not binder round trips),
+                // and the codec itself created when both queues stream.
+                let allow_sw = params.allow_sw;
+                let encoder = enumerate_on_thread(
+                    "media_codec_enum",
+                    "codec enumeration",
+                    "the codec store (media.player) is not responding to this uid",
+                    move || MediaCodecEncoderBackend::new(allow_sw),
+                )?;
+                let card = params
+                    .card
+                    .clone()
+                    .unwrap_or_else(|| "droidvm encoder".to_string());
+                let backend = MediaBackend::new(
+                    params,
+                    encoder_config(&card),
+                    move |event_queue, guest_mapper, mapper, allocator| {
+                        Ok(VideoEncoder::new(
+                            encoder.clone(),
+                            event_queue,
+                            guest_mapper,
+                            mapper,
+                            allocator,
+                        ))
+                    },
+                )?;
+                ex.run_until(conn.run_backend(backend, &ex))
+            })(),
+        ),
     }
+}
+
+/// How a codec helper ends: the outcome of its arm logged, the streams flushed, and `_exit`.
+///
+/// A process that has walked `AMediaCodecStore` must not `exit()`: the Store's file-scope
+/// `std::vector<AMediaCodecInfo>` is destroyed by `__cxa_finalize` after the allocator arena it
+/// lives in, and the process dies with SIGSEGV inside `libmediandk` -- `codec_probe list`
+/// printed everything and returned 139 (`logs/vpu_wp/B5-acceptance.md` D24). A helper that
+/// returns from `main` on a clean shutdown would take the same path, and the VMM's child reaper
+/// would report `child media helper (pid N) exited: signo 11` and take the VM down as a crash.
+/// `_exit` runs no destructor, and the process has nothing else to wind down: its device was
+/// dropped on the worker thread, and the enumeration thread, if it timed out, is inside binder
+/// and expendable. The exit code is the one `main` would have produced: 0 for `Ok`, 1 for an
+/// error, which is logged here as `main` would have logged it.
+fn leave_after_codec_store(kind: &str, result: anyhow::Result<()>) -> ! {
+    let code = match result {
+        Ok(()) => {
+            info!("media helper ({}): done; leaving through _exit (D24)", kind);
+            0
+        }
+        Err(e) => {
+            error!("Failed to run device: {:#}", e);
+            1
+        }
+    };
+    // Rust's stderr is unbuffered and the Android logger writes through; the flush is for
+    // anything a logger buffers on another platform.
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
+    // SAFETY: `_exit` takes an exit code and does not return.
+    unsafe { libc::_exit(code) }
 }
 
 /// How long the helper waits for the camera enumeration. `list_cameras` is binder work
