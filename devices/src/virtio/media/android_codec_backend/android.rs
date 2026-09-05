@@ -129,18 +129,30 @@ pub(super) const CODEC_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// thread that runs them. Nothing of the guest's is at stake by then (the FIFOs are already
 /// empty); the bound only keeps `REQBUFS(0)` / close from waiting on a wedged component.
 pub(super) const CODEC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Wall-clock ceiling on the D45 hold (D48). An `InputBufferDone` deferred behind the initial
-/// `SOURCE_CHANGE` is normally released the moment the codec asks for more input than the held
-/// buffers carried (`note_input_done` / the `InputAvailable` arm of `take_events`); this bound is
-/// the backstop, so a codec that neither announces nor asks for more cannot park a
-/// one-buffer-in-flight client forever. It is evaluated on every backend wake (the codec always
-/// bumps the session eventfd for an `InputAvailable` or a `FormatChanged`), and it is far longer
-/// than the ~57 ms a hardware decoder took to announce from a buffer it could parse (B9 §5.4), so
-/// it never trips the D45 ordering for a stream the codec can announce from.
-pub(super) const DEFERRED_INPUT_DONE_DEADLINE: Duration = Duration::from_millis(500);
+/// How long an `InputBufferDone` is held behind a `SOURCE_CHANGE` the client is waiting for
+/// before it is returned anyway (D55/D56). The hold ends the instant the codec announces
+/// (`announce` -> `release_deferred_input_done`); this is the ceiling for the case the codec
+/// *cannot* announce (a garbage stream, or the 31-byte header of D44), so a one-buffer-in-flight
+/// client is freed rather than parked forever. It is the *only* thing that ends the hold without
+/// an announcement -- the F12 "codec asked for more input" release was dropped, because MediaCodec
+/// can recycle the input slot (`onInputAvailable`) *before* it announces (`onOutputFormatChanged`),
+/// so releasing on that recycle emptied a waiting GStreamer's OUTPUT queue and its CAPTURE poll
+/// took `POLLPRI|POLLERR` (D55, `v4l2_m2m_poll_for_data`; gst treats `POLLERR` as fatal). A
+/// hardware decoder that *can* announce does so ~40--60 ms after the first buffer on 5566 (B9
+/// §5.4), so 250 ms holds the buffer well past the announcement in every ordinary case -- keeping
+/// gst's `SOURCE_CHANGE`-before-buffer ordering with a wide (4--6x) margin -- while an ffmpeg or a
+/// `v4l2-compliance -s` on an unannounceable stream waits at most this long. Because the helper's
+/// poll loop watches only session eventfds, the deadline is made to fire without a codec event by
+/// [`GraceTimer`], a thread that bumps the session sink when the deadline passes; the check itself
+/// ([`Self::release_deferred_input_done_if_stale`]) runs in `take_events` on that wake.
+pub(super) const ANNOUNCE_GRACE: Duration = Duration::from_millis(250);
 /// Floor of `KEY_MAX_INPUT_SIZE`, the codec's input buffer capacity. The device's own floor for
 /// an `OUTPUT` buffer is the same 1 MiB, so an ordinary access unit goes in whole.
 const MIN_INPUT_BUFFER_SIZE: usize = 1 << 20;
+/// Largest buffer scanned for a parameter-set-only access unit (the D55 DRC hold, `decode`). A new
+/// SPS/PPS/VPS set is a few hundred bytes; anything larger carries a picture and is not config, so
+/// the scan is skipped rather than run on every frame.
+const PARAMETER_SET_SCAN_LIMIT: usize = 8192;
 /// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`, announced with every format change. Outputs are copied
 /// out and released to the codec at once, so the codec's own reference frames never pin a
 /// `CAPTURE` buffer: a small number keeps the pipeline moving (GStreamer adds its own extras,
@@ -162,6 +174,83 @@ pub(super) const STALE_LOG_LIMIT: u32 = 3;
 /// everything; the session ends rather than spinning.
 pub(super) const MAX_REFUSED_INDICES: u32 = 64;
 
+/// Wakes a decoder session's worker once a deferred `InputBufferDone` has been held past
+/// [`ANNOUNCE_GRACE`] with no `SOURCE_CHANGE` (D56). The device's poll loop watches only session
+/// eventfds -- the codec bumps them, nothing else does -- so a codec that goes silent after
+/// consuming an unannounceable stream (a `v4l2-compliance -s` feeding garbage) would never wake
+/// the worker to run the backstop. This one thread per session, armed with the hold's deadline,
+/// bumps the same session sink the codec's callbacks do; the worker then runs
+/// [`MediaCodecDecoderSession::release_deferred_input_done_if_stale`] in `take_events` on that
+/// wake, exactly as it does on a codec wake. A later `arm` supersedes an earlier deadline; a
+/// spurious wake after the hold already ended is harmless (the check finds nothing held). This is
+/// the camera backend's pattern -- a thread that is not the worker waking it through the sink.
+struct GraceTimer {
+    /// `None` after `Drop` has taken it to end the loop; `Some` for the session's life.
+    arm: Option<mpsc::Sender<Instant>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl GraceTimer {
+    fn spawn(sink: DecoderSink) -> Self {
+        let (arm, rx) = mpsc::channel::<Instant>();
+        let handle = thread::Builder::new()
+            .name("vpu-dec-grace".to_string())
+            .spawn(move || grace_timer_loop(rx, sink))
+            .ok();
+        GraceTimer {
+            arm: Some(arm),
+            handle,
+        }
+    }
+
+    /// Wake the session's worker at `deadline`. Supersedes any deadline already armed.
+    fn arm(&self, deadline: Instant) {
+        if let Some(arm) = &self.arm {
+            let _ = arm.send(deadline);
+        }
+    }
+}
+
+impl Drop for GraceTimer {
+    fn drop(&mut self) {
+        // Drop the only sender so the loop's `recv` errors and the thread returns, then join it,
+        // so no timer thread outlives its session.
+        self.arm.take();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Wait for a deadline, then bump `sink` when it passes; a newer deadline supersedes. Returns when
+/// the [`GraceTimer`] (the only sender) is dropped.
+fn grace_timer_loop(rx: mpsc::Receiver<Instant>, sink: DecoderSink) {
+    let mut deadline = match rx.recv() {
+        Ok(deadline) => deadline,
+        Err(_) => return,
+    };
+    loop {
+        let now = Instant::now();
+        let next = if now >= deadline {
+            sink.signal();
+            rx.recv().map_err(|_| ())
+        } else {
+            match rx.recv_timeout(deadline - now) {
+                Ok(deadline) => Ok(deadline),
+                Err(RecvTimeoutError::Timeout) => {
+                    sink.signal();
+                    rx.recv().map_err(|_| ())
+                }
+                Err(RecvTimeoutError::Disconnected) => Err(()),
+            }
+        };
+        match next {
+            Ok(deadline_) => deadline = deadline_,
+            Err(()) => return,
+        }
+    }
+}
+
 /// The coded formats a decoder device can offer, in `ENUM_FMT(OUTPUT)` order (and an encoder
 /// device in `ENUM_FMT(CAPTURE)` order), and the MediaCodec mime each stands for (design §7.2,
 /// §7.3). Whether one is offered is decided by the codec store.
@@ -170,7 +259,10 @@ pub(super) const CODED_FORMATS: [(&[u8; 4], &str); 5] = [
     (b"HEVC", "video/hevc"),
     (b"VP80", "video/x-vnd.on2.vp8"),
     (b"VP90", "video/x-vnd.on2.vp9"),
-    (b"AV10", "video/av01"),
+    // `V4L2_PIX_FMT_AV1` is `v4l2_fourcc('A','V','0','1')` = `AV01`, not `AV10` (D54): with the
+    // wrong spelling `v4l2-compliance`'s `determine_codec_mask` bails on the unknown compressed
+    // format and cannot classify the node, and any client matching on the fourcc cannot see AV1.
+    (b"AV01", "video/av01"),
 ];
 
 /// The `FEATURE_*` strings that matter for the choice (`NdkMediaCodecInfo.h`,
@@ -563,6 +655,25 @@ fn max_input_size(coded: (u32, u32)) -> usize {
     ((coded.0 as usize * coded.1 as usize * 3 / 2) / 2 + 128).max(MIN_INPUT_BUFFER_SIZE)
 }
 
+/// Whether `data` is a whole access unit of nothing but parameter sets (SPS/PPS, no slice): a
+/// `codec_data`/`CODEC_CONFIG` buffer, which mid-stream may carry a new SPS and raise a
+/// `SOURCE_CHANGE`. `None` for a codec whose bitstream is not Annex-B NAL (VP8/VP9/AV1), whose
+/// resolution rides in every keyframe rather than a separable header, so there is nothing to
+/// detect. This is the exact predicate `pump_input` uses to flag `BUFFER_FLAG_CODEC_CONFIG`.
+fn is_parameter_sets_only(data: &[u8], nal: Option<NalCodec>) -> bool {
+    let Some(nal) = nal else {
+        return false;
+    };
+    match annexb_access_units(data, nal) {
+        Ok(units) => {
+            !units.is_empty()
+                && units.iter().all(|u| !u.has_picture)
+                && units.iter().any(|u| u.has_parameter_sets)
+        }
+        Err(_) => false,
+    }
+}
+
 /// Run `op` on a thread of its own and wait at most `timeout` for what it returns. `None` is a
 /// timeout (or a thread that could not be started): the thread is then detached, and whatever
 /// `op` owns -- the codec -- is dropped by that thread when the call finally returns, which is
@@ -638,15 +749,27 @@ pub struct MediaCodecDecoderSession {
     /// (`InputBufferDone`) rather than only when a codec input slot happens to be free -- see
     /// [`PendingInput`] and D28.
     pending: VecDeque<PendingInput>,
-    /// Guest `OUTPUT` buffer indices whose `InputBufferDone` is held back until the stream's
-    /// format is first announced, so a client polling for the initial `SOURCE_CHANGE` still has a
-    /// buffer in its `OUTPUT` queue and does not take `POLLPRI|POLLERR` on the idle `CAPTURE`
-    /// side (D45, the B8 `pollrace.py` measurement). Empty once the first `FormatChanged` is out.
+    /// Guest `OUTPUT` buffer indices whose `InputBufferDone` is held back until the
+    /// `SOURCE_CHANGE` the client is waiting for is announced, so a client polling for that event
+    /// still has a buffer in its `OUTPUT` queue and does not empty it and take `POLLPRI|POLLERR`
+    /// on the idle `CAPTURE` side (D45/D55, the B8 `pollrace.py` measurement). Held while
+    /// [`Self::awaiting_format`]: before the first `FormatChanged`, and across a mid-stream
+    /// resolution change from the buffer that carried the new parameter sets to the second
+    /// `FormatChanged`.
     deferred_input_done: VecDeque<u32>,
-    /// When the current run of `deferred_input_done` began holding, for the
-    /// [`DEFERRED_INPUT_DONE_DEADLINE`] backstop (D48). `Some` exactly while a buffer is held;
-    /// reset to `None` on every release.
+    /// When the current run of `deferred_input_done` began holding, for the [`ANNOUNCE_GRACE`]
+    /// backstop (D55/D56). `Some` exactly while a buffer is held; reset to `None` on every
+    /// release. The [`GraceTimer`] is armed with `deferred_since + ANNOUNCE_GRACE` on the
+    /// empty->held transition so the backstop fires even if the codec never wakes the worker
+    /// again.
     deferred_since: Option<Instant>,
+    /// A parameter-set-only buffer was fed to the codec after the stream was already announced: it
+    /// may carry a new SPS and raise a mid-stream `SOURCE_CHANGE`, so its `InputBufferDone` (and
+    /// any queued behind it) is held like the initial one until that second `FormatChanged` (or
+    /// the grace), for the same reason -- a GStreamer client that stops feeding while it waits for
+    /// the change (its `wait_for_src_ch`) must not have its `OUTPUT` queue emptied (D55, at a
+    /// DRC). Cleared on every release and on flush/stop/fail.
+    awaiting_drc: bool,
     /// `CAPTURE` buffers lent by the device, oldest first.
     captures: VecDeque<OutputBuffer>,
     /// Outputs the codec delivered that no `CAPTURE` buffer has taken yet, and the format
@@ -676,10 +799,14 @@ pub struct MediaCodecDecoderSession {
     inputs: u64,
     frames: u64,
     started_at: Option<Instant>,
+    /// Wakes the worker when a held `InputBufferDone` outlives [`ANNOUNCE_GRACE`] with no codec
+    /// event (D56). Dropped with the session, which joins its thread.
+    grace: GraceTimer,
 }
 
 impl MediaCodecDecoderSession {
     fn new(id: u32, sink: DecoderSink, codecs: Vec<ChosenCodec>) -> Self {
+        let grace = GraceTimer::spawn(sink.clone());
         Self {
             id,
             sink,
@@ -693,6 +820,8 @@ impl MediaCodecDecoderSession {
             pending: VecDeque::new(),
             deferred_input_done: VecDeque::new(),
             deferred_since: None,
+            awaiting_drc: false,
+            grace,
             captures: VecDeque::new(),
             held_outputs: VecDeque::new(),
             events: Vec::new(),
@@ -726,6 +855,7 @@ impl MediaCodecDecoderSession {
         self.pending.clear();
         self.deferred_input_done.clear();
         self.deferred_since = None;
+        self.awaiting_drc = false;
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
@@ -763,20 +893,32 @@ impl MediaCodecDecoderSession {
         }
     }
 
-    /// Return the guest's `OUTPUT` buffer, or hold it behind the initial `SOURCE_CHANGE`. Until
-    /// the stream's format is first announced the buffer stays outstanding, so a client polling
-    /// for the event still has something in its `OUTPUT` queue and does not empty it and take
-    /// `POLLPRI|POLLERR` on the still-idle `CAPTURE` side (D45, the B8 `pollrace.py` measurement
-    /// -- `POLLPRI` before `POLLOUT`). The hold is bounded three ways so it cannot deadlock a
-    /// one-buffer-in-flight client (D48): the announcement releases it ([`Self::announce`]); the
-    /// codec asking for more input than the held buffers carried releases it (the `InputAvailable`
-    /// arm of [`Self::take_events`]); and [`DEFERRED_INPUT_DONE_DEADLINE`] is the wall-clock
-    /// backstop ([`Self::release_deferred_input_done_if_stale`]). After the announcement the buffer
+    /// Whether an `InputBufferDone` should be held back behind a `SOURCE_CHANGE` the client is
+    /// waiting for: before the first `FormatChanged` (the initial announcement), and across a
+    /// mid-stream resolution change once a parameter-set-only buffer has been fed
+    /// ([`Self::awaiting_drc`]), until the second `FormatChanged`.
+    fn awaiting_format(&self) -> bool {
+        self.announced.is_none() || self.awaiting_drc
+    }
+
+    /// Return the guest's `OUTPUT` buffer, or hold it behind the `SOURCE_CHANGE` the client is
+    /// waiting for. While [`Self::awaiting_format`] the buffer stays outstanding, so a client
+    /// polling for the event (GStreamer's `wait_for_src_ch`, which stops feeding until the change)
+    /// still has something in its `OUTPUT` queue and does not empty it and take `POLLPRI|POLLERR`
+    /// on the still-idle `CAPTURE` side (D45/D55, the B8 `pollrace.py` measurement -- `POLLPRI`
+    /// before `POLLOUT`). The hold ends two ways (D55/D56): the announcement releases it
+    /// ([`Self::announce`]); and [`ANNOUNCE_GRACE`], armed on the [`GraceTimer`] here so it fires
+    /// even if the codec never wakes the worker again, is the ceiling for a codec that *cannot*
+    /// announce ([`Self::release_deferred_input_done_if_stale`]). There is no "codec asked for more
+    /// input" release: MediaCodec can recycle the input slot before it announces, and releasing
+    /// then is exactly what emptied a waiting gst's queue (D55). After the announcement the buffer
     /// goes back at once.
     fn note_input_done(&mut self, index: u32) {
-        if self.announced.is_none() {
+        if self.awaiting_format() {
             if self.deferred_since.is_none() {
-                self.deferred_since = Some(Instant::now());
+                let now = Instant::now();
+                self.deferred_since = Some(now);
+                self.grace.arm(now + ANNOUNCE_GRACE);
             }
             self.deferred_input_done.push_back(index);
         } else {
@@ -784,35 +926,37 @@ impl MediaCodecDecoderSession {
         }
     }
 
-    /// Release the `OUTPUT` buffers held behind the initial `SOURCE_CHANGE`
-    /// ([`Self::note_input_done`]), pushed **after** the `FormatChanged` event that closes the
-    /// window so the guest sees the event first.
+    /// Release the `OUTPUT` buffers held behind the `SOURCE_CHANGE` ([`Self::note_input_done`]),
+    /// pushed **after** the `FormatChanged` event that closes the window so the guest sees the
+    /// event first. Ends the hold: `awaiting_drc` and the grace clock are cleared.
     fn release_deferred_input_done(&mut self) {
         while let Some(index) = self.deferred_input_done.pop_front() {
             self.events.push(DecoderEvent::InputBufferDone(index));
         }
         self.deferred_since = None;
+        self.awaiting_drc = false;
     }
 
-    /// The D48 backstop: release the held `OUTPUT` buffers if the codec has held them past
-    /// [`DEFERRED_INPUT_DONE_DEADLINE`] without ever announcing. Evaluated on every backend wake.
-    /// The primary release ([`Self::note_input_done`]'s counterpart in the `InputAvailable` arm of
-    /// [`Self::take_events`]) fires first in every measured case; this only guards a codec that
-    /// went silent, so no one-buffer-in-flight client is ever parked forever.
+    /// The D55/D56 backstop: release the held `OUTPUT` buffers if they have outlived
+    /// [`ANNOUNCE_GRACE`] with no `SOURCE_CHANGE`. Runs in `take_events` on every wake, including
+    /// the artificial one the [`GraceTimer`] posts when the deadline passes -- which is what makes
+    /// it fire for a codec that went silent (D56), the case a purely event-driven check missed.
+    /// The announcement releases the buffers first in every ordinary case; this only guards a
+    /// stream the codec cannot announce from, so no one-buffer-in-flight client is parked forever.
     fn release_deferred_input_done_if_stale(&mut self) {
-        if self.announced.is_some() || self.deferred_input_done.is_empty() {
+        if self.deferred_input_done.is_empty() {
             return;
         }
         if self
             .deferred_since
-            .is_some_and(|since| since.elapsed() >= DEFERRED_INPUT_DONE_DEADLINE)
+            .is_some_and(|since| since.elapsed() >= ANNOUNCE_GRACE)
         {
             warn!(
                 "decoder session {}: releasing {} held OUTPUT buffer(s) after {:?} without a \
-                 SOURCE_CHANGE -- the codec neither announced nor asked for more input (D48 backstop)",
+                 SOURCE_CHANGE -- the codec did not announce a format (D55/D56 grace)",
                 self.id,
                 self.deferred_input_done.len(),
-                DEFERRED_INPUT_DONE_DEADLINE
+                ANNOUNCE_GRACE
             );
             self.release_deferred_input_done();
         }
@@ -1313,6 +1457,7 @@ impl MediaCodecDecoderSession {
         // still held behind an initial `SOURCE_CHANGE` (D45) are dropped, not reported late.
         self.deferred_input_done.clear();
         self.deferred_since = None;
+        self.awaiting_drc = false;
         self.eos_queued = false;
         self.eos_seen = false;
         self.parked = false;
@@ -1483,6 +1628,23 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         // SAFETY: the device guarantees `len` readable bytes at `ptr` until we report the
         // `InputBufferDone` queued just below; nothing else reads or writes that region.
         let data = unsafe { std::slice::from_raw_parts(buffer.ptr.as_ptr(), buffer.len) }.to_vec();
+        // A parameter-set-only buffer fed after the stream is already announced may carry a new
+        // SPS and raise a mid-stream `SOURCE_CHANGE`: begin holding `InputBufferDone` (this one and
+        // any behind it) until that second `FormatChanged`, so a client that waits for the change
+        // without feeding (GStreamer's `wait_for_src_ch`) is not emptied and does not take
+        // `POLLPRI|POLLERR` (D55, at a DRC). Decided on the staged copy, never on guest memory --
+        // the same predicate `pump_input` uses to set `BUFFER_FLAG_CODEC_CONFIG`. Set before
+        // `note_input_done` so this buffer is itself held. The grace bounds it if no change comes.
+        // Only small buffers are scanned: a parameter-set-only access unit is a few hundred bytes,
+        // and a large buffer always carries a picture (so the predicate is false), which spares the
+        // NAL scan on every ordinary frame.
+        if self.announced.is_some()
+            && !self.awaiting_drc
+            && data.len() <= PARAMETER_SET_SCAN_LIMIT
+            && is_parameter_sets_only(&data, self.nal)
+        {
+            self.awaiting_drc = true;
+        }
         self.pending.push_back(PendingInput::Bitstream {
             data,
             offset: 0,
@@ -1653,6 +1815,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         self.pending.clear();
         self.deferred_input_done.clear();
         self.deferred_since = None;
+        self.awaiting_drc = false;
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
@@ -1697,21 +1860,18 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                             );
                         }
                     }
-                    // D48: the codec is offering an input slot while nothing is staged to feed it
-                    // and it has announced nothing -- it has consumed every buffer we handed it
-                    // and wants more. That is the exact moment a one-buffer-in-flight client (a
-                    // stateful ffmpeg on an mp4, `v4l2-compliance -s`) must get its OUTPUT buffer
-                    // back, or it never queues the next. The `pending`-empty test is what keeps the
-                    // D45 hold intact during the initial fill: the slots the codec offers up front
-                    // arrive while the first buffer is still staged (`pending` non-empty), so this
-                    // does not fire, and the hold stands until the codec either announces
-                    // (`announce`, POLLPRI first) or, unable to, recycles a slot here with the FIFO
-                    // drained. A codec that can announce from the first buffer emits
-                    // `FormatChanged` before it recycles that slot (measured: POLLPRI at/before
-                    // POLLOUT, B9 §5.4), so D45's ordering holds for it.
-                    if self.announced.is_none() && self.pending.is_empty() {
-                        self.release_deferred_input_done();
-                    }
+                    // The codec is offering an input slot -- it has consumed a buffer and wants
+                    // more. This is NOT a release point for a held `InputBufferDone` (D55): the
+                    // F12 fix released here when the FIFO was drained and nothing was announced,
+                    // but MediaCodec can recycle the input slot *before* it announces
+                    // (`onInputAvailable` ahead of `onOutputFormatChanged` in some runs), so
+                    // releasing then returned the OUTPUT buffer before the `SOURCE_CHANGE` a
+                    // GStreamer client was waiting for, emptied its OUTPUT queue while it sat in
+                    // `wait_for_src_ch`, and its CAPTURE poll took `POLLPRI|POLLERR` (4/20 DRC
+                    // runs died). The hold now ends only on the announcement (`announce`) or on
+                    // [`ANNOUNCE_GRACE`] (`release_deferred_input_done_if_stale`, timer-driven), so
+                    // a client that stops feeding is never emptied before the event, and one that
+                    // keeps feeding an unannounceable stream is freed by the grace.
                     self.free_inputs.push_back(index);
                 }
                 CodecEvent::OutputAvailable { index, info } => {
@@ -1753,8 +1913,9 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                     self.pump_input();
                 }
             }
-            // The D48 wall-clock backstop: if the codec has held the initial buffers past the
-            // deadline without announcing and without asking for more input, release them anyway.
+            // The D55/D56 grace: if buffers have been held past `ANNOUNCE_GRACE` with no
+            // `SOURCE_CHANGE`, release them. This runs on the artificial wake the `GraceTimer`
+            // posts too, so it fires even when the codec has gone silent (D56).
             self.release_deferred_input_done_if_stale();
         }
         std::mem::take(&mut self.events)
