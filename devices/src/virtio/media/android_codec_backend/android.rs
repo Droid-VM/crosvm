@@ -88,8 +88,8 @@ use android_codec::BUFFER_FLAG_CODEC_CONFIG;
 use android_codec::BUFFER_FLAG_END_OF_STREAM;
 use android_codec::BUFFER_FLAG_PARTIAL_FRAME;
 use android_codec::COLOR_FORMAT_YUV420_FLEXIBLE;
-use anyhow::bail;
 use anyhow::Context;
+use base::debug;
 use base::error;
 use base::info;
 use base::warn;
@@ -110,14 +110,14 @@ use virtio_media::v4l2r::Rect;
 /// How long `STREAMON(OUTPUT)` waits for `createCodecByName` + `configure` + `start`. Creating a
 /// codec is a round of binder into `media.codec` and the vendor HAL, normally well under a
 /// second; past this the guest's ioctl answers `ETIMEDOUT` rather than the worker staying parked.
-const CODEC_START_TIMEOUT: Duration = Duration::from_secs(10);
+pub(super) const CODEC_START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a seek (`STREAMOFF(OUTPUT)`) waits for `AMediaCodec_flush` + `start`: a flush waits
 /// for the component to give every buffer back, normally milliseconds.
-const CODEC_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const CODEC_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a session teardown waits for `AMediaCodec_stop` + `delete` before detaching the
 /// thread that runs them. Nothing of the guest's is at stake by then (the FIFOs are already
 /// empty); the bound only keeps `REQBUFS(0)` / close from waiting on a wedged component.
-const CODEC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const CODEC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Floor of `KEY_MAX_INPUT_SIZE`, the codec's input buffer capacity. The device's own floor for
 /// an `OUTPUT` buffer is the same 1 MiB, so an ordinary access unit goes in whole.
 const MIN_INPUT_BUFFER_SIZE: usize = 1 << 20;
@@ -132,15 +132,20 @@ const MIN_CAPTURE_BUFFERS: u32 = 4;
 const FALLBACK_SIZE_RANGE: SizeRange = SizeRange::new(16, 4096, 2);
 /// How many refused input / output indices are logged one by one after a seek; the rest are
 /// counted. A callback posted before `AMediaCodec_flush` can still be delivered after it, with
-/// an index that no longer means anything (`logs/vpu_wp/M6-probe.md` §9 item 5).
-const STALE_LOG_LIMIT: u32 = 3;
+/// an index that no longer means anything (`logs/vpu_wp/M6-probe.md` §9 item 5): such an index
+/// answers `getInputBuffer` / `getOutputBuffer` with null, which is skipped at debug level and
+/// never counted against this limit (`logs/vpu_wp/B5-acceptance.md` D23 -- the HEVC decoder
+/// delivers one after most seeks). What is counted here is a *refusal*: an NDK status from
+/// `queueInputBuffer` / `releaseOutputBuffer` on an index the codec did hand out.
+pub(super) const STALE_LOG_LIMIT: u32 = 3;
 /// More refused indices than this since the last seek is not staleness but a codec that refuses
 /// everything; the session ends rather than spinning.
-const MAX_REFUSED_INDICES: u32 = 64;
+pub(super) const MAX_REFUSED_INDICES: u32 = 64;
 
-/// The coded formats a decoder device can offer, in `ENUM_FMT(OUTPUT)` order, and the MediaCodec
-/// mime each stands for (design §7.2). Whether one is offered is decided by the codec store.
-const CODED_FORMATS: [(&[u8; 4], &str); 5] = [
+/// The coded formats a decoder device can offer, in `ENUM_FMT(OUTPUT)` order (and an encoder
+/// device in `ENUM_FMT(CAPTURE)` order), and the MediaCodec mime each stands for (design §7.2,
+/// §7.3). Whether one is offered is decided by the codec store.
+pub(super) const CODED_FORMATS: [(&[u8; 4], &str); 5] = [
     (b"H264", "video/avc"),
     (b"HEVC", "video/hevc"),
     (b"VP80", "video/x-vnd.on2.vp8"),
@@ -150,7 +155,7 @@ const CODED_FORMATS: [(&[u8; 4], &str); 5] = [
 
 /// The `FEATURE_*` strings that matter for the choice (`NdkMediaCodecInfo.h`,
 /// `AMediaCodecInfo_FEATURE_SecurePlayback` / `_LowLatency`).
-const FEATURE_SECURE_PLAYBACK: &str = "secure-playback";
+pub(super) const FEATURE_SECURE_PLAYBACK: &str = "secure-playback";
 const FEATURE_LOW_LATENCY: &str = "low-latency";
 
 /// One codec the backend picked for a coded format: what `STREAMON(OUTPUT)` creates.
@@ -181,7 +186,11 @@ impl MediaCodecDecoderBackend {
     /// no lock: call it once, from one thread, after the uid drop (design §7.2).
     ///
     /// Software decoders are left out unless `allow_sw`; a format with no eligible decoder is
-    /// simply not offered.
+    /// simply not offered. A platform with no eligible decoder at all still gets its device,
+    /// with no coded format (`ENUM_FMT` lists nothing and the device refuses every session with
+    /// `ENODEV`): the alternative, a helper that exits, is a VM that does not boot, which the
+    /// app cannot foresee because it has no way to ask the codec store from the daemon's uid
+    /// (`logs/vpu_wp/A4.md` §10 item 2).
     pub fn new(allow_sw: bool) -> anyhow::Result<Self> {
         let list = list_codecs(&ListOptions {
             include_non_video: false,
@@ -207,7 +216,7 @@ impl MediaCodecDecoderBackend {
         let mut codecs = Vec::new();
         for (fourcc, mime) in CODED_FORMATS {
             let fourcc = PixelFormat::from_fourcc(fourcc);
-            match choose(&list.codecs, mime, allow_sw) {
+            match choose(&list.codecs, CodecKind::Decoder, mime, allow_sw) {
                 Some((chosen, passed_over)) => {
                     let (width, height) = size_ranges(chosen, fourcc);
                     info!(
@@ -276,9 +285,10 @@ impl MediaCodecDecoderBackend {
             }
         }
         if caps.coded_formats.is_empty() {
-            bail!(
-                "no usable video decoder: the codec store ({}) lists {} decoder(s), none of them \
-                 hardware for {} (allow_sw={})",
+            warn!(
+                "decoder: no usable video decoder: the codec store ({}) lists {} decoder(s), \
+                 none of them hardware for {} (allow_sw={}); the device is served with no coded \
+                 format, and every session on it is refused with ENODEV",
                 list.source,
                 decoders,
                 CODED_FORMATS
@@ -288,6 +298,7 @@ impl MediaCodecDecoderBackend {
                     .join(", "),
                 allow_sw
             );
+            return Ok(Self { caps, codecs });
         }
         info!(
             "decoder: {} coded format(s) for the guest from {} ({} decoder(s) listed, \
@@ -306,13 +317,13 @@ impl MediaCodecDecoderBackend {
     }
 }
 
-fn has_feature(info: &CodecInfo, feature: &str) -> bool {
+pub(super) fn has_feature(info: &CodecInfo, feature: &str) -> bool {
     info.features
         .iter()
         .any(|f| f.feature == feature && f.supported)
 }
 
-fn is_hardware(info: &CodecInfo) -> bool {
+pub(super) fn is_hardware(info: &CodecInfo) -> bool {
     match info.codec_type {
         CodecType::HardwareAccelerated => true,
         CodecType::SoftwareOnly | CodecType::SoftwareWithDeviceAccess | CodecType::Invalid => false,
@@ -324,14 +335,16 @@ fn is_hardware(info: &CodecInfo) -> bool {
     }
 }
 
-/// How much a decoder is wanted for a format: vendor hardware first, then any hardware, then --
-/// only with `allow_sw` -- software. `None` is "not eligible".
-fn rank(info: &CodecInfo, mime: &str, allow_sw: bool) -> Option<u8> {
-    if info.kind != CodecKind::Decoder || info.mime != mime {
+/// How much a codec of `kind` is wanted for a format: vendor hardware first, then any hardware,
+/// then -- only with `allow_sw` -- software. `None` is "not eligible". The encoder backend
+/// applies the same rule (design §7.3: "the same preference rule as the decoder").
+fn rank(info: &CodecInfo, kind: CodecKind, mime: &str, allow_sw: bool) -> Option<u8> {
+    if info.kind != kind || info.mime != mime {
         return None;
     }
     // A decoder that *requires* secure playback decodes DRM content into buffers nobody may
-    // read: never usable here. The name check covers a platform without the feature strings.
+    // read (and a secure encoder reads from buffers nobody may write): never usable here. The
+    // name check covers a platform without the feature strings.
     if info
         .features
         .iter()
@@ -348,18 +361,20 @@ fn rank(info: &CodecInfo, mime: &str, allow_sw: bool) -> Option<u8> {
     }
 }
 
-/// The decoder for `mime`, and the names of the eligible ones it was preferred to. Among equal
-/// ranks the shorter canonical name wins (the base component before its `.low_latency` and other
-/// variants), then the store's own order, which lists the platform's preferred codec first.
-fn choose<'a>(
+/// The codec of `kind` for `mime`, and the names of the eligible ones it was preferred to.
+/// Among equal ranks the shorter canonical name wins (the base component before its
+/// `.low_latency`, `.cq` and other variants), then the store's own order, which lists the
+/// platform's preferred codec first.
+pub(super) fn choose<'a>(
     codecs: &'a [CodecInfo],
+    kind: CodecKind,
     mime: &str,
     allow_sw: bool,
 ) -> Option<(&'a CodecInfo, Vec<String>)> {
     let mut eligible: Vec<(u8, usize, &CodecInfo)> = codecs
         .iter()
         .enumerate()
-        .filter_map(|(order, c)| rank(c, mime, allow_sw).map(|r| (r, order, c)))
+        .filter_map(|(order, c)| rank(c, kind, mime, allow_sw).map(|r| (r, order, c)))
         .collect();
     eligible.sort_by(|a, b| {
         b.0.cmp(&a.0)
@@ -456,7 +471,7 @@ struct Announced {
 }
 
 /// The errno a guest's ioctl gets for a codec call that failed.
-fn errno_for(e: &CodecError) -> i32 {
+pub(super) fn errno_for(e: &CodecError) -> i32 {
     match e {
         CodecError::LibraryLoad(..) | CodecError::MissingSymbol(_) => libc::ENOSYS,
         // createCodecByName gave nothing: the name the store gave does not resolve, or the
@@ -471,14 +486,14 @@ fn errno_for(e: &CodecError) -> i32 {
 }
 
 /// A V4L2 timestamp as the microsecond presentation time MediaCodec carries through a frame.
-fn pts_from(ts: bindings::timeval) -> u64 {
+pub(super) fn pts_from(ts: bindings::timeval) -> u64 {
     (ts.tv_sec as i64)
         .wrapping_mul(1_000_000)
         .wrapping_add(ts.tv_usec as i64) as u64
 }
 
 /// The way back: a presentation time as a V4L2 timestamp (`V4L2_BUF_FLAG_TIMESTAMP_COPY`).
-fn timeval_from(pts_us: i64) -> bindings::timeval {
+pub(super) fn timeval_from(pts_us: i64) -> bindings::timeval {
     bindings::timeval {
         tv_sec: pts_us.div_euclid(1_000_000) as _,
         tv_usec: pts_us.rem_euclid(1_000_000) as _,
@@ -496,8 +511,9 @@ fn max_input_size(coded: (u32, u32)) -> usize {
 /// timeout (or a thread that could not be started): the thread is then detached, and whatever
 /// `op` owns -- the codec -- is dropped by that thread when the call finally returns, which is
 /// the only way the platform gets the codec back. The value `op` produces after a timeout is
-/// dropped there too.
-fn bounded<T: Send + 'static>(
+/// dropped there too. `who` names the caller in the log (`decoder` / `encoder`).
+pub(super) fn bounded<T: Send + 'static>(
+    who: &'static str,
     session: u32,
     what: &'static str,
     timeout: Duration,
@@ -513,8 +529,8 @@ fn bounded<T: Send + 'static>(
         Ok(thread) => thread,
         Err(e) => {
             error!(
-                "decoder session {}: cannot start a thread for {}: {}",
-                session, what, e
+                "{} session {}: cannot start a thread for {}: {}",
+                who, session, what, e
             );
             return None;
         }
@@ -523,22 +539,22 @@ fn bounded<T: Send + 'static>(
         Ok(value) => {
             // It has sent, so it is finishing: this join is bounded.
             if thread.join().is_err() {
-                error!("decoder session {}: the {} thread panicked", session, what);
+                error!("{} session {}: the {} thread panicked", who, session, what);
             }
             Some(value)
         }
         Err(RecvTimeoutError::Timeout) => {
             error!(
-                "decoder session {}: {} did not return within {:?}; the codec is abandoned to \
-                 its thread and the session ends",
-                session, what, timeout
+                "{} session {}: {} did not return within {:?}; the codec is abandoned to its \
+                 thread and the session ends",
+                who, session, what, timeout
             );
             None
         }
         Err(RecvTimeoutError::Disconnected) => {
             error!(
-                "decoder session {}: the {} thread ended without an answer",
-                session, what
+                "{} session {}: the {} thread ended without an answer",
+                who, session, what
             );
             None
         }
@@ -578,8 +594,12 @@ pub struct MediaCodecDecoderSession {
     dead: bool,
     input_capacity: Option<usize>,
     layout_logged: bool,
-    /// Refused indices since the last seek (stale callbacks), and seeks so far.
+    /// Indices refused by the codec since the last seek, stale indices (a null buffer for an
+    /// index a flush made void, D23) since the last seek, and seeks so far.
     refused: u32,
+    stale: u32,
+    /// `Codec::stale_events` as of the last seek: what the crate's generation stamp dropped.
+    stale_events_seen: u64,
     seeks: u32,
     inputs: u64,
     frames: u64,
@@ -608,6 +628,8 @@ impl MediaCodecDecoderSession {
             input_capacity: None,
             layout_logged: false,
             refused: 0,
+            stale: 0,
+            stale_events_seen: 0,
             seeks: 0,
             inputs: 0,
             frames: 0,
@@ -634,12 +656,24 @@ impl MediaCodecDecoderSession {
         self.sink.signal();
     }
 
-    /// A refused input or output index: stale after a seek, or a codec that refuses everything.
+    /// A refused input or output index. A null buffer (`CodecError::Null` from `getInputBuffer`
+    /// / `getOutputBuffer`) is a stale index -- a callback the NDK looper had queued before a
+    /// flush and delivered after it (D23) -- and is skipped: counted for the seek line, a debug
+    /// line, never a session error. Anything else is the codec refusing an index it handed out,
+    /// which is tolerated up to [`MAX_REFUSED_INDICES`] per seek.
     fn refused_index(&mut self, what: &str, index: i32, e: &CodecError) {
+        if matches!(e, CodecError::Null(_)) {
+            self.stale += 1;
+            debug!(
+                "decoder session {}: stale {} index {} after a flush ignored ({})",
+                self.id, what, index, e
+            );
+            return;
+        }
         self.refused += 1;
         if self.refused <= STALE_LOG_LIMIT {
             warn!(
-                "decoder session {}: {} index {} refused: {} (a stale index after a seek?)",
+                "decoder session {}: {} index {} refused: {}",
                 self.id, what, index, e
             );
         }
@@ -1083,8 +1117,9 @@ impl MediaCodecDecoderSession {
         self.eos_queued = false;
         self.eos_seen = false;
         self.refused = 0;
+        self.stale = 0;
         let id = self.id;
-        match bounded(id, what, CODEC_FLUSH_TIMEOUT, move || {
+        match bounded("decoder", id, what, CODEC_FLUSH_TIMEOUT, move || {
             let mut codec = codec;
             let result = codec.flush_and_restart();
             (codec, result)
@@ -1111,7 +1146,7 @@ impl MediaCodecDecoderSession {
     fn stop_codec(&mut self, codec: Codec) {
         let id = self.id;
         let name = codec.name().to_string();
-        if bounded(id, "stop", CODEC_STOP_TIMEOUT, move || {
+        if bounded("decoder", id, "stop", CODEC_STOP_TIMEOUT, move || {
             let mut codec = codec;
             if let Err(e) = codec.stop() {
                 warn!("decoder session {}: AMediaCodec_stop: {}", id, e);
@@ -1165,7 +1200,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         let sink = self.sink.clone();
         let name = chosen.name.clone();
         let id = self.id;
-        let created = bounded(id, "start", CODEC_START_TIMEOUT, move || {
+        let created = bounded("decoder", id, "start", CODEC_START_TIMEOUT, move || {
             let mut codec = Codec::create_by_name(&name)?;
             // Every callback bumps the device session's eventfd once it has queued its event:
             // that is the whole wake-up path, no thread in between.
@@ -1295,16 +1330,29 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             .retain(|e| !matches!(e, DecoderEvent::InputBufferDone(_)));
         let held = self.held_outputs.len();
         let refused = self.refused;
+        let stale = self.stale;
         self.seeks += 1;
         let result = self.flush_codec("flush");
+        // What the crate's generation stamp dropped at this flush (D23): events queued before
+        // the flush that nobody had taken yet.
+        let stale_events = self
+            .codec
+            .as_ref()
+            .map(|codec| codec.stale_events())
+            .unwrap_or(self.stale_events_seen);
+        let dropped_by_flush = stale_events.saturating_sub(self.stale_events_seen);
+        self.stale_events_seen = stale_events;
         info!(
             "decoder session {}: seek #{}: {} pending input(s) and {} held output(s) dropped, \
-             {} stale index(es) since the last seek{}",
+             {} stale index(es) ignored and {} refused since the last seek, {} queued event(s) \
+             dropped by this flush{}",
             self.id,
             self.seeks,
             pending,
             held,
+            stale,
             refused,
+            dropped_by_flush,
             match result {
                 Ok(()) => "".to_string(),
                 Err(errno) => format!("; the flush failed with errno {errno}"),
