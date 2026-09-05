@@ -1119,6 +1119,7 @@ fn create_virtio_devices(
                 snd_params,
                 snd_device_tube,
                 worker_process_pids,
+                helper_pid_labels,
             )?);
         }
     }

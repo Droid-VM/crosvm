@@ -116,6 +116,137 @@ pub enum MediaDeviceKind {
     Encoder,
 }
 
+/// Where the device for a [`MediaDeviceKind`] is built (`VPU_DESIGN.md` §3.5, §6, §7.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaDeviceSupport {
+    /// In the VMM's own process, and in a helper process when `uid=` asks for one.
+    InVmmOrHelper,
+    /// In a helper only: the device talks to a host service that resolves the caller from the
+    /// real uid, so there is nothing the VMM could build for itself and `uid=` is required.
+    HelperOnly,
+    /// Nowhere yet. The kind still parses, so a command line written for a later milestone is
+    /// refused by name instead of starting something else.
+    Unimplemented,
+}
+
+impl MediaDeviceKind {
+    /// Every kind, so that a list of kinds in a message cannot drift from the enum.
+    pub const ALL: [MediaDeviceKind; 5] = [
+        MediaDeviceKind::Simple,
+        MediaDeviceKind::Loopback,
+        MediaDeviceKind::Camera,
+        MediaDeviceKind::Decoder,
+        MediaDeviceKind::Encoder,
+    ];
+
+    /// The `kind=` spelling `--virtio-media` parses, which is what a message to an operator
+    /// should use: `Debug` says `Camera`, the command line says `camera`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaDeviceKind::Simple => "simple",
+            MediaDeviceKind::Loopback => "loopback",
+            MediaDeviceKind::Camera => "camera",
+            MediaDeviceKind::Decoder => "decoder",
+            MediaDeviceKind::Encoder => "encoder",
+        }
+    }
+
+    /// Where this kind's device is built -- the one table saying which kinds exist and where.
+    ///
+    /// The VMM reads it *before* it decides whether to run the device in a helper, so a kind
+    /// nothing implements is refused there, by name, rather than launching a helper that
+    /// refuses it on the far side of a vhost-user socket the VMM can then only report as reset
+    /// (`logs/vpu_wp/B4-acceptance.md` §7.1, defect D15). The helper reads it too, so both
+    /// sides refuse the same kinds with the same words.
+    pub fn support(self) -> MediaDeviceSupport {
+        match self {
+            MediaDeviceKind::Simple | MediaDeviceKind::Loopback => {
+                MediaDeviceSupport::InVmmOrHelper
+            }
+            // cameraserver refuses uid 0, so the camera exists in the helper alone (design §7.1).
+            MediaDeviceKind::Camera => MediaDeviceSupport::HelperOnly,
+            MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
+                MediaDeviceSupport::Unimplemented
+            }
+        }
+    }
+
+    /// The refusal an unimplemented kind gets, worded identically wherever it is refused.
+    pub fn unimplemented_message(self) -> String {
+        format!(
+            "--virtio-media kind={} is not implemented yet (only {} are)",
+            self.as_str(),
+            Self::implemented_kinds()
+        )
+    }
+
+    /// The kinds something implements, as prose: `simple, loopback and camera`.
+    fn implemented_kinds() -> String {
+        let names: Vec<&'static str> = Self::ALL
+            .iter()
+            .filter(|kind| kind.support() != MediaDeviceSupport::Unimplemented)
+            .map(|kind| kind.as_str())
+            .collect();
+        match names.split_last() {
+            None => "none".to_string(),
+            Some((last, [])) => last.to_string(),
+            Some((last, rest)) => format!("{} and {}", rest.join(", "), last),
+        }
+    }
+}
+
+#[cfg(test)]
+mod media_device_kind_tests {
+    use super::MediaDeviceKind;
+    use super::MediaDeviceSupport;
+
+    /// The table is the contract two processes rely on: the VMM refuses an unimplemented kind
+    /// before it launches a helper, and the helper refuses it with the same words. Anything
+    /// added to the enum has to be given a place here.
+    #[test]
+    fn every_kind_has_a_place_and_a_command_line_name() {
+        assert_eq!(MediaDeviceKind::ALL.len(), 5);
+        for kind in MediaDeviceKind::ALL {
+            // Same spelling `--virtio-media kind=` parses, i.e. `Debug` lowercased.
+            assert_eq!(kind.as_str(), format!("{:?}", kind).to_lowercase());
+        }
+        assert_eq!(
+            MediaDeviceKind::Simple.support(),
+            MediaDeviceSupport::InVmmOrHelper
+        );
+        assert_eq!(
+            MediaDeviceKind::Loopback.support(),
+            MediaDeviceSupport::InVmmOrHelper
+        );
+        assert_eq!(
+            MediaDeviceKind::Camera.support(),
+            MediaDeviceSupport::HelperOnly
+        );
+        assert_eq!(
+            MediaDeviceKind::Decoder.support(),
+            MediaDeviceSupport::Unimplemented
+        );
+        assert_eq!(
+            MediaDeviceKind::Encoder.support(),
+            MediaDeviceSupport::Unimplemented
+        );
+    }
+
+    #[test]
+    fn the_refusal_names_the_kind_and_lists_what_exists() {
+        assert_eq!(
+            MediaDeviceKind::Decoder.unimplemented_message(),
+            "--virtio-media kind=decoder is not implemented yet (only simple, loopback and \
+             camera are)"
+        );
+        assert_eq!(
+            MediaDeviceKind::Encoder.unimplemented_message(),
+            "--virtio-media kind=encoder is not implemented yet (only simple, loopback and \
+             camera are)"
+        );
+    }
+}
+
 /// Structure supporting the implementation of `VirtioMediaEventQueue` for sending events to the
 /// driver.
 ///

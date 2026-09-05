@@ -50,8 +50,9 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
         BackendConnection::from_opts(opts.socket.as_deref(), opts.socket_path.as_deref(), opts.fd)?;
 
     // One arm per device type: the backend is generic over the device it runs, so each kind is
-    // its own instantiation. The list is the in-VMM one (`create_virtio_media_device`) and must
-    // refuse the same kinds it does, by name.
+    // its own instantiation. Which kinds exist is `MediaDeviceKind::support`'s table, the same
+    // one the VMM reads before it launches this process, and the refusal below is that table's
+    // wording -- so both sides refuse the same kinds with the same words (B4 §7.1, D15).
     match params.kind {
         MediaDeviceKind::Simple => {
             use virtio_media::devices::SimpleCaptureDevice;
@@ -119,11 +120,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
             ex.run_until(conn.run_backend(backend, &ex))?
         }
         kind @ (MediaDeviceKind::Decoder | MediaDeviceKind::Encoder) => {
-            bail!(
-                "--virtio-media kind={:?} is not implemented yet (only simple, loopback and \
-                 camera are)",
-                kind
-            )
+            bail!("{}", kind.unimplemented_message())
         }
     }
 }
