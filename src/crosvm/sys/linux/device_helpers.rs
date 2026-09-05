@@ -1316,8 +1316,8 @@ pub fn register_video_device(
 /// before `uid=` decides where the device is built: a kind nothing implements is refused here,
 /// by name, so a command line written for a later milestone fails to start rather than starting
 /// a helper that refuses it on the far side of a socket (B4 §7.1, defect D15). `kind=camera`
-/// exists in the helper alone -- the camera service refuses uid 0 (design §7.1) -- so without
-/// `uid=` it is refused here too.
+/// exists in the helper alone -- the camera service refuses uid 0 (design §7.1) -- and so do
+/// the two codec kinds (design §7.4), so without `uid=` they are refused here too.
 #[cfg(feature = "media")]
 pub fn create_virtio_media_device(
     protection_type: ProtectionType,
@@ -1372,10 +1372,13 @@ pub fn create_virtio_media_device(
                  (VPU_DESIGN.md §7.4)"
             )
         }
-        // Refused above, before the uid was looked at; kept so the match stays exhaustive and
-        // says the same thing if the table ever changes.
         MediaDeviceKind::Encoder => {
-            bail!("{}", config.kind.unimplemented_message())
+            bail!(
+                "--virtio-media kind=encoder needs uid=<app uid>: the encoder device runs in a \
+                 helper process under the app's uid, because the codec services resolve the \
+                 caller from the real uid and every codec device keeps to the one process model \
+                 (VPU_DESIGN.md §7.4)"
+            )
         }
     };
 

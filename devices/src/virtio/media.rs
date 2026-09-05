@@ -111,7 +111,7 @@ pub enum MediaDeviceKind {
     Camera,
     /// A host video decoder, over the MediaCodec NDK; helper only (`uid=` required).
     Decoder,
-    /// A host video encoder (not wired yet).
+    /// A host video encoder, over the MediaCodec NDK; helper only (`uid=` required).
     Encoder,
 }
 
@@ -164,12 +164,14 @@ impl MediaDeviceKind {
             }
             // cameraserver refuses uid 0, so the camera exists in the helper alone (design §7.1);
             // the codecs follow the one process model (design §7.4).
-            MediaDeviceKind::Camera | MediaDeviceKind::Decoder => MediaDeviceSupport::HelperOnly,
-            MediaDeviceKind::Encoder => MediaDeviceSupport::Unimplemented,
+            MediaDeviceKind::Camera | MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
+                MediaDeviceSupport::HelperOnly
+            }
         }
     }
 
-    /// The refusal an unimplemented kind gets, worded identically wherever it is refused.
+    /// The refusal an unimplemented kind gets, worded identically wherever it is refused. Every
+    /// kind of today is implemented; the wording stays for the next one added to the enum.
     pub fn unimplemented_message(self) -> String {
         format!(
             "--virtio-media kind={} is not implemented yet (only {} are)",
@@ -226,16 +228,21 @@ mod media_device_kind_tests {
         );
         assert_eq!(
             MediaDeviceKind::Encoder.support(),
-            MediaDeviceSupport::Unimplemented
+            MediaDeviceSupport::HelperOnly
         );
+        assert!(MediaDeviceKind::ALL
+            .iter()
+            .all(|kind| kind.support() != MediaDeviceSupport::Unimplemented));
     }
 
+    /// Every kind is implemented since M7, so the refusal is what a sixth kind would get: it
+    /// names the kind and lists all five, the list being built from the table, never typed.
     #[test]
     fn the_refusal_names_the_kind_and_lists_what_exists() {
         assert_eq!(
             MediaDeviceKind::Encoder.unimplemented_message(),
-            "--virtio-media kind=encoder is not implemented yet (only simple, loopback, camera \
-             and decoder are)"
+            "--virtio-media kind=encoder is not implemented yet (only simple, loopback, camera, \
+             decoder and encoder are)"
         );
     }
 }
@@ -936,6 +943,19 @@ pub fn camera_config(card: &str) -> VirtioMediaDeviceConfig {
 /// The virtio config area of a `decoder` device called `card`: a multi-planar memory-to-memory
 /// device, the kernel's stateful decoder interface (`VPU_DESIGN.md` §7.2).
 pub fn decoder_config(card: &str) -> VirtioMediaDeviceConfig {
+    use virtio_media::v4l2r::ioctl::Capabilities;
+
+    VirtioMediaDeviceConfig {
+        device_caps: (Capabilities::VIDEO_M2M_MPLANE | Capabilities::STREAMING).bits(),
+        // VFL_TYPE_VIDEO
+        device_type: 0,
+        card: card_name(card),
+    }
+}
+
+/// The virtio config area of an `encoder` device called `card`: a multi-planar memory-to-memory
+/// device, the kernel's stateful encoder interface (`VPU_DESIGN.md` §7.3).
+pub fn encoder_config(card: &str) -> VirtioMediaDeviceConfig {
     use virtio_media::v4l2r::ioctl::Capabilities;
 
     VirtioMediaDeviceConfig {
