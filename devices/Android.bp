@@ -113,6 +113,11 @@ rust_test {
         "libenumn",
         "libremain",
     ],
+    target: {
+        android: {
+            rustlibs: ["libandroid_camera"],
+        },
+    },
 }
 
 rust_test {
@@ -312,5 +317,12 @@ rust_library {
         "libenumn",
         "libremain",
     ],
+    // Cargo: [target.'cfg(target_os = "android")'.dependencies]. The camera backend is Android
+    // only, and libandroid_camera is not host_supported, so it is a target dependency.
+    target: {
+        android: {
+            rustlibs: ["libandroid_camera"],
+        },
+    },
     apex_available: ["com.android.virt"],
 }

@@ -8,6 +8,8 @@ use argh::FromArgs;
 use base::RawDescriptor;
 use cros_async::Executor;
 
+use crate::virtio::media::android_camera_backend::AndroidCameraBackend;
+use crate::virtio::media::camera_config;
 use crate::virtio::media::loopback_config;
 use crate::virtio::media::simple_capture_config;
 use crate::virtio::media::MediaDeviceKind;
@@ -86,9 +88,40 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
             )?;
             ex.run_until(conn.run_backend(backend, &ex))?
         }
-        kind @ (MediaDeviceKind::Camera | MediaDeviceKind::Decoder | MediaDeviceKind::Encoder) => {
+        MediaDeviceKind::Camera => {
+            use virtio_media::devices::camera::CameraBackend;
+            use virtio_media::devices::CameraDevice;
+
+            // The camera is described here, once, before the frontend is spoken to: a camera
+            // this uid cannot see (or no NDK at all) ends the helper now, which the VMM reports
+            // by name, rather than leaving a device that never answers. The first NDK touch
+            // is this call, and it happens after the uid drop -- this process was exec'd as
+            // the app's uid -- so the binder pool it starts belongs to that uid. Nothing is
+            // opened: the camera is taken at STREAMON, on the stream's own thread.
+            let camera = AndroidCameraBackend::new(params.camera_id.as_deref())?;
+            let card = params
+                .card
+                .clone()
+                .unwrap_or_else(|| format!("camera {}", camera.info().id));
+            let backend = MediaBackend::new(
+                params,
+                camera_config(&card),
+                move |event_queue, guest_mapper, mapper, allocator| {
+                    Ok(CameraDevice::new(
+                        camera.clone(),
+                        event_queue,
+                        guest_mapper,
+                        mapper,
+                        allocator,
+                    ))
+                },
+            )?;
+            ex.run_until(conn.run_backend(backend, &ex))?
+        }
+        kind @ (MediaDeviceKind::Decoder | MediaDeviceKind::Encoder) => {
             bail!(
-                "--virtio-media kind={:?} is not implemented yet (only simple and loopback are)",
+                "--virtio-media kind={:?} is not implemented yet (only simple, loopback and \
+                 camera are)",
                 kind
             )
         }
