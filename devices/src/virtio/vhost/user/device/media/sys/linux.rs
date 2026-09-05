@@ -13,7 +13,10 @@ use anyhow::Context;
 use argh::FromArgs;
 use base::error;
 use base::info;
+use base::FromRawDescriptor;
 use base::RawDescriptor;
+use base::Tube;
+use base::UnixSeqpacket;
 use cros_async::Executor;
 
 use crate::virtio::media::android_camera_backend::AndroidCameraBackend;
@@ -50,6 +53,11 @@ pub struct Options {
     /// guest-physical windows the host may touch. There is no key=value form -- a backend
     /// crosvm launched does not need a human-writable command line.
     config_json: String,
+    #[argh(option, arg_name = "FD")]
+    /// file descriptor of the tube to the VMM's media_host pool allocator, inherited the way
+    /// --fd is. Every MMAP buffer's offset is reserved and released through it; this process
+    /// has no pool allocator of its own (D49).
+    pool_fd: RawDescriptor,
 }
 
 /// Starts a vhost-user media device.
@@ -60,6 +68,13 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
     let ex = Executor::new().context("Failed to create executor")?;
     let conn =
         BackendConnection::from_opts(opts.socket.as_deref(), opts.socket_path.as_deref(), opts.fd)?;
+    // `Tube::pair()` is a `SOCK_SEQPACKET` socketpair, so the inherited number wraps straight
+    // back into the type the VMM created.
+    // SAFETY: `--pool-fd` names a descriptor the VMM opened for this process alone (its CLOEXEC
+    // was cleared for the exec, like --fd's); nothing else here owns or reaches it.
+    let pool_socket = unsafe { UnixSeqpacket::from_raw_descriptor(opts.pool_fd) };
+    let pool_tube =
+        Tube::try_from(pool_socket).context("cannot wrap --pool-fd into a pool tube")?;
 
     // One arm per device type: the backend is generic over the device it runs, so each kind is
     // its own instantiation. Which kinds exist is `MediaDeviceKind::support`'s table, the same
@@ -72,6 +87,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
             let backend = MediaBackend::new(
                 params,
                 simple_capture_config(),
+                pool_tube,
                 |event_queue, guest_mapper, mapper, allocator| {
                     Ok(SimpleCaptureDevice::new(
                         event_queue,
@@ -90,6 +106,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
             let backend = MediaBackend::new(
                 params,
                 loopback_config(card.as_deref().unwrap_or("droidvm loopback")),
+                pool_tube,
                 |event_queue, guest_mapper, mapper, allocator| {
                     Ok(LoopbackDevice::new(
                         event_queue,
@@ -120,6 +137,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
             let backend = MediaBackend::new(
                 params,
                 camera_config(&card),
+                pool_tube,
                 move |event_queue, guest_mapper, mapper, allocator| {
                     Ok(CameraDevice::new(
                         camera.clone(),
@@ -158,6 +176,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
                 let backend = MediaBackend::new(
                     params,
                     decoder_config(&card),
+                    pool_tube,
                     move |event_queue, guest_mapper, mapper, allocator| {
                         Ok(VideoDecoder::new(
                             decoder.clone(),
@@ -193,6 +212,7 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
                 let backend = MediaBackend::new(
                     params,
                     encoder_config(&card),
+                    pool_tube,
                     move |event_queue, guest_mapper, mapper, allocator| {
                         Ok(VideoEncoder::new(
                             encoder.clone(),
