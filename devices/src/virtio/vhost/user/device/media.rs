@@ -208,12 +208,18 @@ where
         if self.pool.is_none() {
             let handle = pool_handle_at(&mem, self.params.pool_gpa)
                 .context("the media_host pool is not in the memory table")?;
+            // The mapping is the step that can fail for a reason worth retrying, so it happens
+            // BEFORE the tube is consumed (R8-11): a failure here leaves `pool_tube` in place
+            // for the next start_queue, instead of closing it -- which the VMM would read as
+            // this helper's EOF and log a live process as gone.
+            let mapped =
+                MappedPool::new(handle).context("cannot map the media_host pool for serving")?;
             let tube = self
                 .pool_tube
                 .take()
                 .context("the --pool-fd tube is gone but the pool was never set up")?;
             self.pool = Some(
-                RemotePool::new(tube, handle, card_str(&self.config.card))
+                RemotePool::new(tube, mapped, card_str(&self.config.card))
                     .context("cannot set up the media_host pool")?,
             );
         }
