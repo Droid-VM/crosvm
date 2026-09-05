@@ -348,6 +348,11 @@ ndk_api! {
     ) -> i32;
     fn ACameraOutputTarget_free(target: *mut ACameraOutputTarget);
     fn ACaptureRequest_free(request: *mut ACaptureRequest);
+    fn ACaptureRequest_getConstEntry(
+        request: *const ACaptureRequest,
+        tag: u32,
+        entry: *mut ACameraMetadataConstEntry,
+    ) -> i32;
     fn ACaptureRequest_addTarget(
         request: *mut ACaptureRequest,
         target: *const ACameraOutputTarget,
@@ -1602,6 +1607,11 @@ impl RequestUpdate {
 /// which is why a [`ResultListener`] is handed a borrow.
 pub struct CaptureResult<'a> {
     metadata: *const ACameraMetadata,
+    /// The request this result was taken with, as the framework handed it to the callback
+    /// ("the capture request that generated this capture result",
+    /// `NdkCameraCaptureSession.h:212`); null only if the framework passed none. See
+    /// [`CaptureResult::requested_awb_mode`] for what it is for.
+    request: *const ACaptureRequest,
     _callback: PhantomData<&'a ()>,
 }
 
@@ -1616,6 +1626,33 @@ impl CaptureResult<'_> {
         // SAFETY: the metadata is live for the callback this value is confined to.
         let status = unsafe { ACameraMetadata_getConstEntry(self.metadata, tag, &mut entry) };
         (status == ACAMERA_OK && entry.count > 0).then_some(entry)
+    }
+
+    /// The same tag, read out of the *request* this result came from rather than out of the
+    /// result.
+    fn request_entry(&self, tag: u32) -> Option<ACameraMetadataConstEntry> {
+        if self.request.is_null() {
+            return None;
+        }
+        let mut entry = ACameraMetadataConstEntry {
+            tag: 0,
+            entry_type: 0,
+            count: 0,
+            data: std::ptr::null(),
+        };
+        // SAFETY: the request is live for the callback this value is confined to, and the
+        // entry it fills in is owned by the framework ("Do not attempt to free it",
+        // `NdkCaptureRequest.h:143-144`).
+        let status = unsafe { ACaptureRequest_getConstEntry(self.request, tag, &mut entry) };
+        (status == ACAMERA_OK && entry.count > 0).then_some(entry)
+    }
+
+    fn requested_u8(&self, tag: u32) -> Option<u8> {
+        let e = self
+            .request_entry(tag)
+            .filter(|e| e.entry_type == TYPE_BYTE)?;
+        // SAFETY: type BYTE, count >= 1, owned by the request for the callback.
+        Some(unsafe { *(e.data as *const u8) })
     }
 
     fn u8(&self, tag: u32) -> Option<u8> {
@@ -1703,6 +1740,45 @@ impl CaptureResult<'_> {
     pub fn control_mode(&self) -> Option<ControlMode> {
         ControlMode::from_u8(self.u8(TAG_CONTROL_MODE)?)
     }
+
+    /// `CONTROL_AWB_MODE` as the *request this result was taken with* asked for it.
+    ///
+    /// A repeating request replaced mid-stream does not reach the sensor at once: the results
+    /// of the requests already in the pipeline keep coming first, and on 5566 the new value
+    /// appears somewhere between the second and the seventh result after the submission
+    /// (B8 §6(a) transitions, `16_d36_probe.txt`). So "the result does not carry what was
+    /// asked for" means one of two entirely different things, and only the request the result
+    /// came with tells them apart:
+    ///
+    /// * the request does **not** carry the value -- this is an older capture, still in flight when
+    ///   the new request was submitted, and nothing has been decided yet;
+    /// * the request **does** carry it and the result does not -- the camera ran the entry and
+    ///   substituted its own value, which is the HAL dropping it (D36/D47).
+    ///
+    /// Waiting a fixed number of results instead was D47: six of them is inside the window
+    /// above, so a mode set mid-stream was reported "dropped" although the very next results
+    /// echoed it.
+    pub fn requested_awb_mode(&self) -> Option<AwbMode> {
+        AwbMode::from_u8(self.requested_u8(TAG_CONTROL_AWB_MODE)?)
+    }
+
+    /// `CONTROL_EFFECT_MODE` as the request asked for it; see
+    /// [`CaptureResult::requested_awb_mode`].
+    pub fn requested_effect_mode(&self) -> Option<EffectMode> {
+        EffectMode::from_u8(self.requested_u8(TAG_CONTROL_EFFECT_MODE)?)
+    }
+
+    /// `CONTROL_SCENE_MODE` as the request asked for it; see
+    /// [`CaptureResult::requested_awb_mode`].
+    pub fn requested_scene_mode(&self) -> Option<SceneMode> {
+        SceneMode::from_u8(self.requested_u8(TAG_CONTROL_SCENE_MODE)?)
+    }
+
+    /// `CONTROL_MODE` as the request asked for it; see [`CaptureResult::requested_awb_mode`].
+    /// A scene mode applies only under `UseSceneMode`, so the two are read together.
+    pub fn requested_control_mode(&self) -> Option<ControlMode> {
+        ControlMode::from_u8(self.requested_u8(TAG_CONTROL_MODE)?)
+    }
 }
 
 /// Called with every completed capture's result, on the camera framework's callback thread:
@@ -1754,7 +1830,7 @@ extern "C" fn on_capture_progressed(
 extern "C" fn on_capture_completed(
     context: *mut c_void,
     _session: *mut ACameraCaptureSession,
-    _request: *mut ACaptureRequest,
+    request: *mut ACaptureRequest,
     result: *const ACameraMetadata,
 ) {
     if context.is_null() {
@@ -1765,8 +1841,13 @@ extern "C" fn on_capture_completed(
     let ctx = unsafe { &*(context as *const ResultContext) };
     ctx.completed.fetch_add(1, Ordering::Relaxed);
     if let (Some(listener), false) = (&ctx.listener, result.is_null()) {
+        // The request is the framework's copy of the one this capture was taken with -- it
+        // "will not match what application has submitted" (`NdkCameraCaptureSession.h:207`),
+        // and that is the point: it says what the camera actually ran, so a result that has
+        // not caught up with a mid-stream change can be told from one the HAL overrode.
         listener(&CaptureResult {
             metadata: result,
+            request,
             _callback: PhantomData,
         });
     }

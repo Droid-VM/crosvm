@@ -26,10 +26,12 @@
 //! fires one AF scan a second in, `--exposure`/`--iso` take the exposure manual.
 //!
 //! `--watch` asks for each of `CONTROL_AWB_MODE`, `CONTROL_EFFECT_MODE` and
-//! `CONTROL_SCENE_MODE` in turn and prints what the capture result says the camera *used*. That
-//! is the D36 decider: those three set and read back through V4L2 without moving a pixel on
-//! 5566, and only the result says whether the camera took the request entry and rendered
-//! nothing (the HAL's business) or never saw it at all (ours).
+//! `CONTROL_SCENE_MODE` in turn -- mid-stream, with the repeating request already running --
+//! and prints what the capture result says the camera *used*, and how many results the new
+//! request took to reach it. That is the D36 decider: those three set and read back through
+//! V4L2 without moving a pixel on 5566, and only the result says whether the camera took the
+//! request entry and rendered nothing (the HAL's business) or never saw it at all (ours). It
+//! is also the D47 decider, because it measures the very case the guest hits, without a guest.
 //!
 //! `--uid` drops to that uid before touching the camera, the way `snd_helper` does for AAudio:
 //! `cameraserver` resolves the client package from the real uid, and uid 0 resolves to none.
@@ -544,6 +546,40 @@ struct Transitions {
     effect: Option<EffectMode>,
     scene: Option<SceneMode>,
     control_mode: Option<android_camera::ControlMode>,
+    /// What `--watch` last asked for and what became of it; see [`Pending`].
+    pending: Option<Pending>,
+}
+
+/// One mode `--watch` has just asked for mid-stream, waiting for the camera's answer.
+///
+/// The answer is not "what the next result says": a repeating request replaced while the camera
+/// runs takes a few captures to reach the sensor, and the results still in the pipeline
+/// legitimately carry the old value. The answer is the first result whose *own request* carries
+/// what was asked for -- from then on the result is the camera's verdict on that entry. Reading
+/// a fixed number of results later instead is what made D47: on 5566 the request needs between
+/// two and seven of them, and the backend looked after six.
+struct Pending {
+    want: Wanted,
+    /// `Transitions::results` at the submission, so the wait can be reported in results.
+    armed_at: u64,
+    settled: Option<Settled>,
+}
+
+/// The entry `--watch` asked for, in the shape the request carries it.
+#[derive(Clone, Copy)]
+enum Wanted {
+    Awb(AwbMode),
+    Effect(EffectMode),
+    /// A scene and the `CONTROL_MODE` it needs: a scene applies only under `USE_SCENE_MODE`.
+    Scene(SceneMode, android_camera::ControlMode),
+}
+
+/// The camera's answer: how many results the request took to come back, whether the result
+/// echoed the value, and what it said instead when it did not.
+struct Settled {
+    after: u64,
+    echoed: bool,
+    got: String,
 }
 
 fn result_listener(seen: Arc<Mutex<Transitions>>) -> ResultListener {
@@ -608,15 +644,57 @@ fn result_listener(seen: Arc<Mutex<Transitions>>) -> ResultListener {
         if control_mode.is_some() {
             seen.control_mode = control_mode;
         }
+        // `--watch`: the first result whose own request carries what was just asked for is the
+        // camera's answer to that entry; everything before it is a capture that was already in
+        // the pipeline when the request was replaced (D47).
+        if let Some(pending) = seen.pending.as_mut() {
+            if pending.settled.is_none() {
+                let after = n.saturating_sub(pending.armed_at);
+                pending.settled = match pending.want {
+                    Wanted::Awb(want) => {
+                        (result.requested_awb_mode() == Some(want)).then(|| Settled {
+                            after,
+                            echoed: awb == Some(want),
+                            got: format!("{awb:?}"),
+                        })
+                    }
+                    Wanted::Effect(want) => {
+                        (result.requested_effect_mode() == Some(want)).then(|| Settled {
+                            after,
+                            echoed: effect == Some(want),
+                            got: format!("{effect:?}"),
+                        })
+                    }
+                    Wanted::Scene(want, mode) => (result.requested_scene_mode() == Some(want)
+                        && result.requested_control_mode() == Some(mode))
+                    .then(|| Settled {
+                        after,
+                        echoed: scene == Some(want) && control_mode == Some(mode),
+                        got: format!("{scene:?} under CONTROL_MODE {control_mode:?}"),
+                    }),
+                };
+            }
+        }
     })
 }
 
-/// The D36 decider: ask for each of the three modes a guest can set and this camera may ignore,
-/// let the request pipeline drain, and print what the capture result says the camera used.
+/// How many frames one `--watch` set waits for the camera's answer before giving up: a second
+/// at 30 fps, many times the two-to-seven results the request itself needs.
+const WATCH_DEADLINE_FRAMES: u32 = 30;
+
+/// The D36 decider, and since B8 the D47 one too: with the repeating request already running,
+/// ask for each of the three modes a guest can set and this camera may ignore, then print what
+/// the camera did with the entry and how long it took to run it.
 ///
-/// `echoed` means the camera took the request entry, so a picture that does not change is the
-/// HAL's rendering and the honest answer is to document it; `dropped` means the entry never
-/// reached the camera, which would be a defect on our side of the NDK.
+/// `ECHOED` means the camera ran the request entry and reported the value back, so a picture
+/// that does not change is the HAL's rendering and the honest answer is to document it
+/// (D36 advisory). `DROPPED` means the camera ran the entry and used a different value.
+/// `NOT SENT` means no capture request ever carried it, which would be a defect on our side of
+/// the NDK -- and is what D47 looked like when the answer was read a fixed six results after
+/// the set, before the request had reached the sensor.
+///
+/// Every set here happens mid-stream, which is the case the guest hits and the one B8 could
+/// only measure through V4L2: `camera_probe capture --watch` settles it without a guest.
 fn watch_modes(
     camera: &mut Camera,
     seen: &Arc<Mutex<Transitions>>,
@@ -646,43 +724,36 @@ fn watch_modes(
         .collect();
 
     println!();
-    println!("D36 echo test: what the capture result says the camera used");
+    println!("D36/D47 echo test: the three modes set mid-stream, and what the camera did");
     for mode in &awbs {
-        let update = RequestUpdate::new().awb_mode(*mode);
-        camera.apply(&update).map_err(|e| e.to_string())?;
-        let got = drain(camera, seen)?.0;
-        println!(
-            "  CONTROL_AWB_MODE     requested {:<16?} result {:<16?} {}",
-            mode,
-            got,
-            verdict(got == Some(*mode))
-        );
+        let line = watch_one(
+            camera,
+            seen,
+            RequestUpdate::new().awb_mode(*mode),
+            Wanted::Awb(*mode),
+        )?;
+        println!("  CONTROL_AWB_MODE     requested {:<16?} {}", mode, line);
     }
     for mode in &effects {
-        let update = RequestUpdate::new().effect_mode(*mode);
-        camera.apply(&update).map_err(|e| e.to_string())?;
-        let got = drain(camera, seen)?.1;
-        println!(
-            "  CONTROL_EFFECT_MODE  requested {:<16?} result {:<16?} {}",
-            mode,
-            got,
-            verdict(got == Some(*mode))
-        );
+        let line = watch_one(
+            camera,
+            seen,
+            RequestUpdate::new().effect_mode(*mode),
+            Wanted::Effect(*mode),
+        )?;
+        println!("  CONTROL_EFFECT_MODE  requested {:<16?} {}", mode, line);
     }
     for mode in &scenes {
         // A scene has no effect at all unless the control mode says to use it.
-        let update = RequestUpdate::new()
-            .control_mode(android_camera::ControlMode::UseSceneMode)
-            .scene_mode(*mode);
-        camera.apply(&update).map_err(|e| e.to_string())?;
-        let (_, _, got, control_mode) = drain(camera, seen)?;
-        println!(
-            "  CONTROL_SCENE_MODE   requested {:<16?} result {:<16?} {}  (CONTROL_MODE {:?})",
-            mode,
-            got,
-            verdict(got == Some(*mode)),
-            control_mode
-        );
+        let line = watch_one(
+            camera,
+            seen,
+            RequestUpdate::new()
+                .control_mode(android_camera::ControlMode::UseSceneMode)
+                .scene_mode(*mode),
+            Wanted::Scene(*mode, android_camera::ControlMode::UseSceneMode),
+        )?;
+        println!("  CONTROL_SCENE_MODE   requested {:<16?} {}", mode, line);
     }
     // Back to the neutral settings, so the rest of the run is not measured under a scene.
     let restore = RequestUpdate::new()
@@ -690,45 +761,55 @@ fn watch_modes(
         .effect_mode(EffectMode::Off)
         .control_mode(android_camera::ControlMode::Auto)
         .scene_mode(SceneMode::Disabled);
-    camera.apply(&restore).map_err(|e| e.to_string())?;
-    drain(camera, seen)?;
+    watch_one(
+        camera,
+        seen,
+        restore,
+        Wanted::Scene(SceneMode::Disabled, android_camera::ControlMode::Auto),
+    )?;
     Ok(())
 }
 
-fn verdict(echoed: bool) -> &'static str {
-    if echoed {
-        "ECHOED"
-    } else {
-        "DROPPED"
-    }
-}
-
-/// Consume frames until the request pipeline has certainly turned over -- twelve, four times its
-/// depth -- and answer with the three modes the last result carried.
-#[allow(clippy::type_complexity)]
-fn drain(
+/// Submit `update` on the running camera, keep the frames flowing, and answer with the verdict
+/// on `want` as one printable clause.
+fn watch_one(
     camera: &mut Camera,
     seen: &Arc<Mutex<Transitions>>,
-) -> Result<
-    (
-        Option<AwbMode>,
-        Option<EffectMode>,
-        Option<SceneMode>,
-        Option<android_camera::ControlMode>,
-    ),
-    String,
-> {
-    for _ in 0..12 {
+    update: RequestUpdate,
+    want: Wanted,
+) -> Result<String, String> {
+    {
+        let mut state = seen.lock().unwrap_or_else(|e| e.into_inner());
+        let armed_at = state.results;
+        state.pending = Some(Pending {
+            want,
+            armed_at,
+            settled: None,
+        });
+    }
+    camera.apply(&update).map_err(|e| e.to_string())?;
+    for _ in 0..WATCH_DEADLINE_FRAMES {
         if camera
             .next_frame(Duration::from_millis(2000))
             .map_err(|e| e.to_string())?
             .is_none()
         {
-            return Err("no frame within 2s while draining the request pipeline".to_owned());
+            return Err("no frame within 2s while waiting for the camera's answer".to_owned());
+        }
+        let state = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(settled) = state.pending.as_ref().and_then(|p| p.settled.as_ref()) {
+            return Ok(format!(
+                "result {:<28} {}  (the request the camera ran carried it {} result(s) after \
+                 the set)",
+                settled.got,
+                if settled.echoed { "ECHOED" } else { "DROPPED" },
+                settled.after
+            ));
         }
     }
-    let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
-    Ok((seen.awb, seen.effect, seen.scene, seen.control_mode))
+    Ok(format!(
+        "NOT SENT  (no capture request carried it within {WATCH_DEADLINE_FRAMES} frames)"
+    ))
 }
 
 fn cmd_capture(args: &Args) -> Result<(), String> {
