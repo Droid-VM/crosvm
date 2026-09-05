@@ -1527,7 +1527,7 @@ impl DeviceSlot {
 
 /// A device slot over guest memory, for this module's tests and the command ring's.
 #[cfg(test)]
-pub(super) mod test_util {
+pub(crate) mod test_util {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::thread::JoinHandle;
@@ -1535,12 +1535,18 @@ pub(super) mod test_util {
     use base::pagesize;
     use base::Event;
 
+    use super::super::usb_hub::UsbPort;
+    use super::super::xhci_abi::AddressedTrb;
     use super::super::xhci_abi::CommandCompletionEventTrb;
     use super::super::xhci_abi::EventRingSegmentTableEntry;
+    use super::super::xhci_abi::NormalTrb;
+    use super::super::xhci_abi::TransferDescriptor;
     use super::super::xhci_abi::Trb;
     use super::super::xhci_abi::TrbCast;
     use super::super::xhci_abi::TrbType;
     use super::super::xhci_regs::init_xhci_mmio_space_and_regs;
+    use super::super::xhci_transfer::XhciTransfer;
+    use super::super::xhci_transfer::XhciTransferManager;
     use super::*;
 
     /// Event ring segment: 16 TRBs.
@@ -1573,6 +1579,7 @@ pub(super) mod test_util {
     pub struct Fixture {
         pub mem: GuestMemory,
         pub slots: DeviceSlots,
+        pub hub: Arc<UsbHub>,
         pub interrupter: Arc<Mutex<Interrupter>>,
         pub fail_handle: Arc<TestFailHandle>,
         pub irq: Event,
@@ -1613,7 +1620,7 @@ pub(super) mod test_util {
             let slots = DeviceSlots::new(
                 fail_handle.clone(),
                 regs.dcbaap.clone(),
-                hub,
+                hub.clone(),
                 interrupter.clone(),
                 event_loop.clone(),
                 mem.clone(),
@@ -1621,6 +1628,7 @@ pub(super) mod test_util {
             let fixture = Fixture {
                 mem,
                 slots,
+                hub,
                 interrupter,
                 fail_handle,
                 irq,
@@ -1639,6 +1647,30 @@ pub(super) mod test_util {
 
         pub fn slot(&self) -> Arc<DeviceSlot> {
             self.slots.slot(SLOT_ID).unwrap()
+        }
+
+        /// The port slot 1 sits on; nothing is attached behind it.
+        pub fn port(&self) -> Arc<UsbPort> {
+            self.hub.get_port(PORT_ID).unwrap()
+        }
+
+        /// A transfer of `td` on `endpoint_id` of slot 1, made by `manager`.
+        pub fn transfer(
+            &self,
+            manager: &XhciTransferManager,
+            endpoint_id: u8,
+            td: TransferDescriptor,
+        ) -> XhciTransfer {
+            manager.create_transfer(
+                self.mem.clone(),
+                self.port(),
+                self.interrupter.clone(),
+                SLOT_ID,
+                endpoint_id,
+                td,
+                Event::new().unwrap(),
+                None,
+            )
         }
 
         pub fn device_context(&self) -> DeviceContext {
@@ -1799,6 +1831,27 @@ pub(super) mod test_util {
 
     pub fn stream_ring(stream_id: u16) -> GuestAddress {
         GuestAddress(STREAM_RING + 0x100 * stream_id as u64)
+    }
+
+    /// A transfer descriptor of one Normal TRB per entry of `lengths`, chained, with cycle bit
+    /// set, laid out from `base` the way a ring holds them (16 bytes apart). The TRBs are
+    /// addressed only: nothing is written to guest memory.
+    pub fn normal_td(base: u64, lengths: &[u32]) -> TransferDescriptor {
+        lengths
+            .iter()
+            .enumerate()
+            .map(|(i, len)| {
+                let mut trb = NormalTrb::new();
+                trb.set_trb_type(TrbType::Normal);
+                trb.set_trb_transfer_length(*len);
+                trb.set_cycle(true);
+                trb.set_chain(i + 1 < lengths.len());
+                AddressedTrb {
+                    trb: *trb.cast::<Trb>().unwrap(),
+                    gpa: base + i as u64 * size_of::<Trb>() as u64,
+                }
+            })
+            .collect()
     }
 }
 

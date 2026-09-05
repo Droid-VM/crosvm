@@ -6,6 +6,8 @@
 
 mod command_ring_controller;
 mod device_slot;
+#[cfg(test)]
+pub(crate) use device_slot::test_util;
 mod event_ring;
 mod interrupter;
 mod intr_moderation_handler;

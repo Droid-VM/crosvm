@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::cmp;
 use std::mem;
 use std::mem::drop;
 use std::sync::Arc;
@@ -515,9 +516,24 @@ impl BackendDeviceType {
             let state = xhci_transfer.state().lock();
             match *state {
                 XhciTransferState::Cancelled => {
+                    // What the device sent before the URB was unlinked is the guest's: the
+                    // Stopped event reports the data stage as moved that far.
+                    let actual_length = t.actual_length();
+                    if direction == ControlRequestDataPhaseTransferDirection::DeviceToHost {
+                        if let (TransferBuffer::Vector(v), Some(buffer)) = (t.buffer(), &buffer) {
+                            if let Some(control_request_data) =
+                                v.get(mem::size_of::<UsbRequestSetup>()..)
+                            {
+                                let moved = cmp::min(actual_length, control_request_data.len());
+                                buffer
+                                    .write(&control_request_data[..moved])
+                                    .map_err(Error::WriteBuffer)?;
+                            }
+                        }
+                    }
                     drop(state);
                     xhci_transfer
-                        .on_transfer_complete(&TransferStatus::Cancelled, 0)
+                        .on_transfer_complete(&TransferStatus::Cancelled, actual_length as u32)
                         .map_err(Error::TransferComplete)?;
                 }
                 XhciTransferState::Completed => {

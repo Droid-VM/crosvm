@@ -237,9 +237,15 @@ impl UsbEndpoint {
                     match *state {
                         XhciTransferState::Cancelled => {
                             debug!("Xhci transfer has been cancelled");
+                            // What the device took before the URB was unlinked is what the
+                            // descriptor moved; the Stopped event reports the rest as residual.
+                            let actual_length = t.actual_length();
                             drop(state);
                             xhci_transfer
-                                .on_transfer_complete(&TransferStatus::Cancelled, 0)
+                                .on_transfer_complete(
+                                    &TransferStatus::Cancelled,
+                                    actual_length as u32,
+                                )
                                 .map_err(Error::TransferComplete)
                         }
                         XhciTransferState::Completed => {
@@ -305,9 +311,33 @@ impl UsbEndpoint {
                     match *state {
                         XhciTransferState::Cancelled => {
                             debug!("Xhci transfer has been cancelled");
+                            // What the device sent before the URB was unlinked is the guest's:
+                            // the Stopped event reports the descriptor as moved that far (spec
+                            // 6.4.2.1), so those bytes must be in its buffer.
+                            let actual_length = t.actual_length();
+                            let copied_length = match t.buffer() {
+                                TransferBuffer::Vector(v) => buffer
+                                    .write(&v[..cmp::min(actual_length, v.len())])
+                                    .map_err(Error::WriteBuffer)?,
+                                TransferBuffer::Dma(buf) => {
+                                    if let Some(buf) = buf.upgrade() {
+                                        let buf = buf.lock();
+                                        let data = buf.as_slice();
+                                        buffer
+                                            .write(&data[..cmp::min(actual_length, data.len())])
+                                            .map_err(Error::WriteBuffer)?
+                                    } else {
+                                        return Err(Error::GetDmaBuffer);
+                                    }
+                                }
+                            };
+                            let actual_length = cmp::min(actual_length, copied_length);
                             drop(state);
                             xhci_transfer
-                                .on_transfer_complete(&TransferStatus::Cancelled, 0)
+                                .on_transfer_complete(
+                                    &TransferStatus::Cancelled,
+                                    actual_length as u32,
+                                )
                                 .map_err(Error::TransferComplete)
                         }
                         XhciTransferState::Completed => {

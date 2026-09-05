@@ -80,6 +80,14 @@ impl EventHandler for UsbUtilEventHandler {
 }
 
 /// Helper function to update xhci_transfer state.
+///
+/// Only a URB the kernel really unlinked (-ENOENT) is `Cancelled`. One whose cancel was issued
+/// but that came back with any other status had finished on the device before the discard
+/// landed -- usbfs answers the discard with EINVAL then -- and its data and status are as real
+/// as any other completion's: it is `Completed` and reports its ordinary Transfer Event, as on
+/// hardware, where a TD that completes as the endpoint stops is not the one in progress.
+/// Reported as cancelled instead, it was a TD with neither a completion nor a Stopped event;
+/// Windows re-queued it after its watchdog and waited on a device that had already answered.
 pub fn update_transfer_state(
     xhci_transfer: &Arc<XhciTransfer>,
     status: TransferStatus,
@@ -92,10 +100,7 @@ pub fn update_transfer_state(
     }
 
     match *state {
-        XhciTransferState::Cancelling => {
-            *state = XhciTransferState::Cancelled;
-        }
-        XhciTransferState::Submitted { .. } => {
+        XhciTransferState::Cancelling | XhciTransferState::Submitted { .. } => {
             *state = XhciTransferState::Completed;
         }
         _ => {
@@ -105,4 +110,46 @@ pub fn update_transfer_state(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::usb::xhci::test_util::normal_td;
+    use crate::usb::xhci::test_util::Fixture;
+    use crate::usb::xhci::xhci_transfer::XhciTransferManager;
+
+    fn cancelling_transfer(f: &Fixture) -> Arc<XhciTransfer> {
+        let t = f.transfer(
+            &XhciTransferManager::default(),
+            3,
+            normal_td(0x2000, &[0x100]),
+        );
+        *t.state().lock() = XhciTransferState::Cancelling;
+        Arc::new(t)
+    }
+
+    /// The URB was discarded after it had completed (usbfs: EINVAL on the discard, then the
+    /// URB reaped with its real status): the transfer completed, and reports so.
+    #[test]
+    fn a_transfer_reaped_complete_after_its_cancel_is_completed() {
+        let f = Fixture::new();
+        for status in [
+            TransferStatus::Completed,
+            TransferStatus::Error,
+            TransferStatus::Stalled,
+        ] {
+            let t = cancelling_transfer(&f);
+            update_transfer_state(&t, status).unwrap();
+            assert!(
+                matches!(*t.state().lock(), XhciTransferState::Completed),
+                "a cancelling transfer reaped with a status other than Cancelled completed"
+            );
+        }
+
+        // Only a URB the kernel unlinked (-ENOENT) was really cancelled.
+        let t = cancelling_transfer(&f);
+        update_transfer_state(&t, TransferStatus::Cancelled).unwrap();
+        assert!(matches!(*t.state().lock(), XhciTransferState::Cancelled));
+    }
 }
