@@ -476,9 +476,15 @@ impl MediaPool {
     /// its own calls, never across a tube operation -- and its `send` is bounded by
     /// [`POOL_RPC_TIMEOUT`] (the one way it could block is a helper that never reads).
     ///
-    /// On any recv or send failure -- EOF because the helper exited or died, a malformed
-    /// request, a send that timed out -- the thread drops the lease, which is `release_owner`'s
-    /// sweep (`reclaiming N media_host buffers from a device that went away`), and exits.
+    /// The sweep -- the lease dropped, `release_owner`'s `reclaiming N media_host buffers from
+    /// a device that went away` -- happens on EOF and **only** on EOF: EOF is the one event that
+    /// proves the helper's process is gone and cannot write into its buffers any more. Every
+    /// other tube failure (a malformed request, a transient recv errno, a send that timed out)
+    /// keeps the lease alive: the thread logs, keeps serving while the errors look transient,
+    /// and if the connection has to be abandoned it parks on a blocking recv until the EOF
+    /// really arrives ([`park_until_eof`]). Sweeping on anything less re-opens D49 -- the
+    /// still-running helper keeps writing into offsets the pool has already handed to a
+    /// neighbour (review-m8 R8-1).
     pub fn spawn_server(
         &self,
         card: &str,
@@ -493,17 +499,30 @@ impl MediaPool {
             .name(format!("media pool {card}"))
             .spawn(move || {
                 serve_pool(&tube, &mut lease, &name);
-                // `lease` drops here: whatever the helper still held goes back to the pool.
+                // `lease` drops here -- and `serve_pool` returns only on EOF, so the helper
+                // process is gone and whatever it still held goes back to the pool.
             })
             .with_context(|| format!("cannot start the media pool server thread for \"{card}\""))
     }
 }
 
+/// How many consecutive unreadable requests the pool server tolerates before it stops serving
+/// the connection and [`park_until_eof`]s. One bad packet is survived (the helper's request
+/// times out and the client resyncs); an errno that repeats this often is not transient.
+const POOL_SERVER_MAX_CONSECUTIVE_ERRORS: u32 = 8;
+
 /// The pool server's loop: see [`MediaPool::spawn_server`].
+///
+/// Returns only when the tube has reached EOF, because returning is the sweep (the caller drops
+/// the lease) and only EOF proves the helper cannot write into its buffers any more (R8-1).
 fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
+    let mut errors_in_a_row = 0u32;
     loop {
         let request: PoolRequest = match tube.recv() {
-            Ok(request) => request,
+            Ok(request) => {
+                errors_in_a_row = 0;
+                request
+            }
             Err(TubeError::Disconnected) => {
                 // The helper is gone -- it exited, or died. Dropping the lease (our caller's
                 // job) is the sweep; the reclaim line, when there is anything to reclaim, is the
@@ -512,14 +531,26 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
                 return;
             }
             Err(e) => {
-                // A malformed request, or a read error. Nothing about this connection can be
-                // trusted any more, so it is dropped -- which the helper sees as EIO on its next
-                // request -- but the VMM and the pool sail on.
-                error!(
-                    "virtio-media: dropping \"{card}\"'s pool connection over a request that \
-                     cannot be read: {e}"
-                );
-                return;
+                // A malformed request, or a transient read errno. The helper is still alive --
+                // this is NOT EOF -- so its buffers stay reserved; it sees a timeout on the
+                // answer that never comes and resyncs. Log the first of a run, keep serving.
+                errors_in_a_row += 1;
+                if errors_in_a_row == 1 {
+                    error!(
+                        "virtio-media: cannot read \"{card}\"'s pool request (the lease is \
+                         kept; only EOF sweeps): {e}"
+                    );
+                }
+                if errors_in_a_row >= POOL_SERVER_MAX_CONSECUTIVE_ERRORS {
+                    error!(
+                        "virtio-media: giving up on serving \"{card}\" after {errors_in_a_row} \
+                         consecutive errors; holding its lease until EOF"
+                    );
+                    park_until_eof(tube, card);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
             }
         };
         let response = match request {
@@ -536,8 +567,33 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
             }
         };
         if let Err(e) = tube.send(&response) {
-            error!("virtio-media: cannot answer \"{card}\"'s pool request: {e}");
+            // The helper is not reading its answers. Serving it is pointless, but it is still
+            // alive and still writing into its buffers, so the lease must survive until EOF.
+            error!(
+                "virtio-media: cannot answer \"{card}\"'s pool request (nobody is reading; \
+                 holding its lease until EOF): {e}"
+            );
+            park_until_eof(tube, card);
             return;
+        }
+    }
+}
+
+/// Block on the tube until it reaches EOF, discarding everything else. The connection is being
+/// abandoned, but the helper on the far end is still a live process with live buffers: only its
+/// EOF -- process exit -- makes dropping the lease (the caller's next step) sound. Requests read
+/// here are deliberately not answered; the helper sees timeouts, `EIO`s its guest, and its
+/// reservations stay on the books until the process really goes.
+fn park_until_eof(tube: &Tube, card: &str) {
+    loop {
+        match tube.recv::<PoolRequest>() {
+            Ok(_) => {}
+            Err(TubeError::Disconnected) => {
+                info!("virtio-media: the pool connection for \"{card}\" is closed");
+                return;
+            }
+            // Still not EOF; don't spin on a repeating errno.
+            Err(_) => std::thread::sleep(Duration::from_millis(100)),
         }
     }
 }
@@ -733,6 +789,7 @@ mod tests {
     use base::pagesize;
     use base::SafeDescriptor;
     use base::SharedMemory;
+    use base::UnixSeqpacket;
     use vm_memory::GuestAddress;
 
     use super::*;
@@ -1061,5 +1118,62 @@ mod tests {
             .buffer_at(0, page)
             .unwrap();
         client.release(orphan);
+    }
+
+    /// A tube error that is not EOF must not sweep the lease: the helper on the far end is
+    /// still a live process, still writing into the buffers it holds (R8-1). One garbage packet
+    /// is logged and survived -- the pool's books do not move and the server keeps serving --
+    /// and a run of them makes the server abandon the connection but hold the lease, parked
+    /// until the EOF that alone proves the writer is gone.
+    #[test]
+    fn a_non_eof_tube_error_keeps_the_lease_alive() {
+        let page = pagesize() as u64;
+        let shm = SafeDescriptor::from(SharedMemory::new("media_pool_test", POOL_SIZE).unwrap());
+        let pool = MediaPool::new(handle_over(&shm)).unwrap();
+
+        let (vmm_socket, helper_socket) = UnixSeqpacket::pair().unwrap();
+        // A raw copy of the helper's end, to inject packets no `PoolRequest` deserializes from.
+        let raw = helper_socket.try_clone().unwrap();
+        let server = pool
+            .spawn_server("camera", Tube::try_from(vmm_socket).unwrap())
+            .unwrap();
+        let mut camera = remote_client(&shm, Tube::try_from(helper_socket).unwrap(), "camera");
+
+        let held = camera.allocate(5 * page).unwrap();
+        assert_eq!(used(&pool), 5 * page);
+
+        // One unreadable packet: a non-EOF error on the server's recv.
+        raw.send(b"not a pool request").unwrap();
+        // The next round trip proves the server is still serving (SOCK_SEQPACKET is FIFO, so
+        // the garbage was processed first) and that the error swept nothing.
+        let second = camera.allocate(page).unwrap();
+        assert_eq!(used(&pool), 6 * page);
+        camera.release(second);
+        assert_eq!(
+            used(&pool),
+            5 * page,
+            "an injected non-EOF error did not move the pool's books"
+        );
+
+        // A whole run of them: the server stops serving -- but the lease must survive, parked
+        // until EOF.
+        for _ in 0..POOL_SERVER_MAX_CONSECUTIVE_ERRORS {
+            raw.send(b"junk").unwrap();
+        }
+        // The next request goes unanswered (the server is parked): a bounded EIO, and no sweep.
+        assert_eq!(camera.allocate(page).err(), Some(libc::EIO));
+        assert_eq!(
+            used(&pool),
+            5 * page,
+            "the parked server still holds the lease for its live helper"
+        );
+
+        // Only EOF sweeps: every client-side copy of the fd closes, the parked server sees it.
+        drop(raw);
+        drop(camera);
+        drop(held);
+        server.join().unwrap();
+        assert_eq!(used(&pool), 0);
+        assert_eq!(live(&pool), 0);
     }
 }
