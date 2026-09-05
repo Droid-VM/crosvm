@@ -303,6 +303,11 @@ where
                 // and let a later `stop()` take its `already stopped` path without cancelling
                 // them. Stay Running and let their completions bring us back.
                 if !dequeue_all || self.handler.lock().is_quiesced() {
+                    debug!(
+                        "xhci: {}: ring empty at {:#x}, parking",
+                        self.name,
+                        self.get_dequeue_pointer().0
+                    );
                     *state = RingBufferState::Stopped;
                     self.stop_callback.lock().clear();
                 }
