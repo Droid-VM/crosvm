@@ -119,12 +119,19 @@ struct AImageReaderImageListener {
 ///
 /// Each declaration expands into three things: a field in `NdkApi`, the `dlsym` that fills it, and
 /// a free function of the same name, so call sites read exactly as they would against a real
-/// `extern "C"` block.
+/// `extern "C"` block. Entry points in the `optional` group may be missing from the platform's
+/// libraries: they become `Option` fields, `None` when absent, and get no free function.
 macro_rules! ndk_api {
-    ($( fn $name:ident ( $($arg:ident : $argty:ty),* $(,)? ) $(-> $ret:ty)?; )*) => {
+    (
+        $( fn $name:ident ( $($arg:ident : $argty:ty),* $(,)? ) $(-> $ret:ty)?; )*
+        optional {
+            $( fn $oname:ident ( $($oarg:ident : $oargty:ty),* $(,)? ) $(-> $oret:ty)?; )*
+        }
+    ) => {
         #[allow(non_snake_case)]
         struct NdkApi {
             $( $name: unsafe extern "C" fn($($argty),*) $(-> $ret)?, )*
+            $( $oname: Option<unsafe extern "C" fn($($oargty),*) $(-> $oret)?>, )*
         }
 
         impl NdkApi {
@@ -139,6 +146,10 @@ macro_rules! ndk_api {
                     // the type written here is the one transcribed from the NDK header.
                     $( $name: unsafe {
                         symbol(&handles, concat!(stringify!($name), "\0"))?
+                    }, )*
+                    // SAFETY: as above; a missing symbol is simply not offered.
+                    $( $oname: unsafe {
+                        symbol(&handles, concat!(stringify!($oname), "\0")).ok()
                     }, )*
                 };
                 // cameraserver drives a capture session by calling back into this process:
@@ -182,7 +193,10 @@ fn open_library(name: &'static str) -> std::result::Result<*mut c_void, CameraEr
                 CStr::from_ptr(err).to_string_lossy().into_owned()
             }
         };
-        return Err(CameraError::LibraryLoad(name.trim_end_matches('\0'), reason));
+        return Err(CameraError::LibraryLoad(
+            name.trim_end_matches('\0'),
+            reason,
+        ));
     }
     Ok(handle)
 }
@@ -342,6 +356,12 @@ ndk_api! {
     // libbinder_ndk: only to get this process onto the binder bus, see NdkApi::load.
     fn ABinderProcess_setThreadPoolMaxThreadCount(num_threads: u32) -> bool;
     fn ABinderProcess_startThreadPool();
+
+    optional {
+        // API 24 like the rest, but the one call a consumer can live without: a reader whose
+        // platform lacks it falls back to acquiring in order (`Camera::next_frame_latest`).
+        fn AImageReader_acquireLatestImage(reader: *mut AImageReader, image: *mut *mut AImage) -> i32;
+    }
 }
 
 /// Enough threads for the camera callbacks (results, buffer notifications, device state) without
@@ -373,6 +393,7 @@ const SECTION_LOGICAL_MULTI_CAMERA: u32 = 26 << 16;
 const TAG_CONTROL_AE_MODE: u32 = SECTION_CONTROL + 3;
 const TAG_CONTROL_AE_TARGET_FPS_RANGE: u32 = SECTION_CONTROL + 5;
 const TAG_CONTROL_AF_MODE: u32 = SECTION_CONTROL + 7;
+const TAG_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES: u32 = SECTION_CONTROL + 20;
 const TAG_CONTROL_MAX_REGIONS: u32 = SECTION_CONTROL + 28;
 const TAG_CONTROL_ZOOM_RATIO_RANGE: u32 = SECTION_CONTROL + 46;
 const TAG_CONTROL_ZOOM_RATIO: u32 = SECTION_CONTROL + 47;
@@ -381,6 +402,7 @@ const TAG_FLASH_INFO_AVAILABLE: u32 = SECTION_FLASH_INFO;
 const TAG_LENS_FACING: u32 = SECTION_LENS + 5;
 const TAG_SCALER_AVAILABLE_MAX_DIGITAL_ZOOM: u32 = SECTION_SCALER + 4;
 const TAG_SCALER_AVAILABLE_STREAM_CONFIGURATIONS: u32 = SECTION_SCALER + 10;
+const TAG_SCALER_AVAILABLE_MIN_FRAME_DURATIONS: u32 = SECTION_SCALER + 11;
 const TAG_SENSOR_ORIENTATION: u32 = SECTION_SENSOR + 14;
 const TAG_INFO_SUPPORTED_HARDWARE_LEVEL: u32 = SECTION_INFO;
 const TAG_REQUEST_AVAILABLE_CAPABILITIES: u32 = SECTION_REQUEST + 12;
@@ -513,6 +535,14 @@ pub struct CameraInfo {
     pub max_regions: (i32, i32, i32),
     /// Output sizes for `YUV_420_888`, largest first.
     pub yuv_sizes: Vec<(i32, i32)>,
+    /// `SCALER_AVAILABLE_MIN_FRAME_DURATIONS` for `YUV_420_888`, as `((width, height), ns)`: the
+    /// shortest frame duration each size sustains, which caps the frame rate a V4L2
+    /// `ENUM_FRAMEINTERVALS` may offer there. A size missing here made no promise.
+    pub yuv_min_frame_durations: Vec<((i32, i32), i64)>,
+    /// `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` as `(min, max)` pairs: what
+    /// [`Camera::set_fps_range`] accepts. A V4L2 `S_PARM` carries one rate, which the capture
+    /// device maps to the widest of these whose maximum is that rate.
+    pub fps_ranges: Vec<(i32, i32)>,
     /// `REQUEST_AVAILABLE_CAPABILITIES`, raw. Kept as the list rather than as the one flag we
     /// care about so that "this camera is not a logical multi-camera" cannot be confused with
     /// "the capability list did not read", which is the same empty answer.
@@ -592,7 +622,8 @@ impl Characteristics {
             Some(e) if e.entry_type == TYPE_BYTE => {
                 // SAFETY: the entry reports type BYTE and count elements owned by the metadata,
                 // which outlives the copy made here.
-                unsafe { std::slice::from_raw_parts(e.data as *const u8, e.count as usize) }.to_vec()
+                unsafe { std::slice::from_raw_parts(e.data as *const u8, e.count as usize) }
+                    .to_vec()
             }
             _ => Vec::new(),
         }
@@ -631,6 +662,24 @@ impl Characteristics {
         }
     }
 
+    /// `SCALER_AVAILABLE_MIN_FRAME_DURATIONS` is a flat int64 array of
+    /// (format, width, height, duration_ns) quads.
+    fn min_frame_durations(&self, format: i32) -> Vec<((i32, i32), i64)> {
+        self.i64s(TAG_SCALER_AVAILABLE_MIN_FRAME_DURATIONS)
+            .chunks_exact(4)
+            .filter(|q| q[0] == format as i64)
+            .map(|q| ((q[1] as i32, q[2] as i32), q[3]))
+            .collect()
+    }
+
+    /// `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` is a flat int32 array of (min, max) pairs.
+    fn fps_ranges(&self) -> Vec<(i32, i32)> {
+        self.i32s(TAG_CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            .chunks_exact(2)
+            .map(|p| (p[0], p[1]))
+            .collect()
+    }
+
     /// `SCALER_AVAILABLE_STREAM_CONFIGURATIONS` is a flat int32 array of
     /// (format, width, height, input) quads; input==1 entries are reprocessing inputs, not outputs.
     fn output_sizes(&self, format: i32) -> Vec<(i32, i32)> {
@@ -649,8 +698,17 @@ impl Characteristics {
         let regions = self.i32s(TAG_CONTROL_MAX_REGIONS);
         CameraInfo {
             id,
-            facing: self.u8s(TAG_LENS_FACING).first().copied().unwrap_or(255).into(),
-            orientation: self.i32s(TAG_SENSOR_ORIENTATION).first().copied().unwrap_or(0),
+            facing: self
+                .u8s(TAG_LENS_FACING)
+                .first()
+                .copied()
+                .unwrap_or(255)
+                .into(),
+            orientation: self
+                .i32s(TAG_SENSOR_ORIENTATION)
+                .first()
+                .copied()
+                .unwrap_or(0),
             hardware_level: self
                 .u8s(TAG_INFO_SUPPORTED_HARDWARE_LEVEL)
                 .first()
@@ -672,6 +730,8 @@ impl Characteristics {
                 _ => (0, 0, 0),
             },
             yuv_sizes: self.output_sizes(AIMAGE_FORMAT_YUV_420_888),
+            yuv_min_frame_durations: self.min_frame_durations(AIMAGE_FORMAT_YUV_420_888),
+            fps_ranges: self.fps_ranges(),
             capabilities: self.u8s(TAG_REQUEST_AVAILABLE_CAPABILITIES),
             physical_ids_raw_len: self.u8s(TAG_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS).len(),
             physical_ids: split_nul_strings(&self.u8s(TAG_LOGICAL_MULTI_CAMERA_PHYSICAL_IDS)),
@@ -700,7 +760,8 @@ pub fn list_cameras() -> Result<Vec<CameraInfo>> {
 
     let mut out = Vec::new();
     // SAFETY: the list is non-null after an OK status, and its two fields describe the array.
-    let ids = unsafe { std::slice::from_raw_parts((*list).camera_ids, (*list).num_cameras as usize) };
+    let ids =
+        unsafe { std::slice::from_raw_parts((*list).camera_ids, (*list).num_cameras as usize) };
     for &id in ids {
         // SAFETY: the NDK guarantees each entry is a NUL-terminated string owned by the list.
         let cstr = unsafe { CStr::from_ptr(id) };
@@ -747,12 +808,50 @@ extern "C" fn on_image_available(context: *mut c_void, _reader: *mut AImageReade
     signal.signal();
 }
 
-extern "C" fn on_device_disconnected(_context: *mut c_void, _device: *mut ACameraDevice) {
-    base::error!("android_camera: camera device disconnected");
+/// What the platform tells an open camera about itself, on a binder thread of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceState {
+    /// The camera was taken away: another client with higher priority opened it, or a policy
+    /// closed it. Frames stop; the handle only remains to be closed.
+    Disconnected,
+    /// A fatal device error (`ERROR_CAMERA_DEVICE`, `ERROR_CAMERA_SERVICE`, ...): the camera is
+    /// unusable until closed and reopened.
+    Error(i32),
 }
 
-extern "C" fn on_device_error(_context: *mut c_void, _device: *mut ACameraDevice, error: i32) {
+/// Called with every [`DeviceState`] the platform reports, from a binder thread, so it must be
+/// `Send + Sync` and must not block; a capture loop typically pushes the state onto a channel and
+/// wakes whoever waits for frames.
+pub type StateListener = Box<dyn Fn(DeviceState) + Send + Sync>;
+
+/// The context the device-state callbacks are given: the pointer the NDK hands back is to this.
+struct StateContext {
+    listener: Option<StateListener>,
+}
+
+impl StateContext {
+    fn notify(&self, state: DeviceState) {
+        if let Some(listener) = &self.listener {
+            listener(state);
+        }
+    }
+}
+
+extern "C" fn on_device_disconnected(context: *mut c_void, _device: *mut ACameraDevice) {
+    base::error!("android_camera: camera device disconnected");
+    if !context.is_null() {
+        // SAFETY: context is the `StateContext` `Camera::open_with` registered; the box that
+        // holds it outlives the device (it is dropped after `ACameraDevice_close`).
+        unsafe { &*(context as *const StateContext) }.notify(DeviceState::Disconnected);
+    }
+}
+
+extern "C" fn on_device_error(context: *mut c_void, _device: *mut ACameraDevice, error: i32) {
     base::error!("android_camera: camera device error {}", error);
+    if !context.is_null() {
+        // SAFETY: as above.
+        unsafe { &*(context as *const StateContext) }.notify(DeviceState::Error(error));
+    }
 }
 
 extern "C" fn on_session_closed(_context: *mut c_void, _session: *mut ACameraCaptureSession) {}
@@ -763,7 +862,8 @@ extern "C" fn on_session_active(_context: *mut c_void, _session: *mut ACameraCap
 pub struct Camera {
     // Torn down in Drop in the reverse of the order built, so the raw handles are kept as fields
     // rather than in wrappers whose drop order would be the declaration order.
-    manager: Manager,
+    /// Never read after `open_with`; kept so the manager outlives the device it opened.
+    _manager: Manager,
     device: *mut ACameraDevice,
     session: *mut ACameraCaptureSession,
     request: *mut ACaptureRequest,
@@ -775,6 +875,8 @@ pub struct Camera {
     /// `signal_raw`.
     _listener: Box<AImageReaderImageListener>,
     _device_callbacks: Box<ACameraDeviceStateCallbacks>,
+    /// What `_device_callbacks.context` points at; dropped after the device is closed.
+    _state: Box<StateContext>,
     _session_callbacks: Box<ACameraCaptureSessionStateCallbacks>,
     signal: Arc<FrameSignal>,
     signal_raw: *const FrameSignal,
@@ -782,12 +884,88 @@ pub struct Camera {
     pub height: i32,
 }
 
+/// Everything `Camera::open_with` has created so far, so that a failure halfway releases it all
+/// in the reverse order of construction -- the same order `Camera::drop` uses -- instead of
+/// leaking an opened device per attempt. Every handle is null (or `None`) until created; once
+/// the `Camera` exists it takes them over and the guard has nothing left to free.
+struct OpenGuard {
+    manager: Option<Manager>,
+    signal_raw: *const FrameSignal,
+    reader: *mut AImageReader,
+    listener: Option<Box<AImageReaderImageListener>>,
+    device_callbacks: Option<Box<ACameraDeviceStateCallbacks>>,
+    state: Option<Box<StateContext>>,
+    device: *mut ACameraDevice,
+    output: *mut ACaptureSessionOutput,
+    container: *mut ACaptureSessionOutputContainer,
+    session_callbacks: Option<Box<ACameraCaptureSessionStateCallbacks>>,
+    session: *mut ACameraCaptureSession,
+    request: *mut ACaptureRequest,
+    target: *mut ACameraOutputTarget,
+}
+
+impl Drop for OpenGuard {
+    fn drop(&mut self) {
+        // SAFETY: every non-null handle was produced by the matching create call and is released
+        // exactly once, here or in `Camera::drop`, never both: `Camera::open_with` nulls the
+        // fields it takes over.
+        unsafe {
+            if !self.session.is_null() {
+                ACameraCaptureSession_stopRepeating(self.session);
+                ACameraCaptureSession_close(self.session);
+            }
+            if !self.device.is_null() {
+                ACameraDevice_close(self.device);
+            }
+            if !self.request.is_null() {
+                ACaptureRequest_free(self.request);
+            }
+            if !self.target.is_null() {
+                ACameraOutputTarget_free(self.target);
+            }
+            if !self.container.is_null() {
+                ACaptureSessionOutputContainer_free(self.container);
+            }
+            if !self.output.is_null() {
+                ACaptureSessionOutput_free(self.output);
+            }
+            if !self.reader.is_null() {
+                AImageReader_delete(self.reader);
+            }
+            if !self.signal_raw.is_null() {
+                drop(Arc::from_raw(self.signal_raw));
+            }
+        }
+        // The boxes (callback structs, state context) and the manager drop with the guard, after
+        // the handles that referenced them are gone.
+    }
+}
+
 impl Camera {
     /// Open `id` and start a repeating request delivering `width`x`height` `YUV_420_888` frames.
     ///
     /// `max_images` is how many frames may be held by the caller at once; the camera stalls when
-    /// they are all outstanding, so it is the queue depth a V4L2 `REQBUFS` would ask for.
+    /// they are all outstanding, so it is the queue depth a V4L2 `REQBUFS` would ask for. Keep it
+    /// at 3 or more if [`Camera::next_frame_latest`] is to discard anything (`NdkImageReader.h`:
+    /// with fewer than two free slots it cannot).
     pub fn open(id: &str, width: i32, height: i32, max_images: i32) -> Result<Camera> {
+        Self::open_with(id, width, height, max_images, None)
+    }
+
+    /// As [`Camera::open`], with `on_state` told when the platform disconnects the camera or
+    /// reports a device error -- the only way a caller learns that frames have stopped for good
+    /// rather than stalled.
+    ///
+    /// Fails cleanly: whatever was created before the failing step is released again, so a
+    /// caller may retry (a guest reopening after a transient `ERROR_CAMERA_IN_USE`) without
+    /// leaking an opened device per attempt.
+    pub fn open_with(
+        id: &str,
+        width: i32,
+        height: i32,
+        max_images: i32,
+        on_state: Option<StateListener>,
+    ) -> Result<Camera> {
         ensure_loaded()?;
         let manager = Manager::new()?;
         let c_id = CString::new(id).map_err(|_| CameraError::BadCameraId)?;
@@ -804,14 +982,30 @@ impl Camera {
         }
         drop(characteristics);
 
+        let mut g = OpenGuard {
+            manager: Some(manager),
+            signal_raw: std::ptr::null(),
+            reader: null_mut(),
+            listener: None,
+            device_callbacks: None,
+            state: None,
+            device: null_mut(),
+            output: null_mut(),
+            container: null_mut(),
+            session_callbacks: None,
+            session: null_mut(),
+            request: null_mut(),
+            target: null_mut(),
+        };
+        let manager_ptr = g.manager.as_ref().expect("just set").0;
+
         let signal = Arc::new(FrameSignal {
             delivered: AtomicU64::new(0),
             lock: Mutex::new(()),
             cond: Condvar::new(),
         });
-        let signal_raw = Arc::into_raw(Arc::clone(&signal));
+        g.signal_raw = Arc::into_raw(Arc::clone(&signal));
 
-        let mut reader: *mut AImageReader = null_mut();
         check_media("AImageReader_new", unsafe {
             // SAFETY: out-parameter written only on success.
             AImageReader_new(
@@ -819,59 +1013,60 @@ impl Camera {
                 height,
                 AIMAGE_FORMAT_YUV_420_888,
                 max_images,
-                &mut reader,
+                &mut g.reader,
             )
         })?;
 
         let mut listener = Box::new(AImageReaderImageListener {
-            context: signal_raw as *mut c_void,
+            context: g.signal_raw as *mut c_void,
             on_image_available: Some(on_image_available),
         });
         check_media("AImageReader_setImageListener", unsafe {
             // SAFETY: reader is live, and the listener box outlives it (dropped after
-            // AImageReader_delete in Camera::drop).
-            AImageReader_setImageListener(reader, listener.as_mut() as *mut _)
+            // AImageReader_delete, in Camera::drop or in the guard).
+            AImageReader_setImageListener(g.reader, listener.as_mut() as *mut _)
         })?;
+        g.listener = Some(listener);
 
         let mut window: *mut ANativeWindow = null_mut();
         // SAFETY: reader is live; the window it returns is owned by the reader.
         check_media("AImageReader_getWindow", unsafe {
-            AImageReader_getWindow(reader, &mut window)
+            AImageReader_getWindow(g.reader, &mut window)
         })?;
 
+        let state = Box::new(StateContext { listener: on_state });
         let mut device_callbacks = Box::new(ACameraDeviceStateCallbacks {
-            context: null_mut(),
+            context: state.as_ref() as *const StateContext as *mut c_void,
             on_disconnected: Some(on_device_disconnected),
             on_error: Some(on_device_error),
             on_client_shared_access_priority_changed: None,
         });
-        let mut device: *mut ACameraDevice = null_mut();
         // SAFETY: all four arguments are live for the call; device is written only on success.
         // This is the call that fails with ERROR_PERMISSION_DENIED when the real uid resolves to
         // no package or to one without CAMERA.
         check("ACameraManager_openCamera", unsafe {
             ACameraManager_openCamera(
-                manager.0,
+                manager_ptr,
                 c_id.as_ptr(),
                 device_callbacks.as_mut() as *mut _,
-                &mut device,
+                &mut g.device,
             )
         })?;
+        g.state = Some(state);
+        g.device_callbacks = Some(device_callbacks);
 
-        let mut output: *mut ACaptureSessionOutput = null_mut();
         // SAFETY: window belongs to the live reader; output written only on success.
         check("ACaptureSessionOutput_create", unsafe {
-            ACaptureSessionOutput_create(window, &mut output)
+            ACaptureSessionOutput_create(window, &mut g.output)
         })?;
 
-        let mut container: *mut ACaptureSessionOutputContainer = null_mut();
         // SAFETY: out-parameter written only on success.
         check("ACaptureSessionOutputContainer_create", unsafe {
-            ACaptureSessionOutputContainer_create(&mut container)
+            ACaptureSessionOutputContainer_create(&mut g.container)
         })?;
         // SAFETY: both handles are live and the container only records the pointer.
         check("ACaptureSessionOutputContainer_add", unsafe {
-            ACaptureSessionOutputContainer_add(container, output)
+            ACaptureSessionOutputContainer_add(g.container, g.output)
         })?;
 
         let mut session_callbacks = Box::new(ACameraCaptureSessionStateCallbacks {
@@ -880,53 +1075,55 @@ impl Camera {
             on_ready: Some(on_session_ready),
             on_active: Some(on_session_active),
         });
-        let mut session: *mut ACameraCaptureSession = null_mut();
         // SAFETY: device and container are live; the callbacks box outlives the session.
         check("ACameraDevice_createCaptureSession", unsafe {
             ACameraDevice_createCaptureSession(
-                device,
-                container,
+                g.device,
+                g.container,
                 session_callbacks.as_mut() as *const _,
-                &mut session,
+                &mut g.session,
             )
         })?;
+        g.session_callbacks = Some(session_callbacks);
 
         // TEMPLATE_RECORD rather than TEMPLATE_PREVIEW: a virtio-media capture device is a
         // continuous stream, and RECORD is the template whose defaults hold the frame rate steady
         // instead of letting AE drop it in low light.
-        let mut request: *mut ACaptureRequest = null_mut();
         // SAFETY: device is live; request written only on success.
         check("ACameraDevice_createCaptureRequest", unsafe {
-            ACameraDevice_createCaptureRequest(device, TEMPLATE_RECORD, &mut request)
+            ACameraDevice_createCaptureRequest(g.device, TEMPLATE_RECORD, &mut g.request)
         })?;
 
-        let mut target: *mut ACameraOutputTarget = null_mut();
         // SAFETY: window belongs to the live reader; target written only on success.
         check("ACameraOutputTarget_create", unsafe {
-            ACameraOutputTarget_create(window, &mut target)
+            ACameraOutputTarget_create(window, &mut g.target)
         })?;
         // SAFETY: both handles live; the request records the target.
         check("ACaptureRequest_addTarget", unsafe {
-            ACaptureRequest_addTarget(request, target)
+            ACaptureRequest_addTarget(g.request, g.target)
         })?;
 
+        // Everything exists: the camera takes the handles over and the guard is left empty.
         let camera = Camera {
-            manager,
-            device,
-            session,
-            request,
-            target,
-            output,
-            container,
-            reader,
-            _listener: listener,
-            _device_callbacks: device_callbacks,
-            _session_callbacks: session_callbacks,
+            _manager: g.manager.take().expect("set above"),
+            device: std::mem::replace(&mut g.device, null_mut()),
+            session: std::mem::replace(&mut g.session, null_mut()),
+            request: std::mem::replace(&mut g.request, null_mut()),
+            target: std::mem::replace(&mut g.target, null_mut()),
+            output: std::mem::replace(&mut g.output, null_mut()),
+            container: std::mem::replace(&mut g.container, null_mut()),
+            reader: std::mem::replace(&mut g.reader, null_mut()),
+            _listener: g.listener.take().expect("set above"),
+            _device_callbacks: g.device_callbacks.take().expect("set above"),
+            _state: g.state.take().expect("set above"),
+            _session_callbacks: g.session_callbacks.take().expect("set above"),
             signal,
-            signal_raw,
+            signal_raw: std::mem::replace(&mut g.signal_raw, std::ptr::null()),
             width,
             height,
         };
+        drop(g);
+        // A failure here is the camera's own to unwind, through `Camera::drop`.
         camera.submit()?;
         Ok(camera)
     }
@@ -991,14 +1188,17 @@ impl Camera {
     pub fn set_fps_range(&mut self, min: i32, max: i32) -> Result<()> {
         let range = [min, max];
         // SAFETY: request is live; the pointer addresses two i32, matching count 2.
-        check("ACaptureRequest_setEntry_i32(AE_TARGET_FPS_RANGE)", unsafe {
-            ACaptureRequest_setEntry_i32(
-                self.request,
-                TAG_CONTROL_AE_TARGET_FPS_RANGE,
-                2,
-                range.as_ptr(),
-            )
-        })?;
+        check(
+            "ACaptureRequest_setEntry_i32(AE_TARGET_FPS_RANGE)",
+            unsafe {
+                ACaptureRequest_setEntry_i32(
+                    self.request,
+                    TAG_CONTROL_AE_TARGET_FPS_RANGE,
+                    2,
+                    range.as_ptr(),
+                )
+            },
+        )?;
         self.submit()
     }
 
@@ -1010,16 +1210,44 @@ impl Camera {
     /// Wait up to `timeout` for the next frame. `Ok(None)` means the deadline passed with the
     /// camera still running, which is a stall rather than an error.
     pub fn next_frame(&self, timeout: Duration) -> Result<Option<Frame<'_>>> {
+        self.acquire(timeout, false)
+    }
+
+    /// As [`Camera::next_frame`], but the *newest* frame, discarding older ones the reader still
+    /// holds (`AImageReader_acquireLatestImage`): what a consumer that has fallen behind wants,
+    /// since a frame it skipped is stale by the time it would be copied. On a platform without
+    /// that entry point this is [`Camera::next_frame`].
+    pub fn next_frame_latest(&self, timeout: Duration) -> Result<Option<Frame<'_>>> {
+        self.acquire(timeout, true)
+    }
+
+    /// Whether [`Camera::next_frame_latest`] really discards, or is the ordered fallback.
+    pub fn can_acquire_latest(&self) -> bool {
+        ndk().AImageReader_acquireLatestImage.is_some()
+    }
+
+    fn acquire(&self, timeout: Duration, latest: bool) -> Result<Option<Frame<'_>>> {
         let deadline = Instant::now() + timeout;
         loop {
             let mut image: *mut AImage = null_mut();
             // SAFETY: reader is live; image is written only when a buffer was available.
-            let status = unsafe { AImageReader_acquireNextImage(self.reader, &mut image) };
+            let status = unsafe {
+                match (latest, ndk().AImageReader_acquireLatestImage) {
+                    (true, Some(acquire_latest)) => acquire_latest(self.reader, &mut image),
+                    _ => AImageReader_acquireNextImage(self.reader, &mut image),
+                }
+            };
             match status {
                 AMEDIA_OK => return Frame::new(image).map(Some),
                 // Not an error: the queue is empty until the camera produces the next frame.
                 AMEDIA_IMGREADER_NO_BUFFER_AVAILABLE => {}
-                other => return Err(CameraError::Ndk("AImageReader_acquireNextImage", other, "AMEDIA")),
+                other => {
+                    return Err(CameraError::Ndk(
+                        "AImageReader_acquireNextImage",
+                        other,
+                        "AMEDIA",
+                    ))
+                }
             }
             let now = Instant::now();
             if now >= deadline {
@@ -1071,6 +1299,26 @@ pub struct Plane {
     len: usize,
     pub row_stride: i32,
     pub pixel_stride: i32,
+}
+
+impl Plane {
+    /// The first byte of the plane, valid for [`Plane::len`] bytes while the frame lives.
+    ///
+    /// For interleaved chroma (NV12/NV21) the two chroma planes are one allocation, offset by a
+    /// byte: `len` of each stops one byte short of the region's end -- the last sample's other
+    /// half belongs to the other plane -- so a copy of the whole region must take the farther of
+    /// the two ends, which is what `plane_data()`'s per-plane slices cannot express.
+    pub fn as_ptr(&self) -> *const u8 {
+        self.data
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 }
 
 /// One acquired frame. Holds a buffer the camera cannot reuse until it is dropped, so a caller

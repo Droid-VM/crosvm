@@ -6,11 +6,9 @@ edition = "2021"
 
 [dependencies]
 base = { path = "../base" }
+libc = "0.2"
 thiserror = "1"
 
 [[bin]]
 name = "camera_probe"
 path = "src/probe.rs"
-
-[dev-dependencies]
-libc = "0.2"

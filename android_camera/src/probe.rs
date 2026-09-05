@@ -222,6 +222,26 @@ fn cmd_list() -> Result<(), String> {
         if c.yuv_sizes.len() > 8 {
             println!("      ... and {} more", c.yuv_sizes.len() - 8);
         }
+        println!(
+            "    fps ranges          {}",
+            if c.fps_ranges.is_empty() {
+                "(read returned nothing)".to_owned()
+            } else {
+                c.fps_ranges
+                    .iter()
+                    .map(|(lo, hi)| format!("{}-{}", lo, hi))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        // The V4L2 device caps ENUM_FRAMEINTERVALS at each size by these.
+        println!(
+            "    min frame durations {} for YUV_420_888",
+            c.yuv_min_frame_durations.len()
+        );
+        for ((w, h), ns) in c.yuv_min_frame_durations.iter().take(4) {
+            println!("      {}x{}: {} ns ({:.1} fps max)", w, h, ns, 1e9 / *ns as f64);
+        }
     }
     Ok(())
 }

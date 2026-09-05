@@ -27,6 +27,9 @@ rust_library {
     // not linked: both reach libgui, whose build needs projects a crosvm-only AOSP checkout does
     // not carry. dlopen itself comes from the default system_shared_libs -- naming libdl here
     // instead asks for the full bionic build, which wants projects this tree does not carry either.
+    // libdevices, which depends on this since the camera device, is available to the virt APEX,
+    // so this must be too or soong refuses the dependency (same as libandroid_audio).
+    apex_available: ["com.android.virt"],
 }
 
 // installable:false, like crosvm_device_only_bin: installing into system/bin makes the install
