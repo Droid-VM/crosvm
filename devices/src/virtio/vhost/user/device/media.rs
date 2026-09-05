@@ -103,6 +103,14 @@ pub struct MediaBackendParams {
     /// Guest-physical base of the `media_host` pool. The region that starts here in the memory
     /// table the frontend sends is the pool; `MMAP` buffers are carved out of it.
     pub pool_gpa: u64,
+    /// This device's `(offset, len)` slice of the pool's offset space
+    /// (`media::pool::carve_slices`). Each helper is a separate process with its own allocator
+    /// over the shared window, so without a slice every helper hands out offset 0, 0x1000, ...
+    /// and one device's buffers alias another's (D49: the encoder's coded frames scribbled the
+    /// camera's raw buffers). `None` -- an old VMM, or a VM with one media device -- is the
+    /// whole pool.
+    #[serde(default)]
+    pub pool_slice: Option<(u64, u64)>,
     /// `(guest-physical base, size)` of every window the host may touch: the pools, the swiotlb
     /// region, shared RAM -- everything but memory lent to a protected guest. A scatter-gather
     /// entry outside all of them is `EFAULT`. For an unprotected VM this is every region.
@@ -191,7 +199,10 @@ where
         if self.pool.is_none() {
             let handle = pool_handle_at(&mem, self.params.pool_gpa)
                 .context("the media_host pool is not in the memory table")?;
-            self.pool = Some(MediaPool::new(handle).context("cannot set up the media_host pool")?);
+            self.pool = Some(
+                MediaPool::with_slice(handle, self.params.pool_slice)
+                    .context("cannot set up the media_host pool")?,
+            );
         }
         let pool = self.pool.as_ref().expect("pool was just set");
 
@@ -340,6 +351,7 @@ mod tests {
             role: Some("main".into()),
             allow_sw: true,
             pool_gpa: 0x1_4000_0000,
+            pool_slice: Some((0x40_0000, 0x80_0000)),
             access_windows: vec![(0x1_4000_0000, 0x1000_0000), (0x9000_0000, 0x40_0000)],
             access_platform: true,
         };
@@ -358,6 +370,10 @@ mod tests {
             (None, None, None)
         );
         assert_eq!(minimal.pool_gpa, 4096);
+        assert_eq!(
+            minimal.pool_slice, None,
+            "an old VMM's JSON means the whole pool"
+        );
         assert_eq!(minimal.access_windows, vec![(4096, 8192)]);
         assert!(!minimal.access_platform);
         assert!(!minimal.allow_sw);

@@ -70,6 +70,41 @@ pub fn pool_handle_at(mem: &GuestMemory, gpa: u64) -> anyhow::Result<MediaPoolHa
     })
 }
 
+/// Split a pool of `size` bytes into one page-aligned `(offset, len)` slice per weight, in
+/// order, covering the pool: `size * w / total` rounded down to a page, the remainder on the
+/// last slice. The weights are the media devices of the VM in configuration order (the decoder
+/// weighs twice the others: its CAPTURE queue holds a decoded-frame queue, not one frame in
+/// flight), so the VMM and every helper agree on who owns which bytes without ever talking --
+/// which is the whole point: helpers cannot share the VM-wide allocator, and two allocators
+/// over one window alias each other's buffers (D49).
+///
+/// An empty `weights` returns no slices; a zero weight gets a zero-length slice (which
+/// [`MediaPool::with_slice`] refuses -- do not pass one for a device that allocates).
+pub fn carve_slices(size: u64, weights: &[u64]) -> Vec<(u64, u64)> {
+    let page = base::pagesize() as u64;
+    let total: u64 = weights.iter().sum();
+    if total == 0 {
+        return weights.iter().map(|_| (0, 0)).collect();
+    }
+    let mut slices = Vec::with_capacity(weights.len());
+    let mut at = 0u64;
+    for w in weights {
+        let len = (size / total).saturating_mul(*w) / page * page;
+        slices.push((at, len));
+        at += len;
+    }
+    // The rounding's remainder goes to the last slice that allocates at all.
+    if let Some(last) = slices
+        .iter()
+        .zip(weights)
+        .rposition(|(_, w)| *w > 0)
+        .map(|i| &mut slices[i].1)
+    {
+        *last += size - at;
+    }
+    slices
+}
+
 /// The VM-wide `media_host` pool: one offset space, shared by every media device.
 ///
 /// It has to be VM-wide. A pool offset is what the device answers `VIDIOC_QUERYBUF` with and the
@@ -78,11 +113,19 @@ pub fn pool_handle_at(mem: &GuestMemory, gpa: u64) -> anyhow::Result<MediaPoolHa
 /// two unrelated buffers -- while one device's `release` frees space the other is still filling
 /// (`VPU_DESIGN.md` §2.2 sizes the one 256 MiB pool for every media device in the VM).
 ///
+/// A media *helper* is a separate process and cannot share this allocator, so it gets a `slice`
+/// instead: a `(offset, len)` window of the offset space that is its alone, computed once by the
+/// VMM over every media device of the VM ([`carve_slices`]) and carried in the helper's
+/// parameters. Without that, three helpers over one pool each hand out offset 0 first, and the
+/// encoder's coded-frame writes land inside the camera's raw buffers -- which is exactly D49's
+/// band of noise (`logs/vpu_wp/F12-encoder.md`).
+///
 /// The descriptor is dup'ed and the whole pool mapped exactly once, here; a buffer's own dup is
 /// what the crate's `HostBuffer` carries.
 pub struct MediaPoolAllocator {
     pool: MediaPoolHandle,
-    /// The pool's offset space, `[0, pool.size)`, page aligned.
+    /// This allocator's part of the pool's offset space -- `[0, pool.size)` for the VM-wide
+    /// allocator, the device's slice in a helper -- page aligned.
     allocator: AddressAllocator,
     /// Our own mapping of the pool, so that buffers can be filled from this process.
     host_map: MemoryMapping,
@@ -100,7 +143,7 @@ pub struct MediaPoolAllocator {
 }
 
 impl MediaPoolAllocator {
-    fn new(pool: MediaPoolHandle) -> anyhow::Result<Self> {
+    fn new(pool: MediaPoolHandle, slice: Option<(u64, u64)>) -> anyhow::Result<Self> {
         let file = File::from(
             pool.fd
                 .try_clone()
@@ -111,9 +154,24 @@ impl MediaPoolAllocator {
             .offset(pool.fd_offset)
             .build()
             .context("cannot map the media_host pool")?;
+        let page = base::pagesize() as u64;
+        let (start, len) = slice.unwrap_or((0, pool.size));
+        if len == 0
+            || start % page != 0
+            || len % page != 0
+            || start.checked_add(len).map_or(true, |end| end > pool.size)
+        {
+            anyhow::bail!(
+                "media_host pool slice {:#x}+{:#x} is not a page-aligned part of the {:#x}-byte \
+                 pool",
+                start,
+                len,
+                pool.size
+            );
+        }
         let allocator = AddressAllocator::new(
-            AddressRange::from_start_and_end(0, pool.size - 1),
-            Some(base::pagesize() as u64),
+            AddressRange::from_start_and_end(start, start + len - 1),
+            Some(page),
             None,
         )?;
         Ok(MediaPoolAllocator {
@@ -253,14 +311,33 @@ impl MediaPool {
     /// Map the pool and build its allocator. One dup of the descriptor and one host mapping, for
     /// the whole VM.
     pub fn new(pool: MediaPoolHandle) -> anyhow::Result<Self> {
+        Self::with_slice(pool, None)
+    }
+
+    /// Map the pool but allocate from `slice` (`(offset, len)` in the pool's offset space) alone.
+    /// This is how a helper process, which cannot share the VM-wide allocator, is kept off the
+    /// other devices' buffers: the VMM carves one slice per media device ([`carve_slices`]) and
+    /// each helper allocates only inside its own. `None` is the whole pool.
+    pub fn with_slice(pool: MediaPoolHandle, slice: Option<(u64, u64)>) -> anyhow::Result<Self> {
         let fd = pool.fd.as_raw_descriptor();
         let (gpa, size) = (pool.gpa, pool.size);
-        let inner = MediaPoolAllocator::new(pool)?;
-        info!(
-            "virtio-media: serving MMAP buffers from the media_host pool (gpa {:#x}, {} MiB)",
-            gpa,
-            size >> 20
-        );
+        let inner = MediaPoolAllocator::new(pool, slice)?;
+        match slice {
+            None => info!(
+                "virtio-media: serving MMAP buffers from the media_host pool (gpa {:#x}, {} MiB)",
+                gpa,
+                size >> 20
+            ),
+            Some((start, len)) => info!(
+                "virtio-media: serving MMAP buffers from the media_host pool slice {:#x}+{:#x} \
+                 (gpa {:#x}, {} of {} MiB)",
+                start,
+                len,
+                gpa,
+                len >> 20,
+                size >> 20
+            ),
+        }
         Ok(MediaPool {
             inner: Arc::new(Mutex::new(inner)),
             fd,
@@ -331,16 +408,97 @@ mod tests {
     /// A pool over a plain shared-memory object, the same shape `MediaPoolHandle` describes for
     /// the `media_host` window carved out of guest memory.
     fn pool() -> MediaPool {
+        MediaPool::new(handle()).unwrap()
+    }
+
+    fn handle() -> MediaPoolHandle {
         let shm = SharedMemory::new("media_pool_test", POOL_SIZE).unwrap();
         let fd = SafeDescriptor::from(shm);
-        MediaPool::new(MediaPoolHandle {
+        MediaPoolHandle {
             fd,
             fd_offset: 0,
             host_va: 0,
             gpa: 0x1_0000_0000,
             size: POOL_SIZE,
-        })
-        .unwrap()
+        }
+    }
+
+    /// The D49 regression: helper processes cannot share one allocator, so each gets a slice of
+    /// the offset space, and two sliced pools over the same window never hand out the same
+    /// bytes. Without slices both start at offset 0 and the encoder's coded-frame writes land
+    /// inside the camera's raw buffers.
+    #[test]
+    fn sliced_pools_over_one_window_do_not_alias() {
+        let page = pagesize() as u64;
+        let slices = carve_slices(POOL_SIZE, &[1, 2, 1]);
+        assert_eq!(slices.len(), 3);
+        // Page-aligned, in order, disjoint, and covering the whole pool.
+        let mut end = 0;
+        for (start, len) in &slices {
+            assert_eq!(*start % page, 0);
+            assert_eq!(*len % page, 0);
+            assert_eq!(*start, end, "slices are adjacent and disjoint");
+            end = start + len;
+        }
+        assert_eq!(end, POOL_SIZE, "the slices cover the pool");
+        assert_eq!(
+            slices[1].1,
+            2 * slices[0].1,
+            "the decoder's weight doubles its slice"
+        );
+
+        // Two "helpers" over the same window, each on its own slice: every offset handed out
+        // stays inside its slice, so none alias -- unlike two whole-window pools, which both
+        // answer 0 first.
+        let (camera, encoder) = (
+            MediaPool::with_slice(handle(), Some(slices[0])).unwrap(),
+            MediaPool::with_slice(handle(), Some(slices[2])).unwrap(),
+        );
+        let mut cam_lease = camera.lease("camera".into());
+        let mut enc_lease = encoder.lease("encoder".into());
+        for _ in 0..3 {
+            let raw = cam_lease.allocate(5 * page).unwrap();
+            let coded = enc_lease.allocate(2 * page).unwrap();
+            let (r, c) = (raw.pool_offset.unwrap(), coded.pool_offset.unwrap());
+            let (cs, ce) = (slices[0].0, slices[0].0 + slices[0].1);
+            let (es, ee) = (slices[2].0, slices[2].0 + slices[2].1);
+            assert!(r >= cs && r + 5 * page <= ce, "camera stays in its slice");
+            assert!(c >= es && c + 2 * page <= ee, "encoder stays in its slice");
+        }
+        // A slice is also all a helper gets: exhaustion is ENOMEM, not a neighbour's bytes.
+        let full = cam_lease.allocate(slices[0].1).map(|b| b.pool_offset);
+        assert_eq!(full, Err(libc::ENOMEM));
+
+        // The unsliced pool still answers offset 0 first, so the whole-pool path is unchanged.
+        let mut whole = pool().lease("lb0".into());
+        assert_eq!(whole.allocate(page).unwrap().pool_offset, Some(0));
+
+        // A slice outside the pool, or an unaligned one, is refused when the pool is built.
+        assert!(MediaPool::with_slice(handle(), Some((0, POOL_SIZE + page))).is_err());
+        assert!(MediaPool::with_slice(handle(), Some((page / 2, page))).is_err());
+        assert!(MediaPool::with_slice(handle(), Some((0, 0))).is_err());
+    }
+
+    /// `carve_slices` corner cases: one device takes everything, a zero total carves nothing,
+    /// and the rounding remainder lands on the last slice that allocates.
+    #[test]
+    fn carve_slices_covers_the_pool() {
+        let page = pagesize() as u64;
+        assert_eq!(carve_slices(POOL_SIZE, &[1]), vec![(0, POOL_SIZE)]);
+        assert_eq!(carve_slices(POOL_SIZE, &[0, 0]), vec![(0, 0), (0, 0)]);
+        // Three equal weights do not divide 16 MiB of pages evenly: the remainder goes to the
+        // last slice and the total still covers the pool.
+        let thirds = carve_slices(POOL_SIZE, &[1, 1, 1]);
+        let total: u64 = thirds.iter().map(|(_, len)| len).sum();
+        assert_eq!(total, POOL_SIZE);
+        assert!(thirds[2].1 >= thirds[0].1);
+        // A trailing zero weight stays empty; the remainder finds the last allocating slice.
+        let with_empty = carve_slices(POOL_SIZE, &[1, 1, 0]);
+        assert_eq!(with_empty[2].1, 0);
+        assert_eq!(with_empty[0].1 + with_empty[1].1, POOL_SIZE);
+        assert!(with_empty
+            .iter()
+            .all(|(start, len)| (start + len) % page == 0));
     }
 
     fn used(pool: &MediaPool) -> u64 {
