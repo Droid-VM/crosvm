@@ -15,7 +15,9 @@ use base::RawDescriptor;
 use cros_async::Executor;
 
 use crate::virtio::media::android_camera_backend::AndroidCameraBackend;
+use crate::virtio::media::android_codec_backend::MediaCodecDecoderBackend;
 use crate::virtio::media::camera_config;
+use crate::virtio::media::decoder_config;
 use crate::virtio::media::loopback_config;
 use crate::virtio::media::simple_capture_config;
 use crate::virtio::media::MediaDeviceKind;
@@ -126,7 +128,41 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
             )?;
             ex.run_until(conn.run_backend(backend, &ex))?
         }
-        kind @ (MediaDeviceKind::Decoder | MediaDeviceKind::Encoder) => {
+        MediaDeviceKind::Decoder => {
+            use virtio_media::devices::VideoDecoder;
+
+            // As the camera: the codec store is read here, once, before the frontend is spoken
+            // to, so a platform with no usable hardware decoder (or no media NDK) ends the
+            // helper now, by name; the codec itself is created at STREAMON(OUTPUT). The store's
+            // tables have no lock, which is why this is the one walk, on one thread, after the
+            // uid drop (design §7.2). The wait is bounded for the same reason the camera's is.
+            let allow_sw = params.allow_sw;
+            let decoder = enumerate_on_thread(
+                "media_codec_enum",
+                "codec enumeration",
+                "the codec store (media.player) is not responding to this uid",
+                move || MediaCodecDecoderBackend::new(allow_sw),
+            )?;
+            let card = params
+                .card
+                .clone()
+                .unwrap_or_else(|| "droidvm decoder".to_string());
+            let backend = MediaBackend::new(
+                params,
+                decoder_config(&card),
+                move |event_queue, guest_mapper, mapper, allocator| {
+                    Ok(VideoDecoder::new(
+                        decoder.clone(),
+                        event_queue,
+                        guest_mapper,
+                        mapper,
+                        allocator,
+                    ))
+                },
+            )?;
+            ex.run_until(conn.run_backend(backend, &ex))?
+        }
+        kind @ MediaDeviceKind::Encoder => {
             bail!("{}", kind.unimplemented_message())
         }
     }
@@ -137,39 +173,56 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
 /// timeout of its own, and it runs before the vhost-user handshake is answered, so a
 /// `cameraserver` that never replies would hold the VMM inside `VhostUserFrontend::new` and the
 /// VM would never start (`review-m4` R4). Longer than the frontend's own `open_stream` bound: an
-/// enumeration is once per VM and a cold camera service is slow the first time.
-const CAMERA_ENUMERATION_TIMEOUT: Duration = Duration::from_secs(15);
+/// enumeration is once per VM and a cold camera service is slow the first time. The codec
+/// store's enumeration (`AMediaCodecStore_*`, fetched from `media.player`) is bounded by the
+/// same value for the same reasons.
+const ENUMERATION_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Describe the camera on a thread of its own, so the wait for it is bounded.
+fn enumerate_camera(camera_id: Option<String>) -> anyhow::Result<AndroidCameraBackend> {
+    enumerate_on_thread(
+        "media_camera_enum",
+        "camera enumeration",
+        "the camera service is not responding to this uid",
+        move || AndroidCameraBackend::new(camera_id.as_deref()),
+    )
+}
+
+/// Run `describe` on a thread called `thread_name` and wait at most [`ENUMERATION_TIMEOUT`] for
+/// what it returns.
 ///
 /// On a timeout the helper exits non-zero and the VMM reports it -- `child media helper (pid N)
 /// exited` (`logs/vpu_wp/M3.md` §5.1), plus this line on the helper's inherited stderr -- which is
-/// the whole point: a helper that cannot describe its camera must fail visibly instead of leaving
+/// the whole point: a helper that cannot describe its device must fail visibly instead of leaving
 /// the VMM blocked on a handshake it will never answer. The enumeration thread is not joined; it
 /// may still be inside binder, and the process is on its way out.
-fn enumerate_camera(camera_id: Option<String>) -> anyhow::Result<AndroidCameraBackend> {
+fn enumerate_on_thread<T: Send + 'static>(
+    thread_name: &'static str,
+    what: &'static str,
+    why: &'static str,
+    describe: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
     let (tx, rx) = mpsc::sync_channel(1);
     thread::Builder::new()
-        .name("media_camera_enum".to_string())
+        .name(thread_name.to_string())
         .spawn(move || {
-            let _ = tx.send(AndroidCameraBackend::new(camera_id.as_deref()));
+            let _ = tx.send(describe());
         })
-        .context("cannot start the camera enumeration thread")?;
+        .with_context(|| format!("cannot start the {what} thread"))?;
 
-    match rx.recv_timeout(CAMERA_ENUMERATION_TIMEOUT) {
+    match rx.recv_timeout(ENUMERATION_TIMEOUT) {
         Ok(described) => described,
         Err(RecvTimeoutError::Timeout) => {
-            let secs = CAMERA_ENUMERATION_TIMEOUT.as_secs();
+            let secs = ENUMERATION_TIMEOUT.as_secs();
             error!(
-                "camera enumeration did not answer within {} s: the camera service is not \
-                 responding to this uid; the media helper exits so the VM fails to start \
-                 instead of waiting for a device that will never be built",
-                secs
+                "{} did not answer within {} s: {}; the media helper exits so the VM fails to \
+                 start instead of waiting for a device that will never be built",
+                what, secs, why
             );
-            bail!("camera enumeration did not answer within {} s", secs)
+            bail!("{} did not answer within {} s", what, secs)
         }
         Err(RecvTimeoutError::Disconnected) => {
-            bail!("the camera enumeration thread ended without an answer")
+            bail!("the {} thread ended without an answer", what)
         }
     }
 }

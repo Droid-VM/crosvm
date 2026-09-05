@@ -107,6 +107,7 @@ zerocopy = { version = "0.8.13", features = ["derive"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android_camera = { path = "../android_camera" }
+android_codec = { path = "../android_codec" }
 
 [target.'cfg(any(target_os = "android", target_os = "linux"))'.dependencies]
 android_audio = { path = "../android_audio" }

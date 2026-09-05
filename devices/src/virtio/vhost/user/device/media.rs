@@ -14,18 +14,18 @@
 //! What this process is *not* told, and how it copes:
 //!
 //! * It has no `ProtectionType`. The VMM stamps the one protection-dependent feature bit,
-//!   `VIRTIO_F_ACCESS_PLATFORM`, into the parameters (`access_platform`), the way the snd helper
-//!   is told; the frontend can only mask features, never add one.
-//! * Its `GuestMemory` is rebuilt from `SET_MEM_TABLE`, which carries every region of the VMM's
-//!   -- the `media_host` pool included, memfd and all -- but no purpose and no protection flag.
-//!   So the pool is found again by its guest-physical base (`pool_gpa`,
-//!   [`crate::virtio::media::pool::pool_handle_at`]) at the first `start_queue`, when the table
-//!   has arrived; and the host's right to touch a guest scatter-gather entry is decided by the
-//!   window list the VMM computed (`access_windows`, `HostAccessPolicy::Windows`), not by the
-//!   memory itself, so a bad entry is `EFAULT` to the guest rather than a `SIGBUS` here.
-//! * It serves `MMAP` buffers from the pool only. The frontend forwards a shared-memory BAR to
-//!   the GPU alone, so the `Bar` shape is not available out of process, and the VMM refuses
-//!   `uid=` without a pool rather than start a device with no usable buffers.
+//!   `VIRTIO_F_ACCESS_PLATFORM`, into the parameters (`access_platform`), the way the snd helper is
+//!   told; the frontend can only mask features, never add one.
+//! * Its `GuestMemory` is rebuilt from `SET_MEM_TABLE`, which carries every region of the VMM's --
+//!   the `media_host` pool included, memfd and all -- but no purpose and no protection flag. So the
+//!   pool is found again by its guest-physical base (`pool_gpa`,
+//!   [`crate::virtio::media::pool::pool_handle_at`]) at the first `start_queue`, when the table has
+//!   arrived; and the host's right to touch a guest scatter-gather entry is decided by the window
+//!   list the VMM computed (`access_windows`, `HostAccessPolicy::Windows`), not by the memory
+//!   itself, so a bad entry is `EFAULT` to the guest rather than a `SIGBUS` here.
+//! * It serves `MMAP` buffers from the pool only. The frontend forwards a shared-memory BAR to the
+//!   GPU alone, so the `Bar` shape is not available out of process, and the VMM refuses `uid=`
+//!   without a pool rather than start a device with no usable buffers.
 //!
 //! The device itself, its worker thread, and every trait implementation it is built from are the
 //! in-VMM ones (`crate::virtio::media`); the two queues arrive one `start_queue` at a time and
@@ -84,7 +84,7 @@ use crate::virtio::Writer;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaBackendParams {
-    /// Which device to be. `simple`, `loopback` and `camera` exist today.
+    /// Which device to be. `simple`, `loopback`, `camera` and `decoder` exist today.
     pub kind: MediaDeviceKind,
     /// The V4L2 card name (`--virtio-media card=`); each kind has a default.
     #[serde(default)]
@@ -95,6 +95,10 @@ pub struct MediaBackendParams {
     /// `main` or `aux` (`kind=camera`).
     #[serde(default)]
     pub role: Option<String>,
+    /// Offer software codecs too, not only hardware-accelerated ones (`kind=decoder`,
+    /// `kind=encoder`; design §7.4).
+    #[serde(default)]
+    pub allow_sw: bool,
     /// Guest-physical base of the `media_host` pool. The region that starts here in the memory
     /// table the frontend sends is the pool; `MMAP` buffers are carved out of it.
     pub pool_gpa: u64,
@@ -333,6 +337,7 @@ mod tests {
             card: Some("lb0".into()),
             camera_id: None,
             role: Some("main".into()),
+            allow_sw: true,
             pool_gpa: 0x1_4000_0000,
             access_windows: vec![(0x1_4000_0000, 0x1000_0000), (0x9000_0000, 0x40_0000)],
             access_platform: true,
@@ -354,6 +359,7 @@ mod tests {
         assert_eq!(minimal.pool_gpa, 4096);
         assert_eq!(minimal.access_windows, vec![(4096, 8192)]);
         assert!(!minimal.access_platform);
+        assert!(!minimal.allow_sw);
 
         assert!(serde_json::from_str::<MediaBackendParams>(
             r#"{"kind":"webcam","pool_gpa":0,"access_windows":[]}"#

@@ -9,13 +9,13 @@
 //!
 //! Host-owned (`MMAP`) buffers come from one of two backings (`VPU_DESIGN.md` §3.2):
 //!
-//! * `Bar`, the upstream shape: a memfd per buffer, mapped into a 4 GiB PCI shared-memory BAR
-//!   the guest reaches through `virtio_get_shm_region()`. What a KVM VM without a pool gets.
-//! * `Pool`: buffers are slices of the `media_host` pool (`--pre-alloc media-host-mb=N`), which
-//!   the guest already maps as a whole from its `media_host` reserved-memory node; the device
-//!   declares no shared-memory region at all, and the offset it answers `MMAP` with is the
-//!   buffer's offset inside the pool. This is the only shape that works on Gunyah, whose 64-bit
-//!   MMIO window has room for one 4 GiB BAR and the GPU already has it.
+//! * `Bar`, the upstream shape: a memfd per buffer, mapped into a 4 GiB PCI shared-memory BAR the
+//!   guest reaches through `virtio_get_shm_region()`. What a KVM VM without a pool gets.
+//! * `Pool`: buffers are slices of the `media_host` pool (`--pre-alloc media-host-mb=N`), which the
+//!   guest already maps as a whole from its `media_host` reserved-memory node; the device declares
+//!   no shared-memory region at all, and the offset it answers `MMAP` with is the buffer's offset
+//!   inside the pool. This is the only shape that works on Gunyah, whose 64-bit MMIO window has
+//!   room for one 4 GiB BAR and the GPU already has it.
 //!
 //! Guest-owned (`USERPTR`) buffers are resolved in `guest_buf` (`VPU_DESIGN.md` §3.4).
 //!
@@ -27,8 +27,7 @@
 //! address (`guest_buf::HostAccessPolicy`).
 
 pub mod android_camera_backend;
-#[cfg(feature = "video-decoder")]
-pub mod decoder_adapter;
+pub mod android_codec_backend;
 pub mod guest_buf;
 pub mod kill;
 pub mod pool;
@@ -110,7 +109,7 @@ pub enum MediaDeviceKind {
     Loopback,
     /// A host camera, over the Camera2 NDK; helper only (`uid=` required).
     Camera,
-    /// A host video decoder (not wired yet).
+    /// A host video decoder, over the MediaCodec NDK; helper only (`uid=` required).
     Decoder,
     /// A host video encoder (not wired yet).
     Encoder,
@@ -163,11 +162,10 @@ impl MediaDeviceKind {
             MediaDeviceKind::Simple | MediaDeviceKind::Loopback => {
                 MediaDeviceSupport::InVmmOrHelper
             }
-            // cameraserver refuses uid 0, so the camera exists in the helper alone (design §7.1).
-            MediaDeviceKind::Camera => MediaDeviceSupport::HelperOnly,
-            MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
-                MediaDeviceSupport::Unimplemented
-            }
+            // cameraserver refuses uid 0, so the camera exists in the helper alone (design §7.1);
+            // the codecs follow the one process model (design §7.4).
+            MediaDeviceKind::Camera | MediaDeviceKind::Decoder => MediaDeviceSupport::HelperOnly,
+            MediaDeviceKind::Encoder => MediaDeviceSupport::Unimplemented,
         }
     }
 
@@ -224,7 +222,7 @@ mod media_device_kind_tests {
         );
         assert_eq!(
             MediaDeviceKind::Decoder.support(),
-            MediaDeviceSupport::Unimplemented
+            MediaDeviceSupport::HelperOnly
         );
         assert_eq!(
             MediaDeviceKind::Encoder.support(),
@@ -235,14 +233,9 @@ mod media_device_kind_tests {
     #[test]
     fn the_refusal_names_the_kind_and_lists_what_exists() {
         assert_eq!(
-            MediaDeviceKind::Decoder.unimplemented_message(),
-            "--virtio-media kind=decoder is not implemented yet (only simple, loopback and \
-             camera are)"
-        );
-        assert_eq!(
             MediaDeviceKind::Encoder.unimplemented_message(),
-            "--virtio-media kind=encoder is not implemented yet (only simple, loopback and \
-             camera are)"
+            "--virtio-media kind=encoder is not implemented yet (only simple, loopback, camera \
+             and decoder are)"
         );
     }
 }
@@ -940,6 +933,19 @@ pub fn camera_config(card: &str) -> VirtioMediaDeviceConfig {
     }
 }
 
+/// The virtio config area of a `decoder` device called `card`: a multi-planar memory-to-memory
+/// device, the kernel's stateful decoder interface (`VPU_DESIGN.md` §7.2).
+pub fn decoder_config(card: &str) -> VirtioMediaDeviceConfig {
+    use virtio_media::v4l2r::ioctl::Capabilities;
+
+    VirtioMediaDeviceConfig {
+        device_caps: (Capabilities::VIDEO_M2M_MPLANE | Capabilities::STREAMING).bits(),
+        // VFL_TYPE_VIDEO
+        device_type: 0,
+        card: card_name(card),
+    }
+}
+
 /// Create a simple media capture device.
 ///
 /// This device can only generate a fixed pattern at a fixed resolution, and should only be used
@@ -1048,62 +1054,25 @@ pub fn create_virtio_media_v4l2_proxy_device<P: AsRef<Path>>(
     Ok(Box::new(device))
 }
 
-/// Create a decoder adapter device.
+/// The virtio-video decoder adapter is gone.
 ///
-/// This is a regular virtio-media decoder device leveraging the virtio-video decoder backends.
+/// `decoder_adapter.rs` implemented the fork's *previous* `VideoDecoderBackend`, the
+/// virtio-video-shaped one; `logs/vpu_wp/M6-crate.md` §1 replaced that trait with the one the
+/// MediaCodec backend (`android_codec_backend`) implements, and no soong target ever built the
+/// adapter (design §4.4: "do not reference"). Rather than leave a file that breaks the
+/// `video-decoder` feature build, the adapter was removed and this entry point, which the
+/// `--virtio-media-adapter` command line still reaches under that feature, says so.
 #[cfg(feature = "video-decoder")]
 pub fn create_virtio_media_decoder_adapter_device(
-    features: u64,
+    _features: u64,
     _gpu_tube: base::Tube,
     backend: VideoBackendType,
-    pool: Option<MediaPool>,
+    _pool: Option<MediaPool>,
 ) -> anyhow::Result<Box<dyn VirtioDevice>> {
-    use decoder_adapter::VirtioVideoAdapter;
-    use virtio_media::devices::video_decoder::VideoDecoder;
-    use virtio_media::v4l2r::ioctl::Capabilities;
-
-    #[cfg(feature = "ffmpeg")]
-    use crate::virtio::video::decoder::backend::ffmpeg::FfmpegDecoder;
-    #[cfg(feature = "vaapi")]
-    use crate::virtio::video::decoder::backend::vaapi::VaapiDecoder;
-    #[cfg(feature = "libvda")]
-    use crate::virtio::video::decoder::backend::vda::LibvdaDecoder;
-    use crate::virtio::video::decoder::DecoderBackend;
-
-    let card_name_str = format!("{:?} decoder adapter", backend).to_lowercase();
-    let config = VirtioMediaDeviceConfig {
-        device_caps: (Capabilities::VIDEO_M2M_MPLANE | Capabilities::STREAMING).bits(),
-        // VFL_TYPE_VIDEO
-        device_type: 0,
-        card: card_name(&card_name_str),
-    };
-
-    let create_device = move |event_queue, _, mapper: HostMapper, allocator: BufferAllocator| {
-        let backend = match backend {
-            #[cfg(feature = "libvda")]
-            VideoBackendType::Libvda => {
-                LibvdaDecoder::new(libvda::decode::VdaImplType::Gavda)?.into_trait_object()
-            }
-            #[cfg(feature = "libvda")]
-            VideoBackendType::LibvdaVd => {
-                LibvdaDecoder::new(libvda::decode::VdaImplType::Gavd)?.into_trait_object()
-            }
-            #[cfg(feature = "vaapi")]
-            VideoBackendType::Vaapi => VaapiDecoder::new()?.into_trait_object(),
-            #[cfg(feature = "ffmpeg")]
-            VideoBackendType::Ffmpeg => FfmpegDecoder::new().into_trait_object(),
-        };
-
-        let adapter = VirtioVideoAdapter::new(backend);
-        let decoder = VideoDecoder::new(adapter, event_queue, mapper, allocator);
-
-        Ok(decoder)
-    };
-
-    Ok(Box::new(CrosvmVirtioMediaDevice::new(
-        features,
-        config,
-        pool,
-        create_device,
-    )))
+    anyhow::bail!(
+        "the virtio-media decoder adapter over the {:?} virtio-video backend was removed with the \
+         decoder trait it implemented (logs/vpu_wp/M6-crate.md §1); the host video decoder is \
+         --virtio-media kind=decoder,uid=<app uid>",
+        backend
+    )
 }

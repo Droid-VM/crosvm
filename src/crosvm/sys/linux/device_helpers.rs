@@ -1364,9 +1364,17 @@ pub fn create_virtio_media_device(
                  from the real uid and refuses root (VPU_DESIGN.md §7.1)"
             )
         }
+        MediaDeviceKind::Decoder => {
+            bail!(
+                "--virtio-media kind=decoder needs uid=<app uid>: the decoder device runs in a \
+                 helper process under the app's uid, because the codec services resolve the \
+                 caller from the real uid and every codec device keeps to the one process model \
+                 (VPU_DESIGN.md §7.4)"
+            )
+        }
         // Refused above, before the uid was looked at; kept so the match stays exhaustive and
         // says the same thing if the table ever changes.
-        MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
+        MediaDeviceKind::Encoder => {
             bail!("{}", config.kind.unimplemented_message())
         }
     };
@@ -1423,6 +1431,7 @@ fn create_unprivileged_virtio_media_device(
         card: config.card.clone(),
         camera_id: config.camera_id.clone(),
         role: config.role.clone(),
+        allow_sw: config.allow_sw,
         pool_gpa,
         access_windows: host_accessible_windows(mem, protection_type.isolates_memory())
             .into_iter()

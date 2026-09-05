@@ -2831,7 +2831,7 @@ pub struct RunCommand {
     #[cfg(all(unix, feature = "media"))]
     #[argh(
         option,
-        arg_name = "kind=KIND[,card=NAME][,camera_id=ID][,role=ROLE][,uid=N][,gid=N]"
+        arg_name = "kind=KIND[,card=NAME][,camera_id=ID][,role=ROLE][,allow_sw=BOOL][,uid=N][,gid=N]"
     )]
     #[serde(default)]
     #[merge(strategy = append)]
@@ -2853,16 +2853,22 @@ pub struct RunCommand {
     ///         into a CAPTURE buffer, for testing guest-owned and
     ///         host-owned buffers together. camera is a host
     ///         camera over the Camera2 NDK and needs uid=;
-    ///         decoder and encoder parse but are not
-    ///         implemented yet.
+    ///         decoder is a stateful V4L2 decoder over the
+    ///         host's MediaCodec hardware decoders and needs
+    ///         uid= too; encoder parses but is not implemented
+    ///         yet.
     ///     card=NAME - V4L2 card name shown to the guest (31
     ///         bytes at most).
     ///     camera_id=ID - Host camera to expose (camera).
     ///     role=(main,aux) - Camera role (camera).
+    ///     allow_sw=(true,false) - Offer the host's software
+    ///         codecs too, not only hardware ones (decoder).
+    ///         Default false.
     ///     uid=INT - Run the backend in its own process under
     ///         this host uid, as --virtio-snd does. Any kind
-    ///         may use it; camera requires it, because
-    ///         cameraserver refuses uid 0.
+    ///         may use it; camera and decoder require it,
+    ///         because the camera and codec services refuse
+    ///         uid 0.
     ///     gid=INT - Group for that process. Defaults to uid.
     pub virtio_media: Vec<MediaDeviceConfig>,
 
