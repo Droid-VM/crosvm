@@ -9,13 +9,25 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
+#[cfg(feature = "media")]
+use std::net::Shutdown;
 use std::ops::RangeInclusive;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
+#[cfg(feature = "media")]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str;
+#[cfg(feature = "media")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "media")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "media")]
+use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(feature = "media")]
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -1450,24 +1462,157 @@ fn create_unprivileged_virtio_media_device(
         params.access_windows.len(),
     );
 
+    // `VhostUserFrontend::new` below is the vhost-user handshake: `set_owner`, `get_features`,
+    // `get_protocol_features`, each a blocking read on this socket with no timeout of its own, and
+    // the helper answers only once it has built its device -- for `kind=camera`, after a round of
+    // binder work (`review-m4` R4). A helper that never answers would hold the VM in device
+    // creation for good, so the wait is bounded; a helper that has already given up is named,
+    // because the child reaper that would otherwise report it is not running yet.
+    let watchdog = HandshakeWatchdog::arm(&vmm_end, pid)?;
+
     let connection = vmm_end
         .try_into()
         .context("failed to create a vhost-user connection to the media backend")?;
 
-    let dev = VhostUserFrontend::new(
+    let result = VhostUserFrontend::new(
         virtio::DeviceType::Media,
         virtio::base_features(protection_type),
         connection,
         None,
         None,
-    )
-    .context("failed to set up the vhost-user frontend for media")?;
+    );
+    if watchdog.finish() {
+        // The socket has been shut down; this connection is finished whatever `new` returned.
+        bail!("{}", media_handshake_failure(pid, true));
+    }
+    let dev = result.with_context(|| media_handshake_failure(pid, false))?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),
         // No sandbox here: virtqueue handling happens in the backend process.
         jail: None,
     })
+}
+
+/// How long the VMM waits for a media helper to answer the vhost-user handshake.
+#[cfg(feature = "media")]
+const MEDIA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds one vhost-user handshake with a helper process.
+///
+/// **Why a watchdog and not `SO_RCVTIMEO`.** The socket does support a receive timeout, but
+/// `vmm_vhost` maps the `EAGAIN` it raises to `Error::SocketRetry`
+/// (`third_party/vmm_vhost/src/lib.rs:204-206`), which `Connection::recv_into_bufs_all` retries in
+/// a loop (`third_party/vmm_vhost/src/connection.rs:135-138`): a read timeout would spin, not
+/// fail. What does end a blocked `recvmsg` is a shutdown of the socket -- it then returns 0 bytes,
+/// which `recv_into_bufs` turns into `Error::Disconnect` -- so the watchdog holds a dup of the
+/// VMM's end and shuts it down for reading when it gives up. The dup is a second handle on the
+/// same socket, so the shutdown reaches the socket the frontend is reading; closing the dup (when
+/// the thread ends) shuts nothing down.
+#[cfg(feature = "media")]
+struct HandshakeWatchdog {
+    /// Set by whichever of the two finishes first. The loser leaves the socket alone, so a
+    /// handshake that completes in the same instant the watchdog expires is not cut off after the
+    /// fact -- and the winner is what [`HandshakeWatchdog::finish`] reports.
+    over: Arc<AtomicBool>,
+    /// Dropping it wakes the thread at once, so a handshake that answered does not wait out the
+    /// timeout.
+    done: mpsc::Sender<()>,
+    thread: thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "media")]
+impl HandshakeWatchdog {
+    fn arm(vmm_end: &UnixStream, pid: Pid) -> Result<Self> {
+        let socket = vmm_end
+            .try_clone()
+            .context("failed to duplicate the media helper's socket")?;
+        let over = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&over);
+        let (done, wait) = mpsc::channel::<()>();
+        let thread = thread::Builder::new()
+            .name("media_handshake".to_string())
+            .spawn(move || {
+                if !matches!(
+                    wait.recv_timeout(MEDIA_HANDSHAKE_TIMEOUT),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+                if flag
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    warn!(
+                        "the media helper (pid {}) has not answered the vhost-user handshake in \
+                         {} s; giving up on it",
+                        pid,
+                        MEDIA_HANDSHAKE_TIMEOUT.as_secs()
+                    );
+                    let _ = socket.shutdown(Shutdown::Read);
+                }
+            })
+            .context("failed to start the media helper's handshake watchdog")?;
+        Ok(Self { over, done, thread })
+    }
+
+    /// Claim the outcome and join the thread. `true` means the watchdog got there first, i.e. the
+    /// socket was shut down and the handshake is over whatever it returned.
+    fn finish(self) -> bool {
+        let timed_out = self
+            .over
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err();
+        drop(self.done);
+        let _ = self.thread.join();
+        timed_out
+    }
+}
+
+/// The error for a media helper whose handshake did not happen, with `waitpid(pid, WNOHANG)`
+/// asked what became of the helper itself.
+///
+/// A helper that refused its parameters -- an unknown `camera_id`, a uid that can see no camera,
+/// no NDK, a kind it does not implement -- has already exited by the time the VMM's read fails,
+/// and the VMM's own error is then `Connection reset by peer` with nothing to say who reset it
+/// (B4 §7.1, defect D15). Its exit status is that missing sentence, and nothing else will ever
+/// report it: the child reaper does not run until the VM is built.
+#[cfg(feature = "media")]
+fn media_handshake_failure(pid: Pid, timed_out: bool) -> String {
+    if let Some(how) = media_helper_end(pid) {
+        return format!(
+            "the media helper (pid {pid}) {how} before the handshake -- read its stderr \
+             (the VM log)"
+        );
+    }
+    if timed_out {
+        return format!(
+            "the media helper (pid {pid}) did not answer the vhost-user handshake within {} s",
+            MEDIA_HANDSHAKE_TIMEOUT.as_secs()
+        );
+    }
+    format!(
+        "failed to set up the vhost-user frontend for media: the helper (pid {pid}) is still \
+         running -- read its stderr (the VM log)"
+    )
+}
+
+/// How a helper ended, or `None` if it is still running.
+#[cfg(feature = "media")]
+fn media_helper_end(pid: Pid) -> Option<String> {
+    match base::linux::wait_for_pid(pid, libc::WNOHANG) {
+        // Still running: slow, or wedged, but not the one that gave up.
+        Ok((None, _)) => None,
+        Ok((Some(_), status)) => Some(match (status.code(), status.signal()) {
+            (Some(code), _) => format!("exited with status {code}"),
+            (_, Some(signal)) => format!("was killed by signal {signal}"),
+            _ => format!("ended ({status})"),
+        }),
+        Err(e) => {
+            warn!("cannot ask what the media helper (pid {}) did: {}", pid, e);
+            None
+        }
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
