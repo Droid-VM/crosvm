@@ -1323,6 +1323,7 @@ pub fn create_virtio_media_device(
     protection_type: ProtectionType,
     config: &MediaDeviceConfig,
     pool: Option<MediaPool>,
+    pool_slice: Option<(u64, u64)>,
     mem: &GuestMemory,
     worker_process_pids: &mut BTreeSet<Pid>,
     helper_pid_labels: &mut BTreeMap<u32, String>,
@@ -1342,6 +1343,7 @@ pub fn create_virtio_media_device(
             protection_type,
             config,
             pool,
+            pool_slice,
             mem,
             worker_process_pids,
             helper_pid_labels,
@@ -1402,6 +1404,7 @@ fn create_unprivileged_virtio_media_device(
     protection_type: ProtectionType,
     config: &MediaDeviceConfig,
     pool: Option<MediaPool>,
+    pool_slice: Option<(u64, u64)>,
     mem: &GuestMemory,
     worker_process_pids: &mut BTreeSet<Pid>,
     helper_pid_labels: &mut BTreeMap<u32, String>,
@@ -1436,6 +1439,7 @@ fn create_unprivileged_virtio_media_device(
         role: config.role.clone(),
         allow_sw: config.allow_sw,
         pool_gpa,
+        pool_slice,
         access_windows: host_accessible_windows(mem, protection_type.isolates_memory())
             .into_iter()
             .map(|window| (window.start, window.end - window.start + 1))
@@ -1463,14 +1467,18 @@ fn create_unprivileged_virtio_media_device(
     // is: this line is the only place a running helper is named (B4 §5.1, defect D14). Find it
     // later by cmdline, not by name -- `deploy/vpu/README.md` has the one-liner.
     info!(
-        "launched media helper: pid {}, uid {}, gid {}, kind {}, card {}, pool_gpa {:#x}, {} \
-         access window(s)",
+        "launched media helper: pid {}, uid {}, gid {}, kind {}, card {}, pool_gpa {:#x}, pool \
+         slice {}, {} access window(s)",
         pid,
         uid,
         gid,
         config.kind.as_str(),
         config.card.as_deref().unwrap_or("<default>"),
         pool_gpa,
+        match pool_slice {
+            Some((start, len)) => format!("{:#x}+{:#x}", start, len),
+            None => "whole pool".to_string(),
+        },
         params.access_windows.len(),
     );
 
