@@ -500,8 +500,17 @@ impl BackendDeviceType {
         };
 
         let tmp_transfer = xhci_transfer.clone();
+        let control_transfer_state = self.get_control_transfer_state();
         let callback = move |t: BackendTransferType| {
             usb_trace!("setup token control transfer callback");
+            if t.status() == TransferStatus::Stalled {
+                // The endpoint halts here and the guest, once it has reset it, moves the ring
+                // past this whole TD: the STATUS stage that would have closed this transfer is
+                // never executed, so expect the next SETUP instead.
+                let mut state = control_transfer_state.write().unwrap();
+                state.executed = false;
+                state.ctl_ep_state = ControlEndpointState::SetupStage;
+            }
             update_transfer_state(&xhci_transfer, t.status())?;
             let state = xhci_transfer.state().lock();
             match *state {
@@ -584,8 +593,13 @@ impl BackendDeviceType {
                     .create_usb_request_setup()
                     .map_err(Error::CreateUsbRequestSetup)?;
                 if control_transfer_state.ctl_ep_state != ControlEndpointState::SetupStage {
-                    error!("Control endpoint is in an inconsistant state");
-                    return Ok(());
+                    // A SETUP always begins a new control transfer (USB 2.0 8.5.3): the stages
+                    // of the one before it were abandoned, typically because the guest reset a
+                    // halted endpoint and moved the ring past the failed TD. Start over rather
+                    // than drop this stage, which would leave the ring waiting for a completion
+                    // that never comes.
+                    warn!("xhci: SETUP arrived mid control transfer; starting a new one");
+                    control_transfer_state.executed = false;
                 }
                 usb_trace!("setup stage: setup buffer: {:?}", setup);
                 control_transfer_state.control_request_setup = setup;
@@ -598,7 +612,16 @@ impl BackendDeviceType {
             }
             XhciTransferType::DataStage => {
                 if control_transfer_state.ctl_ep_state != ControlEndpointState::DataStage {
-                    error!("Control endpoint is in an inconsistant state");
+                    error!(
+                        "Control endpoint is in an inconsistant state: DATA stage without SETUP"
+                    );
+                    // Fail it the way a device would, so the guest resets the endpoint and
+                    // retries from a SETUP instead of waiting on it forever.
+                    control_transfer_state.executed = false;
+                    control_transfer_state.ctl_ep_state = ControlEndpointState::SetupStage;
+                    xhci_transfer
+                        .on_transfer_complete(&TransferStatus::Stalled, 0)
+                        .map_err(Error::TransferComplete)?;
                     return Ok(());
                 }
                 // Requests with a DataStage will be executed here.
@@ -614,7 +637,13 @@ impl BackendDeviceType {
             }
             XhciTransferType::StatusStage => {
                 if control_transfer_state.ctl_ep_state == ControlEndpointState::SetupStage {
-                    error!("Control endpoint is in an inconsistant state");
+                    error!(
+                        "Control endpoint is in an inconsistant state: STATUS stage without SETUP"
+                    );
+                    control_transfer_state.executed = false;
+                    xhci_transfer
+                        .on_transfer_complete(&TransferStatus::Stalled, 0)
+                        .map_err(Error::TransferComplete)?;
                     return Ok(());
                 }
                 if control_transfer_state.executed {

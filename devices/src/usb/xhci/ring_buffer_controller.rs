@@ -103,6 +103,8 @@ pub struct RingBufferController<T: 'static + TransferDescriptorHandler> {
     event_loop: Arc<EventLoop>,
     event: Event,
     dequeue_all: AtomicBool,
+    /// Set by `halt`; `on_event` parks the ring when it sees it.
+    halt_requested: AtomicBool,
 }
 
 impl<T: 'static + TransferDescriptorHandler> Display for RingBufferController<T> {
@@ -132,6 +134,7 @@ where
             event_loop: event_loop.clone(),
             event: evt,
             dequeue_all: AtomicBool::new(false),
+            halt_requested: AtomicBool::new(false),
         });
         let event_handler: Arc<dyn EventHandler> = controller.clone();
         event_loop
@@ -186,6 +189,9 @@ where
     /// Start the ring buffer.
     pub fn start(&self) {
         xhci_trace!("start {}", self.name);
+        // A doorbell after the guest reset a halted endpoint means run; a halt that has not been
+        // acted on yet is stale.
+        self.halt_requested.store(false, Ordering::SeqCst);
         let mut state = self.state.lock();
         if *state != RingBufferState::Running {
             *state = RingBufferState::Running;
@@ -202,9 +208,12 @@ where
     /// waiting on is answered now.
     pub fn halt(&self) {
         xhci_trace!("halt {}", self.name);
-        let mut state = self.state.lock();
-        *state = RingBufferState::Stopped;
-        self.stop_callback.lock().clear();
+        // Parked from `on_event` rather than here: a transfer can complete synchronously from
+        // inside the handler, on the event-loop thread that already holds `state`.
+        self.halt_requested.store(true, Ordering::SeqCst);
+        if let Err(e) = self.event.signal() {
+            error!("cannot signal ring buffer controller halt: {}", e);
+        }
     }
 
     /// Stop the ring buffer asynchronously.
@@ -215,7 +224,12 @@ where
             info!("xhci: {} is already stopped", self.name);
             return;
         }
-        if self.handler.lock().stop() {
+        // Only wait when there is something to wait for. A ring that is Running but idle (the
+        // guest rang the doorbell and nothing was queued, or a descriptor was answered without a
+        // completion signal) has no completion coming to move it to Stopped, and the guest's Stop
+        // Endpoint command would never be answered.
+        let handler = self.handler.lock();
+        if handler.stop() && !handler.is_quiesced() {
             *state = RingBufferState::Stopping;
             self.stop_callback.lock().push(callback);
         } else {
@@ -246,6 +260,15 @@ where
     fn on_event(&self) -> anyhow::Result<()> {
         // `self.event` triggers ring buffer controller to run.
         self.event.wait().context("cannot read from event")?;
+        if self.halt_requested.swap(false, Ordering::SeqCst) {
+            // The endpoint halted on an error: hardware executes nothing more from this ring
+            // until software resets the endpoint and rings the doorbell (spec 4.8.3). Nothing
+            // is in flight any more, so a stop the guest is waiting on is answered now.
+            let mut state = self.state.lock();
+            *state = RingBufferState::Stopped;
+            self.stop_callback.lock().clear();
+            return Ok(());
+        }
         let dequeue_all = self.dequeue_all.load(Ordering::Relaxed);
         let mut state = self.state.lock();
 
