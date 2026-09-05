@@ -51,6 +51,7 @@ pub mod image;
 pub mod synth;
 
 pub use image::tight_nv12;
+pub use image::tight_nv12_rows;
 pub use image::ChromaLayout;
 pub use image::ImageError;
 pub use image::MediaImage2;
@@ -1798,7 +1799,16 @@ struct Shared {
     /// +1 per event: a device worker polls this next to its virtqueue events.
     event: Event,
     callbacks: AtomicU64,
+    /// Run after every push, besides the eventfd above: a consumer that polls a descriptor of
+    /// its own (the virtio-media decoder device, whose session eventfd is the device's) installs
+    /// one that bumps it, and needs no thread of its own to forward the wake-up.
+    wake: OnceLock<WakeHook>,
 }
+
+/// What [`Codec::set_wake_hook`] installs: runs on the codec's callback thread, once per event,
+/// after the event is queued. Must only wake something up -- a write to an eventfd -- never do
+/// work (`NdkMediaCodec.h:506`).
+pub type WakeHook = Box<dyn Fn() + Send + Sync>;
 
 impl Shared {
     fn push(&self, ev: CodecEvent) {
@@ -1810,6 +1820,9 @@ impl Shared {
         // A signal that fails (fd closed under us) leaves the event in the queue for the next
         // take; nothing to report from a foreign thread.
         let _ = self.event.signal();
+        if let Some(wake) = self.wake.get() {
+            wake();
+        }
     }
 }
 
@@ -1919,6 +1932,7 @@ impl Codec {
             queue: Mutex::new(VecDeque::new()),
             event: Event::new().map_err(|e| CodecError::Event(e.to_string()))?,
             callbacks: AtomicU64::new(0),
+            wake: OnceLock::new(),
         });
         let userdata = Arc::into_raw(shared.clone());
         let mut codec = Codec {
@@ -2022,6 +2036,18 @@ impl Codec {
         flags: u32,
         fill: impl FnOnce(&mut [u8]) -> std::result::Result<usize, String>,
     ) -> Result<()> {
+        self.queue_input_with_flags(index, pts_us, |buf| fill(buf).map(|used| (used, flags)))
+    }
+
+    /// As [`Self::queue_input_with`], but `fill` also returns the buffer flags: for a caller that
+    /// can only tell what it queued -- parameter sets alone, so `BUFFER_FLAG_CODEC_CONFIG` -- by
+    /// looking at the bytes once they are in the codec's own buffer.
+    pub fn queue_input_with_flags(
+        &self,
+        index: i32,
+        pts_us: u64,
+        fill: impl FnOnce(&mut [u8]) -> std::result::Result<(usize, u32), String>,
+    ) -> Result<()> {
         let mut size = 0usize;
         // SAFETY: live codec; the buffer stays ours until queueInputBuffer.
         let ptr = unsafe { AMediaCodec_getInputBuffer(self.ptr, index as usize, &mut size) };
@@ -2030,7 +2056,7 @@ impl Codec {
         }
         // SAFETY: the NDK reported `size` writable bytes at `ptr`.
         let buf = unsafe { std::slice::from_raw_parts_mut(ptr, size) };
-        let used = fill(buf).map_err(CodecError::Fill)?;
+        let (used, flags) = fill(buf).map_err(CodecError::Fill)?;
         if used > size {
             return Err(CodecError::BufferTooSmall(index, size, used));
         }
@@ -2120,6 +2146,14 @@ impl Codec {
     /// to its `WaitContext`.
     pub fn poll_event(&self) -> &Event {
         &self.shared.event
+    }
+
+    /// Install `hook`, run by every callback after it has queued its event (in addition to the
+    /// eventfd). Once per codec: a second call is refused and returns `false`. For a consumer
+    /// whose poll descriptor is not [`Self::poll_event`], so that no thread has to sit between
+    /// the two.
+    pub fn set_wake_hook(&self, hook: WakeHook) -> bool {
+        self.shared.wake.set(hook).is_ok()
     }
 
     /// Everything queued so far, without waiting.

@@ -621,7 +621,12 @@ fn run_decode(
                                     l.effective_stride().unwrap_or(w as i32).max(0) as usize;
                                 let slice =
                                     l.effective_slice_height().unwrap_or(h as i32).max(0) as usize;
-                                let assumed = assumed_nv12(w, h, stride, slice);
+                                let assumed = MediaImage2::semiplanar(
+                                    w as u32,
+                                    h as u32,
+                                    stride as u32,
+                                    slice as u32,
+                                );
                                 android_codec::tight_nv12(&assumed, used, &mut nv12)
                                     .map_err(|e| format!("output {} (no image-data, assumed NV12 {stride}x{slice}): {e}", outcome.outputs))?;
                                 frame.width = w;
@@ -705,39 +710,6 @@ fn run_decode(
     outcome.callbacks = codec.callbacks_fired();
     codec.stop().map_err(|e| e.to_string())?;
     Ok(outcome)
-}
-
-/// A `MediaImage2` for the stride/slice-height idiom, NV12 assumed: the fallback for a codec
-/// that publishes no `image-data`.
-fn assumed_nv12(w: usize, h: usize, stride: usize, slice: usize) -> MediaImage2 {
-    let mut image = MediaImage2 {
-        image_type: android_codec::image::MEDIA_IMAGE_TYPE_YUV,
-        num_planes: 3,
-        width: w as u32,
-        height: h as u32,
-        bit_depth: 8,
-        bit_depth_allocated: 8,
-        planes: Default::default(),
-    };
-    image.planes[0] = android_codec::PlaneInfo {
-        offset: 0,
-        col_inc: 1,
-        row_inc: stride as i32,
-        horiz_subsampling: 1,
-        vert_subsampling: 1,
-    };
-    image.planes[1] = android_codec::PlaneInfo {
-        offset: (stride * slice) as u32,
-        col_inc: 2,
-        row_inc: stride as i32,
-        horiz_subsampling: 2,
-        vert_subsampling: 2,
-    };
-    image.planes[2] = android_codec::PlaneInfo {
-        offset: (stride * slice + 1) as u32,
-        ..image.planes[1]
-    };
-    image
 }
 
 /// Survey open question 1: does `getOutputBuffer`'s pointer already include `mPlane[0].mOffset`?
