@@ -2194,7 +2194,9 @@ impl Codec {
 
     /// Output buffer `index` as delivered by `OutputAvailable`: the whole readable range the NDK
     /// reports (`abuf->size()`), which since API 35 starts at the data. Valid until
-    /// [`release_output`](Codec::release_output).
+    /// [`release_output`](Codec::release_output), which takes `&mut self` so that the borrow
+    /// this returns provably ends before the release (review-m6 R6-13): a use after the release
+    /// does not compile.
     pub fn output_buffer(&self, index: i32) -> Result<&[u8]> {
         let mut size = 0usize;
         // SAFETY: live codec; the buffer is ours until released.
@@ -2206,7 +2208,8 @@ impl Codec {
         Ok(unsafe { std::slice::from_raw_parts(ptr, size) })
     }
 
-    pub fn release_output(&self, index: i32) -> Result<()> {
+    /// Give output buffer `index` back to the codec. Ends every [`Self::output_buffer`] borrow.
+    pub fn release_output(&mut self, index: i32) -> Result<()> {
         // SAFETY: live codec, index owned by us; render=false, there is no surface.
         check("AMediaCodec_releaseOutputBuffer", unsafe {
             AMediaCodec_releaseOutputBuffer(self.ptr, index as usize, false)

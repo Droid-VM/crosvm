@@ -784,7 +784,7 @@ impl MediaCodecDecoderSession {
     fn pump_output(&mut self) {
         // The codec is taken out of `self` for the duration: `output_buffer` borrows it, and the
         // helpers below need `self`. It goes back at the end, dead or not, so `stop` can stop it.
-        let Some(codec) = self.codec.take() else {
+        let Some(mut codec) = self.codec.take() else {
             return;
         };
         while !self.dead {
@@ -1296,7 +1296,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             match entry {
                 Held::Output { index, .. } => {
                     held += 1;
-                    if let Some(codec) = self.codec.as_ref() {
+                    if let Some(codec) = self.codec.as_mut() {
                         if let Err(e) = codec.release_output(index) {
                             warn!(
                                 "decoder session {}: releasing output {} on STREAMOFF(CAPTURE): {}",
