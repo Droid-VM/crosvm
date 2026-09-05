@@ -767,10 +767,15 @@ impl TransferHandle {
             ))
         } < 0
         {
-            return Err(Error::IoctlFailed(
-                usb_sys::USBDEVFS_DISCARDURB,
-                base::Error::last(),
-            ));
+            let err = base::Error::last();
+            // usbfs answers EINVAL when the URB is not pending any more: it completed and was
+            // reaped between the caller's decision to cancel and this ioctl. A guest tearing
+            // down an isochronous stream cancels hundreds of descriptors at once and most have
+            // already landed, so this is the ordinary outcome, not a failure.
+            if err.errno() == libc::EINVAL {
+                return Err(Error::TransferAlreadyCompleted);
+            }
+            return Err(Error::IoctlFailed(usb_sys::USBDEVFS_DISCARDURB, err));
         }
 
         Ok(())

@@ -17,6 +17,7 @@ use usb_util::DescriptorHeader;
 use usb_util::Device;
 use usb_util::DeviceDescriptorTree;
 use usb_util::DeviceSpeed;
+use usb_util::Error as UsbUtilError;
 use usb_util::InterfaceDescriptor;
 use usb_util::Transfer;
 use usb_util::TransferBuffer;
@@ -174,7 +175,10 @@ impl AsRawDescriptor for HostDevice {
 
 impl GenericTransferHandle for TransferHandle {
     fn cancel(&self) -> Result<()> {
-        TransferHandle::cancel(self).map_err(Error::TransferHandle)
+        TransferHandle::cancel(self).map_err(|e| match e {
+            UsbUtilError::TransferAlreadyCompleted => Error::TransferHandleAlreadyComplete,
+            e => Error::TransferHandle(e),
+        })
     }
 }
 

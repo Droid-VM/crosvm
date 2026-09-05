@@ -753,6 +753,9 @@ impl BackendDeviceType {
                                 Ok(()) => {
                                     debug!("cancel issued to kernel");
                                 }
+                                Err(Error::TransferHandleAlreadyComplete) => {
+                                    debug!("XhciTransfer completed before it could be cancelled");
+                                }
                                 Err(e) => {
                                     error!("failed to cancel XhciTransfer: {}", e);
                                 }
