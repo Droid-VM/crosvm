@@ -1,0 +1,66 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright DroidVM contributors
+// Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
+
+// Rust bindings for the Android MediaCodec NDK, plus a probe that exercises them on a device.
+//   build:    m codec_probe
+//   collect:  out/soong/.intermediates/external/crosvm/android_codec/codec_probe_bin/*/codec_probe
+package {
+    default_applicable_licenses: ["external_crosvm_license"],
+}
+
+rust_library {
+    name: "libandroid_codec",
+    defaults: ["crosvm_defaults"],
+    host_supported: false,
+    crate_name: "android_codec",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    crate_root: "src/lib.rs",
+    edition: "2021",
+    rustlibs: [
+        "libbase_rust",
+        "liblibc",
+        "libserde",
+        "libserde_json",
+        "libthiserror",
+    ],
+    // libmediandk (MediaCodec) is opened with dlopen at run time, not linked: it reaches libgui,
+    // whose build needs projects a crosvm-only AOSP checkout does not carry (the same reason as
+    // android_camera). dlopen itself comes from the default system_shared_libs -- naming libdl
+    // here instead asks for the full bionic build, which wants projects this tree does not carry
+    // either. The API 36 codec-store symbols are resolved as optional, so the library also loads
+    // on an older Android and reports what is missing.
+    // libdevices, which will depend on this from the decoder device, is available to the virt
+    // APEX, so this must be too or soong refuses the dependency (same as libandroid_camera).
+    apex_available: ["com.android.virt"],
+}
+
+// installable:false, like camera_probe_bin: installing into system/bin makes the install rule
+// depend on the installed system/lib64/libc.so, which builds bionic from source and wants
+// external/llvm-libc. Nothing here needs to be in an image -- the binary is pushed by hand.
+rust_binary {
+    name: "codec_probe_bin",
+    defaults: ["crosvm_defaults"],
+    host_supported: false,
+    installable: false,
+    stem: "codec_probe",
+    crate_name: "codec_probe",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.1.0",
+    crate_root: "src/probe.rs",
+    edition: "2021",
+    prefer_rlib: true,
+    rustlibs: [
+        "libandroid_codec",
+        "liblibc",
+        "libserde_json",
+    ],
+}
+
+// An installable:false module gets no phony of its own, so `m codec_probe_bin` is an unknown
+// target. This gives `m codec_probe` a real one.
+phony {
+    name: "codec_probe",
+    required: ["codec_probe_bin"],
+}

@@ -41,6 +41,7 @@ members = [
     "acpi_tables",
     "android_audio",
     "android_camera",
+    "android_codec",
     "arch",
     "argh_helpers",
     "audio_util",
