@@ -1279,9 +1279,10 @@ pub fn register_video_device(
 /// does (`VPU_DESIGN.md` §6); `mem` is then what the host-accessible windows are computed from,
 /// and the helper's pid is recorded so its exit is judged and logged as one of ours.
 ///
-/// Only `simple` and `loopback` exist today; the other kinds are refused here, by name, so a
-/// command line written for a later milestone fails to start rather than starting something
-/// else.
+/// `simple`, `loopback` and `camera` exist today; the camera only in a helper, because the
+/// camera service refuses uid 0 (design §7.1), so `kind=camera` without `uid=` is refused here.
+/// The other kinds are refused by name, so a command line written for a later milestone fails
+/// to start rather than starting something else.
 #[cfg(feature = "media")]
 pub fn create_virtio_media_device(
     protection_type: ProtectionType,
@@ -1313,9 +1314,17 @@ pub fn create_virtio_media_device(
             config.card.as_deref().unwrap_or("droidvm loopback"),
             pool,
         ),
-        MediaDeviceKind::Camera | MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
+        MediaDeviceKind::Camera => {
             bail!(
-                "--virtio-media kind={:?} is not implemented yet (only simple and loopback are)",
+                "--virtio-media kind=camera needs uid=<app uid>: the camera device runs in a \
+                 helper process under the app's uid, because cameraserver resolves the caller \
+                 from the real uid and refuses root (VPU_DESIGN.md §7.1)"
+            )
+        }
+        MediaDeviceKind::Decoder | MediaDeviceKind::Encoder => {
+            bail!(
+                "--virtio-media kind={:?} is not implemented yet (only simple, loopback and \
+                 camera are)",
                 config.kind
             )
         }
