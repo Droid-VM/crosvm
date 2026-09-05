@@ -23,10 +23,25 @@
 //!                          binder thread ────┘ device-state callback (StateListener)
 //! ```
 //!
-//! Nothing here blocks the worker: `give_empty` and `set_controls` post to a channel,
-//! `take_*` drain one, `close` is the only wait and it is the §2.5 join. `open_stream` does
-//! wait, for the camera to open on the new thread -- that is `STREAMON`, which is synchronous
-//! for the guest anyway and is when the camera is taken from the host.
+//! Nothing here blocks the worker for long: `give_empty` and `set_controls` post to a channel
+//! and `take_*` drain one. Two waits remain, and both are the worker's:
+//!
+//! * `open_stream` waits for the camera to open on the new thread -- that is `STREAMON`, which is
+//!   synchronous for the guest anyway and is when the camera is taken from the host. It is bounded
+//!   by [`OPEN_TIMEOUT`], because `ACameraManager_openCamera` and
+//!   `ACameraDevice_createCaptureSession` are synchronous binder calls into `cameraserver` with no
+//!   timeout of their own and a wedged one must not park the worker (`review-m4` R3). On a timeout
+//!   the capture thread is *detached*, never joined, and `STREAMON` answers `ETIMEDOUT`.
+//! * `close` (and `Drop`) joins the capture thread, which is the §2.5 barrier -- no host write
+//!   into a buffer after the stream is gone -- and cannot be given up. The loop itself answers
+//!   within one `FRAME_WAIT`, but the join then waits for `Camera::drop`, i.e.
+//!   `ACameraDevice_close`, which "will stop all repeating captures ... and block until all
+//!   capture requests ... [are] complete" (`NdkCameraDevice.h:181-184`): **unbounded by the NDK's
+//!   own contract**, so this join is bounded only by the platform's goodwill.
+//!
+//! The worker's `KillSignal` (`crate::virtio::media::kill`) covers neither: it is armed for
+//! `EventQueue::send_event` alone and does not reach into a device call. `logs/vpu_wp/F5-crosvm.md`
+//! §2.3 says what making the open wait interruptible by it would take.
 //!
 //! # The copy
 //!
@@ -80,6 +95,10 @@ const MAX_READER_DEPTH: u32 = 8;
 const FRAME_WAIT: Duration = Duration::from_millis(50);
 /// The camera is running but no frame has come for this long: say so, once per interval.
 const STALL_REPORT: Duration = Duration::from_secs(2);
+/// How long `STREAMON` waits for the capture thread to report that the camera opened. Generous:
+/// a cold `cameraserver` on a loaded phone takes hundreds of milliseconds, and the guest's own
+/// ioctl is what is being held. Past it the wait is given up rather than the worker parked.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One host camera, described once at construction (`list_cameras`, no permission needed) and
 /// opened per stream. Cheap to clone: the device factory builds a device from it on the worker
@@ -291,26 +310,53 @@ impl CameraBackend for AndroidCameraBackend {
                 libc::EAGAIN
             })?;
 
-        let mut stream = AndroidCameraStream {
-            commands,
-            filled,
-            events,
-            thread: Some(thread),
-            id,
-        };
-        match opened_rx.recv() {
-            Ok(Ok(())) => Ok(stream),
+        // The stream value is built on the success path only: an `AndroidCameraStream` that was
+        // never returned would run `Drop` -- a `Stop` and a join -- on a thread this path has
+        // just decided not to wait for.
+        match opened_rx.recv_timeout(OPEN_TIMEOUT) {
+            Ok(Ok(())) => Ok(AndroidCameraStream {
+                commands,
+                filled,
+                events,
+                thread: Some(thread),
+                id,
+            }),
             Ok(Err(errno)) => {
-                stream.join();
+                // It failed to open, so it is on its way out and the join is bounded.
+                join_capture_thread(&id, thread);
                 Err(errno)
             }
             // The thread died before it could say (a panic would have aborted the process; this
             // is the channel closing without a message).
-            Err(_) => {
-                stream.join();
+            Err(RecvTimeoutError::Disconnected) => {
+                join_capture_thread(&id, thread);
                 Err(libc::EIO)
             }
+            Err(RecvTimeoutError::Timeout) => {
+                error!(
+                    "camera {}: did not open within {:?}; STREAMON fails with ETIMEDOUT and the \
+                     capture thread is detached",
+                    id, OPEN_TIMEOUT
+                );
+                // Detached, not joined: whatever `Camera::open_with` is blocked in has no bound,
+                // so joining here would park the worker exactly as the unbounded wait did. The
+                // command sender is dropped instead, which disconnects the channel; whenever the
+                // open does return, the loop's first `try_recv` sees `Disconnected` and the
+                // thread exits, dropping its `Camera` -- the platform's only handback -- on the
+                // thread that opened it. It holds no lent buffer: nothing is lent until
+                // `STREAMON` has succeeded, and this one has not.
+                drop(commands);
+                Err(libc::ETIMEDOUT)
+            }
         }
+    }
+}
+
+/// Wait for a capture thread that is already finishing, reporting a panic in it as an error
+/// rather than propagating it into the worker.
+fn join_capture_thread(id: &str, thread: thread::JoinHandle<()>) {
+    if thread.join().is_err() {
+        error!("camera {}: the capture thread panicked", id);
     }
 }
 
