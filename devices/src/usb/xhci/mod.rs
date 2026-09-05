@@ -335,10 +335,29 @@ impl Xhci {
         // left every empty SuperSpeed port claiming U0 with nothing attached -- a state its hub
         // driver answers with a controller reset, ten times over, and the root hub is dead. The
         // strobe itself always reads as zero.
-        if (value & PORTSC_PORT_LINK_STATE_WRITE_STROBE) == 0 {
+        let strobe = (value & PORTSC_PORT_LINK_STATE_WRITE_STROBE) != 0;
+        if !strobe {
             value = (value & !PORTSC_PORT_LINK_STATE_MASK) | (old & PORTSC_PORT_LINK_STATE_MASK);
         }
         value &= !PORTSC_PORT_LINK_STATE_WRITE_STROBE;
+        let old_pls = (old & PORTSC_PORT_LINK_STATE_MASK) >> PORTSC_PORT_LINK_STATE_SHIFT;
+        let new_pls = (value & PORTSC_PORT_LINK_STATE_MASK) >> PORTSC_PORT_LINK_STATE_SHIFT;
+        // Resume completes when software brings a suspended (U3) or resuming port back to U0.
+        // The link is back at once here; software learns of it from the Port Link State Change
+        // bit and a port status change event (spec 4.15.2.2). Without them Windows' hub driver
+        // waits 500 ms for the event, declares the device gone and re-enumerates it, so the
+        // first use of any device after selective suspend fails.
+        if strobe
+            && new_pls == PORTSC_PLS_U0
+            && (old_pls == PORTSC_PLS_U3 || old_pls == PORTSC_PLS_RESUME)
+            && (value & PORTSC_CURRENT_CONNECT_STATUS) != 0
+        {
+            value |= PORTSC_PORT_LINK_STATE_CHANGE;
+            self.interrupter
+                .lock()
+                .send_port_status_change_trb(port_id)
+                .map_err(Error::SendInterrupt)?;
+        }
         // xHCI spec 4.19.5.
         if (value & PORTSC_PORT_RESET) > 0 || (value & PORTSC_WARM_PORT_RESET) > 0 {
             self.device_slots

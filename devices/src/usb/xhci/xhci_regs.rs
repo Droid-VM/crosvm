@@ -77,6 +77,12 @@ pub const PORTSC_WARM_RESET_CHANGE: u32 = 1u32 << 19;
 pub const PORTSC_PLS_U0: u32 = 0;
 /// PLS value for RxDetect, what a port with nothing attached reports, see spec 4.19.1.
 pub const PORTSC_PLS_RXDETECT: u32 = 5;
+/// Port link state U3 (suspended), see spec 5.4.8.
+pub const PORTSC_PLS_U3: u32 = 3;
+/// Port link state Resume (USB2 resume signalling in progress), see spec 5.4.8.
+pub const PORTSC_PLS_RESUME: u32 = 15;
+/// Bitmask for portsc register, see spec 5.4.8.
+pub const PORTSC_PORT_LINK_STATE_CHANGE: u32 = 1u32 << 22;
 /// The portsc reset value: PP set, PLS = RxDetect, see spec 5.4.8.
 pub const PORTSC_RESET_VALUE: u32 = 0x000002A0;
 /// Bitmask for portsc register, see spec 5.4.8.
