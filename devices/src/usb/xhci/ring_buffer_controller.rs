@@ -82,6 +82,29 @@ pub trait TransferDescriptorHandler {
     fn is_quiesced(&self) -> bool {
         true
     }
+
+    /// Called once, when a ring that was Stopping parks, before the stop callback is released.
+    /// A handler that had a descriptor in progress reports it here -- a transfer ring sends its
+    /// Stopped Transfer Event (spec 4.6.9), which therefore precedes the Stop Endpoint Command
+    /// Completion -- and returns where the ring is to be left: at that descriptor's first TRB,
+    /// with the cycle state the ring had there, so it runs again from there unless software
+    /// moves the ring with Set TR Dequeue Pointer. Of several descriptors in flight (a
+    /// drained-ahead ring) it is the earliest; the later ones stay on the ring behind it. `None`
+    /// leaves the ring where it is. A halted ring is never asked: its failing descriptor was
+    /// already reported.
+    fn finish_stop(&self) -> anyhow::Result<Option<StoppedTd>> {
+        Ok(None)
+    }
+}
+
+/// Where a stopped ring is left (spec 4.6.9): the first TRB of the descriptor that was in
+/// progress, the cycle state the ring had there, and what that descriptor had moved -- its
+/// Stopped EDTLA (6.2.4.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StoppedTd {
+    pub first_trb: GuestAddress,
+    pub cycle: bool,
+    pub bytes: u32,
 }
 
 /// Upper bound on the descriptors one `on_event` hands off when the whole ring is drained. A ring
@@ -104,6 +127,9 @@ pub struct RingBufferController<T: 'static + TransferDescriptorHandler> {
     dequeue_all: AtomicBool,
     /// Set by `halt`; `on_event` parks the ring when it sees it.
     halt_requested: AtomicBool,
+    /// The descriptor the last stop left the ring at; `None` when it stopped with nothing in
+    /// progress, or has run since.
+    stopped: Mutex<Option<StoppedTd>>,
 }
 
 impl<T: 'static + TransferDescriptorHandler> Display for RingBufferController<T> {
@@ -134,6 +160,7 @@ where
             event: evt,
             dequeue_all: AtomicBool::new(false),
             halt_requested: AtomicBool::new(false),
+            stopped: Mutex::new(None),
         });
         let event_handler: Arc<dyn EventHandler> = controller.clone();
         event_loop
@@ -185,12 +212,21 @@ where
         self.dequeue_all.store(enabled, Ordering::Relaxed);
     }
 
+    /// The descriptor the last stop left the ring at (spec 4.6.9), for the context write-back
+    /// that follows the stop; `None` when the ring stopped with nothing in progress, or has run
+    /// since.
+    pub fn stopped_td(&self) -> Option<StoppedTd> {
+        *self.stopped.lock()
+    }
+
     /// Start the ring buffer.
     pub fn start(&self) {
         xhci_trace!("start {}", self.name);
         // A doorbell after the guest reset a halted endpoint means run; a halt that has not been
         // acted on yet is stale.
         self.halt_requested.store(false, Ordering::SeqCst);
+        // So is where the last stop left the ring: it is about to move.
+        *self.stopped.lock() = None;
         let mut state = self.state.lock();
         if *state != RingBufferState::Running {
             *state = RingBufferState::Running;
@@ -290,6 +326,24 @@ where
                 if dequeue_all && !self.handler.lock().is_quiesced() {
                     return Ok(());
                 }
+                // The descriptor in progress is reported Stopped and the ring left at it (spec
+                // 4.6.9) before the stop callback below answers the guest, so the Transfer
+                // Event precedes the Stop Endpoint Command Completion.
+                let stopped = self
+                    .handler
+                    .lock()
+                    .finish_stop()
+                    .context("cannot finish stop")?;
+                if let Some(td) = &stopped {
+                    debug!(
+                        "xhci: {}: stopped at {:#x} (cycle {}) with {} bytes of the descriptor moved",
+                        self.name, td.first_trb.0, td.cycle, td.bytes
+                    );
+                    let mut ring_buffer = self.lock_ring_buffer();
+                    ring_buffer.set_dequeue_pointer(td.first_trb);
+                    ring_buffer.set_consumer_cycle_state(td.cycle);
+                }
+                *self.stopped.lock() = stopped;
                 debug!("xhci: {}: stopping ring buffer controller", self.name);
                 *state = RingBufferState::Stopped;
                 self.stop_callback.lock().clear();
@@ -578,10 +632,29 @@ mod tests {
     }
 
     /// A transfer ring's shape: the handler reports whether a transfer is still in flight, and
-    /// the test decides.
+    /// the test decides; asked to finish a stop it answers with the position the test preset
+    /// and notes the call in `order`, against the stop callback.
     struct TrackedHandler {
         sender: Sender<(i32, Event)>,
         quiesced: Arc<AtomicBool>,
+        rewind: Arc<Mutex<Option<StoppedTd>>>,
+        order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl TrackedHandler {
+        fn new(
+            sender: Sender<(i32, Event)>,
+            quiesced: &Arc<AtomicBool>,
+            rewind: &Arc<Mutex<Option<StoppedTd>>>,
+            order: &Arc<Mutex<Vec<&'static str>>>,
+        ) -> TrackedHandler {
+            TrackedHandler {
+                sender,
+                quiesced: quiesced.clone(),
+                rewind: rewind.clone(),
+                order: order.clone(),
+            }
+        }
     }
 
     impl TransferDescriptorHandler for TrackedHandler {
@@ -598,6 +671,218 @@ mod tests {
         fn is_quiesced(&self) -> bool {
             self.quiesced.load(Ordering::SeqCst)
         }
+
+        fn finish_stop(&self) -> anyhow::Result<Option<StoppedTd>> {
+            self.order.lock().push("stopped");
+            Ok(*self.rewind.lock())
+        }
+    }
+
+    /// Waits for `done` on the event loop, up to a few seconds.
+    fn wait_for(done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Three one-TRB descriptors (1, 2, 3 at 0x100, 0x110, 0x120) and a link back to 0x100 that
+    /// toggles the cycle, so a drained-ahead ring runs dry after them.
+    fn setup_mem_three_tds() -> GuestMemory {
+        let trb_size = size_of::<Trb>() as u64;
+        let gm = GuestMemory::new(&[(GuestAddress(0), pagesize() as u64)]).unwrap();
+        for i in 0..3u64 {
+            let mut trb = NormalTrb::new();
+            trb.set_trb_type(TrbType::Normal);
+            trb.set_data_buffer(i + 1);
+            trb.set_chain(false);
+            gm.write_obj_at_addr(trb, GuestAddress(0x100 + i * trb_size))
+                .unwrap();
+        }
+        let mut ltrb = LinkTrb::new();
+        ltrb.set_trb_type(TrbType::Link);
+        ltrb.set_ring_segment_pointer(0x100);
+        ltrb.set_toggle_cycle(true);
+        gm.write_obj_at_addr(ltrb, GuestAddress(0x100 + 3 * trb_size))
+            .unwrap();
+        gm
+    }
+
+    /// A Stop Endpoint with a transfer in flight: when the cancelled transfer completes the ring
+    /// reports it through the handler, is left at its first TRB, and only then answers the stop
+    /// -- the Stopped Transfer Event precedes the Command Completion (spec 4.6.9). A doorbell
+    /// without a Set TR Dequeue Pointer runs the descriptor again.
+    #[test]
+    fn stop_with_a_transfer_in_flight_rewinds_to_it_and_reports_before_the_callback() {
+        let (tx, rx) = channel();
+        let mem = setup_mem();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let rewind = Arc::new(Mutex::new(None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let controller = RingBufferController::new_with_handler(
+            "".to_string(),
+            mem,
+            l.clone(),
+            TrackedHandler::new(tx, &quiesced, &rewind, &order),
+        )
+        .unwrap();
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (first, complete) = rx.recv().unwrap();
+        assert_eq!(first, 1);
+        // TD 1 (TRBs 1..4, over the link at 0x120) is dequeued: the ring stands past it.
+        assert_eq!(controller.get_dequeue_pointer(), GuestAddress(0x220));
+        assert_eq!(controller.stopped_td(), None);
+
+        let stopped = StoppedTd {
+            first_trb: GuestAddress(0x100),
+            cycle: false,
+            bytes: 0x40,
+        };
+        *rewind.lock() = Some(stopped);
+        let o = order.clone();
+        controller.stop(RingBufferStopCallback::new(move || {
+            o.lock().push("callback")
+        }));
+        assert!(order.lock().is_empty(), "the stop waits for the transfer");
+
+        // The cancelled transfer completes.
+        complete.signal().unwrap();
+        wait_for(|| order.lock().len() == 2);
+        assert_eq!(*order.lock(), vec!["stopped", "callback"]);
+        assert_eq!(controller.get_dequeue_pointer(), GuestAddress(0x100));
+        assert!(!controller.get_consumer_cycle_state());
+        assert_eq!(controller.stopped_td(), Some(stopped));
+
+        controller.start();
+        let (again, _) = rx.recv().unwrap();
+        assert_eq!(again, 1, "the stopped descriptor runs again");
+        assert_eq!(controller.stopped_td(), None);
+        l.stop();
+        j.join().unwrap();
+    }
+
+    /// A drained-ahead ring with three descriptors in flight is stopped; the first completed on
+    /// the device, the other two were cancelled. The ring reports once, when the last of them
+    /// is done, and is left at the earliest unfinished descriptor; the one behind it stays on
+    /// the ring and runs after it.
+    #[test]
+    fn stop_of_a_drained_ring_rewinds_to_the_earliest_unfinished_descriptor() {
+        let (tx, rx) = channel();
+        let mem = setup_mem_three_tds();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let rewind = Arc::new(Mutex::new(None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let controller = RingBufferController::new_with_handler(
+            "".to_string(),
+            mem,
+            l.clone(),
+            TrackedHandler::new(tx, &quiesced, &rewind, &order),
+        )
+        .unwrap();
+        controller.set_dequeue_all(true);
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (_, done1) = rx.recv().unwrap();
+        let (second, done2) = rx.recv().unwrap();
+        let (third, done3) = rx.recv().unwrap();
+        assert_eq!((second, third), (2, 3));
+
+        let o = order.clone();
+        controller.stop(RingBufferStopCallback::new(move || {
+            o.lock().push("callback")
+        }));
+        // TD 2 is the earliest the handler could not finish.
+        let stopped = StoppedTd {
+            first_trb: GuestAddress(0x110),
+            cycle: false,
+            bytes: 0,
+        };
+        *rewind.lock() = Some(stopped);
+        done1.signal().unwrap();
+        done2.signal().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            order.lock().is_empty(),
+            "two descriptors still in flight: the stop waits"
+        );
+
+        quiesced.store(true, Ordering::SeqCst);
+        done3.signal().unwrap();
+        wait_for(|| order.lock().len() == 2);
+        assert_eq!(
+            *order.lock(),
+            vec!["stopped", "callback"],
+            "reported exactly once, before the callback"
+        );
+        assert_eq!(controller.get_dequeue_pointer(), GuestAddress(0x110));
+        assert!(!controller.get_consumer_cycle_state());
+        assert_eq!(controller.stopped_td(), Some(stopped));
+
+        controller.start();
+        let (next, _) = rx.recv().unwrap();
+        assert_eq!(next, 2);
+        let (next, _) = rx.recv().unwrap();
+        assert_eq!(
+            next, 3,
+            "the descriptor behind the stopped one is still there"
+        );
+        l.stop();
+        j.join().unwrap();
+    }
+
+    /// A halt parks the ring where it stands: the failing descriptor was already reported, so
+    /// the handler is not asked and nothing is rewound.
+    #[test]
+    fn halt_does_not_rewind() {
+        let (tx, rx) = channel();
+        let mem = setup_mem();
+        let (l, j) = EventLoop::start("test".to_string(), None).unwrap();
+        let l = Arc::new(l);
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let rewind = Arc::new(Mutex::new(None));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let controller = RingBufferController::new_with_handler(
+            "".to_string(),
+            mem,
+            l.clone(),
+            TrackedHandler::new(tx, &quiesced, &rewind, &order),
+        )
+        .unwrap();
+        controller.set_dequeue_pointer(GuestAddress(0x100));
+        controller.set_consumer_cycle_state(false);
+        controller.start();
+        let (first, complete) = rx.recv().unwrap();
+        assert_eq!(first, 1);
+        *rewind.lock() = Some(StoppedTd {
+            first_trb: GuestAddress(0x100),
+            cycle: false,
+            bytes: 0,
+        });
+
+        controller.halt();
+        complete.signal().unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "a halted ring must not hand out the next descriptor"
+        );
+        assert!(order.lock().is_empty(), "the handler is not asked");
+        assert_eq!(controller.get_dequeue_pointer(), GuestAddress(0x220));
+        assert_eq!(controller.stopped_td(), None);
+
+        controller.start();
+        let (next, _) = rx.recv().unwrap();
+        assert_eq!(next, 5);
+        l.stop();
+        j.join().unwrap();
     }
 
     /// A ring that is Stopping (a Stop Endpoint waits on it) whose transfer has completed but
@@ -616,10 +901,12 @@ mod tests {
             "".to_string(),
             mem,
             l.clone(),
-            TrackedHandler {
-                sender: tx,
-                quiesced: quiesced.clone(),
-            },
+            TrackedHandler::new(
+                tx,
+                &quiesced,
+                &Arc::new(Mutex::new(None)),
+                &Arc::new(Mutex::new(Vec::new())),
+            ),
         )
         .unwrap();
         controller.set_dequeue_pointer(GuestAddress(0x100));

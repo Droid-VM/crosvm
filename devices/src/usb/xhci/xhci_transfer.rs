@@ -6,6 +6,8 @@ use std::cmp::min;
 use std::fmt;
 use std::fmt::Display;
 use std::mem;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -21,6 +23,7 @@ use sync::Mutex;
 use thiserror::Error;
 use usb_util::TransferStatus;
 use usb_util::UsbRequestSetup;
+use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
 
@@ -142,12 +145,35 @@ impl Display for XhciTransferType {
     }
 }
 
+/// The descriptor an endpoint had in progress when it stopped (spec 4.6.9), as its ring reports
+/// it when it parks: the Stopped Transfer Event (6.4.2.1) and where the ring is left, the
+/// descriptor's first TRB with the cycle state the ring had there.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StoppedTransfer {
+    /// Creation order; of several cancelled transfers the ring keeps the earliest.
+    seq: u64,
+    pub first_trb: GuestAddress,
+    pub cycle: bool,
+    /// What the descriptor moved before it stopped: its Stopped EDTLA (6.2.4.1).
+    pub bytes: u32,
+    pub completion_code: TrbCompletionCode,
+    /// The TRB in progress, ED = 0.
+    pub trb_pointer: u64,
+    /// What that TRB had left to move; 0 with `StoppedLengthInvalid`.
+    pub residual: u32,
+}
+
 /// Xhci Transfer manager holds reference to all ongoing transfers. Can cancel them all if
 /// needed.
 #[derive(Clone)]
 pub struct XhciTransferManager {
     transfers: Arc<Mutex<Vec<Weak<Mutex<XhciTransferState>>>>>,
     device_slot: Weak<DeviceSlot>,
+    /// Of the transfers the stop under way cancelled, the one dequeued first: the ring is left
+    /// at it and it alone is reported Stopped. Cleared when a stop begins.
+    stopped: Arc<Mutex<Option<StoppedTransfer>>>,
+    /// Creation order of the transfers, so the earliest of several cancelled ones is known.
+    next_seq: Arc<AtomicU64>,
 }
 
 impl XhciTransferManager {
@@ -156,6 +182,8 @@ impl XhciTransferManager {
         XhciTransferManager {
             transfers: Arc::new(Mutex::new(Vec::new())),
             device_slot,
+            stopped: Arc::new(Mutex::new(None)),
+            next_seq: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -183,6 +211,7 @@ impl XhciTransferManager {
         };
         let t = XhciTransfer {
             manager: self.clone(),
+            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
             state: Arc::new(Mutex::new(XhciTransferState::Created)),
             mem,
             port,
@@ -201,6 +230,9 @@ impl XhciTransferManager {
 
     /// Cancel all current transfers.
     pub fn cancel_all(&self) {
+        // A new stop: what an earlier one left unread -- the ring halted before it parked --
+        // is not this stop's descriptor in progress.
+        *self.stopped.lock() = None;
         self.transfers.lock().iter().for_each(|t| {
             let state = match t.upgrade() {
                 Some(state) => state,
@@ -218,6 +250,24 @@ impl XhciTransferManager {
     /// completion has been reported, so this answers whether the endpoint is really quiescent.
     pub fn has_pending_transfers(&self) -> bool {
         self.transfers.lock().iter().any(|t| t.upgrade().is_some())
+    }
+
+    /// The descriptor the stop under way left in progress, once: the earliest of those its
+    /// transfers reported cancelled. `None` when none was (the ring stopped idle, or a transfer
+    /// that raced the cancel completed instead).
+    pub fn take_stopped(&self) -> Option<StoppedTransfer> {
+        self.stopped.lock().take()
+    }
+
+    fn record_stopped(&self, stopped: StoppedTransfer) {
+        let mut earliest = self.stopped.lock();
+        let is_earlier = match earliest.as_ref() {
+            Some(e) => stopped.seq < e.seq,
+            None => true,
+        };
+        if is_earlier {
+            *earliest = Some(stopped);
+        }
     }
 
     fn remove_transfer(&self, t: &Arc<Mutex<XhciTransferState>>) {
@@ -244,6 +294,7 @@ impl Default for XhciTransferManager {
 /// XhciBackendDevice.
 pub struct XhciTransfer {
     manager: XhciTransferManager,
+    seq: u64,
     state: Arc<Mutex<XhciTransferState>>,
     mem: GuestMemory,
     port: Arc<UsbPort>,
@@ -356,8 +407,13 @@ impl XhciTransfer {
                 };
             }
             TransferStatus::Cancelled => {
-                // TODO(jkwang) According to the spec, we should send a stopped event here. But
-                // kernel driver does not do anything meaningful when it sees a stopped event.
+                // The endpoint stopped with this descriptor in progress (spec 4.6.9): it is
+                // reported with a Stopped Transfer Event and the ring is left at it. Both happen
+                // when the ring parks (the handler's `finish_stop`), so the event precedes the
+                // Stop Endpoint Command Completion, and a drained-ahead ring with several
+                // descriptors cancelled reports the earliest one only.
+                self.manager
+                    .record_stopped(self.stopped_at(bytes_transferred)?);
                 return self
                     .transfer_completion_event
                     .signal()
@@ -480,6 +536,49 @@ impl XhciTransfer {
         Ok(())
     }
 
+    /// Where this descriptor stopped after `bytes_transferred` of it moved. The first data TRB
+    /// not moved whole is the TRB in progress and the event carries what it had left (spec
+    /// 6.4.2.1); a descriptor whose data TRBs all moved stopped at its last one with nothing
+    /// left; one without a data TRB (a bare Event Data or No-op TRB) has no length to report,
+    /// which is Stopped - Length Invalid. The pointer is always a transfer TRB, ED = 0
+    /// (4.11.5.2). The ring is left at the descriptor's first TRB, whose cycle bit is the
+    /// consumer cycle state the ring had there.
+    fn stopped_at(&self, bytes_transferred: u32) -> Result<StoppedTransfer> {
+        let first = &self.transfer_trbs[0];
+        let mut edtla: u32 = 0;
+        let mut last_data_trb = None;
+        let mut in_progress = None;
+        for atrb in &self.transfer_trbs {
+            let carries_data = matches!(
+                atrb.trb.get_trb_type().map_err(Error::TrbType)?,
+                TrbType::Normal | TrbType::SetupStage | TrbType::DataStage | TrbType::Isoch
+            );
+            if !carries_data {
+                continue;
+            }
+            edtla += atrb.trb.transfer_length().map_err(Error::TransferLength)?;
+            last_data_trb = Some(atrb);
+            if edtla > bytes_transferred {
+                in_progress = Some((atrb, edtla - bytes_transferred));
+                break;
+            }
+        }
+        let (completion_code, trb_pointer, residual) =
+            match in_progress.or_else(|| last_data_trb.map(|atrb| (atrb, 0))) {
+                Some((atrb, residual)) => (TrbCompletionCode::Stopped, atrb.gpa, residual),
+                None => (TrbCompletionCode::StoppedLengthInvalid, first.gpa, 0),
+            };
+        Ok(StoppedTransfer {
+            seq: self.seq,
+            first_trb: GuestAddress(first.gpa),
+            cycle: first.trb.get_cycle(),
+            bytes: bytes_transferred,
+            completion_code,
+            trb_pointer,
+            residual,
+        })
+    }
+
     /// Send this transfer to backend if it's a valid transfer.
     pub fn send_to_backend_if_valid(self) -> Result<()> {
         if self.validate_transfer()? {
@@ -547,4 +646,121 @@ fn trb_is_valid(atrb: &AddressedTrb) -> bool {
         }
     };
     can_be_in_transfer_ring && (atrb.trb.interrupter_target() < MAX_INTERRUPTER)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_util::normal_td;
+    use super::super::test_util::Fixture;
+    use super::super::xhci_abi::NoopTrb;
+    use super::super::xhci_abi::NormalTrb;
+    use super::super::xhci_abi::Trb;
+    use super::*;
+
+    /// A TRB of `ty` (an Event Data or No-op TRB) at `gpa`, ending its descriptor.
+    fn data_less_trb(ty: TrbType, gpa: u64) -> AddressedTrb {
+        let mut trb = NoopTrb::new();
+        trb.set_trb_type(ty);
+        trb.set_cycle(true);
+        trb.set_chain(false);
+        AddressedTrb {
+            trb: *trb.cast::<Trb>().unwrap(),
+            gpa,
+        }
+    }
+
+    /// What a cancelled transfer of `td` with `bytes` moved records for its ring.
+    fn stopped(f: &Fixture, td: TransferDescriptor, bytes: u32) -> StoppedTransfer {
+        let manager = XhciTransferManager::default();
+        f.transfer(&manager, 3, td)
+            .on_transfer_complete(&TransferStatus::Cancelled, bytes)
+            .unwrap();
+        manager.take_stopped().unwrap()
+    }
+
+    #[test]
+    fn cancelled_td_reports_stopped_at_the_trb_in_progress() {
+        let f = Fixture::new();
+        // 0x150 of 0x100 + 0x200 + 0x300 moved: the second TRB is in progress, 0x1b0 left of it.
+        let td = stopped(&f, normal_td(0x2000, &[0x100, 0x200, 0x300]), 0x150);
+        assert_eq!(td.completion_code, TrbCompletionCode::Stopped);
+        assert_eq!(td.trb_pointer, 0x2010);
+        assert_eq!(td.residual, 0x1b0);
+        assert_eq!(td.first_trb, GuestAddress(0x2000));
+        assert!(td.cycle);
+        assert_eq!(td.bytes, 0x150);
+
+        // Nothing moved: the first TRB, whole.
+        let td = stopped(&f, normal_td(0x2000, &[0x100, 0x200, 0x300]), 0);
+        assert_eq!(td.completion_code, TrbCompletionCode::Stopped);
+        assert_eq!(td.trb_pointer, 0x2000);
+        assert_eq!(td.residual, 0x100);
+        assert_eq!(td.bytes, 0);
+
+        // Everything moved: the last TRB, with nothing left.
+        let td = stopped(&f, normal_td(0x2000, &[0x100, 0x200, 0x300]), 0x600);
+        assert_eq!(td.completion_code, TrbCompletionCode::Stopped);
+        assert_eq!(td.trb_pointer, 0x2020);
+        assert_eq!(td.residual, 0);
+
+        // A descriptor ending in an Event Data TRB: the pointer is the data TRB, never the
+        // Event Data one (ED = 0, spec 4.11.5.2).
+        let mut td = normal_td(0x2000, &[0x100]);
+        td[0].trb.cast_mut::<NormalTrb>().unwrap().set_chain(true);
+        td.push(data_less_trb(TrbType::EventData, 0x2010));
+        let td = stopped(&f, td, 0);
+        assert_eq!(td.completion_code, TrbCompletionCode::Stopped);
+        assert_eq!(td.trb_pointer, 0x2000);
+        assert_eq!(td.residual, 0x100);
+        assert_eq!(td.first_trb, GuestAddress(0x2000));
+    }
+
+    #[test]
+    fn a_cancelled_td_without_data_trbs_is_stopped_length_invalid() {
+        let f = Fixture::new();
+        for ty in [TrbType::EventData, TrbType::Noop] {
+            let td = stopped(&f, vec![data_less_trb(ty, 0x2000)], 0);
+            assert_eq!(
+                td.completion_code,
+                TrbCompletionCode::StoppedLengthInvalid,
+                "{:?}",
+                ty
+            );
+            assert_eq!(td.trb_pointer, 0x2000);
+            assert_eq!(td.residual, 0);
+            assert_eq!(td.first_trb, GuestAddress(0x2000));
+            assert!(td.cycle);
+        }
+    }
+
+    /// Several transfers cancelled by one stop (a drained-ahead ring): the ring is left at the
+    /// one dequeued first, whichever order they are reaped in, and a new stop starts afresh.
+    #[test]
+    fn the_earliest_cancelled_transfer_is_the_one_the_ring_stops_at() {
+        let f = Fixture::new();
+        let manager = XhciTransferManager::default();
+        let first = f.transfer(&manager, 3, normal_td(0x2000, &[0x100]));
+        let second = f.transfer(&manager, 3, normal_td(0x2010, &[0x100]));
+        let third = f.transfer(&manager, 3, normal_td(0x2020, &[0x100]));
+        third
+            .on_transfer_complete(&TransferStatus::Cancelled, 0)
+            .unwrap();
+        second
+            .on_transfer_complete(&TransferStatus::Cancelled, 0)
+            .unwrap();
+        // The first completed before the cancel landed: it is not part of the stopped set.
+        first
+            .on_transfer_complete(&TransferStatus::Completed, 0x100)
+            .unwrap();
+        let td = manager.take_stopped().unwrap();
+        assert_eq!(td.first_trb, GuestAddress(0x2010));
+        assert_eq!(manager.take_stopped(), None, "reported once");
+
+        // What an earlier stop left behind is not the next one's descriptor in progress.
+        third
+            .on_transfer_complete(&TransferStatus::Cancelled, 0)
+            .unwrap();
+        manager.cancel_all();
+        assert_eq!(manager.take_stopped(), None);
+    }
 }

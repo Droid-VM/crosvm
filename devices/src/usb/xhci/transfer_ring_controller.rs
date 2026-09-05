@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 
 use anyhow::Context;
+use base::debug;
 use base::Event;
 use sync::Mutex;
 use vm_memory::GuestMemory;
@@ -17,6 +18,7 @@ use super::xhci_abi::TransferDescriptor;
 use super::xhci_transfer::XhciTransferManager;
 use crate::usb::xhci::ring_buffer_controller::Error as RingBufferControllerError;
 use crate::usb::xhci::ring_buffer_controller::RingBufferController;
+use crate::usb::xhci::ring_buffer_controller::StoppedTd;
 use crate::usb::xhci::ring_buffer_controller::TransferDescriptorHandler;
 use crate::utils::EventLoop;
 
@@ -80,6 +82,44 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
     fn is_quiesced(&self) -> bool {
         !self.transfer_manager.has_pending_transfers()
     }
+
+    /// The earliest transfer this stop cancelled is the descriptor in progress: its Stopped
+    /// Transfer Event goes out now, ahead of the Command Completion the parked ring releases,
+    /// and the ring is left at its first TRB.
+    fn finish_stop(&self) -> anyhow::Result<Option<StoppedTd>> {
+        let stopped = match self.transfer_manager.take_stopped() {
+            Some(stopped) => stopped,
+            None => return Ok(None),
+        };
+        debug!(
+            "xhci: slot {} endpoint {} stream {:?}: descriptor at {:#x} stopped at trb {:#x}, {} bytes moved, {} left ({:?})",
+            self.slot_id,
+            self.endpoint_id,
+            self.stream_id,
+            stopped.first_trb.0,
+            stopped.trb_pointer,
+            stopped.bytes,
+            stopped.residual,
+            stopped.completion_code
+        );
+        self.interrupter
+            .lock()
+            .send_transfer_event_trb(
+                stopped.completion_code,
+                stopped.trb_pointer,
+                stopped.residual,
+                // ED is clear: the pointer is the TRB in progress, not an Event Data value.
+                false,
+                self.slot_id,
+                self.endpoint_id,
+            )
+            .context("cannot send stopped transfer event")?;
+        Ok(Some(StoppedTd {
+            first_trb: stopped.first_trb,
+            cycle: stopped.cycle,
+            bytes: stopped.bytes,
+        }))
+    }
 }
 
 impl TransferRingController {
@@ -114,5 +154,79 @@ impl TransferRingController {
                 stream_id,
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use usb_util::TransferStatus;
+    use vm_memory::GuestAddress;
+
+    use super::super::test_util::normal_td;
+    use super::super::test_util::Fixture;
+    use super::super::test_util::SLOT_ID;
+    use super::super::xhci_abi::TrbCompletionCode;
+    use super::*;
+    use crate::utils::FailHandle;
+
+    /// The stop cancelled two transfers; the ring parks, and its handler sends one Stopped
+    /// Transfer Event -- for the descriptor dequeued first, pointing at the TRB in progress with
+    /// that TRB's residual, ED clear -- and leaves the ring at that descriptor's first TRB.
+    #[test]
+    fn finish_stop_reports_the_earliest_cancelled_descriptor_and_leaves_the_ring_at_it() {
+        let f = Fixture::new();
+        let handler = TransferRingTrbHandler {
+            mem: f.mem.clone(),
+            port: f.port(),
+            interrupter: f.interrupter.clone(),
+            slot_id: SLOT_ID,
+            endpoint_id: 3,
+            transfer_manager: XhciTransferManager::default(),
+            stream_id: None,
+        };
+        assert_eq!(
+            handler.finish_stop().unwrap(),
+            None,
+            "nothing was in flight"
+        );
+
+        let first = f.transfer(
+            &handler.transfer_manager,
+            3,
+            normal_td(0x2000, &[0x100, 0x200]),
+        );
+        let second = f.transfer(&handler.transfer_manager, 3, normal_td(0x2020, &[0x300]));
+        // The later descriptor is reaped first.
+        second
+            .on_transfer_complete(&TransferStatus::Cancelled, 0)
+            .unwrap();
+        first
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x150)
+            .unwrap();
+
+        assert_eq!(
+            handler.finish_stop().unwrap(),
+            Some(StoppedTd {
+                first_trb: GuestAddress(0x2000),
+                cycle: true,
+                bytes: 0x150,
+            })
+        );
+        let events = f.transfer_events();
+        assert_eq!(events.len(), 1, "one Stopped event per ring");
+        let event = &events[0];
+        assert_eq!(
+            event.get_completion_code().unwrap(),
+            TrbCompletionCode::Stopped
+        );
+        assert_eq!(event.get_trb_pointer(), 0x2010);
+        assert_eq!(event.get_trb_transfer_length(), 0x1b0);
+        assert_eq!(event.get_event_data(), 0);
+        assert_eq!(event.get_slot_id(), SLOT_ID);
+        assert_eq!(event.get_endpoint_id(), 3);
+
+        assert_eq!(handler.finish_stop().unwrap(), None, "reported once");
+        assert_eq!(f.transfer_events().len(), 1);
+        assert!(!f.fail_handle.failed());
     }
 }

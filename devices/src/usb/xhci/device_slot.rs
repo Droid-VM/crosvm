@@ -6,6 +6,7 @@ use std::mem::size_of;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::Weak;
 
 use base::debug;
 use base::error;
@@ -833,21 +834,24 @@ impl DeviceSlot {
         dequeue_pointer: GuestAddress,
         dequeue_cycle_state: bool,
     ) -> Result<()> {
-        let addr = stream_context_array_addr
-            .checked_add(stream_id as u64 * STREAM_CONTEXT_SIZE as u64)
-            .ok_or(Error::BadDeviceContextAddr(stream_context_array_addr))?;
-        let mut stream_context: StreamContext = self
-            .mem
-            .read_obj_from_addr(addr)
-            .map_err(Error::ReadGuestMemory)?;
-        stream_context.set_tr_dequeue_pointer(DequeuePtr::new(dequeue_pointer));
-        stream_context.set_dequeue_cycle_state(dequeue_cycle_state);
-        self.mem
-            .write_obj_at_addr(stream_context, addr)
-            .map_err(Error::WriteGuestMemory)
+        write_stream_context(
+            &self.mem,
+            stream_context_array_addr,
+            stream_id,
+            dequeue_pointer,
+            dequeue_cycle_state,
+            None,
+        )
     }
 
     /// Stop an endpoint.
+    ///
+    /// The endpoint state goes to Stopped here. The ring position -- the Endpoint Context's TR
+    /// Dequeue Pointer and DCS, or those of each populated Stream Context plus the Stopped EDTLA
+    /// of a stream whose ring stopped with a descriptor in progress -- is written from the stop
+    /// callback, once every ring has actually stopped and been left at the descriptor it was
+    /// executing (spec 4.6.9), right before the Command Completion. Read before the stop, as it
+    /// used to be, the pointer was the one past that descriptor.
     pub fn stop_endpoint<
         C: FnMut(TrbCompletionCode) -> std::result::Result<(), ()> + 'static + Send,
     >(
@@ -863,49 +867,74 @@ impl DeviceSlot {
         let index = endpoint_id - 1;
         let mut device_context = self.get_device_context()?;
         let endpoint_context = &mut device_context.endpoint_context[index as usize];
-        match self.get_trcs(index as usize) {
+        // The callback's last clone lives until the endpoint state below is in guest memory, so
+        // a ring that stops at once answers after it, like one that stops later. The closures
+        // hold their rings weakly: a ring keeps its stop callback until it parks, and must not
+        // keep itself alive through it. A ring that is gone by then had its slot reset from
+        // under the stop, and the guest gave the context up with it.
+        let _stop = match self.get_trcs(index as usize) {
             Some(TransferRingControllers::Endpoint(trc)) => {
+                let mem = self.mem.clone();
+                let device_context_addr = self.get_device_context_addr()?;
+                let ring = Arc::downgrade(&trc);
                 let auto_cb = RingBufferStopCallback::new(fallible_closure(
                     fail_handle,
                     move || -> Result<()> {
+                        if let Some(trc) = ring.upgrade() {
+                            write_endpoint_context_position(
+                                &mem,
+                                device_context_addr,
+                                endpoint_id,
+                                trc.get_dequeue_pointer(),
+                                trc.get_consumer_cycle_state(),
+                            )?;
+                        }
                         cb(TrbCompletionCode::Success).map_err(|_| Error::CallbackFailed)
                     },
                 ));
-                trc.stop(auto_cb);
-                let dequeue_pointer = trc.get_dequeue_pointer();
-                let dcs = trc.get_consumer_cycle_state();
-                endpoint_context.set_tr_dequeue_pointer(DequeuePtr::new(dequeue_pointer));
-                endpoint_context.set_dequeue_cycle_state(dcs);
+                trc.stop(auto_cb.clone());
+                Some(auto_cb)
             }
             Some(TransferRingControllers::Stream(trcs)) => {
                 let stream_context_array_addr = endpoint_context.get_tr_dequeue_pointer().get_gpa();
+                let mem = self.mem.clone();
+                let rings: Vec<(u16, Weak<TransferRingController>)> = trcs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, trc)| {
+                        trc.as_ref()
+                            .map(|trc| ((i + 1) as u16, Arc::downgrade(trc)))
+                    })
+                    .collect();
                 let auto_cb = RingBufferStopCallback::new(fallible_closure(
                     fail_handle,
                     move || -> Result<()> {
+                        for (stream_id, ring) in &rings {
+                            if let Some(trc) = ring.upgrade() {
+                                write_stream_context(
+                                    &mem,
+                                    stream_context_array_addr,
+                                    *stream_id,
+                                    trc.get_dequeue_pointer(),
+                                    trc.get_consumer_cycle_state(),
+                                    trc.stopped_td().map(|td| td.bytes),
+                                )?;
+                            }
+                        }
                         cb(TrbCompletionCode::Success).map_err(|_| Error::CallbackFailed)
                     },
                 ));
-                for (i, trc) in trcs.iter().enumerate() {
-                    let trc = match trc {
-                        Some(trc) => trc,
-                        None => continue,
-                    };
-                    let dequeue_pointer = trc.get_dequeue_pointer();
-                    let dcs = trc.get_consumer_cycle_state();
+                for trc in trcs.iter().flatten() {
                     trc.stop(auto_cb.clone());
-                    self.write_back_stream_context(
-                        stream_context_array_addr,
-                        (i + 1) as u16,
-                        dequeue_pointer,
-                        dcs,
-                    )?;
                 }
+                Some(auto_cb)
             }
             None => {
                 error!("endpoint at index {} is not started", index);
                 cb(TrbCompletionCode::ContextStateError).map_err(|_| Error::CallbackFailed)?;
+                None
             }
-        }
+        };
         endpoint_context.set_endpoint_state(EndpointState::Stopped);
         self.set_device_context(device_context)?;
         Ok(())
@@ -1525,6 +1554,56 @@ impl DeviceSlot {
     }
 }
 
+/// Writes a stream ring's position into entry `stream_id` of the Stream Context Array at
+/// `stream_context_array_addr`, and its Stopped EDTLA when the ring stopped with a descriptor in
+/// progress (spec 6.2.4.1). Only that one 16-byte entry is touched, and only those fields: the
+/// guest owns the rest of the array, and an entry whose ring stopped with nothing in progress
+/// keeps whatever Stopped EDTLA it had.
+fn write_stream_context(
+    mem: &GuestMemory,
+    stream_context_array_addr: GuestAddress,
+    stream_id: u16,
+    dequeue_pointer: GuestAddress,
+    dequeue_cycle_state: bool,
+    stopped_edtla: Option<u32>,
+) -> Result<()> {
+    let addr = stream_context_array_addr
+        .checked_add(stream_id as u64 * STREAM_CONTEXT_SIZE as u64)
+        .ok_or(Error::BadDeviceContextAddr(stream_context_array_addr))?;
+    let mut stream_context: StreamContext = mem
+        .read_obj_from_addr(addr)
+        .map_err(Error::ReadGuestMemory)?;
+    stream_context.set_tr_dequeue_pointer(DequeuePtr::new(dequeue_pointer));
+    stream_context.set_dequeue_cycle_state(dequeue_cycle_state);
+    if let Some(stopped_edtla) = stopped_edtla {
+        // A 24-bit field.
+        stream_context.set_stopped_edtla(stopped_edtla & 0xff_ffff);
+    }
+    mem.write_obj_at_addr(stream_context, addr)
+        .map_err(Error::WriteGuestMemory)
+}
+
+/// Writes a ring's position into the Endpoint Context of `device_context_index` in the Device
+/// Context at `device_context_addr`, leaving the rest of that context as it is.
+fn write_endpoint_context_position(
+    mem: &GuestMemory,
+    device_context_addr: GuestAddress,
+    device_context_index: u8,
+    dequeue_pointer: GuestAddress,
+    dequeue_cycle_state: bool,
+) -> Result<()> {
+    let addr = device_context_addr
+        .checked_add(device_context_index as u64 * DEVICE_CONTEXT_ENTRY_SIZE as u64)
+        .ok_or(Error::BadDeviceContextAddr(device_context_addr))?;
+    let mut endpoint_context: EndpointContext = mem
+        .read_obj_from_addr(addr)
+        .map_err(Error::ReadGuestMemory)?;
+    endpoint_context.set_tr_dequeue_pointer(DequeuePtr::new(dequeue_pointer));
+    endpoint_context.set_dequeue_cycle_state(dequeue_cycle_state);
+    mem.write_obj_at_addr(endpoint_context, addr)
+        .map_err(Error::WriteGuestMemory)
+}
+
 /// A device slot over guest memory, for this module's tests and the command ring's.
 #[cfg(test)]
 pub(crate) mod test_util {
@@ -1541,6 +1620,7 @@ pub(crate) mod test_util {
     use super::super::xhci_abi::EventRingSegmentTableEntry;
     use super::super::xhci_abi::NormalTrb;
     use super::super::xhci_abi::TransferDescriptor;
+    use super::super::xhci_abi::TransferEventTrb;
     use super::super::xhci_abi::Trb;
     use super::super::xhci_abi::TrbCast;
     use super::super::xhci_abi::TrbType;
@@ -1791,6 +1871,26 @@ pub(crate) mod test_util {
                 }
             }
             completions
+        }
+
+        /// Every Transfer Event on the event ring so far, in order; events of other kinds
+        /// between them are skipped.
+        pub fn transfer_events(&self) -> Vec<TransferEventTrb> {
+            let mut events = Vec::new();
+            for i in 0..16u64 {
+                let trb: Trb = self
+                    .mem
+                    .read_obj_from_addr(GuestAddress(EVENT_RING + i * size_of::<Trb>() as u64))
+                    .unwrap();
+                match trb.get_trb_type() {
+                    Ok(TrbType::TransferEvent) => {
+                        events.push(*trb.cast::<TransferEventTrb>().unwrap())
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            events
         }
     }
 
@@ -2430,6 +2530,161 @@ mod tests {
             );
         }
         assert!(!f.fail_handle.failed());
+    }
+
+    /// The Stream Context is written from the ring as it stands when the stop is answered --
+    /// the position a stop that rewound the ring left it at -- with the endpoint already
+    /// Stopped in guest memory, and a stream whose ring had nothing in progress keeps the
+    /// Stopped EDTLA the guest gave it.
+    #[test]
+    fn stop_endpoint_writes_the_context_from_the_ring_the_callback_sees() {
+        let f = stopped_stream_endpoint();
+        f.set_endpoint_state(3, EndpointState::Running);
+        let mut sc = f.stream_context(2);
+        sc.set_stopped_edtla(0x1234);
+        f.set_stream_context(2, sc);
+        // Stream 2 runs: its ring is empty (nothing in that memory carries its cycle bit), so it
+        // parks where it stands. Where that is, is then moved to a marker.
+        assert!(f.slot().ring_doorbell(3, 2).unwrap());
+        let marker = stream_ring(2).unchecked_add(0x40);
+        let trc = stream_trcs(&f.slot(), 3)[1].clone().unwrap();
+        trc.set_dequeue_pointer(marker);
+
+        let seen = Arc::new(Mutex::new(None));
+        let s = seen.clone();
+        let mem = f.mem.clone();
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, move |code| {
+                let sc: StreamContext = mem.read_obj_from_addr(stream_context_addr(2)).unwrap();
+                let ctx: DeviceContext = mem
+                    .read_obj_from_addr(GuestAddress(DEVICE_CONTEXT))
+                    .unwrap();
+                *s.lock() = Some((
+                    code,
+                    sc.get_tr_dequeue_pointer().get_gpa(),
+                    sc.get_dequeue_cycle_state(),
+                    sc.get_stopped_edtla(),
+                    ctx.endpoint_context[2].get_endpoint_state().unwrap(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            *seen.lock(),
+            Some((
+                TrbCompletionCode::Success,
+                marker,
+                true,
+                0x1234,
+                EndpointState::Stopped
+            )),
+            "at the completion the context carries the ring's position and the Stopped state"
+        );
+        assert_eq!(
+            f.stream_context(1).get_tr_dequeue_pointer().get_gpa(),
+            stream_ring(1)
+        );
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// The same for an endpoint without streams: the Endpoint Context's TR Dequeue Pointer and
+    /// DCS come from the ring at the completion, and the rest of the context stays.
+    #[test]
+    fn stop_endpoint_without_streams_writes_the_ring_position_at_the_completion() {
+        let f = Fixture::new();
+        f.write_input_context(0, 1 << 3, 3, bulk_endpoint_context(3));
+        assert_eq!(
+            f.slot()
+                .configure_endpoint(&f.configure_endpoint_trb())
+                .unwrap(),
+            TrbCompletionCode::Success
+        );
+        let trc = match f.slot().get_trcs(2) {
+            Some(TransferRingControllers::Endpoint(trc)) => trc,
+            _ => panic!("DCI 3 must be a plain endpoint"),
+        };
+        let marker = GuestAddress(STREAM_RING + 0x40);
+        trc.set_dequeue_pointer(marker);
+        trc.set_consumer_cycle_state(false);
+
+        let seen = Arc::new(Mutex::new(None));
+        let s = seen.clone();
+        let mem = f.mem.clone();
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, move |code| {
+                let ctx: DeviceContext = mem
+                    .read_obj_from_addr(GuestAddress(DEVICE_CONTEXT))
+                    .unwrap();
+                let ep = ctx.endpoint_context[2];
+                *s.lock() = Some((
+                    code,
+                    ep.get_tr_dequeue_pointer().get_gpa(),
+                    ep.get_dequeue_cycle_state(),
+                    ep.get_endpoint_state().unwrap(),
+                    ep.get_max_packet_size(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            *seen.lock(),
+            Some((
+                TrbCompletionCode::Success,
+                marker,
+                false,
+                EndpointState::Stopped,
+                1024
+            ))
+        );
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A stream whose ring stopped with a descriptor in progress gets its Stopped EDTLA (24
+    /// bits, spec 6.2.4.1); one that stopped idle keeps the value it had. Nothing else in the
+    /// entry moves.
+    #[test]
+    fn stream_context_write_back_sets_the_stopped_edtla_of_a_stopped_stream_only() {
+        let f = Fixture::new();
+        f.write_stream_context_array(1..3);
+        for stream_id in 1..3 {
+            let mut sc = f.stream_context(stream_id);
+            sc.set_stopped_edtla(0x1234);
+            sc.set_reserved1(0x5a);
+            sc.set_reserved2(0xdeadbeef);
+            f.set_stream_context(stream_id, sc);
+        }
+
+        write_stream_context(
+            &f.mem,
+            GuestAddress(STREAM_CONTEXT_ARRAY),
+            1,
+            GuestAddress(0x5000),
+            false,
+            Some(0x0123_4567),
+        )
+        .unwrap();
+        write_stream_context(
+            &f.mem,
+            GuestAddress(STREAM_CONTEXT_ARRAY),
+            2,
+            GuestAddress(0x6000),
+            true,
+            None,
+        )
+        .unwrap();
+
+        let sc = f.stream_context(1);
+        assert_eq!(sc.get_tr_dequeue_pointer().get_gpa(), GuestAddress(0x5000));
+        assert!(!sc.get_dequeue_cycle_state());
+        assert_eq!(sc.get_stopped_edtla(), 0x23_4567);
+        assert_eq!(sc.get_stream_context_type(), 1);
+        assert_eq!(sc.get_reserved1(), 0x5a);
+        assert_eq!(sc.get_reserved2(), 0xdeadbeef);
+        let sc = f.stream_context(2);
+        assert_eq!(sc.get_tr_dequeue_pointer().get_gpa(), GuestAddress(0x6000));
+        assert!(sc.get_dequeue_cycle_state());
+        assert_eq!(sc.get_stopped_edtla(), 0x1234);
+        assert_eq!(sc.get_reserved2(), 0xdeadbeef);
     }
 
     #[test]

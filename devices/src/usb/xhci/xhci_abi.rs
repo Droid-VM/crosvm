@@ -85,6 +85,7 @@ pub enum TrbCompletionCode {
     ContextStateError = 19,
     CommandRingStopped = 24,
     Stopped = 26,
+    StoppedLengthInvalid = 27,
     InvalidStreamIdError = 34,
 }
 
