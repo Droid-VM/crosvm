@@ -12,10 +12,17 @@
 //!
 //! ```text
 //! camera_probe list  [--uid N]
+//! camera_probe controls --id 0 [--uid N]
 //! camera_probe capture --id 0 --size 1280x720 --frames 90 [--uid N] [--zoom R]
 //!                      [--flash off|single|torch] [--af off|auto|continuous-video|continuous-picture]
-//!                      [--fps MIN:MAX] [--dump PATH]
+//!                      [--fps MIN:MAX] [--exposure NS --iso N] [--af-trigger] [--dump PATH]
 //! ```
+//!
+//! `controls` prints the ranges and menus the V4L2 camera device builds its controls from
+//! (`VPU_DESIGN.md` §7.1): what the acceptance records. `capture` also reports what the
+//! capture-result callbacks saw -- every autofocus and auto-exposure state transition, the lens
+//! in use -- which is the pipeline the device's `V4L2_EVENT_CTRL` comes from; `--af-trigger`
+//! fires one AF scan a second in, `--exposure`/`--iso` take the exposure manual.
 //!
 //! `--uid` drops to that uid before touching the camera, the way `snd_helper` does for AAudio:
 //! `cameraserver` resolves the client package from the real uid, and uid 0 resolves to none.
@@ -27,9 +34,22 @@ use std::process::ExitCode;
 use std::time::Duration;
 use std::time::Instant;
 
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use android_camera::AeMode;
 use android_camera::AfMode;
+use android_camera::AfTrigger;
+use android_camera::AntibandingMode;
+use android_camera::AwbMode;
 use android_camera::Camera;
+use android_camera::CaptureResult;
+use android_camera::EffectMode;
 use android_camera::FlashMode;
+use android_camera::RequestUpdate;
+use android_camera::ResultListener;
+use android_camera::SceneMode;
+use android_camera::VideoStabilizationMode;
 use android_camera::YuvLayout;
 
 struct Args {
@@ -44,6 +64,11 @@ struct Args {
     af: Option<AfMode>,
     fps: Option<(i32, i32)>,
     dump: Option<String>,
+    /// Manual exposure: `SENSOR_EXPOSURE_TIME` in ns and `SENSOR_SENSITIVITY`, under
+    /// `AE_MODE_OFF`.
+    exposure_ns: Option<i64>,
+    iso: Option<i32>,
+    af_trigger: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,6 +86,9 @@ fn parse_args() -> Result<Args, String> {
         af: None,
         fps: None,
         dump: None,
+        exposure_ns: None,
+        iso: None,
+        af_trigger: false,
     };
     while let Some(flag) = argv.next() {
         let mut value = || {
@@ -107,6 +135,11 @@ fn parse_args() -> Result<Args, String> {
                 ));
             }
             "--dump" => args.dump = Some(value()?),
+            "--exposure" => {
+                args.exposure_ns = Some(value()?.parse().map_err(|e| format!("--exposure: {}", e))?)
+            }
+            "--iso" => args.iso = Some(value()?.parse().map_err(|e| format!("--iso: {}", e))?),
+            "--af-trigger" => args.af_trigger = true,
             other => return Err(format!("unknown flag {:?}", other)),
         }
     }
@@ -152,6 +185,134 @@ fn use_case_name(value: i64) -> String {
         6 => "CROPPED_RAW".to_owned(),
         other => format!("vendor(0x{:x})", other),
     }
+}
+
+/// A byte list as names, one per value, with the numbers this crate cannot name kept as such.
+fn names<T: std::fmt::Debug>(values: &[u8], name: impl Fn(u8) -> Option<T>) -> String {
+    if values.is_empty() {
+        return "(read returned nothing)".to_owned();
+    }
+    values
+        .iter()
+        .map(|&v| match name(v) {
+            Some(n) => format!("{:?}({})", n, v),
+            None => format!("?({})", v),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The characteristics the V4L2 camera device derives its controls from, for one camera.
+fn cmd_controls(args: &Args) -> Result<(), String> {
+    let cameras = android_camera::list_cameras().map_err(|e| e.to_string())?;
+    let c = cameras
+        .iter()
+        .find(|c| c.id == args.id)
+        .ok_or_else(|| format!("camera {:?} is not one this uid can see", args.id))?;
+    println!("camera {} ({:?})", c.id, c.facing);
+    println!(
+        "  zoom ratio range         {}",
+        match c.zoom_ratio_range {
+            Some((lo, hi)) => format!(
+                "{:.2}..{:.2}  -> ZOOM_ABSOLUTE {}..{} (x100)",
+                lo,
+                hi,
+                (lo * 100.0).ceil() as i64,
+                (hi * 100.0).floor() as i64
+            ),
+            None => "(none: no ZOOM_ABSOLUTE)".to_owned(),
+        }
+    );
+    println!(
+        "  af available modes       {}",
+        names(&c.af_modes, AfMode::from_u8)
+    );
+    println!("  flash available          {}", c.flash_available);
+    println!(
+        "  ae available modes       {}  (Off and On -> EXPOSURE_AUTO / ISO_SENSITIVITY_AUTO)",
+        names(&c.ae_modes, AeMode::from_u8)
+    );
+    println!(
+        "  exposure time range      {}",
+        match c.exposure_time_range_ns {
+            Some((lo, hi)) => format!(
+                "{}..{} ns  -> EXPOSURE_ABSOLUTE {}..{} (100 us)",
+                lo,
+                hi,
+                (lo as u64).div_ceil(100_000).max(1),
+                (hi as u64) / 100_000
+            ),
+            None => "(none)".to_owned(),
+        }
+    );
+    println!(
+        "  sensitivity range        {}",
+        match c.sensitivity_range {
+            Some((lo, hi)) => format!("ISO {}..{}  -> ISO_SENSITIVITY menu", lo, hi),
+            None => "(none)".to_owned(),
+        }
+    );
+    println!(
+        "  ae compensation          {}",
+        match (c.ae_compensation_range, c.ae_compensation_step) {
+            (Some((lo, hi)), Some((num, den))) => format!(
+                "{}..{} steps of {}/{} EV  -> AUTO_EXPOSURE_BIAS menu of {} items",
+                lo,
+                hi,
+                num,
+                den,
+                (hi as i64 - lo as i64 + 1).max(0)
+            ),
+            (range, step) => format!("range {:?}, step {:?}", range, step),
+        }
+    );
+    println!(
+        "  awb available modes      {}",
+        names(&c.awb_modes, AwbMode::from_u8)
+    );
+    println!(
+        "  antibanding modes        {}",
+        names(&c.antibanding_modes, AntibandingMode::from_u8)
+    );
+    println!(
+        "  available effects        {}",
+        names(&c.effects, EffectMode::from_u8)
+    );
+    println!(
+        "  available scene modes    {}",
+        names(&c.scene_modes, SceneMode::from_u8)
+    );
+    let stabilization = names(
+        &c.video_stabilization_modes,
+        VideoStabilizationMode::from_u8,
+    );
+    println!("  video stabilization      {}", stabilization);
+    println!(
+        "  max regions AE/AWB/AF    {:?}  (non-zero -> the private regions controls)",
+        c.max_regions
+    );
+    println!(
+        "  active array             {}",
+        match c.active_array {
+            Some(r) => format!(
+                "left {} top {} width {} height {}  (the regions' coordinate system)",
+                r.left, r.top, r.width, r.height
+            ),
+            None => "(none: no regions controls)".to_owned(),
+        }
+    );
+    println!(
+        "  physical lenses          {}",
+        if c.physical_ids.is_empty() {
+            "(none)".to_owned()
+        } else {
+            format!(
+                "{}  (-> the private active-physical-id menu)",
+                c.physical_ids.join(", ")
+            )
+        }
+    );
+    Ok(())
 }
 
 fn cmd_list() -> Result<(), String> {
@@ -355,12 +516,66 @@ fn dump_frame(path: &str, frame: &android_camera::Frame<'_>) -> Result<(), Strin
     Ok(())
 }
 
+/// What the capture-result callbacks reported: every transition of the three states the V4L2
+/// device turns into `V4L2_EVENT_CTRL`, with the frame it happened at.
+#[derive(Default)]
+struct Transitions {
+    results: u64,
+    af: Option<android_camera::AfState>,
+    ae: Option<android_camera::AeState>,
+    lens: Option<String>,
+    log: Vec<String>,
+}
+
+fn result_listener(seen: Arc<Mutex<Transitions>>) -> ResultListener {
+    Box::new(move |result: &CaptureResult<'_>| {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.results += 1;
+        let n = seen.results;
+        if let Some(af) = result.af_state() {
+            if seen.af != Some(af) {
+                seen.af = Some(af);
+                seen.log.push(format!("result {}: AF_STATE {:?}", n, af));
+            }
+        }
+        if let Some(ae) = result.ae_state() {
+            if seen.ae != Some(ae) {
+                seen.ae = Some(ae);
+                seen.log.push(format!(
+                    "result {}: AE_STATE {:?} (exposure {:?} ns, iso {:?}, zoom {:?})",
+                    n,
+                    ae,
+                    result.exposure_time_ns(),
+                    result.sensitivity(),
+                    result.zoom_ratio()
+                ));
+            }
+        }
+        if let Some(lens) = result.active_physical_id() {
+            if seen.lens.as_deref() != Some(lens.as_str()) {
+                seen.log
+                    .push(format!("result {}: ACTIVE_PHYSICAL_ID {}", n, lens));
+                seen.lens = Some(lens);
+            }
+        }
+    })
+}
+
 fn cmd_capture(args: &Args) -> Result<(), String> {
     // Depth 4: enough that acquiring one frame does not stall the camera, small enough that a leak
     // shows up immediately as a stall rather than as growing memory.
     let opened = Instant::now();
-    let mut camera =
-        Camera::open(&args.id, args.width, args.height, 4).map_err(|e| e.to_string())?;
+    let seen = Arc::new(Mutex::new(Transitions::default()));
+    let mut camera = Camera::open_with(
+        &args.id,
+        args.width,
+        args.height,
+        4,
+        None,
+        Some(result_listener(Arc::clone(&seen))),
+        &RequestUpdate::new(),
+    )
+    .map_err(|e| e.to_string())?;
     println!(
         "opened camera {} at {}x{} in {:?}",
         args.id, args.width, args.height, opened.elapsed()
@@ -369,6 +584,21 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
     if let Some((lo, hi)) = args.fps {
         camera.set_fps_range(lo, hi).map_err(|e| e.to_string())?;
         println!("fps range set to {}:{}", lo, hi);
+    }
+    if args.exposure_ns.is_some() || args.iso.is_some() {
+        // Manual exposure is AE off with both values written, in one submission.
+        let mut update = RequestUpdate::new().ae_mode(AeMode::Off);
+        if let Some(ns) = args.exposure_ns {
+            update = update.exposure_time_ns(ns);
+        }
+        if let Some(iso) = args.iso {
+            update = update.sensitivity(iso);
+        }
+        camera.apply(&update).map_err(|e| e.to_string())?;
+        println!(
+            "manual exposure: {:?} ns, iso {:?} (AE_MODE_OFF)",
+            args.exposure_ns, args.iso
+        );
     }
     if let Some(mode) = args.af {
         camera.set_af_mode(mode).map_err(|e| e.to_string())?;
@@ -393,7 +623,17 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
     let mut luma_min = f64::MAX;
     let mut luma_max = f64::MIN;
 
+    let mut af_fired = false;
     while received < args.frames {
+        // One AF scan, a second in, once the stream has settled. Before the frame is acquired:
+        // a held frame borrows the camera.
+        if args.af_trigger && received >= 30 && !af_fired {
+            camera
+                .trigger_af(AfTrigger::Start)
+                .map_err(|e| e.to_string())?;
+            println!("  AF trigger START fired at frame {}", received);
+            af_fired = true;
+        }
         let frame = match camera
             .next_frame(Duration::from_millis(2000))
             .map_err(|e| e.to_string())?
@@ -468,6 +708,22 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
     println!("listener callbacks    {}", camera.frames_signalled());
     println!("distinct luma digests {} of {}", digests.len(), received);
     println!("luma mean range       {:.1}..{:.1}", luma_min, luma_max);
+    let stats = camera.results();
+    println!(
+        "capture results       {} completed, {} failed, {} buffers lost",
+        stats.completed, stats.failed, stats.buffers_lost
+    );
+    {
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        println!(
+            "result transitions    {} (from {} results read in the callback)",
+            seen.log.len(),
+            seen.results
+        );
+        for line in &seen.log {
+            println!("  {}", line);
+        }
+    }
 
     // The two ways this can pass without the camera working: every frame identical (a frozen or
     // never-filled buffer), or every pixel zero (a black frame that still has the right shape).
@@ -510,8 +766,12 @@ fn run() -> Result<(), String> {
     println!("running as uid {}", unsafe { libc::getuid() });
     match args.command.as_str() {
         "list" => cmd_list(),
+        "controls" => cmd_controls(&args),
         "capture" => cmd_capture(&args),
-        other => Err(format!("unknown command {:?}; want list or capture", other)),
+        other => Err(format!(
+            "unknown command {:?}; want list, controls or capture",
+            other
+        )),
     }
 }
 
