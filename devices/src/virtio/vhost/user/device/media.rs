@@ -84,7 +84,8 @@ use crate::virtio::Writer;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MediaBackendParams {
-    /// Which device to be. `simple`, `loopback`, `camera` and `decoder` exist today.
+    /// Which device to be. `simple`, `loopback`, `camera`, `decoder` and `encoder` exist
+    /// today.
     pub kind: MediaDeviceKind,
     /// The V4L2 card name (`--virtio-media card=`); each kind has a default.
     #[serde(default)]
