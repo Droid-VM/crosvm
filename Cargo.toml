@@ -40,6 +40,7 @@ members = [
     "aarch64",
     "acpi_tables",
     "android_audio",
+    "android_camera",
     "arch",
     "argh_helpers",
     "audio_util",
