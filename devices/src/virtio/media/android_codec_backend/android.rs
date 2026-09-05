@@ -492,12 +492,20 @@ enum Held {
     Format(Option<MediaFormat>),
 }
 
-/// A bitstream buffer waiting for a codec input slot, or the end of the stream.
+/// Bitstream waiting for a codec input slot, or the end of the stream. The bytes are a **copy**
+/// of the guest's `OUTPUT` buffer, taken in [`MediaCodecDecoderSession::decode`] so the guest
+/// buffer can be returned right away: the guest gets `InputBufferDone` as soon as the copy is
+/// made, not gated on the codec offering an input slot. That is what lets the `OUTPUT` queue
+/// drain when the codec makes no progress -- a stream of undecodable bytes with no `CAPTURE`
+/// consumer, which is exactly what `v4l2-compliance`'s streaming test feeds (D28).
 enum PendingInput {
     Bitstream {
-        buffer: InputBuffer,
+        /// The bitstream copied out of the guest buffer.
+        data: Vec<u8>,
         /// Bytes already handed to the codec, when the access unit goes in pieces.
         offset: usize,
+        /// The frame's timestamp, carried through to the decoded frame (`TIMESTAMP_COPY`).
+        timestamp: bindings::timeval,
     },
     Eos,
 }
@@ -616,8 +624,16 @@ pub struct MediaCodecDecoderSession {
     format_changes: u32,
     /// Input indices the codec offered and nothing has used yet.
     free_inputs: VecDeque<i32>,
-    /// Bitstream buffers waiting for an input index, oldest first.
+    /// Bitstream copied out of the guest's `OUTPUT` buffers, waiting for a codec input index,
+    /// oldest first. The bytes are staged here so the guest buffer can be returned at once
+    /// (`InputBufferDone`) rather than only when a codec input slot happens to be free -- see
+    /// [`PendingInput`] and D28.
     pending: VecDeque<PendingInput>,
+    /// Guest `OUTPUT` buffer indices whose `InputBufferDone` is held back until the stream's
+    /// format is first announced, so a client polling for the initial `SOURCE_CHANGE` still has a
+    /// buffer in its `OUTPUT` queue and does not take `POLLPRI|POLLERR` on the idle `CAPTURE`
+    /// side (D45, the B8 `pollrace.py` measurement). Empty once the first `FormatChanged` is out.
+    deferred_input_done: VecDeque<u32>,
     /// `CAPTURE` buffers lent by the device, oldest first.
     captures: VecDeque<OutputBuffer>,
     /// Outputs the codec delivered that no `CAPTURE` buffer has taken yet, and the format
@@ -662,6 +678,7 @@ impl MediaCodecDecoderSession {
             format_changes: 0,
             free_inputs: VecDeque::new(),
             pending: VecDeque::new(),
+            deferred_input_done: VecDeque::new(),
             captures: VecDeque::new(),
             held_outputs: VecDeque::new(),
             events: Vec::new(),
@@ -693,6 +710,7 @@ impl MediaCodecDecoderSession {
         error!("decoder session {}: {}", self.id, why);
         self.dead = true;
         self.pending.clear();
+        self.deferred_input_done.clear();
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
@@ -730,6 +748,28 @@ impl MediaCodecDecoderSession {
         }
     }
 
+    /// Return the guest's `OUTPUT` buffer, or hold it behind the initial `SOURCE_CHANGE`. Until
+    /// the stream's format is first announced the buffer stays outstanding, so a client polling
+    /// for the event still has something in its `OUTPUT` queue and does not empty it and take
+    /// `POLLPRI|POLLERR` on the still-idle `CAPTURE` side (D45, the B8 `pollrace.py` measurement
+    /// -- `POLLPRI` before `POLLOUT`). After the announcement the buffer goes back at once.
+    fn note_input_done(&mut self, index: u32) {
+        if self.announced.is_none() {
+            self.deferred_input_done.push_back(index);
+        } else {
+            self.events.push(DecoderEvent::InputBufferDone(index));
+        }
+    }
+
+    /// Release the `OUTPUT` buffers held behind the initial `SOURCE_CHANGE`
+    /// ([`Self::note_input_done`]), pushed **after** the `FormatChanged` event that closes the
+    /// window so the guest sees the event first.
+    fn release_deferred_input_done(&mut self) {
+        while let Some(index) = self.deferred_input_done.pop_front() {
+            self.events.push(DecoderEvent::InputBufferDone(index));
+        }
+    }
+
     /// Feed the codec from the pending FIFO while it offers input slots.
     fn pump_input(&mut self) {
         while !self.dead && !self.eos_queued {
@@ -756,62 +796,58 @@ impl MediaCodecDecoderSession {
                         self.refused_index("input", index, &e);
                     }
                 },
-                PendingInput::Bitstream { buffer, offset } => {
-                    let buffer = *buffer;
+                PendingInput::Bitstream {
+                    data,
+                    offset,
+                    timestamp,
+                } => {
                     let start = *offset;
-                    let remaining = buffer.len - start;
+                    let ts = *timestamp;
+                    let remaining = data.len() - start;
+                    let src: &[u8] = &data[start..];
                     let nal = self.nal;
                     let mut copied = 0usize;
-                    let result =
-                        codec.queue_input_with_flags(index, pts_from(buffer.timestamp), |dst| {
-                            let n = remaining.min(dst.len());
-                            // SAFETY: the device lends `len` readable bytes at `ptr` until
-                            // `InputBufferDone`, which is only reported below; `dst` is the codec's
-                            // own input buffer, `n` bytes of which exist; the two never overlap.
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    buffer.ptr.as_ptr().add(start),
-                                    dst.as_mut_ptr(),
-                                    n,
-                                )
-                            };
-                            copied = n;
-                            let mut flags = 0;
-                            if n < remaining {
-                                // The rest follows in the next input buffer(s).
-                                flags |= BUFFER_FLAG_PARTIAL_FRAME;
-                            }
-                            // Parameter sets on their own (a `codec_data` buffer, or SPS/PPS a
-                            // client sends ahead of the first picture) are config, not a frame;
-                            // decided on the codec's copy, never on the guest's memory.
-                            if start == 0 && n == remaining {
-                                if let Some(nal) = nal {
-                                    if let Ok(units) = annexb_access_units(&dst[..n], nal) {
-                                        if !units.is_empty()
-                                            && units.iter().all(|u| !u.has_picture)
-                                            && units.iter().any(|u| u.has_parameter_sets)
-                                        {
-                                            flags |= BUFFER_FLAG_CODEC_CONFIG;
-                                        }
+                    let result = codec.queue_input_with_flags(index, pts_from(ts), |dst| {
+                        let n = remaining.min(dst.len());
+                        dst[..n].copy_from_slice(&src[..n]);
+                        copied = n;
+                        let mut flags = 0;
+                        if n < remaining {
+                            // The rest follows in the next input buffer(s).
+                            flags |= BUFFER_FLAG_PARTIAL_FRAME;
+                        }
+                        // Parameter sets on their own (a `codec_data` buffer, or SPS/PPS a
+                        // client sends ahead of the first picture) are config, not a frame;
+                        // decided on the codec's copy, never on the guest's memory.
+                        if start == 0 && n == remaining {
+                            if let Some(nal) = nal {
+                                if let Ok(units) = annexb_access_units(&dst[..n], nal) {
+                                    if !units.is_empty()
+                                        && units.iter().all(|u| !u.has_picture)
+                                        && units.iter().any(|u| u.has_parameter_sets)
+                                    {
+                                        flags |= BUFFER_FLAG_CODEC_CONFIG;
                                     }
                                 }
                             }
-                            Ok((n, flags))
-                        });
+                        }
+                        Ok((n, flags))
+                    });
                     match result {
                         Ok(()) => {
                             self.free_inputs.pop_front();
-                            if let Some(PendingInput::Bitstream { offset, .. }) =
-                                self.pending.front_mut()
-                            {
-                                *offset += copied;
-                            }
-                            if start + copied >= buffer.len {
+                            // The guest buffer was already returned in `decode`; the staged copy
+                            // is dropped once every byte has reached the codec.
+                            let done = match self.pending.front_mut() {
+                                Some(PendingInput::Bitstream { offset, data, .. }) => {
+                                    *offset += copied;
+                                    *offset >= data.len()
+                                }
+                                _ => false,
+                            };
+                            if done {
                                 self.pending.pop_front();
                                 self.inputs += 1;
-                                // The bitstream is in the codec's buffer: the guest's goes back.
-                                self.events
-                                    .push(DecoderEvent::InputBufferDone(buffer.index));
                             }
                         }
                         Err(e) => {
@@ -971,6 +1007,10 @@ impl MediaCodecDecoderSession {
         info: BufferInfo,
         is_last: bool,
     ) {
+        // If a codec reports its format only through the first output buffer rather than a
+        // distinct `onAsyncFormatChanged`, this is where the window (D45) closes: release any
+        // held `OUTPUT` buffers behind the frame. Normally the announcement drained them already.
+        self.release_deferred_input_done();
         self.events.push(DecoderEvent::FrameDecoded {
             index: capture_index,
             bytesused,
@@ -1143,6 +1183,9 @@ impl MediaCodecDecoderSession {
                 ),
             }
         }
+        // The initial `SOURCE_CHANGE` is out: any `OUTPUT` buffers held behind it (D45) can go
+        // back now, after the event in `self.events`.
+        self.release_deferred_input_done();
     }
 
     /// `onAsyncFormatChanged`: the stream's size, from the output format.
@@ -1218,6 +1261,9 @@ impl MediaCodecDecoderSession {
             }
         }
         self.free_inputs.clear();
+        // The guest takes its OUTPUT buffers back itself on the seek (`STREAMOFF(OUTPUT)`); any
+        // still held behind an initial `SOURCE_CHANGE` (D45) are dropped, not reported late.
+        self.deferred_input_done.clear();
         self.eos_queued = false;
         self.eos_seen = false;
         self.parked = false;
@@ -1380,9 +1426,21 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             // codec once the LAST buffer is out (`take_events`).
             self.restart_after_eos()?;
         }
-        self.pending
-            .push_back(PendingInput::Bitstream { buffer, offset: 0 });
+        // Copy the bitstream out of the guest buffer now, so it can be returned as soon as the
+        // copy is made instead of only when the codec has a free input slot -- the codec is fed
+        // from this staged copy in `pump_input` (D28: an `OUTPUT`-only stream of undecodable
+        // bytes, as `v4l2-compliance` feeds, must still drain its buffers). The device lends
+        // `len` readable bytes at `ptr` until `InputBufferDone`, which follows the copy.
+        // SAFETY: the device guarantees `len` readable bytes at `ptr` until we report the
+        // `InputBufferDone` queued just below; nothing else reads or writes that region.
+        let data = unsafe { std::slice::from_raw_parts(buffer.ptr.as_ptr(), buffer.len) }.to_vec();
+        self.pending.push_back(PendingInput::Bitstream {
+            data,
+            offset: 0,
+            timestamp: buffer.timestamp,
+        });
         let before = self.events.len();
+        self.note_input_done(buffer.index);
         self.pump_input();
         if self.events.len() > before {
             self.sink.signal();
@@ -1544,6 +1602,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
 
     fn stop(&mut self) {
         self.pending.clear();
+        self.deferred_input_done.clear();
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
