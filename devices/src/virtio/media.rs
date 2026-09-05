@@ -26,6 +26,7 @@
 //! differs is who hands them the queues and who answers whether the host may touch a guest
 //! address (`guest_buf::HostAccessPolicy`).
 
+pub mod android_camera_backend;
 #[cfg(feature = "video-decoder")]
 pub mod decoder_adapter;
 pub mod guest_buf;
@@ -107,7 +108,7 @@ pub enum MediaDeviceKind {
     /// A memory-to-memory device copying OUTPUT buffers into CAPTURE buffers, for testing the
     /// buffer memory model from the guest.
     Loopback,
-    /// A host camera (not wired yet).
+    /// A host camera, over the Camera2 NDK; helper only (`uid=` required).
     Camera,
     /// A host video decoder (not wired yet).
     Decoder,
@@ -779,6 +780,19 @@ pub fn loopback_config(card: &str) -> VirtioMediaDeviceConfig {
 
     VirtioMediaDeviceConfig {
         device_caps: (Capabilities::VIDEO_M2M_MPLANE | Capabilities::STREAMING).bits(),
+        // VFL_TYPE_VIDEO
+        device_type: 0,
+        card: card_name(card),
+    }
+}
+
+/// The virtio config area of a `camera` device called `card`: a multi-planar capture device
+/// (`VPU_DESIGN.md` §7.1).
+pub fn camera_config(card: &str) -> VirtioMediaDeviceConfig {
+    use virtio_media::v4l2r::ioctl::Capabilities;
+
+    VirtioMediaDeviceConfig {
+        device_caps: (Capabilities::VIDEO_CAPTURE_MPLANE | Capabilities::STREAMING).bits(),
         // VFL_TYPE_VIDEO
         device_type: 0,
         card: card_name(card),
