@@ -101,6 +101,12 @@ pub fn pool_handle_at(mem: &GuestMemory, gpa: u64) -> anyhow::Result<MediaPoolHa
 /// round trip drains it and resyncs instead of poisoning the connection (R8-4).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PoolRequest {
+    /// The first message on a fresh tube, and the only one with no answer: the helper's actual
+    /// V4L2 card string (`droidvm decoder`, `camera 0`, ...), which the VMM's label (the kind
+    /// name, unless `card=` was given) need not match. The server thread adopts it for its log
+    /// lines and its thread name, so the card the guest sees is the card the VMM's pool lines
+    /// name (R8-6).
+    Hello { card: String },
     /// Carve `len` bytes (page-rounded by the VMM) out of the pool for this helper.
     Reserve { id: u64, len: u64 },
     /// Give the reservation at `offset` back. An offset this helper does not own is logged by
@@ -515,14 +521,14 @@ impl MediaPool {
         tube: Tube,
     ) -> anyhow::Result<std::thread::JoinHandle<()>> {
         let mut lease = self.lease(card.to_string());
-        let name = card.to_string();
+        let mut name = card.to_string();
         if let Err(e) = tube.set_send_timeout(Some(POOL_RPC_TIMEOUT)) {
             error!("virtio-media: cannot bound the pool server's send: {e}");
         }
         std::thread::Builder::new()
             .name(format!("media pool {card}"))
             .spawn(move || {
-                serve_pool(&tube, &mut lease, &name);
+                serve_pool(&tube, &mut lease, &mut name);
                 // `lease` drops here -- and `serve_pool` returns only on EOF, so the helper
                 // process is gone and whatever it still held goes back to the pool.
             })
@@ -539,7 +545,9 @@ const POOL_SERVER_MAX_CONSECUTIVE_ERRORS: u32 = 8;
 ///
 /// Returns only when the tube has reached EOF, because returning is the sweep (the caller drops
 /// the lease) and only EOF proves the helper cannot write into its buffers any more (R8-1).
-fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
+/// `card` starts as the VMM's label and is replaced by the helper's own card string when its
+/// [`PoolRequest::Hello`] arrives (R8-6).
+fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &mut String) {
     let mut errors_in_a_row = 0u32;
     loop {
         let request: PoolRequest = match tube.recv() {
@@ -578,6 +586,22 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
             }
         };
         let response = match request {
+            PoolRequest::Hello { card: helper_card } => {
+                // The helper introduces itself with the card string its guest actually sees
+                // ('droidvm decoder', 'camera 0', ...), which the VMM's own label -- the kind,
+                // unless card= was given -- need not match. Adopt it, so the exhaustion and
+                // release lines, and this thread's name, grep against the guest's card (R8-6).
+                // The launch line keeps the VMM's kind + card for the mapping.
+                info!(
+                    "virtio-media: the pool connection for \"{card}\" serves the device \
+                     \"{helper_card}\""
+                );
+                *card = helper_card;
+                lease.card = card.clone();
+                // Best effort; comm clips at 15 bytes either way.
+                let _ = base::set_thread_name(&format!("media pool {card}"));
+                continue;
+            }
             PoolRequest::Reserve { id, len } => match lease.reserve(len) {
                 Ok(offset) => PoolResponse::Reserved { id, offset },
                 Err(errno) => PoolResponse::Errno { id, errno },
@@ -729,9 +753,10 @@ struct PoolConnection {
 
 impl RemotePool {
     /// Wrap the helper's `--pool-fd` tube and map the pool this process found at `pool_gpa`
-    /// ([`pool_handle_at`]). Bounds every send and recv on the tube by [`POOL_RPC_TIMEOUT`].
-    pub fn new(tube: Tube, pool: MediaPoolHandle) -> anyhow::Result<Arc<Self>> {
-        Self::with_timeout(tube, pool, POOL_RPC_TIMEOUT)
+    /// ([`pool_handle_at`]). Bounds every send and recv on the tube by [`POOL_RPC_TIMEOUT`],
+    /// and introduces the device by its actual card string ([`PoolRequest::Hello`], R8-6).
+    pub fn new(tube: Tube, pool: MediaPoolHandle, card: String) -> anyhow::Result<Arc<Self>> {
+        Self::with_timeout(tube, pool, card, POOL_RPC_TIMEOUT)
     }
 
     /// [`RemotePool::new`] with the timeout injectable, for tests that want a dead VMM to be
@@ -739,6 +764,7 @@ impl RemotePool {
     pub fn with_timeout(
         tube: Tube,
         pool: MediaPoolHandle,
+        card: String,
         timeout: Duration,
     ) -> anyhow::Result<Arc<Self>> {
         tube.set_recv_timeout(Some(timeout))
@@ -747,6 +773,11 @@ impl RemotePool {
             .context("cannot bound the pool tube's send")?;
         let (gpa, size) = (pool.gpa, pool.size);
         let mapped = MappedPool::new(pool)?;
+        // Fire and forget, best effort: the one message with no answer. A failure here is a
+        // broken tube that every later request will report for itself.
+        if let Err(e) = tube.send(&PoolRequest::Hello { card }) {
+            error!("virtio-media: cannot introduce this device to the VMM's pool server: {e}");
+        }
         info!(
             "virtio-media: serving MMAP buffers from the media_host pool (gpa {:#x}, {} MiB), \
              allocated by the VMM",
@@ -1176,7 +1207,9 @@ mod tests {
 
     /// A remote client over `fd`'s pool, its RPC bound shortened for the tests.
     fn remote_client(fd: &SafeDescriptor, tube: Tube, card: &str) -> RemotePoolAllocator {
-        let pool = RemotePool::with_timeout(tube, handle_over(fd), TEST_RPC_TIMEOUT).unwrap();
+        let pool =
+            RemotePool::with_timeout(tube, handle_over(fd), card.to_string(), TEST_RPC_TIMEOUT)
+                .unwrap();
         RemotePoolAllocator::new(pool, card.to_string())
     }
 
@@ -1314,8 +1347,14 @@ mod tests {
         // Nobody is serving yet: the first request waits out its bound and fails.
         assert_eq!(client.allocate(page).err(), Some(libc::EIO));
 
-        // The wedged VMM catches up: it reads the request it was sitting on and answers it --
-        // an answer nobody is waiting for any more -- and only then starts serving properly.
+        // The wedged VMM catches up: it reads what it was sitting on -- the client's Hello (the
+        // first message on every fresh tube, R8-6), then the timed-out Reserve -- and answers
+        // the Reserve nobody is waiting for any more, before starting to serve properly.
+        let hello: PoolRequest = vmm.recv().unwrap();
+        assert!(
+            matches!(&hello, PoolRequest::Hello { card } if card == "decoder"),
+            "the first message on a fresh tube is Hello: {hello:?}"
+        );
         let late: PoolRequest = vmm.recv().unwrap();
         let PoolRequest::Reserve { id, .. } = late else {
             panic!("expected the timed-out Reserve, got {late:?}");
@@ -1344,7 +1383,9 @@ mod tests {
         let pool = MediaPool::new(handle_over(&shm)).unwrap();
         let (vmm, helper) = Tube::pair().unwrap();
         let server = pool.spawn_server("decoder", vmm).unwrap();
-        let remote = RemotePool::with_timeout(helper, handle_over(&shm), TEST_RPC_TIMEOUT).unwrap();
+        let remote =
+            RemotePool::with_timeout(helper, handle_over(&shm), "decoder".to_string(), TEST_RPC_TIMEOUT)
+                .unwrap();
         let mut client = RemotePoolAllocator::new(Arc::clone(&remote), "decoder".to_string());
 
         // Four buffers outstanding -- still mmap'ed by the guest, say -- when the device resets.
@@ -1402,7 +1443,9 @@ mod tests {
             gpa: 0x1_0000_0000,
             size: 2 * page,
         };
-        let remote = RemotePool::with_timeout(helper, small, TEST_RPC_TIMEOUT).unwrap();
+        let remote =
+            RemotePool::with_timeout(helper, small, "decoder".to_string(), TEST_RPC_TIMEOUT)
+                .unwrap();
         let mut client = RemotePoolAllocator::new(remote, "decoder".to_string());
 
         let first = client.allocate(page).unwrap();

@@ -212,8 +212,10 @@ where
                 .pool_tube
                 .take()
                 .context("the --pool-fd tube is gone but the pool was never set up")?;
-            self.pool =
-                Some(RemotePool::new(tube, handle).context("cannot set up the media_host pool")?);
+            self.pool = Some(
+                RemotePool::new(tube, handle, card_str(&self.config.card))
+                    .context("cannot set up the media_host pool")?,
+            );
         }
         let pool = self.pool.as_ref().expect("pool was just set");
 
