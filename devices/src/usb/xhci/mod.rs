@@ -32,6 +32,8 @@ use std::thread;
 use base::debug;
 use base::error;
 use remain::sorted;
+use std::time::Instant;
+
 use sync::Mutex;
 use thiserror::Error;
 use vm_memory::GuestAddress;
@@ -101,6 +103,8 @@ pub struct Xhci {
     device_slots: DeviceSlots,
     event_loop: Arc<EventLoop>,
     event_loop_join_handle: Option<thread::JoinHandle<()>>,
+    /// When the microframe counter last started from zero (controller reset).
+    mfindex_anchor: Arc<Mutex<Instant>>,
     // resample handler and device provider only lives on EventLoop to handle corresponding events.
     // By design, event loop only hold weak reference. We need to keep a strong reference here to
     // keep it alive.
@@ -175,12 +179,19 @@ impl Xhci {
             device_provider,
             event_loop,
             event_loop_join_handle: Some(join_handle),
+            mfindex_anchor: Arc::new(Mutex::new(Instant::now())),
         });
         Self::init_reg_callbacks(&xhci);
         Ok(xhci)
     }
 
     fn init_reg_callbacks(xhci: &Arc<Xhci>) {
+        // MFINDEX ticks every 125 us from the last controller reset and wraps at 14 bits
+        // (spec 5.5.1).
+        let anchor = xhci.mfindex_anchor.clone();
+        xhci.regs
+            .mfindex
+            .set_read_cb(move || ((anchor.lock().elapsed().as_micros() / 125) & 0x3FFF) as u32);
         // All the callbacks will hold a weak reference to avoid memory leak. Thos weak upgrade
         // should never fail.
         let xhci_weak = Arc::downgrade(xhci);
@@ -271,6 +282,7 @@ impl Xhci {
 
     // Callback for usbcmd register write.
     fn usbcmd_callback(&self, value: u32) -> Result<u32> {
+        debug!("xhci_controller: usbcmd write {:#x}", value);
         if (value & USB_CMD_RESET) > 0 {
             debug!("xhci_controller: reset controller");
             self.reset();
@@ -434,6 +446,7 @@ impl Xhci {
     }
 
     fn reset(&self) {
+        *self.mfindex_anchor.lock() = Instant::now();
         self.regs.usbsts.set_bits(USB_STS_CONTROLLER_NOT_READY);
         let usbsts = self.regs.usbsts.clone();
         self.device_slots.stop_all_and_reset(move || {

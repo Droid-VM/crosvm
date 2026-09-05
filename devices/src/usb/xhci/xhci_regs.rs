@@ -175,6 +175,7 @@ pub struct XhciRegs {
     pub erstsz: Register<u32>,
     pub erstba: Register<u64>,
     pub erdp: Register<u64>,
+    pub mfindex: Register<u32>,
 }
 
 /// This function returns mmio space definition for xhci. See Xhci spec chapter 5
@@ -399,14 +400,18 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
 
     /* Runtime Registers */
 
-    mmio.add_register(
-        // mfindex
-        static_register!(
+    // MFINDEX: the microframe counter (spec 5.5.1), 14 bits, one tick per 125 us while the
+    // controller runs. Read-only; the controller supplies its value from a clock through a read
+    // callback. Guests schedule isochronous work against it: a counter that never moves lets
+    // Windows' USBXHCI queue about 1024 frames of audio and then wait forever for time to pass.
+    let mfindex = register!(
+        name: "mfindex",
         ty: u32,
         offset: 0x3000,
-        value: 0, // 4 ports starting at port 5
-        ),
-    );
+        reset_value: 0,
+        guest_writeable_mask: 0,
+        guest_write_1_to_clear_mask: 0,);
+    mmio.add_register(mfindex.clone());
 
     /* Reg Array for interrupters */
     // Although the following should be register arrays, we only have one interrupter.
@@ -471,6 +476,7 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
         erstsz,
         erstba,
         erdp,
+        mfindex,
     };
 
     /* End of Host Controller Operational Registers */
