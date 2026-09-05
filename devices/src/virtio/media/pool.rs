@@ -28,6 +28,7 @@
 //! the tube, and the lease's drop sweeps everything it still held back into the pool.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
@@ -104,6 +105,11 @@ pub enum PoolRequest {
     /// Give the reservation at `offset` back. An offset this helper does not own is logged by
     /// the VMM and ignored -- the space stays allocated to whoever owns it.
     Release { offset: u64 },
+    /// Give back every reservation this helper's lease still holds -- `Release` for the lot.
+    /// Sent by the backend when its device is torn down (a virtio reset), belt and braces under
+    /// the allocator's own per-offset `Release`s (R8-3); the lease itself stays alive and
+    /// serving.
+    ReleaseAll,
 }
 
 /// The VMM's answer to one [`PoolRequest`].
@@ -563,6 +569,14 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
                 // helper gets its ack either way, because there is nothing it could do
                 // differently and the reservation books are already right.
                 let _ = lease.unreserve(offset);
+                log_pool_usage(lease, card);
+                PoolResponse::Released
+            }
+            PoolRequest::ReleaseAll => {
+                // `release_owner` without dropping the lease: everything this helper holds goes
+                // back (the reclaim line says how much), and the connection keeps serving.
+                let _ = lease.release_all();
+                log_pool_usage(lease, card);
                 PoolResponse::Released
             }
         };
@@ -577,6 +591,15 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &str) {
             return;
         }
     }
+}
+
+/// One line per release, so a log reader can watch the books move without a debugger: how much
+/// this device still holds, and how full the whole pool is (B12 acceptance item c reads it to
+/// see a guest's REQBUFS(0) land in the VMM's accounting). Cheap -- releases happen per
+/// REQBUFS/close, not per frame -- so it is `info!`.
+fn log_pool_usage(lease: &PoolBufferAllocator, card: &str) {
+    let (held, used, size) = lease.usage();
+    info!("virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size}");
 }
 
 /// Block on the tube until it reaches EOF, discarding everything else. The connection is being
@@ -619,6 +642,26 @@ impl PoolBufferAllocator {
     pub(crate) fn unreserve(&mut self, offset: u64) -> Result<(), i32> {
         let owner = self.owner;
         self.pool.lock().unreserve(offset, owner)
+    }
+
+    /// Give back everything this lease still holds -- `release_owner` without dropping the
+    /// lease. What [`PoolRequest::ReleaseAll`] runs; returns how many reservations came back.
+    pub(crate) fn release_all(&mut self) -> usize {
+        let owner = self.owner;
+        self.pool.lock().release_owner(owner)
+    }
+
+    /// `(bytes this lease holds, bytes the pool has handed out, pool size)`, one lock, for the
+    /// per-release accounting line.
+    pub(crate) fn usage(&self) -> (u64, u64, u64) {
+        let pool = self.pool.lock();
+        let held = pool
+            .live
+            .values()
+            .filter(|(o, _)| *o == self.owner)
+            .map(|(_, size)| *size)
+            .sum();
+        (held, pool.used, pool.mapped.size())
     }
 }
 
@@ -725,24 +768,53 @@ impl RemotePool {
         self.dead.store(true, Ordering::Release);
         libc::EIO
     }
+
+    /// Ask the VMM to release everything this helper's lease still holds. The backend sends it
+    /// when its device is torn down (`MediaBackend::stop`): the allocator's own `Drop` has just
+    /// returned every offset it tracked, and this sweeps up anything that slipped past it -- a
+    /// buffer retired inside the device crate, say -- so a guest that resets its media device in
+    /// a loop cannot drain the VM-wide pool (R8-3). The lease stays alive and serving.
+    pub fn release_all(&self) {
+        match self.request(&PoolRequest::ReleaseAll) {
+            Ok(PoolResponse::Released) => {}
+            Ok(other) => {
+                let _ = self.out_of_step(&other);
+            }
+            Err(_) => {
+                error!(
+                    "virtio-media: could not ask the VMM to release this device's pool \
+                     reservations"
+                );
+            }
+        }
+    }
 }
 
 /// A helper device's buffer allocator: every offset comes from the VMM's one allocator, over the
 /// tube; the buffers are built locally from the helper's own whole-pool mapping.
 ///
-/// Dropping it releases nothing (the buffers' offsets live in the VMM's books until they are
-/// released one by one, or until this process's tube closes and the VMM's server sweeps the
-/// lot) -- the same contract `HostBuffer` itself has.
+/// It remembers the offsets it handed out, and its `Drop` returns every one still outstanding:
+/// a virtio reset drops the device -- and this allocator with it -- while the guest may still
+/// have buffers mapped that were never `release`d, and without the give-back a reset loop
+/// drains the VM-wide pool for the life of the process (R8-3; the VMM's own EOF sweep only runs
+/// when the process exits).
 pub struct RemotePoolAllocator {
     pool: Arc<RemotePool>,
     /// The device's V4L2 card name, for this side's error lines (the exhaustion log is the
     /// VMM's, where the allocator is).
     card: String,
+    /// Every offset reserved through this allocator and not yet released -- what `Drop` gives
+    /// back.
+    outstanding: BTreeSet<u64>,
 }
 
 impl RemotePoolAllocator {
     pub fn new(pool: Arc<RemotePool>, card: String) -> Self {
-        RemotePoolAllocator { pool, card }
+        RemotePoolAllocator {
+            pool,
+            card,
+            outstanding: BTreeSet::new(),
+        }
     }
 
     /// Return one reserved offset to the VMM. Logs and carries on whatever comes back: the
@@ -769,7 +841,10 @@ impl VirtioMediaBufferAllocator for RemotePoolAllocator {
         match self.pool.request(&PoolRequest::Reserve { len })? {
             PoolResponse::Reserved { offset } => {
                 match self.pool.mapped.buffer_at(offset, len) {
-                    Ok(buffer) => Ok(buffer),
+                    Ok(buffer) => {
+                        self.outstanding.insert(offset);
+                        Ok(buffer)
+                    }
                     Err(errno) => {
                         // The VMM already booked the reservation, and this side is the only one
                         // that knows the buffer over it was never built: give the offset back,
@@ -793,8 +868,45 @@ impl VirtioMediaBufferAllocator for RemotePoolAllocator {
             );
             return;
         };
+        self.outstanding.remove(&offset);
         self.give_back(offset);
         drop(buf);
+    }
+}
+
+impl Drop for RemotePoolAllocator {
+    fn drop(&mut self) {
+        // A device reset drops this allocator while the guest may still hold mapped buffers
+        // that were never released; their offsets would sit in the VMM's books until the
+        // process exits (R8-3). One bounded round trip per outstanding offset, and the first
+        // failure stops the walk -- the connection is broken or the VMM is gone, and either
+        // way the EOF sweep will settle the books when this process exits.
+        let outstanding = std::mem::take(&mut self.outstanding);
+        if outstanding.is_empty() {
+            return;
+        }
+        info!(
+            "virtio-media: \"{}\" returns {} outstanding pool reservations with the device",
+            self.card,
+            outstanding.len()
+        );
+        for offset in outstanding {
+            match self.pool.request(&PoolRequest::Release { offset }) {
+                Ok(PoolResponse::Released) => {}
+                Ok(other) => {
+                    let _ = self.pool.out_of_step(&other);
+                    break;
+                }
+                Err(_) => {
+                    error!(
+                        "virtio-media: \"{}\" could not return pool offset {:#x} to the VMM \
+                         with the device",
+                        self.card, offset
+                    );
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -1080,8 +1192,11 @@ mod tests {
         assert_eq!(used(&pool), POOL_SIZE, "a foreign release frees nothing");
 
         // The encoder helper dies with its buffer outstanding: EOF on its tube is the server
-        // thread's exit, and the lease it drops sweeps the reservation back.
+        // thread's exit, and the lease it drops sweeps the reservation back. The connection is
+        // poisoned first so the allocator's Drop returns nothing (a SIGKILL'd helper runs no
+        // Drop either) -- what comes back comes back through the EOF sweep alone.
         drop(whole);
+        encoder.pool.dead.store(true, Ordering::Release);
         drop(encoder);
         encoder_server.join().unwrap();
         assert_eq!(
@@ -1134,6 +1249,55 @@ mod tests {
             .buffer_at(0, page)
             .unwrap();
         client.release(orphan);
+    }
+
+    /// A helper-side device teardown -- a virtio reset -- returns its space while the process
+    /// lives on: the allocator's `Drop` releases every offset still outstanding, and the
+    /// backend's `ReleaseAll` sweeps up anything that slipped past it, both with the lease kept
+    /// alive and serving (R8-3; pre-M8 the helper's own local lease swept exactly this way).
+    #[test]
+    fn dropping_the_allocator_returns_its_outstanding_offsets() {
+        let page = pagesize() as u64;
+        let shm = SafeDescriptor::from(SharedMemory::new("media_pool_test", POOL_SIZE).unwrap());
+        let pool = MediaPool::new(handle_over(&shm)).unwrap();
+        let (vmm, helper) = Tube::pair().unwrap();
+        let server = pool.spawn_server("decoder", vmm).unwrap();
+        let remote = RemotePool::with_timeout(helper, handle_over(&shm), TEST_RPC_TIMEOUT).unwrap();
+        let mut client = RemotePoolAllocator::new(Arc::clone(&remote), "decoder".to_string());
+
+        // Four buffers outstanding -- still mmap'ed by the guest, say -- when the device resets.
+        // Dropping a HostBuffer frees nothing in the pool, by design.
+        let buffers: Vec<HostBuffer> = (0..4).map(|_| client.allocate(page).unwrap()).collect();
+        drop(buffers);
+        assert_eq!(used(&pool), 4 * page);
+
+        // The reset drops the allocator; its Drop must return all four offsets while the
+        // process -- the tube, the lease -- stays alive.
+        drop(client);
+        assert_eq!(used(&pool), 0, "Drop returned every outstanding offset");
+        assert_eq!(live(&pool), 0);
+
+        // The lease is alive and serving: the next device over the same connection can have
+        // the whole pool.
+        let mut next = RemotePoolAllocator::new(Arc::clone(&remote), "decoder".to_string());
+        let whole = next.allocate(POOL_SIZE).unwrap();
+        next.release(whole);
+
+        // ReleaseAll -- the backend's belt-and-braces on stop -- also returns everything, with
+        // the lease still alive.
+        let a = next.allocate(page).unwrap();
+        let b = next.allocate(page).unwrap();
+        drop((a, b));
+        assert_eq!(used(&pool), 2 * page);
+        remote.release_all();
+        assert_eq!(used(&pool), 0, "ReleaseAll returned everything, lease intact");
+        let again = next.allocate(page).unwrap();
+        next.release(again);
+
+        drop(next);
+        drop(remote);
+        server.join().unwrap();
+        assert_eq!(used(&pool), 0);
     }
 
     /// A reservation whose buffer cannot be built is given straight back to the VMM: without

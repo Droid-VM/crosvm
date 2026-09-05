@@ -261,6 +261,14 @@ where
             };
             self.queues[0] = Some(cmd_queue);
             self.queues[1] = Some(event_queue);
+            // The device -- and its allocator, whose Drop just returned every offset it was
+            // tracking -- is gone; ask the VMM to release anything that slipped past it (a
+            // buffer retired inside the device crate, say), so a guest that resets this device
+            // in a loop cannot drain the VM-wide pool (R8-3). The lease and the connection
+            // stay up for the next start.
+            if let Some(pool) = &self.pool {
+                pool.release_all();
+            }
         }
     }
 }
