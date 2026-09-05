@@ -744,12 +744,42 @@ impl RemotePoolAllocator {
     pub fn new(pool: Arc<RemotePool>, card: String) -> Self {
         RemotePoolAllocator { pool, card }
     }
+
+    /// Return one reserved offset to the VMM. Logs and carries on whatever comes back: the
+    /// guest's STREAMOFF/REQBUFS(0) must not fail over a bookkeeping line, and if the VMM is
+    /// really gone this process is about to be swept whole anyway.
+    fn give_back(&mut self, offset: u64) {
+        match self.pool.request(&PoolRequest::Release { offset }) {
+            Ok(PoolResponse::Released) => {}
+            Ok(other) => {
+                let _ = self.pool.out_of_step(&other);
+            }
+            Err(_) => {
+                error!(
+                    "virtio-media: \"{}\" could not return pool offset {:#x} to the VMM",
+                    self.card, offset
+                );
+            }
+        }
+    }
 }
 
 impl VirtioMediaBufferAllocator for RemotePoolAllocator {
     fn allocate(&mut self, len: u64) -> Result<HostBuffer, i32> {
         match self.pool.request(&PoolRequest::Reserve { len })? {
-            PoolResponse::Reserved { offset } => self.pool.mapped.buffer_at(offset, len),
+            PoolResponse::Reserved { offset } => {
+                match self.pool.mapped.buffer_at(offset, len) {
+                    Ok(buffer) => Ok(buffer),
+                    Err(errno) => {
+                        // The VMM already booked the reservation, and this side is the only one
+                        // that knows the buffer over it was never built: give the offset back,
+                        // exactly as the in-VMM twin unreserves (R8-2) -- otherwise a helper
+                        // that cannot dup another fd leaks pool space on every retried REQBUFS.
+                        self.give_back(offset);
+                        Err(errno)
+                    }
+                }
+            }
             PoolResponse::Errno(errno) => Err(errno),
             other => Err(self.pool.out_of_step(&other)),
         }
@@ -763,21 +793,7 @@ impl VirtioMediaBufferAllocator for RemotePoolAllocator {
             );
             return;
         };
-        // Log and carry on whatever comes back: the guest's STREAMOFF/REQBUFS(0) must not fail
-        // over a bookkeeping line, and if the VMM is really gone this process is about to be
-        // swept whole anyway.
-        match self.pool.request(&PoolRequest::Release { offset }) {
-            Ok(PoolResponse::Released) => {}
-            Ok(other) => {
-                let _ = self.pool.out_of_step(&other);
-            }
-            Err(_) => {
-                error!(
-                    "virtio-media: \"{}\" could not return pool offset {:#x} to the VMM",
-                    self.card, offset
-                );
-            }
-        }
+        self.give_back(offset);
         drop(buf);
     }
 }
@@ -1118,6 +1134,49 @@ mod tests {
             .buffer_at(0, page)
             .unwrap();
         client.release(orphan);
+    }
+
+    /// A reservation whose buffer cannot be built is given straight back to the VMM: without
+    /// that, every failed `buffer_at` (an `EMFILE` on the per-buffer dup, say) leaks its
+    /// page-rounded reservation for the life of the helper, and retried REQBUFS drain the whole
+    /// VM's pool (R8-2). Injected here by a client whose own mapping is smaller than the pool,
+    /// so the third offset the VMM hands out is one its `buffer_at` must refuse.
+    #[test]
+    fn a_buffer_that_cannot_be_built_returns_its_reservation() {
+        let page = pagesize() as u64;
+        let shm = SafeDescriptor::from(SharedMemory::new("media_pool_test", POOL_SIZE).unwrap());
+        let pool = MediaPool::new(handle_over(&shm)).unwrap();
+        let (vmm, helper) = Tube::pair().unwrap();
+        let server = pool.spawn_server("decoder", vmm).unwrap();
+
+        let small = MediaPoolHandle {
+            fd: shm.try_clone().unwrap(),
+            fd_offset: 0,
+            host_va: 0,
+            gpa: 0x1_0000_0000,
+            size: 2 * page,
+        };
+        let remote = RemotePool::with_timeout(helper, small, TEST_RPC_TIMEOUT).unwrap();
+        let mut client = RemotePoolAllocator::new(remote, "decoder".to_string());
+
+        let first = client.allocate(page).unwrap();
+        let second = client.allocate(page).unwrap();
+        assert_eq!(used(&pool), 2 * page);
+
+        // The VMM reserves the third page; `buffer_at` fails past the small mapping; the failed
+        // allocate must return the reservation rather than strand it.
+        assert_eq!(client.allocate(page).err(), Some(libc::EIO));
+        assert_eq!(
+            used(&pool),
+            2 * page,
+            "the reservation behind the failed buffer build was given back"
+        );
+
+        client.release(first);
+        client.release(second);
+        assert_eq!(used(&pool), 0);
+        drop(client);
+        server.join().unwrap();
     }
 
     /// A tube error that is not EOF must not sweep the lease: the helper on the far end is
