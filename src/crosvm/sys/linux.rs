@@ -1166,6 +1166,7 @@ fn create_virtio_devices(
             card: None,
             camera_id: None,
             role: None,
+            allow_sw: false,
             uid: None,
             gid: None,
         });
