@@ -818,6 +818,19 @@ pub enum ControlMode {
     UseExtendedSceneMode = 4,
 }
 
+impl ControlMode {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Off,
+            1 => Self::Auto,
+            2 => Self::UseSceneMode,
+            3 => Self::OffKeepState,
+            4 => Self::UseExtendedSceneMode,
+            _ => return None,
+        })
+    }
+}
+
 /// `ACAMERA_CONTROL_SCENE_MODE_*` (`NdkCameraMetadataTags.h:9267-9417`; 17 is unassigned).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SceneMode {
@@ -1664,6 +1677,31 @@ impl CaptureResult<'_> {
     /// `SENSOR_SENSITIVITY` as applied.
     pub fn sensitivity(&self) -> Option<i32> {
         self.i32(TAG_SENSOR_SENSITIVITY)
+    }
+
+    /// `CONTROL_AWB_MODE` as applied. These four are request keys the camera device echoes in
+    /// its result -- "the values used for this capture" -- so reading them back is how a caller
+    /// tells a request entry the HAL *took* from one it silently dropped, which is the only way
+    /// to settle D36 (`AUTO_N_PRESET_WHITE_BALANCE`, `COLORFX` and `SCENE_MODE` set and read
+    /// back through V4L2 without changing a pixel).
+    pub fn awb_mode(&self) -> Option<AwbMode> {
+        AwbMode::from_u8(self.u8(TAG_CONTROL_AWB_MODE)?)
+    }
+
+    /// `CONTROL_EFFECT_MODE` as applied.
+    pub fn effect_mode(&self) -> Option<EffectMode> {
+        EffectMode::from_u8(self.u8(TAG_CONTROL_EFFECT_MODE)?)
+    }
+
+    /// `CONTROL_SCENE_MODE` as applied. It has no effect unless [`Self::control_mode`] is
+    /// `UseSceneMode`, so both are worth reading together.
+    pub fn scene_mode(&self) -> Option<SceneMode> {
+        SceneMode::from_u8(self.u8(TAG_CONTROL_SCENE_MODE)?)
+    }
+
+    /// `CONTROL_MODE` as applied.
+    pub fn control_mode(&self) -> Option<ControlMode> {
+        ControlMode::from_u8(self.u8(TAG_CONTROL_MODE)?)
     }
 }
 

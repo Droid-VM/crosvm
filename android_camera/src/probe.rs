@@ -15,7 +15,8 @@
 //! camera_probe controls --id 0 [--uid N]
 //! camera_probe capture --id 0 --size 1280x720 --frames 90 [--uid N] [--zoom R]
 //!                      [--flash off|single|torch] [--af off|auto|continuous-video|continuous-picture]
-//!                      [--fps MIN:MAX] [--exposure NS --iso N] [--af-trigger] [--dump PATH]
+//!                      [--fps MIN:MAX] [--exposure NS --iso N] [--af-trigger] [--watch]
+//!                      [--dump PATH]
 //! ```
 //!
 //! `controls` prints the ranges and menus the V4L2 camera device builds its controls from
@@ -23,6 +24,12 @@
 //! capture-result callbacks saw -- every autofocus and auto-exposure state transition, the lens
 //! in use -- which is the pipeline the device's `V4L2_EVENT_CTRL` comes from; `--af-trigger`
 //! fires one AF scan a second in, `--exposure`/`--iso` take the exposure manual.
+//!
+//! `--watch` asks for each of `CONTROL_AWB_MODE`, `CONTROL_EFFECT_MODE` and
+//! `CONTROL_SCENE_MODE` in turn and prints what the capture result says the camera *used*. That
+//! is the D36 decider: those three set and read back through V4L2 without moving a pixel on
+//! 5566, and only the result says whether the camera took the request entry and rendered
+//! nothing (the HAL's business) or never saw it at all (ours).
 //!
 //! `--uid` drops to that uid before touching the camera, the way `snd_helper` does for AAudio:
 //! `cameraserver` resolves the client package from the real uid, and uid 0 resolves to none.
@@ -69,6 +76,8 @@ struct Args {
     exposure_ns: Option<i64>,
     iso: Option<i32>,
     af_trigger: bool,
+    /// Report what the capture result says of the three modes of D36.
+    watch: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -89,6 +98,7 @@ fn parse_args() -> Result<Args, String> {
         exposure_ns: None,
         iso: None,
         af_trigger: false,
+        watch: false,
     };
     while let Some(flag) = argv.next() {
         let mut value = || {
@@ -140,6 +150,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--iso" => args.iso = Some(value()?.parse().map_err(|e| format!("--iso: {}", e))?),
             "--af-trigger" => args.af_trigger = true,
+            "--watch" => args.watch = true,
             other => return Err(format!("unknown flag {:?}", other)),
         }
     }
@@ -525,6 +536,14 @@ struct Transitions {
     ae: Option<android_camera::AeState>,
     lens: Option<String>,
     log: Vec<String>,
+    /// The three modes of D36 as the *result* carries them -- the values the camera says it
+    /// used -- kept at their latest rather than only on change, so `--watch` can read them back
+    /// after a set. `CONTROL_MODE` comes with the scene: a scene applies only under
+    /// `USE_SCENE_MODE`.
+    awb: Option<AwbMode>,
+    effect: Option<EffectMode>,
+    scene: Option<SceneMode>,
+    control_mode: Option<android_camera::ControlMode>,
 }
 
 fn result_listener(seen: Arc<Mutex<Transitions>>) -> ResultListener {
@@ -558,7 +577,158 @@ fn result_listener(seen: Arc<Mutex<Transitions>>) -> ResultListener {
                 seen.lens = Some(lens);
             }
         }
+        // What the camera says it used for the three modes of D36. Logged on change, kept at
+        // their latest for `--watch`.
+        let (awb, effect) = (result.awb_mode(), result.effect_mode());
+        let (scene, control_mode) = (result.scene_mode(), result.control_mode());
+        if awb.is_some() && seen.awb != awb {
+            seen.log.push(format!("result {}: AWB_MODE {:?}", n, awb));
+        }
+        if effect.is_some() && seen.effect != effect {
+            seen.log
+                .push(format!("result {}: EFFECT_MODE {:?}", n, effect));
+        }
+        if (scene.is_some() || control_mode.is_some())
+            && (seen.scene != scene || seen.control_mode != control_mode)
+        {
+            seen.log.push(format!(
+                "result {}: SCENE_MODE {:?} under CONTROL_MODE {:?}",
+                n, scene, control_mode
+            ));
+        }
+        if awb.is_some() {
+            seen.awb = awb;
+        }
+        if effect.is_some() {
+            seen.effect = effect;
+        }
+        if scene.is_some() {
+            seen.scene = scene;
+        }
+        if control_mode.is_some() {
+            seen.control_mode = control_mode;
+        }
     })
+}
+
+/// The D36 decider: ask for each of the three modes a guest can set and this camera may ignore,
+/// let the request pipeline drain, and print what the capture result says the camera used.
+///
+/// `echoed` means the camera took the request entry, so a picture that does not change is the
+/// HAL's rendering and the honest answer is to document it; `dropped` means the entry never
+/// reached the camera, which would be a defect on our side of the NDK.
+fn watch_modes(
+    camera: &mut Camera,
+    seen: &Arc<Mutex<Transitions>>,
+    info: &android_camera::CameraInfo,
+) -> Result<(), String> {
+    // Two values of each, the first ones the camera offers that are not its neutral setting.
+    let awbs: Vec<AwbMode> = info
+        .awb_modes
+        .iter()
+        .filter_map(|&v| AwbMode::from_u8(v))
+        .filter(|m| !matches!(m, AwbMode::Auto | AwbMode::Off))
+        .take(2)
+        .collect();
+    let effects: Vec<EffectMode> = info
+        .effects
+        .iter()
+        .filter_map(|&v| EffectMode::from_u8(v))
+        .filter(|m| !matches!(m, EffectMode::Off))
+        .take(2)
+        .collect();
+    let scenes: Vec<SceneMode> = info
+        .scene_modes
+        .iter()
+        .filter_map(|&v| SceneMode::from_u8(v))
+        .filter(|m| !matches!(m, SceneMode::Disabled))
+        .take(2)
+        .collect();
+
+    println!();
+    println!("D36 echo test: what the capture result says the camera used");
+    for mode in &awbs {
+        let update = RequestUpdate::new().awb_mode(*mode);
+        camera.apply(&update).map_err(|e| e.to_string())?;
+        let got = drain(camera, seen)?.0;
+        println!(
+            "  CONTROL_AWB_MODE     requested {:<16?} result {:<16?} {}",
+            mode,
+            got,
+            verdict(got == Some(*mode))
+        );
+    }
+    for mode in &effects {
+        let update = RequestUpdate::new().effect_mode(*mode);
+        camera.apply(&update).map_err(|e| e.to_string())?;
+        let got = drain(camera, seen)?.1;
+        println!(
+            "  CONTROL_EFFECT_MODE  requested {:<16?} result {:<16?} {}",
+            mode,
+            got,
+            verdict(got == Some(*mode))
+        );
+    }
+    for mode in &scenes {
+        // A scene has no effect at all unless the control mode says to use it.
+        let update = RequestUpdate::new()
+            .control_mode(android_camera::ControlMode::UseSceneMode)
+            .scene_mode(*mode);
+        camera.apply(&update).map_err(|e| e.to_string())?;
+        let (_, _, got, control_mode) = drain(camera, seen)?;
+        println!(
+            "  CONTROL_SCENE_MODE   requested {:<16?} result {:<16?} {}  (CONTROL_MODE {:?})",
+            mode,
+            got,
+            verdict(got == Some(*mode)),
+            control_mode
+        );
+    }
+    // Back to the neutral settings, so the rest of the run is not measured under a scene.
+    let restore = RequestUpdate::new()
+        .awb_mode(AwbMode::Auto)
+        .effect_mode(EffectMode::Off)
+        .control_mode(android_camera::ControlMode::Auto)
+        .scene_mode(SceneMode::Disabled);
+    camera.apply(&restore).map_err(|e| e.to_string())?;
+    drain(camera, seen)?;
+    Ok(())
+}
+
+fn verdict(echoed: bool) -> &'static str {
+    if echoed {
+        "ECHOED"
+    } else {
+        "DROPPED"
+    }
+}
+
+/// Consume frames until the request pipeline has certainly turned over -- twelve, four times its
+/// depth -- and answer with the three modes the last result carried.
+#[allow(clippy::type_complexity)]
+fn drain(
+    camera: &mut Camera,
+    seen: &Arc<Mutex<Transitions>>,
+) -> Result<
+    (
+        Option<AwbMode>,
+        Option<EffectMode>,
+        Option<SceneMode>,
+        Option<android_camera::ControlMode>,
+    ),
+    String,
+> {
+    for _ in 0..12 {
+        if camera
+            .next_frame(Duration::from_millis(2000))
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err("no frame within 2s while draining the request pipeline".to_owned());
+        }
+    }
+    let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    Ok((seen.awb, seen.effect, seen.scene, seen.control_mode))
 }
 
 fn cmd_capture(args: &Args) -> Result<(), String> {
@@ -611,6 +781,15 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
     if let Some(mode) = args.flash {
         camera.set_flash_mode(mode).map_err(|e| e.to_string())?;
         println!("flash mode set to {:?}", mode);
+    }
+
+    if args.watch {
+        let cameras = android_camera::list_cameras().map_err(|e| e.to_string())?;
+        let info = cameras
+            .iter()
+            .find(|c| c.id == args.id)
+            .ok_or_else(|| format!("camera {:?} is not one this uid can see", args.id))?;
+        watch_modes(&mut camera, &seen, info)?;
     }
 
     let start = Instant::now();

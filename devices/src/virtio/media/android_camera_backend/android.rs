@@ -83,6 +83,7 @@ use std::sync::mpsc::TryRecvError;
 use std::thread;
 use std::time::Duration;
 
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use android_camera::AntibandingMode;
@@ -148,8 +149,14 @@ const MIN_READER_DEPTH: u32 = 3;
 const MAX_READER_DEPTH: u32 = 8;
 /// How long one wait for a frame is; also how late a `Stop` is noticed at most.
 const FRAME_WAIT: Duration = Duration::from_millis(50);
-/// The camera is running but no frame has come for this long: say so, once per interval.
+/// The floor of the stall interval: the camera is running and no frame has come for at least
+/// this long. The interval in force is [`stall_report`], which scales it by what the guest asked
+/// for -- a 54-second exposure delivers one frame a minute, and that is not a stall (D38).
 const STALL_REPORT: Duration = Duration::from_secs(2);
+/// How many capture results to wait for before deciding whether the camera echoed a mode the
+/// guest asked for: the request pipeline is about three frames deep (B7-controls 17.4), so an
+/// immediate comparison would always read the previous value.
+const ECHO_AFTER: u32 = 6;
 /// How long `STREAMON` waits for the capture thread to report that the camera opened. Generous:
 /// a cold `cameraserver` on a loaded phone takes hundreds of milliseconds, and the guest's own
 /// ioctl is what is being held. Past it the wait is given up rather than the worker parked.
@@ -526,7 +533,15 @@ impl CameraBackend for AndroidCameraBackend {
                         sink.signal();
                     })
                 };
-                let results = result_listener(id.clone(), events_tx.clone(), sink.clone());
+                // Shared with the capture thread: what the last set asked of the three modes
+                // the HAL may ignore, so the result listener can say what became of them (D36).
+                let echo = Arc::new(Mutex::new(ModeEcho::default()));
+                let results = result_listener(
+                    id.clone(),
+                    events_tx.clone(),
+                    sink.clone(),
+                    Arc::clone(&echo),
+                );
                 // Every control at its current value, and the frame rate, go into the request
                 // before it is first submitted: the first frame is taken with them.
                 let geometry = Geometry {
@@ -535,9 +550,13 @@ impl CameraBackend for AndroidCameraBackend {
                     height: request.height,
                 };
                 let mut applied = Applied::default();
-                let (mut initial, triggers) =
+                let (mut initial, triggers, asked) =
                     build_update(&id, &facts, &geometry, &mut applied, &request.controls);
+                if !asked.is_empty() {
+                    *echo.lock().unwrap_or_else(|e| e.into_inner()) = asked;
+                }
                 initial = initial.fps_range(request.fps.0 as i32, request.fps.1 as i32);
+                applied.fps_min = request.fps.0;
                 let mut camera = match Camera::open_with(
                     &id,
                     request.width as i32,
@@ -587,6 +606,7 @@ impl CameraBackend for AndroidCameraBackend {
                     &facts,
                     &geometry,
                     &mut applied,
+                    &echo,
                 );
                 // `camera` drops here, on the thread that opened it, which gives it back to the
                 // platform.
@@ -777,6 +797,9 @@ struct Applied {
     exposure_time: u32,
     iso_value: u32,
     flash: FlashLed,
+    /// The bottom of the frame-rate range in force, frames per second: the slowest the camera
+    /// may deliver under automatic exposure. Zero until a range has been set.
+    fps_min: u32,
 }
 
 impl Default for Applied {
@@ -787,6 +810,7 @@ impl Default for Applied {
             exposure_time: 333,
             iso_value: 100,
             flash: FlashLed::Off,
+            fps_min: 0,
         }
     }
 }
@@ -796,6 +820,23 @@ impl Applied {
     /// manual switch turns it off (and then both manual values apply).
     fn manual(&self) -> bool {
         self.exposure == ExposureMode::Manual || self.iso == IsoMode::Manual
+    }
+
+    /// How long one frame should take, given what the guest asked for: its own exposure time
+    /// when the exposure is manual -- a frame cannot arrive faster than the light it is made of
+    /// -- and the period of the frame-rate floor otherwise. Zero when nothing is known.
+    fn frame_duration(&self) -> Duration {
+        let exposure = if self.manual() {
+            // 100 µs units.
+            Duration::from_micros(self.exposure_time as u64 * 100)
+        } else {
+            Duration::ZERO
+        };
+        let interval = match self.fps_min {
+            0 => Duration::ZERO,
+            fps => Duration::from_secs(1) / fps,
+        };
+        std::cmp::max(exposure, interval)
     }
 
     /// The `AE_MODE` / `FLASH_MODE` pair for the current inputs -- the state machine:
@@ -835,9 +876,10 @@ fn build_update(
     geometry: &Geometry,
     applied: &mut Applied,
     controls: &[CameraControl],
-) -> (RequestUpdate, Vec<AfTrigger>) {
+) -> (RequestUpdate, Vec<AfTrigger>, ModeEcho) {
     let mut update = RequestUpdate::new();
     let mut triggers = Vec::new();
+    let mut echo = ModeEcho::default();
     let mut ae_changed = false;
     let areas = |regions: &[Region]| -> Vec<Area> {
         regions.iter().filter_map(|r| geometry.area_of(r)).collect()
@@ -845,6 +887,7 @@ fn build_update(
     for control in controls {
         match control {
             CameraControl::FpsRange(min, max) => {
+                applied.fps_min = *min;
                 update = update.fps_range(*min as i32, *max as i32);
             }
             // Hundredths to the ratio.
@@ -875,7 +918,10 @@ fn build_update(
             }
             CameraControl::WhiteBalance(preset) => {
                 match facts.awb.iter().find(|(p, _)| p == preset) {
-                    Some(&(_, mode)) => update = update.awb_mode(mode),
+                    Some(&(_, mode)) => {
+                        echo.awb = Some(mode);
+                        update = update.awb_mode(mode);
+                    }
                     None => warn!("camera {}: no Camera2 mode for {:?}", id, preset),
                 }
             }
@@ -889,7 +935,10 @@ fn build_update(
             }
             CameraControl::ColorEffect(effect) => {
                 match facts.effects.iter().find(|(e, _)| e == effect) {
-                    Some(&(_, mode)) => update = update.effect_mode(mode),
+                    Some(&(_, mode)) => {
+                        echo.effect = Some(mode);
+                        update = update.effect_mode(mode);
+                    }
                     None => warn!("camera {}: no Camera2 effect for {:?}", id, effect),
                 }
             }
@@ -898,9 +947,11 @@ fn build_update(
             CameraControl::SceneMode(scene) => {
                 match facts.scenes.iter().find(|(s, _)| s == scene) {
                     Some(&(SceneMode::None, mode)) => {
+                        echo.scene = Some((mode, ControlMode::Auto));
                         update = update.control_mode(ControlMode::Auto).scene_mode(mode);
                     }
                     Some(&(_, mode)) => {
+                        echo.scene = Some((mode, ControlMode::UseSceneMode));
                         update = update
                             .control_mode(ControlMode::UseSceneMode)
                             .scene_mode(mode);
@@ -942,7 +993,84 @@ fn build_update(
                 .sensitivity(applied.iso_value as i32);
         }
     }
-    (update, triggers)
+    (update, triggers, echo)
+}
+
+/// The three request entries a HAL may take or silently drop, as one submission asked for
+/// them, and how many capture results have come back since (D36).
+///
+/// `AUTO_N_PRESET_WHITE_BALANCE`, `COLORFX` and `SCENE_MODE` are accepted by the device, mapped
+/// to a Camera2 mode and submitted without an error, and on 5566 they change nothing in the
+/// pixels (B7-controls 10.2, 12.2). A capture result carries the values the camera *used*, so
+/// comparing the two says which half is at fault: an echoed value that changes nothing is the
+/// HAL's business, a value the result does not carry is ours. The verdict is logged once per
+/// set rather than per result.
+#[derive(Default)]
+struct ModeEcho {
+    awb: Option<AwbMode>,
+    effect: Option<EffectMode>,
+    /// The scene, and the `CONTROL_MODE` it needs to have any effect at all.
+    scene: Option<(android_camera::SceneMode, ControlMode)>,
+    /// Results seen since the set; the comparison waits [`ECHO_AFTER`] of them.
+    results: u32,
+}
+
+impl ModeEcho {
+    fn is_empty(&self) -> bool {
+        self.awb.is_none() && self.effect.is_none() && self.scene.is_none()
+    }
+
+    /// What the result says against what was asked for, one clause per mode, or `None` when
+    /// nothing was asked for.
+    fn verdict(&self, result: &CaptureResult<'_>) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        if let Some(want) = self.awb {
+            let got = result.awb_mode();
+            out.push(format!(
+                "AWB_MODE {:?} -> {:?} ({})",
+                want,
+                got,
+                if got == Some(want) {
+                    "echoed"
+                } else {
+                    "dropped"
+                }
+            ));
+        }
+        if let Some(want) = self.effect {
+            let got = result.effect_mode();
+            out.push(format!(
+                "EFFECT_MODE {:?} -> {:?} ({})",
+                want,
+                got,
+                if got == Some(want) {
+                    "echoed"
+                } else {
+                    "dropped"
+                }
+            ));
+        }
+        if let Some((want, mode)) = self.scene {
+            let got = result.scene_mode();
+            let got_mode = result.control_mode();
+            out.push(format!(
+                "SCENE_MODE {:?} -> {:?}, CONTROL_MODE {:?} -> {:?} ({})",
+                want,
+                got,
+                mode,
+                got_mode,
+                if got == Some(want) && got_mode == Some(mode) {
+                    "echoed"
+                } else {
+                    "dropped"
+                }
+            ));
+        }
+        Some(out.join("; "))
+    }
 }
 
 /// Apply `controls` to the running camera in one submission, then fire any AF trigger. A
@@ -953,9 +1081,10 @@ fn apply_controls(
     facts: &Facts,
     geometry: &Geometry,
     applied: &mut Applied,
+    echo: &Arc<Mutex<ModeEcho>>,
     controls: &[CameraControl],
 ) {
-    let (update, triggers) = build_update(id, facts, geometry, applied, controls);
+    let (update, triggers, asked) = build_update(id, facts, geometry, applied, controls);
     if let Err(e) = camera.apply(&update) {
         warn!(
             "camera {}: {} control(s) refused, the stream goes on as it was: {}",
@@ -963,6 +1092,9 @@ fn apply_controls(
             controls.len(),
             e
         );
+    }
+    if !asked.is_empty() {
+        *echo.lock().unwrap_or_else(|e| e.into_inner()) = asked;
     }
     fire_triggers(id, camera, &triggers);
 }
@@ -1021,9 +1153,27 @@ fn result_listener(
     id: String,
     events: mpsc::Sender<CameraEvent>,
     sink: CaptureSink,
+    echo: Arc<Mutex<ModeEcho>>,
 ) -> ResultListener {
     let last = Mutex::new(LastReported::default());
     Box::new(move |result: &CaptureResult<'_>| {
+        // What the camera did with the last set of the three modes it may ignore (D36): read
+        // out of the result a few frames after the set, said once, and then forgotten.
+        {
+            let mut echo = echo.lock().unwrap_or_else(|e| e.into_inner());
+            if !echo.is_empty() {
+                echo.results += 1;
+                if echo.results >= ECHO_AFTER {
+                    if let Some(verdict) = echo.verdict(result) {
+                        info!(
+                            "camera {}: mode echo after {} results: {}",
+                            id, ECHO_AFTER, verdict
+                        );
+                    }
+                    *echo = ModeEcho::default();
+                }
+            }
+        }
         let mut changed: Vec<CameraControl> = Vec::new();
         {
             let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
@@ -1063,6 +1213,19 @@ fn result_listener(
     })
 }
 
+/// How long a stall must last before it is worth a line: [`STALL_REPORT`], or three times the
+/// frame duration the guest's own settings imply, whichever is longer -- and then doubled for
+/// every line already said, up to sixteen times, so a camera that never comes back says so a
+/// handful of times rather than every two seconds.
+///
+/// A guest is entitled to ask for a 54-second exposure, and 5566 answers it with one frame a
+/// minute; that produced 74 identical "no frame for 2s" warnings in one 150-second capture
+/// (D38), which is how a real stall gets lost.
+fn stall_report(applied: &Applied, already_said: u32) -> Duration {
+    let base = std::cmp::max(STALL_REPORT, applied.frame_duration() * 3);
+    base * (1 << already_said.min(4))
+}
+
 /// The capture thread's loop: frames into lent buffers until told to stop or the camera fails.
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
@@ -1077,6 +1240,7 @@ fn capture_loop(
     facts: &Facts,
     geometry: &Geometry,
     applied: &mut Applied,
+    echo: &Arc<Mutex<ModeEcho>>,
 ) {
     let mut empties: VecDeque<EmptyBuffer> = VecDeque::new();
     let mut sequence = 0u32;
@@ -1084,6 +1248,7 @@ fn capture_loop(
     // Discarded since the last frame was handed over; see where `sequence` is set.
     let mut dropped_since_delivery = 0u32;
     let mut stalled = Duration::ZERO;
+    let mut stall_reports = 0u32;
 
     let fail = |why: String| {
         error!("camera {}: {}", id, why);
@@ -1097,7 +1262,7 @@ fn capture_loop(
             match commands.try_recv() {
                 Ok(Command::Lend(buffer)) => empties.push_back(buffer),
                 Ok(Command::Controls(controls)) => {
-                    apply_controls(id, camera, facts, geometry, applied, &controls)
+                    apply_controls(id, camera, facts, geometry, applied, echo, &controls)
                 }
                 Ok(Command::Stop) | Err(TryRecvError::Disconnected) => return,
                 Err(TryRecvError::Empty) => break,
@@ -1119,7 +1284,7 @@ fn capture_loop(
             match commands.recv_timeout(FRAME_WAIT) {
                 Ok(Command::Lend(buffer)) => empties.push_back(buffer),
                 Ok(Command::Controls(controls)) => {
-                    apply_controls(id, camera, facts, geometry, applied, &controls)
+                    apply_controls(id, camera, facts, geometry, applied, echo, &controls)
                 }
                 Ok(Command::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 Err(RecvTimeoutError::Timeout) => (),
@@ -1131,18 +1296,25 @@ fn capture_loop(
             Ok(Some(frame)) => frame,
             Ok(None) => {
                 stalled += FRAME_WAIT;
-                if stalled >= STALL_REPORT {
+                if stalled >= stall_report(applied, stall_reports) {
                     warn!(
-                        "camera {}: no frame for {:?} (sequence {}, {} dropped)",
-                        id, stalled, sequence, dropped
+                        "camera {}: no frame for {:?} (sequence {}, {} dropped, one frame should \
+                         take {:?})",
+                        id,
+                        stalled,
+                        sequence,
+                        dropped,
+                        applied.frame_duration()
                     );
                     stalled = Duration::ZERO;
+                    stall_reports = stall_reports.saturating_add(1);
                 }
                 continue;
             }
             Err(e) => return fail(format!("acquiring a frame failed: {e}")),
         };
         stalled = Duration::ZERO;
+        stall_reports = 0;
 
         let buffer = empties.pop_front().expect("checked non-empty above");
         let bytesused = match copy_frame(&frame, &buffer, width, height) {
