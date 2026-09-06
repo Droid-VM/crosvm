@@ -473,8 +473,25 @@ impl DeviceSlot {
                 context.endpoint_context[endpoint_index].set_endpoint_state(EndpointState::Running);
                 self.set_device_context(context)?;
             }
-            // endpoint is started, start transfer ring
-            transfer_ring_controller.start();
+            // The endpoint is started; run its rings. On an endpoint with streams the
+            // doorbell's stream id is a hint (spec 4.12.2): hardware brought back to running
+            // by any doorbell serves whichever stream the device ERDYs, so every populated
+            // stream ring runs again -- not only the addressed one. A Stop Endpoint rewound
+            // each ring whose TD it cancelled to that TD but reported only one of them
+            // (4.12.1.1: one stream is current); the guest re-arms the other TD without ever
+            // addressing that stream in a doorbell (run5: Windows' UASPStor after a cold-attach
+            // stop, stranding the TD ~16 s until its request timeout). An empty ring parks
+            // again at once; a rewound one re-executes its TD, and the fresh backend transfer
+            // fetches the data the device still holds for that stream. A halted endpoint is
+            // not restarted here (the state check above).
+            match self.get_trcs(endpoint_index) {
+                Some(TransferRingControllers::Stream(trcs)) => {
+                    for trc in trcs.iter().flatten() {
+                        trc.start();
+                    }
+                }
+                _ => transfer_ring_controller.start(),
+            }
         } else {
             error!("doorbell rung when endpoint state is {:?}", endpoint_state);
         }
@@ -884,7 +901,9 @@ impl DeviceSlot {
             .map_err(Error::GetEndpointState)?
             != EndpointState::Running
         {
-            error!("endpoint at index {} is not running", index);
+            // Linux stops already-stopped endpoints legitimately; the Context State Error
+            // completion below is the guest-visible answer.
+            debug!("endpoint at index {} is not running", index);
             return cb(TrbCompletionCode::ContextStateError).map_err(|_| Error::CallbackFailed);
         }
         // The callback's last clone lives until the endpoint state below is in guest memory, so
@@ -2899,6 +2918,153 @@ mod tests {
         );
         assert!(!slot.ring_doorbell(3, 16).unwrap(), "beyond the array");
         assert!(slot.ring_doorbell(3, 8).unwrap());
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// run5 cold1/cold3: a Stop Endpoint cancelled a TD on two stream rings, reported the one
+    /// Stopped event for one of them and rewound the other silently. Windows re-points both
+    /// streams, re-arms the silent ring's TD, and rings the doorbell naming only the reported
+    /// stream -- the silent ring must run again from that doorbell (spec 4.12.2: the stream id
+    /// is a hint; hardware serves whichever stream the device ERDYs), or its TD is stranded
+    /// until the class driver's ~16 s request timeout.
+    #[test]
+    fn doorbell_restarts_every_stream_ring_of_the_endpoint() {
+        let f = stopped_stream_endpoint();
+        f.set_endpoint_state(3, EndpointState::Running);
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, |_| Ok(()))
+            .unwrap();
+        // The stop parked every populated ring and armed each with the command's claim; make
+        // streams 2 and 3 look like the stop cancelled a TD on both -- stream 2 won the one
+        // Stopped event, stream 3 rewound silently: the two-cancelled-TD state of a cold
+        // attach.
+        let trcs = stream_trcs(&f.slot(), 3);
+        trcs[1]
+            .as_ref()
+            .unwrap()
+            .set_stopped_td_for_test(Some(StoppedTd {
+                first_trb: stream_ring(2),
+                cycle: true,
+                bytes: 0x150,
+                reported: true,
+            }));
+        trcs[2]
+            .as_ref()
+            .unwrap()
+            .set_stopped_td_for_test(Some(StoppedTd {
+                first_trb: stream_ring(3),
+                cycle: true,
+                bytes: 0x99,
+                reported: false,
+            }));
+        for (i, trc) in trcs.iter().enumerate() {
+            if let Some(trc) = trc {
+                assert!(
+                    trc.stop_event_claim_for_test().is_some(),
+                    "stream {} must be armed by the stop",
+                    i + 1
+                );
+            }
+        }
+
+        // The doorbell names only stream 2, as Windows' did.
+        assert!(f.slot().ring_doorbell(3, 2).unwrap());
+
+        assert_eq!(
+            f.endpoint_context(3).get_endpoint_state().unwrap(),
+            EndpointState::Running
+        );
+        // `start()` ran on every populated ring: it consumes the stale claim and the
+        // stopped-TD record. Stream 3 -- the silent ring, still standing at its rewound TD --
+        // is the one an addressed-ring-only doorbell would have left parked.
+        for (i, trc) in trcs.iter().enumerate() {
+            if let Some(trc) = trc {
+                assert!(
+                    trc.stop_event_claim_for_test().is_none(),
+                    "stream {} must be started by the doorbell",
+                    i + 1
+                );
+                assert!(
+                    trc.stopped_td().is_none(),
+                    "stream {} must be started by the doorbell",
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(
+            trcs[2].as_ref().unwrap().get_dequeue_pointer(),
+            stream_ring(3),
+            "the silent ring re-runs from its rewound TD"
+        );
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A doorbell whose stream id is Not Valid, reserved (0), or off the array still starts
+    /// nothing -- none of the endpoint's populated rings either.
+    #[test]
+    fn doorbell_on_a_not_valid_stream_starts_no_ring() {
+        let f = stopped_stream_endpoint();
+        f.set_endpoint_state(3, EndpointState::Running);
+        f.slot()
+            .stop_endpoint(f.fail_handle.clone(), 3, |_| Ok(()))
+            .unwrap();
+        for bad in [0u16, 9, 16] {
+            assert!(!f.slot().ring_doorbell(3, bad).unwrap(), "stream id {bad}");
+        }
+        for (i, trc) in stream_trcs(&f.slot(), 3).iter().enumerate() {
+            if let Some(trc) = trc {
+                assert!(
+                    trc.stop_event_claim_for_test().is_some(),
+                    "stream {} must not be started by an ignored doorbell",
+                    i + 1
+                );
+            }
+        }
+        assert_eq!(
+            f.endpoint_context(3).get_endpoint_state().unwrap(),
+            EndpointState::Stopped
+        );
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A doorbell on an endpoint without streams starts its one ring, as before; a stream id
+    /// on such an endpoint stays ignored.
+    #[test]
+    fn doorbell_on_a_plain_endpoint_starts_its_ring() {
+        let f = Fixture::new();
+        f.write_input_context(0, 1 << 3, 3, bulk_endpoint_context(3));
+        assert_eq!(
+            f.slot()
+                .configure_endpoint(&f.configure_endpoint_trb())
+                .unwrap(),
+            TrbCompletionCode::Success
+        );
+        let trc = match f.slot().get_trcs(2) {
+            Some(TransferRingControllers::Endpoint(trc)) => trc,
+            _ => panic!("DCI 3 must be a plain endpoint"),
+        };
+        trc.set_stopped_td_for_test(Some(StoppedTd {
+            first_trb: GuestAddress(STREAM_RING),
+            cycle: true,
+            bytes: 1,
+            reported: true,
+        }));
+
+        assert!(
+            !f.slot().ring_doorbell(3, 5).unwrap(),
+            "a stream id on a streamless endpoint is ignored"
+        );
+        assert!(
+            trc.stopped_td().is_some(),
+            "an ignored doorbell starts nothing"
+        );
+
+        assert!(f.slot().ring_doorbell(3, 0).unwrap());
+        assert_eq!(
+            f.endpoint_context(3).get_endpoint_state().unwrap(),
+            EndpointState::Running
+        );
+        assert!(trc.stopped_td().is_none(), "the ring was started");
         assert!(!f.fail_handle.failed());
     }
 }
