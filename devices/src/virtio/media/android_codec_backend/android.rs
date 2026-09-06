@@ -1771,6 +1771,24 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         result
     }
 
+    fn reinit(&mut self) -> IoctlResult<()> {
+        // STREAMOFF(OUTPUT) that reconfigures CAPTURE across a pending SOURCE_CHANGE (a client's
+        // reinit), NOT a seek: unlike `flush`, nothing is dropped and the codec is not flushed.
+        // The staged bitstream the guest already believes consumed (returned at `decode` time,
+        // D48) and the frames/format the codec already holds are kept -- the codec keeps running,
+        // keeps consuming `self.pending`, and its output waits in `held_outputs` for the CAPTURE
+        // restart -- so no packet is lost the way a seek's `flush_and_restart` would lose it (D53,
+        // the head-of-stream drop "after the first SOURCE_CHANGE"). `deferred_input_done` is empty
+        // here (the announcement that made the change pending released it), so there is nothing to
+        // hold across the call.
+        info!(
+            "decoder session {}: reinit: keeping {} staged input(s) across STREAMOFF(OUTPUT)",
+            self.id,
+            self.pending.len()
+        );
+        Ok(())
+    }
+
     fn drain(&mut self) -> IoctlResult<()> {
         if self.dead {
             return Err(libc::ENODEV);
