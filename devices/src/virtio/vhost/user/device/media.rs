@@ -71,6 +71,7 @@ use crate::virtio::device_constants::media::QUEUE_SIZES;
 use crate::virtio::media::card_str;
 use crate::virtio::media::guest_buf::HostAccessPolicy;
 use crate::virtio::media::pool::pool_handle_at;
+use crate::virtio::media::pool::MappedPool;
 use crate::virtio::media::pool::RemotePool;
 use crate::virtio::media::pool::RemotePoolAllocator;
 use crate::virtio::media::start_worker;
