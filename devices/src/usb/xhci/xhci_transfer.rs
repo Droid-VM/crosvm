@@ -439,17 +439,52 @@ impl XhciTransfer {
                 };
             }
             TransferStatus::Cancelled => {
-                // The endpoint stopped with this descriptor in progress (spec 4.6.9): it is
-                // reported with a Stopped Transfer Event and the ring is left at it. Both happen
-                // when the ring parks (the handler's `finish_stop`), so the event precedes the
-                // Stop Endpoint Command Completion, and a drained-ahead ring with several
-                // descriptors cancelled reports the earliest one only.
-                self.manager
-                    .record_stopped(self.stopped_at(bytes_transferred)?);
-                return self
-                    .transfer_completion_event
+                let td_len = self.td_data_length()?;
+                let completing =
+                    td_len > 0 && bytes_transferred >= td_len && !self.on_drained_ahead_ring();
+                debug!(
+                    "xhci: slot {} ep {} stream {:?}: cancelled TD at {:#x}: {}/{} bytes moved, {}",
+                    self.slot_id,
+                    self.endpoint_id,
+                    self.stream_id,
+                    self.transfer_trbs[0].gpa,
+                    bytes_transferred,
+                    td_len,
+                    if completing { "completing" } else { "stopped" }
+                );
+                if !completing {
+                    // The endpoint stopped with this descriptor in progress (spec 4.6.9): it is
+                    // reported with a Stopped Transfer Event and the ring is left at it. Both
+                    // happen when the ring parks (the handler's `finish_stop`), so the event
+                    // precedes the Stop Endpoint Command Completion, and a drained-ahead ring
+                    // with several descriptors cancelled reports the earliest one only.
+                    self.manager
+                        .record_stopped(self.stopped_at(bytes_transferred)?);
+                    return self
+                        .transfer_completion_event
+                        .signal()
+                        .map_err(Error::WriteCompletionEvent);
+                }
+                // The reap moved the descriptor's whole length: the device had delivered the TD
+                // when the cancel landed, so nothing was in progress any more -- this is a
+                // completion, not a stop. The backend's Cancelled arm already put the bytes in
+                // the guest buffer; the ordinary transfer events (IOC/ISP, Event Data) go out
+                // below, and the ring parks past the TD through the usual take-nothing path: no
+                // rewind, no Stopped event, no claim consumed. Rewound instead, the restarted
+                // ring would re-execute the TD with a fresh backend transfer asking for data
+                // the device already sent and will never resend (run6: a 16 s strand until
+                // UASPStor's request timeout), and a fully-delivered OUT TD would be re-sent.
+                // A drained-ahead (isochronous) ring keeps its one-Stopped-event sweep, above.
+                //
+                // Events before the signal: the signal lets the ring park and release the Stop
+                // Endpoint Command Completion, which every transfer event of the stop's
+                // descriptors must precede (spec 4.6.9). The signal still fires when the event
+                // send fails -- the stop waits on it and would otherwise hang.
+                let events = self.send_transfer_events(status, bytes_transferred);
+                self.transfer_completion_event
                     .signal()
-                    .map_err(Error::WriteCompletionEvent);
+                    .map_err(Error::WriteCompletionEvent)?;
+                return events;
             }
             TransferStatus::Completed => {
                 self.transfer_completion_event
@@ -477,6 +512,12 @@ impl XhciTransfer {
             }
         }
 
+        self.send_transfer_events(status, bytes_transferred)
+    }
+
+    /// Send the transfer events (IOC / ISP, Event Data -- spec 4.11.3.1) that this
+    /// descriptor's outcome calls for.
+    fn send_transfer_events(&self, status: &TransferStatus, bytes_transferred: u32) -> Result<()> {
         let mut edtla: u32 = 0;
         // As noted in xHCI spec 4.11.3.1
         // Transfer Event TRB only occurs under the following conditions:
@@ -566,6 +607,23 @@ impl XhciTransfer {
             }
         }
         Ok(())
+    }
+
+    /// The descriptor's data length: what its data-bearing TRBs -- the ones that advance the
+    /// EDTLA (Normal, Data Stage and Isoch, spec 4.11.5.2), the same walk `stopped_at` does --
+    /// ask to move in all. A cancel reaped with this many bytes moved caught a descriptor the
+    /// device had already delivered whole.
+    fn td_data_length(&self) -> Result<u32> {
+        let mut len: u32 = 0;
+        for atrb in &self.transfer_trbs {
+            if matches!(
+                atrb.trb.get_trb_type().map_err(Error::TrbType)?,
+                TrbType::Normal | TrbType::DataStage | TrbType::Isoch
+            ) {
+                len += atrb.trb.transfer_length().map_err(Error::TransferLength)?;
+            }
+        }
+        Ok(len)
     }
 
     /// Where this descriptor stopped after `bytes_transferred` of it moved. The first data TRB
@@ -731,11 +789,10 @@ mod tests {
         assert_eq!(td.residual, 0x100);
         assert_eq!(td.bytes, 0);
 
-        // Everything moved: the last TRB, with nothing left.
-        let td = stopped(&f, normal_td(0x2000, &[0x100, 0x200, 0x300]), 0x600);
-        assert_eq!(td.completion_code, TrbCompletionCode::Stopped);
-        assert_eq!(td.trb_pointer, 0x2020);
-        assert_eq!(td.residual, 0);
+        // Everything moved is not a stop any more: see
+        // `a_cancelled_td_that_moved_every_byte_completes_instead_of_stopping`, and, for the
+        // drained-ahead ring that keeps the stop semantics at full length,
+        // `a_swept_td_reaped_at_full_length_still_joins_the_stopped_set`.
 
         // A descriptor ending in an Event Data TRB: the pointer is the data TRB, never the
         // Event Data one (ED = 0, spec 4.11.5.2).
@@ -764,6 +821,98 @@ mod tests {
             assert_eq!(td.first_trb, GuestAddress(0x2000));
             assert!(td.cycle);
         }
+    }
+
+    /// A cancel whose reap moved the descriptor's whole length caught a TD the device had
+    /// already delivered (run6: the discard hit as the data IU landed): it completes -- the
+    /// ordinary events of a successful TD go out, nothing is recorded for the ring to rewind
+    /// to, and the ring parks past the TD. Rewound instead, the restarted ring would re-execute
+    /// the TD, asking the device for data it will never resend.
+    #[test]
+    fn a_cancelled_td_that_moved_every_byte_completes_instead_of_stopping() {
+        let f = Fixture::new();
+        let manager = XhciTransferManager::default();
+
+        // A TD with IOC on its last TRB: one Success event there, as a completion sends.
+        let mut td = normal_td(0x2000, &[0x100, 0x200]);
+        td[1].trb
+            .cast_mut::<NormalTrb>()
+            .unwrap()
+            .set_interrupt_on_completion(1);
+        f.transfer(&manager, 3, td)
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x300)
+            .unwrap();
+        assert_eq!(
+            manager.take_stopped(),
+            None,
+            "nothing was in progress: the ring parks past the TD, no rewind"
+        );
+        let events = f.transfer_events();
+        assert_eq!(events.len(), 1, "exactly the event a normal completion sends");
+        assert_eq!(
+            events[0].get_completion_code().unwrap(),
+            TrbCompletionCode::Success
+        );
+        assert_eq!(events[0].get_trb_pointer(), 0x2010);
+        assert_eq!(events[0].get_trb_transfer_length(), 0);
+        assert_eq!(events[0].get_event_data(), 0);
+
+        // A TD ending in an Event Data TRB (Windows ends every TD so): the event is the Event
+        // Data one, ED set, carrying the TD's accumulated length -- as on a completion.
+        let mut td = normal_td(0x3000, &[0x100]);
+        td[0].trb.cast_mut::<NormalTrb>().unwrap().set_chain(true);
+        let mut ed = EventDataTrb::new();
+        ed.set_trb_type(TrbType::EventData);
+        ed.set_event_data(0x1234_5678);
+        ed.set_cycle(true);
+        ed.set_interrupt_on_completion(1);
+        td.push(AddressedTrb {
+            trb: *ed.cast::<Trb>().unwrap(),
+            gpa: 0x3010,
+        });
+        f.transfer(&manager, 3, td)
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x100)
+            .unwrap();
+        assert_eq!(manager.take_stopped(), None);
+        let events = f.transfer_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[1].get_completion_code().unwrap(),
+            TrbCompletionCode::Success
+        );
+        assert_eq!(events[1].get_trb_pointer(), 0x1234_5678);
+        assert_eq!(events[1].get_trb_transfer_length(), 0x100);
+        assert_eq!(events[1].get_event_data(), 1);
+    }
+
+    /// On a drained-ahead (isochronous) ring the stop sweeps every descriptor in flight and
+    /// reports the earliest with the one Stopped event; a swept TD whose reap moved its whole
+    /// length still joins that stopped set -- completing it would send the guest an event for
+    /// a TRB it unlinked (e5eece2's gate).
+    #[test]
+    fn a_swept_td_reaped_at_full_length_still_joins_the_stopped_set() {
+        let f = Fixture::new();
+        let manager = XhciTransferManager::default();
+        manager.set_drained_ahead(true);
+        let mut td = normal_td(0x2000, &[0x100]);
+        td[0].trb
+            .cast_mut::<NormalTrb>()
+            .unwrap()
+            .set_interrupt_on_completion(1);
+        f.transfer(&manager, 3, td)
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x100)
+            .unwrap();
+        let td = manager.take_stopped().unwrap();
+        assert_eq!(td.first_trb, GuestAddress(0x2000));
+        assert_eq!(td.bytes, 0x100);
+        assert_eq!(td.completion_code, TrbCompletionCode::Stopped);
+        assert_eq!(td.trb_pointer, 0x2000, "stopped at its last TRB, nothing left");
+        assert_eq!(td.residual, 0);
+        assert_eq!(
+            f.transfer_events().len(),
+            0,
+            "no completion event for a swept TD, IOC or not"
+        );
     }
 
     /// A transfer reaped after the device disconnected (-ENODEV) sends no Transfer Event, but

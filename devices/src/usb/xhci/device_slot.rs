@@ -486,9 +486,15 @@ impl DeviceSlot {
             // not restarted here (the state check above).
             match self.get_trcs(endpoint_index) {
                 Some(TransferRingControllers::Stream(trcs)) => {
+                    let mut restarted = 0usize;
                     for trc in trcs.iter().flatten() {
                         trc.start();
+                        restarted += 1;
                     }
+                    debug!(
+                        "xhci: slot {} ep {}: doorbell stream {} restarts {} stream rings",
+                        self.slot_id, target, stream_id, restarted
+                    );
                 }
                 _ => transfer_ring_controller.start(),
             }

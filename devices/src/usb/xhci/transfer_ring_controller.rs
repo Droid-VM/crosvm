@@ -56,6 +56,13 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
         descriptor: TransferDescriptor,
         completion_event: Event,
     ) -> anyhow::Result<()> {
+        debug!(
+            "xhci: slot {} ep {} stream {:?}: submitting TD at {:#x}",
+            self.slot_id,
+            self.endpoint_id,
+            self.stream_id,
+            descriptor.first().map_or(0, |atrb| atrb.gpa)
+        );
         let xhci_transfer = self.transfer_manager.create_transfer(
             self.mem.clone(),
             self.port.clone(),
@@ -467,6 +474,67 @@ mod tests {
         );
         assert_eq!(events[1].get_trb_pointer(), 0x3000);
         assert_eq!(events[1].get_trb_transfer_length(), 0x180);
+        assert!(!f.fail_handle.failed());
+    }
+
+    /// A stream ring whose cancel reaped the descriptor's whole length (run6: the discard hit
+    /// as the device delivered the data IU) completed it instead of stopping: it has nothing
+    /// in progress when the endpoint parks, so it neither rewinds nor consumes the endpoint's
+    /// one Stopped event -- the claim is left for the ring that really was mid-TD, exactly as
+    /// with a TD that completed before the cancel.
+    #[test]
+    fn a_stream_cancelled_at_full_length_completes_and_leaves_the_claim() {
+        let f = Fixture::new();
+        let h2 = stream_handler(&f, 2);
+        let h3 = stream_handler(&f, 3);
+        // Stream 2's TD was cut mid-flight: it is the TD in progress.
+        f.transfer(&h2.transfer_manager, 3, normal_td(0x2000, &[0x100]))
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x40)
+            .unwrap();
+        // Stream 3's reap carried its whole 0x200: a completion, not a stop.
+        let mut td = normal_td(0x3000, &[0x200]);
+        td[0].trb
+            .cast_mut::<NormalTrb>()
+            .unwrap()
+            .set_interrupt_on_completion(1);
+        f.transfer(&h3.transfer_manager, 3, td)
+            .on_transfer_complete(&TransferStatus::Cancelled, 0x200)
+            .unwrap();
+
+        let claim = Arc::new(AtomicBool::new(false));
+        assert_eq!(
+            h3.finish_stop(Some(&claim)).unwrap(),
+            None,
+            "nothing was in progress on stream 3: no rewind"
+        );
+        assert!(
+            !claim.load(Ordering::SeqCst),
+            "a ring whose TD completed must not consume the claim"
+        );
+        assert_eq!(
+            h2.finish_stop(Some(&claim)).unwrap(),
+            Some(StoppedTd {
+                first_trb: GuestAddress(0x2000),
+                cycle: true,
+                bytes: 0x40,
+                reported: true,
+            }),
+            "the claim was left for the ring that really was mid-TD"
+        );
+
+        let events = f.transfer_events();
+        assert_eq!(events.len(), 2, "one Success and one Stopped");
+        assert_eq!(
+            events[0].get_completion_code().unwrap(),
+            TrbCompletionCode::Success
+        );
+        assert_eq!(events[0].get_trb_pointer(), 0x3000);
+        assert_eq!(
+            events[1].get_completion_code().unwrap(),
+            TrbCompletionCode::Stopped
+        );
+        assert_eq!(events[1].get_trb_pointer(), 0x2000);
+        assert_eq!(events[1].get_trb_transfer_length(), 0xc0);
         assert!(!f.fail_handle.failed());
     }
 
