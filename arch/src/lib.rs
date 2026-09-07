@@ -373,6 +373,68 @@ pub struct SimplefbParams {
     pub format: String,
 }
 
+/// Bytes per pixel named by a simplefb device-tree `format` string.
+///
+/// The fallback matches the device tree's own default: `a8r8g8b8` is what the node is given when
+/// nobody says otherwise, so an unrecognised string is laid out as if it had said that rather than
+/// producing a geometry no consumer could parse.
+pub fn simplefb_bpp(format: &str) -> u32 {
+    match format {
+        "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
+        "r8g8b8" => 3,
+        "r5g6b5" => 2,
+        _ => 4,
+    }
+}
+
+/// What every simplefb row pitch is rounded up to. `1` means packed, i.e. no padding at all.
+///
+/// **Padding is off by default, and that is a statement about the firmware, not about the GPU.**
+/// The row pitch is written into the device tree, and of the three things that read this
+/// framebuffer only Linux reads it back: EDK2 computes `width * 4` itself and Windows takes the GOP
+/// EDK2 hands it (`SimpleFbDxe.c`, `PixelsPerScanLine = MipiFrameBufferWidth`). So a padded stride
+/// is only correct once the firmware has learned to read `stride` -- until then it would shear
+/// every Windows guest by exactly the padding, on every row.
+///
+/// What padding buys, when the firmware is ready: a LINEAR dmabuf handed to turnip is imported as a
+/// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` image whose `rowPitch` is this stride, and Adreno's 2D
+/// blitter reads that source through the texture pipe at the image's PITCH. A pitch it cannot
+/// express refuses the import and drops the whole screen to the CPU copy path -- which is what a
+/// width that is not a multiple of 64 pixels risks. 256 bytes is the figure the display backend
+/// already documents for exactly this case (`crosvm_android_display_client.cpp`, "1400 -> stride
+/// 5632 = 1408px").
+///
+/// Overridable so that "does this pitch actually get refused?" can be measured on a running device
+/// rather than assumed: nothing has yet shown the refusal, and a padded stride is the wrong thing
+/// to ship on the strength of a suspicion.
+pub const SIMPLEFB_STRIDE_ALIGN_DEFAULT: u32 = 1;
+
+/// `CROSVM_SIMPLEFB_STRIDE_ALIGN`, read once. Rounded up to a power of two, because the arithmetic
+/// below is a mask and a value that is not one would silently mean something else.
+fn simplefb_stride_align() -> u32 {
+    static ALIGN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *ALIGN.get_or_init(|| {
+        let requested = std::env::var("CROSVM_SIMPLEFB_STRIDE_ALIGN")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .filter(|v| *v > 0)
+            .unwrap_or(SIMPLEFB_STRIDE_ALIGN_DEFAULT);
+        requested.next_power_of_two()
+    })
+}
+
+/// The row pitch of the simplefb framebuffer: the distance from one row to the next, which is NOT
+/// `width * bpp` when the width does not land on the alignment above.
+///
+/// This is the one place that decides it. Three consumers have to agree or the picture shears --
+/// the region's size, the device tree `stride` the guest is handed, and the display bridge's own
+/// geometry -- and they used to compute it separately, which is exactly how a padded stride would
+/// have gone wrong in only one of them.
+pub fn simplefb_stride(width: u32, format: &str) -> u32 {
+    let packed = width.saturating_mul(simplefb_bpp(format));
+    packed.next_multiple_of(simplefb_stride_align())
+}
+
 #[sorted]
 pub struct VmComponents {
     #[cfg(all(target_arch = "x86_64", unix))]
