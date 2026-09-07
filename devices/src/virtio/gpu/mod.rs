@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 mod edid;
+mod boot_pool;
 mod parameters;
 mod protocol;
 mod snapshot;
@@ -1812,6 +1813,7 @@ impl DisplayBackend {
 }
 
 pub struct Gpu {
+    boot_drm_pool: Option<[u8; boot_pool::CONFIG_SIZE]>,
     exit_evt_wrtube: SendTube,
     pub gpu_control_tube: Option<Tube>,
     mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
@@ -1928,6 +1930,14 @@ fn set_gpu_worker_rt_prio() {
 }
 
 impl Gpu {
+    /// Describe a fixed DRM arena shared at boot. The caller obtains the range
+    /// from the VM layout, never from a blob response or a guest address.
+    pub fn set_boot_drm_pool(&mut self, base: u64, size: u64) -> anyhow::Result<()> {
+        self.boot_drm_pool = Some(boot_pool::descriptor(base, size)
+            .ok_or_else(|| anyhow!("invalid boot DRM pool range"))?);
+        Ok(())
+    }
+
     pub fn new(
         exit_evt_wrtube: SendTube,
         gpu_control_tube: Tube,
@@ -2012,6 +2022,7 @@ impl Gpu {
 
         let mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>> = Arc::new(Mutex::new(None));
         Gpu {
+            boot_drm_pool: None,
             exit_evt_wrtube,
             gpu_control_tube: Some(gpu_control_tube),
             mapper,
@@ -2347,6 +2358,9 @@ impl VirtioDevice for Gpu {
 
     fn features(&self) -> u64 {
         let mut virtio_gpu_features = 1 << VIRTIO_GPU_F_EDID;
+        if self.boot_drm_pool.is_some() {
+            virtio_gpu_features |= 1 << boot_pool::FEATURE;
+        }
 
         // If a non-2D component is specified, enable 3D features.  It is possible to run display
         // contexts without 3D backend (i.e, gfxstream / virglrender), so check for that too.
@@ -2374,7 +2388,12 @@ impl VirtioDevice for Gpu {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        copy_config(data, 0, self.get_config().as_bytes(), offset);
+        let mut config = [0u8; 16 + boot_pool::CONFIG_SIZE];
+        config[..16].copy_from_slice(self.get_config().as_bytes());
+        if let Some(pool) = self.boot_drm_pool {
+            config[16..].copy_from_slice(&pool);
+        }
+        copy_config(data, 0, &config, offset);
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
