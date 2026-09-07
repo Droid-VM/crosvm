@@ -588,6 +588,7 @@ fn create_virtio_devices(
             add_control_tube(DeviceControlTube::Gpu(gpu_control_host_tube).into());
             let gpu_dev = create_gpu_device(
                 cfg,
+                vm.get_memory(),
                 vm_evt_wrtube,
                 gpu_control_device_tube,
                 resource_bridges,
