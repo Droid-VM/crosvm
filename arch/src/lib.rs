@@ -389,25 +389,23 @@ pub fn simplefb_bpp(format: &str) -> u32 {
 
 /// What every simplefb row pitch is rounded up to. `1` means packed, i.e. no padding at all.
 ///
-/// **Padding is off by default, and that is a statement about the firmware, not about the GPU.**
-/// The row pitch is written into the device tree, and of the three things that read this
-/// framebuffer only Linux reads it back: EDK2 computes `width * 4` itself and Windows takes the GOP
-/// EDK2 hands it (`SimpleFbDxe.c`, `PixelsPerScanLine = MipiFrameBufferWidth`). So a padded stride
-/// is only correct once the firmware has learned to read `stride` -- until then it would shear
-/// every Windows guest by exactly the padding, on every row.
+/// 256 bytes, and it is measured rather than chosen: at 1500x1060 the packed 6000-byte stride
+/// fails `vkCreateImage` outright in turnip -- "failed to create explicit LINEAR display source
+/// image" -- so the screen drops to the CPU copy path, while the same import at 6144 succeeds. A
+/// width that is not a multiple of 64 pixels is otherwise simply unable to use the GPU transport.
+/// 256 is also the figure the display backend already documents for this case
+/// (`crosvm_android_display_client.cpp`, "1400 -> stride 5632 = 1408px").
 ///
-/// What padding buys, when the firmware is ready: a LINEAR dmabuf handed to turnip is imported as a
-/// `VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT` image whose `rowPitch` is this stride, and Adreno's 2D
-/// blitter reads that source through the texture pipe at the image's PITCH. A pitch it cannot
-/// express refuses the import and drops the whole screen to the CPU copy path -- which is what a
-/// width that is not a multiple of 64 pixels risks. 256 bytes is the figure the display backend
-/// already documents for exactly this case (`crosvm_android_display_client.cpp`, "1400 -> stride
-/// 5632 = 1408px").
+/// **This default is coupled to the firmware.** The row pitch is written into the device tree, and
+/// of the three things that read this framebuffer only Linux ever read it back: EDK2 computed
+/// `width * 4` itself and Windows takes the GOP EDK2 hands it. Padding is therefore only correct
+/// against firmware whose `SimpleFbDxe` reads `stride` and sets `PixelsPerScanLine` from it -- with
+/// anything older, a Windows guest shears by exactly the padding, on every row. A VM pointed at an
+/// older firmware needs `CROSVM_SIMPLEFB_STRIDE_ALIGN=1`.
 ///
-/// Overridable so that "does this pitch actually get refused?" can be measured on a running device
-/// rather than assumed: nothing has yet shown the refusal, and a padded stride is the wrong thing
-/// to ship on the strength of a suspicion.
-pub const SIMPLEFB_STRIDE_ALIGN_DEFAULT: u32 = 1;
+/// The cost where it applies is at most 255 bytes a row -- 265 KiB on a 1080-row screen -- against
+/// a region rounded to 2 MiB anyway.
+pub const SIMPLEFB_STRIDE_ALIGN_DEFAULT: u32 = 256;
 
 /// `CROSVM_SIMPLEFB_STRIDE_ALIGN`, read once. Rounded up to a power of two, because the arithmetic
 /// below is a mask and a value that is not one would silently mean something else.

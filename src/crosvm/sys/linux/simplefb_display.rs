@@ -125,6 +125,18 @@ pub fn start_simplefb_display_thread(
     thread::Builder::new()
         .name("simplefb_display".into())
         .spawn(move || {
+            // Whether handing this exporter a frame it did not ask for is nearly free. It decides
+            // the default for `CROSVM_SIMPLEFB_GPU_ALWAYS_FLIP`, and it is a property of the
+            // exporter rather than of the transport -- which is the correction the measurements
+            // forced. See the switch's own note for the four numbers.
+            //
+            // Asked here because `target` is consumed below and this is the last place that knows
+            // which one it was. The honest home for it is a `GpuDisplay` capability, next to
+            // `is_dmabuf_import_supported`, so a sink states its own cost instead of being
+            // classified from outside; that is a trait change and this is not.
+            let unconditional_present_is_cheap =
+                matches!(target, SimplefbDisplayTarget::Android { .. });
+
             // `target` is consumed rather than borrowed: the VNC arm's input devices are moved into
             // the sink, and a device cannot be handed over through a `&`.
             let display_result = match target {
@@ -179,7 +191,13 @@ pub fn start_simplefb_display_thread(
             // GPU device existed -- the device present, the road absent. The Android backend never
             // had input of its own (the app drives the `--input` evdev sockets instead).
 
-            if let Err(e) = simplefb_display_loop(guest_mem, &params, &mut display, transport_cap) {
+            if let Err(e) = simplefb_display_loop(
+                guest_mem,
+                &params,
+                &mut display,
+                transport_cap,
+                unconditional_present_is_cheap,
+            ) {
                 error!("simplefb display thread exited with error: {:?}", e);
             }
         })
@@ -409,14 +427,6 @@ fn build_gpu_transport(
 /// so on that route the two layers agree about what a unit of change is.
 const WATCH_BAND_ROWS: usize = 32;
 
-/// How much of a band is pulled out of guest memory at a time to be hashed.
-///
-/// The hash needs the bytes in a normal slice and guest memory is only reachable through volatile
-/// accesses, so they come across in chunks that stay in L1 rather than in one buffer the size of a
-/// band. This is not the copy that the watcher exists to avoid: nothing downstream sees it, it does
-/// not touch `read_buf`, and it is gone by the end of the band.
-const HASH_CHUNK_BYTES: usize = 4096;
-
 /// How often the watcher looks at the framebuffer while nothing is watching the screen.
 ///
 /// Bookkeeping, not a setting: what it buys is that `last_changed_at` is roughly right at the
@@ -428,8 +438,26 @@ const LIVENESS_INTERVAL: Duration = Duration::from_secs(1);
 /// every tick, and a line per tick is not observability.
 const CHANGE_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
-const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// Whether `len` bytes at two addresses differ.
+///
+/// One of the two is guest memory the guest writes with no synchronisation of any kind, so this is
+/// a racing read by construction -- as every read of this framebuffer is, including the copy beside
+/// it. What makes that safe to build on is not the read but where its answer is recorded: a band is
+/// only ever declared "already on screen" against the bytes that were actually copied, so a
+/// comparison that caught a half-written frame is corrected by the next tick rather than believed.
+///
+/// `memcmp` rather than a hash for a measured reason. The FNV-1a this replaced is a serial
+/// dependency chain -- one xor and one multiply per byte, neither vectorisable nor overlappable --
+/// and cost 10.3 ms for a 1080p frame against 0.45 ms for the same bytes through `memcmp`. That
+/// difference is the whole per-tick budget: a hash is worth paying for when the fingerprint has to
+/// be stored, and here the previous frame is already sitting in `read_buf`.
+///
+/// # Safety
+///
+/// Both pointers must be readable for `len` bytes.
+unsafe fn bytes_differ(a: *const u8, b: *const u8, len: usize) -> bool {
+    len != 0 && libc::memcmp(a as *const libc::c_void, b as *const libc::c_void, len) != 0
+}
 
 /// Debug switches for the bridge, read from the environment once when the loop starts.
 ///
@@ -446,27 +474,39 @@ struct SimplefbDebug {
     /// last given and what guest memory holds at that same moment, and log a per-band comparison
     /// of the two. The trigger file is removed as it is consumed, so one `touch` is one dump.
     dump_prefix: Option<String>,
-    /// `CROSVM_SIMPLEFB_GPU_ALWAYS_FLIP=1`: on the GPU transport, present every tick without
-    /// looking at the framebuffer at all.
+    /// On the GPU transport, present every tick without looking at the framebuffer at all.
     ///
-    /// This is the only configuration in which the host CPU never reads this region, and that is
-    /// the point rather than a side effect. The guest maps it write-combining and the host maps the
-    /// same pages cacheable; on ARM that is a mismatched-attribute alias, and a host cache line
-    /// filled by an earlier tick is not invalidated by the guest's non-cacheable write, so a
-    /// cacheable read can keep returning the old 64 bytes indefinitely. Measured on 5567: stale
-    /// regions on screen whose every fragment was exactly one 64-byte-aligned cache line.
+    /// **Defaults to whether an unconditional present is cheap for this exporter**, which is a
+    /// property of the exporter and not of the transport. That correction came from measurement,
+    /// so the measurement is here -- 1500x1060 at 120 Hz, static desktop, bridge thread only:
     ///
-    /// The GPU reads the same pages through the udmabuf and is not behind that cache, so the only
-    /// thing keeping the stale answer in the picture is the CPU comparison that decides whether to
-    /// flip. Removing the comparison removes the failure -- and, incidentally, the whole per-tick
-    /// full-frame hash.
+    /// | exporter | always flip | present only what changed |
+    /// |---|---|---|
+    /// | native display | **4.1%** | ~20% |
+    /// | VNC | 47.3%, hw encoder fed 118 fps | **21.5%**, encoder fed 0 fps |
+    ///
+    /// The native display's sink does a GPU blit and posts a buffer -- what a display does every
+    /// vsync anyway -- so not asking whether the frame is new is both cheaper and safer than
+    /// asking. The VNC sink reads the frame back, memcmps it whole against `last_clean` and feeds
+    /// a hardware encoder, per offered frame: unconditional presents there run the AVC encoder at
+    /// full rate over a screen that is not moving, which costs power and bitrate on top of the CPU.
+    ///
+    /// What it buys where it is on: this is the only configuration in which the host CPU never
+    /// reads this region. The guest maps it write-combining and the host maps the same pages
+    /// cacheable, so a cacheable read can return bytes the guest overwrote -- and the flip decision
+    /// is a cacheable read. Not making the decision is a stronger fix than making it correctly,
+    /// where the decision was not worth anything.
     gpu_always_flip: bool,
-    /// `CROSVM_SIMPLEFB_INVALIDATE=1`: invalidate the framebuffer's cache lines before reading it.
+    /// **On unless `CROSVM_SIMPLEFB_INVALIDATE=0`**: drop the framebuffer's cache lines before
+    /// reading it.
     ///
-    /// The CPU-copy transport has no equivalent of the switch above: it has to read the region to
-    /// produce a frame at all. This is what makes that read honest. It is also the control for the
-    /// diagnosis -- if this alone clears the stale regions on the GPU transport, then the comparison
-    /// read really was the only thing carrying them.
+    /// Not a switch in the sense the others are. Without it every read of this region -- the
+    /// comparison that decides whether to present, and the copy that produces the frame -- can
+    /// return bytes the guest overwrote and the host's cache never heard about, and the screen
+    /// keeps a stale 64-byte line until something evicts it. That is a correctness failure with no
+    /// symptom in any log, so it is on by default and the environment variable exists to turn it
+    /// OFF, for measuring what it costs or for confirming that it is still what is holding the
+    /// picture together.
     invalidate: bool,
 }
 
@@ -522,36 +562,51 @@ fn invalidate_dcache_range(ptr: *const u8, len: usize) {
 fn invalidate_dcache_range(_ptr: *const u8, _len: usize) {}
 
 impl SimplefbDebug {
-    fn from_env() -> Self {
-        let flag = |name: &str| {
+    fn from_env(unconditional_present_is_cheap: bool) -> Self {
+        // Every switch here is a tri-state: unset means the default, and both `1` and `0` are
+        // answers. A debug switch that could only be turned on would leave the one thing with a
+        // non-false default unable to be turned off.
+        let flag = |name: &str, default: bool| {
             std::env::var(name)
                 .map(|v| v == "1" || v == "true" || v == "on")
-                .unwrap_or(false)
+                .unwrap_or(default)
         };
-        let no_skip = flag("CROSVM_SIMPLEFB_NO_SKIP");
-        let gpu_always_flip = flag("CROSVM_SIMPLEFB_GPU_ALWAYS_FLIP");
-        let invalidate = flag("CROSVM_SIMPLEFB_INVALIDATE");
+        let no_skip = flag("CROSVM_SIMPLEFB_NO_SKIP", false);
+        let gpu_always_flip = flag(
+            "CROSVM_SIMPLEFB_GPU_ALWAYS_FLIP",
+            unconditional_present_is_cheap,
+        );
+        // Default on, so the question the environment answers is "turn it off", not "turn it on".
+        let invalidate = flag("CROSVM_SIMPLEFB_INVALIDATE", true);
         let dump_prefix = std::env::var("CROSVM_SIMPLEFB_DUMP")
             .ok()
             .filter(|v| !v.is_empty());
         if no_skip {
             info!("simplefb: CROSVM_SIMPLEFB_NO_SKIP=1, every tick presents every band");
         }
-        if gpu_always_flip {
-            info!(
-                "simplefb: CROSVM_SIMPLEFB_GPU_ALWAYS_FLIP=1, the gpu transport presents every \
-                 tick and the cpu never reads the framebuffer"
-            );
-        }
+        // Conditional on purpose: which transport this screen ends up on is decided later, and on
+        // the CPU one this setting does nothing at all.
+        info!(
+            "simplefb: on the gpu transport this screen will {}",
+            if gpu_always_flip {
+                "present every tick without reading the framebuffer"
+            } else {
+                "present only what changed"
+            }
+        );
         if invalidate {
             #[cfg(target_arch = "aarch64")]
             info!(
-                "simplefb: CROSVM_SIMPLEFB_INVALIDATE=1, dropping {}-byte cache lines before each \
-                 read",
+                "simplefb: dropping {}-byte cache lines before each read",
                 dcache_line_size()
             );
             #[cfg(not(target_arch = "aarch64"))]
-            warn!("simplefb: CROSVM_SIMPLEFB_INVALIDATE=1 has no effect on this architecture");
+            warn!("simplefb: cache invalidation before reads is unimplemented on this architecture");
+        } else {
+            warn!(
+                "simplefb: CROSVM_SIMPLEFB_INVALIDATE=0, reading the framebuffer through the \
+                 host's caches -- stale 64-byte lines on screen are expected"
+            );
         }
         if let Some(prefix) = &dump_prefix {
             info!("simplefb: dump armed; touch {prefix}.trigger to take one");
@@ -583,55 +638,48 @@ impl SimplefbDebug {
 }
 
 /// Writes, for one moment, both halves of the question "is what the sink was given still what the
-/// guest holds", and logs which bands disagree and how.
+/// guest holds", and logs which bands disagree.
 ///
-/// Four numbers per band, and it is the disagreements BETWEEN them that name the culprit:
+/// What this can and cannot see is worth stating, because an earlier version of it claimed more.
+/// It compares `read_buf` -- the bytes the sink was actually handed -- against a full-frame copy of
+/// guest memory taken here, per band. A band that differs is an update the watcher has not carried
+/// across yet, which on a settled screen is a missed one.
 ///
-///   `stored`  what the watcher believes is on screen (`band_hashes`)
-///   `buf`     what `read_buf` -- the bytes the sink was actually handed -- hashes to
-///   `snap`    a full-frame copy of guest memory taken here, hashed the same way
-///   `guest`   the band-at-a-time read the skip decision itself uses (`hash_band_in_guest`)
-///
-///   stored != buf    the watcher's bookkeeping has parted company with the buffer it describes
-///   buf    != snap   guest memory has moved on from what the sink was given -- a missed update
-///   guest  != snap   two reads of the same memory in the same tick disagree: torn, or stale
-///   guest == stored while buf != snap
-///                    THE ONE THAT MATTERS: the skip path would call this band unchanged, while
-///                    the copy path can see it is not. That is a read that lies, not a logic bug.
+/// It CANNOT see a read that lies. Every read it makes reaches guest memory through the same
+/// cacheable mapping the watcher uses, so a stale cache line is stale for the dump too and all of
+/// its answers agree with each other. That is not hypothetical: it is how the mismatched-attribute
+/// staleness this bridge carries was missed three times. What found that was comparing the dumped
+/// pixels with a known-good earlier frame and measuring the geometry of what differed -- which is
+/// why the two `.bin` files matter more than the counters.
 fn dump_watcher_state(
     prefix: &str,
     watcher: &FramebufferWatcher,
     params: &SimplefbDisplayParams,
     read_buf: &[u8],
     fb: VolatileSlice,
-    scratch: &mut [u8; HASH_CHUNK_BYTES],
 ) {
     let mut snap = vec![0u8; read_buf.len()];
     fb.copy_to_volatile_slice(VolatileSlice::new(&mut snap));
 
     let mut disagreeing = 0usize;
-    let mut lying_reads = 0usize;
     let mut reported = 0usize;
     for band in 0..watcher.bands() {
-        let stored = watcher.band_hashes[band];
-        let buf = watcher.hash_band_in_buf(band, read_buf);
-        let snap_hash = watcher.hash_band_in_buf(band, &snap);
-        let guest = watcher.hash_band_in_guest(fb, band, scratch);
-        if stored == buf && buf == snap_hash && guest == Some(snap_hash) {
+        let (off, len) = watcher.band_range(band);
+        let (Some(a), Some(b)) = (read_buf.get(off..off + len), snap.get(off..off + len)) else {
+            continue;
+        };
+        if a == b {
             continue;
         }
         disagreeing += 1;
-        // The skip would keep this band while the bytes say it moved.
-        if buf != snap_hash && guest == Some(stored) {
-            lying_reads += 1;
-        }
         if reported < 24 {
             reported += 1;
             let (first, last) = watcher.band_rows(band);
+            let at = a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(0);
             info!(
-                "simplefb dump: band {band} rows {first}..{last} stored={stored:#018x} \
-                 buf={buf:#018x} snap={snap_hash:#018x} guest={:#018x}",
-                guest.unwrap_or(0),
+                "simplefb dump: band {band} rows {first}..{last} differs from guest memory, \
+                 first at byte {} of the frame",
+                off + at,
             );
         }
     }
@@ -640,8 +688,8 @@ fn dump_watcher_state(
     let readbuf_path = format!("{prefix}.readbuf.bin");
     let guest_path = format!("{prefix}.guest.bin");
     let summary = format!(
-        "{}x{} stride={} bpp={} fourcc={:#x} bands={} disagreeing={} lying_reads={} \
-         hashes_valid={} pending_present={}\n",
+        "{}x{} stride={} bpp={} fourcc={:#x} bands={} disagreeing={} read_buf_valid={} \
+         pending_present={}\n",
         params.width,
         params.height,
         params.stride,
@@ -649,8 +697,7 @@ fn dump_watcher_state(
         params.fourcc,
         watcher.bands(),
         disagreeing,
-        lying_reads,
-        watcher.hashes_valid,
+        watcher.read_buf_valid,
         watcher.pending_present,
     );
     for (path, bytes) in [
@@ -663,22 +710,11 @@ fn dump_watcher_state(
         }
     }
     info!(
-        "simplefb dump: {}/{} band(s) disagree, {} of them would be skipped as unchanged; \
-         wrote {readbuf_path} and {guest_path}",
+        "simplefb dump: {}/{} band(s) differ from guest memory; wrote {readbuf_path} and \
+         {guest_path}",
         disagreeing,
         watcher.bands(),
-        lying_reads,
     );
-}
-
-/// FNV-1a 64, the same hash both sinks use for their frame diagnostics. Nothing compares a watcher
-/// hash with a sink hash -- these never leave this file -- but there is no reason for a tree to
-/// carry two answers to "how do we hash a frame here".
-fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
-    for b in bytes {
-        hash = (hash ^ *b as u64).wrapping_mul(FNV1A64_PRIME);
-    }
-    hash
 }
 
 /// What the simplefb bridge remembers between ticks so that an unchanged framebuffer costs nothing
@@ -686,25 +722,23 @@ fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
 ///
 /// There is no signal from this device: the guest maps the region write-combining, the region is
 /// shared rather than lent, and Gunyah has no dirty log, so comparing content is the only way to
-/// learn that a frame exists. Storing a hash per band rather than the previous frame is what makes
-/// that affordable -- a few hundred bytes instead of a second full-size buffer, and no write at all
-/// on a tick where nothing moved.
+/// learn that a frame exists.
 ///
-/// The hashes describe `read_buf`, i.e. what the sink was last given, not what guest memory last
-/// held. The one exception is the liveness pass, which has no `read_buf` to describe and is always
-/// followed by a forced full pass before anything is presented again.
+/// The thing compared against is `read_buf` itself -- the bytes the sink was last handed -- so
+/// there is no separate record to keep in step with it, and no way for the two to part company.
+/// The band hashes this replaced were exactly such a record, and they cost a full-frame FNV-1a per
+/// tick to maintain for the privilege.
 struct FramebufferWatcher {
     /// Bytes from the start of one row to the start of the next, as the guest lays them out.
     stride: usize,
     /// Bytes of each row that are actually displayed. Row padding is copied along with its band --
-    /// `read_buf` mirrors the guest's layout -- but it is never hashed: no sink shows those bytes,
-    /// so a guest that scribbles in them has not changed the picture.
+    /// `read_buf` mirrors the guest's layout -- but it is never compared: no sink shows those
+    /// bytes, so a guest that scribbles in them has not changed the picture.
     visible_bytes: usize,
     height: usize,
-    /// FNV-1a of each band's visible bytes.
-    band_hashes: Vec<u64>,
-    /// False when `band_hashes` cannot be trusted to describe `read_buf`, which forces the next
-    /// pass to copy and present every band. Set false on every path that can invalidate the
+    bands: usize,
+    /// False when `read_buf` cannot be trusted to describe what the sink is showing, which forces
+    /// the next pass to copy and present every band. Set false on every path that can break the
     /// relationship: the first tick, a consumer arriving, and any failure mid-pass.
     ///
     /// The direction of this flag is the whole safety argument. A stale "unchanged" verdict does
@@ -712,7 +746,7 @@ struct FramebufferWatcher {
     /// transmitted to say so, which is exactly the black-client bug the VNC sink's `last_clean`
     /// already produced once (see `vnc_server_resize`). So every uncertainty resolves to "re-read
     /// everything", never to "assume it is still on screen".
-    hashes_valid: bool,
+    read_buf_valid: bool,
     /// `read_buf` holds something no sink has accepted yet. A frame the sink refused is not lost
     /// here the way a guest flush would be -- this producer is a clock and offers it again on the
     /// next tick -- but only if the skip logic remembers that it never landed.
@@ -724,7 +758,7 @@ struct FramebufferWatcher {
     /// still attached leaves the flag true throughout, and that client needs the same forced full
     /// pass as one that arrives to an empty sink. See `DisplayT::consumer_generation`.
     consumer_generation: u64,
-    /// When the content last hashed differently. Nothing reads it yet; it becomes the screen
+    /// When the content last compared differently. Nothing reads it yet; it becomes the screen
     /// definition's liveness field, which is how a user is meant to tell a frozen screen from a
     /// live one without staring at it.
     last_changed_at: Instant,
@@ -735,7 +769,6 @@ struct FramebufferWatcher {
 impl FramebufferWatcher {
     fn new(params: &SimplefbDisplayParams) -> Self {
         let height = params.height as usize;
-        let bands = height.div_ceil(WATCH_BAND_ROWS);
         let now = Instant::now();
         FramebufferWatcher {
             stride: params.stride as usize,
@@ -743,8 +776,8 @@ impl FramebufferWatcher {
                 .saturating_mul(params.bpp as usize)
                 .min(params.stride as usize),
             height,
-            band_hashes: vec![0; bands],
-            hashes_valid: false,
+            bands: height.div_ceil(WATCH_BAND_ROWS),
+            read_buf_valid: false,
             pending_present: false,
             had_consumer: false,
             consumer_generation: 0,
@@ -755,13 +788,13 @@ impl FramebufferWatcher {
     }
 
     /// Forget everything believed about what is on screen. Every caller of this is a place where
-    /// the sink's buffers and our hashes may have parted company.
+    /// the sink's buffers and `read_buf` may have parted company.
     fn invalidate(&mut self) {
-        self.hashes_valid = false;
+        self.read_buf_valid = false;
     }
 
     fn bands(&self) -> usize {
-        self.band_hashes.len()
+        self.bands
     }
 
     /// First and last-plus-one row of a band.
@@ -776,40 +809,25 @@ impl FramebufferWatcher {
         (first * self.stride, (last - first) * self.stride)
     }
 
-    /// Hashes a band as it stands in guest memory. `None` means the band could not be read, which
-    /// the caller must treat as changed rather than as unchanged.
-    fn hash_band_in_guest(
-        &self,
-        fb: VolatileSlice,
-        band: usize,
-        scratch: &mut [u8; HASH_CHUNK_BYTES],
-    ) -> Option<u64> {
+    /// Whether a band's visible bytes differ between guest memory and what the sink was last
+    /// handed. `None` means the band could not be read, which the caller must treat as changed
+    /// rather than as unchanged.
+    ///
+    /// Row by row rather than band at a time, because a band is only contiguous when the stride is
+    /// packed -- and it is not, whenever the row pitch has been padded for the GPU transport. Row
+    /// padding is skipped for the same reason it always was: no sink shows those bytes.
+    fn band_differs(&self, fb: VolatileSlice, band: usize, read_buf: &[u8]) -> Option<bool> {
         let (first, last) = self.band_rows(band);
-        let mut hash = FNV1A64_OFFSET_BASIS;
-        for row in first..last {
-            let mut done = 0;
-            while done < self.visible_bytes {
-                let len = (self.visible_bytes - done).min(HASH_CHUNK_BYTES);
-                let src = fb.sub_slice(row * self.stride + done, len).ok()?;
-                src.copy_to_volatile_slice(VolatileSlice::new(&mut scratch[..len]));
-                hash = fnv1a64(hash, &scratch[..len]);
-                done += len;
-            }
-        }
-        Some(hash)
-    }
-
-    /// Hashes a band as it stands in `read_buf`, i.e. in what a sink would be shown.
-    fn hash_band_in_buf(&self, band: usize, read_buf: &[u8]) -> u64 {
-        let (first, last) = self.band_rows(band);
-        let mut hash = FNV1A64_OFFSET_BASIS;
         for row in first..last {
             let off = row * self.stride;
-            if let Some(bytes) = read_buf.get(off..off + self.visible_bytes) {
-                hash = fnv1a64(hash, bytes);
+            let src = fb.sub_slice(off, self.visible_bytes).ok()?;
+            let dst = read_buf.get(off..off + self.visible_bytes)?;
+            // SAFETY: `src` is a live mapping of `visible_bytes` and `dst` a slice of that length.
+            if unsafe { bytes_differ(src.as_ptr(), dst.as_ptr(), self.visible_bytes) } {
+                return Some(true);
             }
         }
-        hash
+        Some(false)
     }
 
     fn copy_band(&self, fb: VolatileSlice, band: usize, read_buf: &mut [u8]) -> bool {
@@ -824,54 +842,50 @@ impl FramebufferWatcher {
         true
     }
 
-    /// Brings `read_buf` up to date with guest memory and says whether a sink needs to see it.
+    /// The band loop both passes share. Returns how many bands were copied and how many of those
+    /// the comparison had called changed -- which on a forced pass is none of them, because a
+    /// forced pass does not ask.
     ///
-    /// Per band: hash it where it lies, and if the hash matches the stored one, do nothing at all
-    /// -- no write to `read_buf`, no second read of guest memory. A band that differs is copied
-    /// immediately, while it is still in cache, and the hash then stored is the hash of the bytes
-    /// that landed in `read_buf`, not the one just computed from guest memory. The guest writes
-    /// this region with no synchronisation of any kind, so the two can disagree; storing the
-    /// pre-copy hash would leave `read_buf` holding bytes whose hash is not recorded anywhere, and
-    /// the same band would be re-copied on every tick for as long as the content kept moving.
-    /// Storing what was copied is self-correcting: whatever ended up in `read_buf` is what the next
-    /// tick compares against, and a torn frame is fixed by the tick after it.
-    ///
-    /// `force_all` is the debug switch (`CROSVM_SIMPLEFB_NO_SKIP`) and nothing else sets it: it
-    /// takes the band skip out of the picture entirely so that a stale region which survives can
-    /// be attributed somewhere other than here.
-    fn sync(
-        &mut self,
-        fb: VolatileSlice,
-        read_buf: &mut [u8],
-        scratch: &mut [u8; HASH_CHUNK_BYTES],
-        force_all: bool,
-    ) -> bool {
-        let force = force_all || !self.hashes_valid;
+    /// A band that differs is copied immediately, and what lands in `read_buf` is what the next
+    /// tick compares against. That is the self-correcting part: the guest writes this region with
+    /// no synchronisation of any kind, so a comparison can catch a half-written frame and the copy
+    /// can land a different half -- and the tick after it sees the difference and copies again.
+    fn pass(&mut self, fb: VolatileSlice, read_buf: &mut [u8], force: bool) -> (usize, usize) {
         let mut copied = 0usize;
         let mut changed = 0usize;
         let mut complete = true;
 
-        for band in 0..self.bands() {
-            if !force {
-                if let Some(hash) = self.hash_band_in_guest(fb, band, scratch) {
-                    if hash == self.band_hashes[band] {
-                        continue;
-                    }
-                }
+        for band in 0..self.bands {
+            let differs = if force {
+                None
+            } else {
+                self.band_differs(fb, band, read_buf)
+            };
+            if differs == Some(false) {
+                continue;
             }
             if !self.copy_band(fb, band, read_buf) {
                 complete = false;
                 continue;
             }
-            let hash = self.hash_band_in_buf(band, read_buf);
-            if hash != self.band_hashes[band] {
+            if differs == Some(true) {
                 changed += 1;
-                self.band_hashes[band] = hash;
             }
             copied += 1;
         }
 
-        self.hashes_valid = complete;
+        self.read_buf_valid = complete;
+        (copied, changed)
+    }
+
+    /// Brings `read_buf` up to date with guest memory and says whether a sink needs to see it.
+    ///
+    /// `force_all` is the debug switch (`CROSVM_SIMPLEFB_NO_SKIP`) and nothing else sets it: it
+    /// takes the band skip out of the picture entirely so that a stale region which survives can
+    /// be attributed somewhere other than here.
+    fn sync(&mut self, fb: VolatileSlice, read_buf: &mut [u8], force_all: bool) -> bool {
+        let force = force_all || !self.read_buf_valid;
+        let (copied, changed) = self.pass(fb, read_buf, force);
         if changed > 0 {
             self.note_change(changed, true);
         }
@@ -881,27 +895,14 @@ impl FramebufferWatcher {
     /// The tick that runs while nobody is watching: notice that the guest is still painting,
     /// without producing a frame for it.
     ///
-    /// This updates the hashes and nothing else -- no copy into `read_buf`, no present -- which is
-    /// why every path back to a consumer goes through `invalidate` first. The hashes left here
-    /// describe guest memory, and the frame the returning viewer must be sent is a fresh one.
-    fn liveness_pass(&mut self, fb: VolatileSlice, scratch: &mut [u8; HASH_CHUNK_BYTES]) {
-        let known = self.hashes_valid;
-        let mut changed = 0usize;
-        let mut complete = true;
-
-        for band in 0..self.bands() {
-            match self.hash_band_in_guest(fb, band, scratch) {
-                Some(hash) => {
-                    if known && hash != self.band_hashes[band] {
-                        changed += 1;
-                    }
-                    self.band_hashes[band] = hash;
-                }
-                None => complete = false,
-            }
-        }
-
-        self.hashes_valid = complete;
+    /// It maintains `read_buf` exactly as the watching pass does, and only the present is left out.
+    /// The hash-based version could not: its record described guest memory rather than the buffer,
+    /// so every path back to a consumer had to go through `invalidate` to undo it. That is still
+    /// done on the arrival edge -- a returning viewer is owed a frame whether or not the content
+    /// moved -- but it is now a deliberate re-supply rather than a repair.
+    fn liveness_pass(&mut self, fb: VolatileSlice, read_buf: &mut [u8]) {
+        let force = !self.read_buf_valid;
+        let (_copied, changed) = self.pass(fb, read_buf, force);
         self.last_liveness_at = Instant::now();
         if changed > 0 {
             self.note_change(changed, false);
@@ -934,6 +935,7 @@ fn simplefb_display_loop(
     params: &SimplefbDisplayParams,
     display: &mut GpuDisplay,
     transport_cap: TransportCap,
+    unconditional_present_is_cheap: bool,
 ) -> Result<()> {
     let display_params = DisplayParameters::default_with_mode(DisplayMode::Windowed(
         params.width,
@@ -984,10 +986,9 @@ fn simplefb_display_loop(
     // Persists across ticks and therefore always holds the last full frame handed to the sink,
     // which is what lets a tick copy only the bands that moved and still present a whole picture.
     let mut read_buf = vec![0u8; fb_size];
-    let mut scratch = [0u8; HASH_CHUNK_BYTES];
     let mut watcher = FramebufferWatcher::new(params);
     let mut no_framebuffer: u64 = 0;
-    let debug = SimplefbDebug::from_env();
+    let debug = SimplefbDebug::from_env(unconditional_present_is_cheap);
 
     loop {
         let frame_start = Instant::now();
@@ -1043,18 +1044,33 @@ fn simplefb_display_loop(
             }
         };
 
-        // Before anything reads a byte of it, so that every read below -- the hashes, the copy, and
-        // the dump's own snapshot -- sees memory rather than a line some earlier tick left behind.
-        if debug.invalidate {
+        // Whether the GPU transport is about to present without anybody looking at the pixels on
+        // this side. Asked once, because two things below need the same answer: the branch itself,
+        // and the cache invalidation, which is only worth its 64-byte-per-line walk on a tick where
+        // a host CPU read is going to act on what it finds.
+        let gpu_presents_blind =
+            debug.gpu_always_flip && has_consumer && matches!(transport, Transport::Gpu(_));
+
+        // Consumed before the invalidation decision rather than after it: a dump reads the
+        // framebuffer, so a tick that takes one is a tick that reads whatever the branch below
+        // would have done.
+        let dump_prefix = debug.dump_requested();
+
+        // Before anything reads a byte of it, so that every read below -- the comparison, the copy,
+        // and the dump's own snapshot -- sees memory rather than a line some earlier tick left
+        // behind. Skipped entirely when nothing on this side is going to read: the walk is ~99k
+        // `dc civac` for a 1500x1060 framebuffer, and paying it 120 times a second to make a read
+        // honest that never happens is the most expensive way to do nothing.
+        if debug.invalidate && (!gpu_presents_blind || dump_prefix.is_some()) {
             invalidate_dcache_range(fb.as_ptr(), fb_size);
         }
 
         // Before `sync`, deliberately: here `read_buf` still holds exactly what the sink was last
-        // handed and `band_hashes` is exactly what the skip below is about to compare against, so
+        // handed, which is exactly what the comparison below is about to be made against, so
         // the dump describes the decision as it stands rather than after it has been remade. It
         // also runs on the ticks that end early, which is where a missed update would be hiding.
-        if let Some(prefix) = debug.dump_requested() {
-            dump_watcher_state(prefix, &watcher, params, &read_buf, fb, &mut scratch);
+        if let Some(prefix) = dump_prefix {
+            dump_watcher_state(prefix, &watcher, params, &read_buf, fb);
         }
 
         // The whole watcher, skipped. The sink is handed the same pages every tick and works out
@@ -1064,7 +1080,7 @@ fn simplefb_display_loop(
         //
         // `has_consumer` still gates it: a flip with nobody attached is a Vulkan blit and a buffer
         // post for no one, and the sink's own arrival edge cannot be seen from here.
-        if debug.gpu_always_flip && has_consumer && matches!(transport, Transport::Gpu(_)) {
+        if gpu_presents_blind {
             // Same shape as the normal present below: the failure is recorded while the transport
             // is borrowed and acted on after, because replacing `transport` is what the fallback
             // does and that cannot happen through a borrow of it.
@@ -1109,7 +1125,7 @@ fn simplefb_display_loop(
             // hashes. `last_changed_at` has to keep moving because the moment somebody wants to
             // know which screen is alive is the moment before they attach to one.
             if watcher.liveness_due() {
-                watcher.liveness_pass(fb, &mut scratch);
+                watcher.liveness_pass(fb, &mut read_buf);
             }
             let elapsed = frame_start.elapsed();
             if elapsed < frame_duration {
@@ -1118,7 +1134,7 @@ fn simplefb_display_loop(
             continue;
         }
 
-        if watcher.sync(fb, &mut read_buf, &mut scratch, debug.no_skip) {
+        if watcher.sync(fb, &mut read_buf, debug.no_skip) {
             watcher.pending_present = true;
         }
         if !watcher.pending_present {
