@@ -94,6 +94,7 @@ pub fn get_gpu_cache_info<'a>(
 /// configuration -- no VNC binding on this screen, a `view-only=true` one, or a native exporter.
 pub fn create_gpu_device(
     cfg: &Config,
+    guest_memory: &vm_memory::GuestMemory,
     exit_evt_wrtube: &SendTube,
     gpu_control_tube: Tube,
     resource_bridges: Vec<Tube>,
@@ -292,6 +293,20 @@ pub fn create_gpu_device(
         &cfg.wayland_socket_paths,
         cfg.gpu_cgroup_path.as_ref(),
     );
+    // Device creation precedes Arch::build_vm, which exports the renderer's
+    // arena environment. Read the already constructed VM layout directly;
+    // inherited environment must never choose the GPA advertised to the guest.
+    #[cfg(target_arch = "aarch64")]
+    if let Some(mb) = cfg.pre_alloc.as_ref().and_then(|p| p.drm_host_mb).filter(|m| *m != 0) {
+        let region = guest_memory.regions()
+            .find(|r| r.options.purpose == vm_memory::MemoryRegionPurpose::Drm2KgslPool)
+            .context("DRM pool region missing from VM layout")?;
+        let base = region.guest_addr.offset();
+        let size = region.size as u64;
+        anyhow::ensure!(mb.checked_mul(1 << 20) == Some(size), "DRM pool layout/size mismatch");
+        dev.set_boot_drm_pool(base, size)?;
+        base::info!("GPU-BOOT-POOL: config from VM layout gpa={:#x} size={:#x}", base, size);
+    }
     #[cfg(any(feature = "vnc", feature = "android_display"))]
     if !transport_cap.allows_gpu_copy() {
         dev.cap_transport_to_cpu();

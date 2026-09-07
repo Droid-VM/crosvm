@@ -916,6 +916,9 @@ impl PciDevice for VirtioPciDevice {
 
     fn write_bar(&mut self, bar_index: usize, offset: u64, data: &[u8]) {
         let was_suspended = self.is_device_suspended();
+        let driver_reset_write = bar_index == self.settings_bar
+            && offset == COMMON_CONFIG_BAR_OFFSET + 0x14
+            && data == [0];
 
         if bar_index == self.settings_bar {
             match offset {
@@ -979,9 +982,18 @@ impl PciDevice for VirtioPciDevice {
             }
         }
 
-        // Device has been reset by the driver
-        if self.device_activated && self.is_reset_requested() {
-            if let Err(e) = self.device.reset() {
+        // A reset must also discard queues configured before DRIVER_OK, or left
+        // behind by an unsuccessful activation. Otherwise the next driver sees
+        // status == 0 with queue_enable == 1 and cannot initialize its queues.
+        // Inactive devices need only the transport reset; do not call a backend
+        // reset implementation that may require an activated worker.
+        if self.is_reset_requested() && (self.device_activated || driver_reset_write) {
+            let reset_result = if self.device_activated {
+                self.device.reset()
+            } else {
+                Ok(())
+            };
+            if let Err(e) = reset_result {
                 error!("failed to reset {} device: {:#}", self.debug_label(), e);
             } else {
                 self.device_activated = false;
@@ -1578,6 +1590,65 @@ impl SharedMemoryMapper for VmRequester {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    struct UnactivatedDevice;
+
+    impl VirtioDevice for UnactivatedDevice {
+        fn keep_rds(&self) -> Vec<RawDescriptor> {
+            Vec::new()
+        }
+
+        fn device_type(&self) -> DeviceType {
+            DeviceType::Gpu
+        }
+
+        fn queue_max_sizes(&self) -> &[u16] {
+            &[256, 256]
+        }
+
+        fn activate(
+            &mut self,
+            _mem: GuestMemory,
+            _interrupt: Interrupt,
+            _queues: BTreeMap<usize, Queue>,
+        ) -> anyhow::Result<()> {
+            anyhow::bail!("test device must not activate")
+        }
+    }
+
+    #[test]
+    fn reset_discards_queues_before_activation() {
+        let (msi, _msi_peer) = Tube::pair().unwrap();
+        let (ioevent, _ioevent_peer) = Tube::pair().unwrap();
+        let (control, _control_peer) = Tube::pair().unwrap();
+        let mut pci = VirtioPciDevice::new(
+            GuestMemory::new(&[(vm_memory::GuestAddress(0), 0x10000)]).unwrap(),
+            Box::new(UnactivatedDevice),
+            msi,
+            false,
+            None,
+            VmMemoryClient::new(ioevent),
+            control,
+        )
+        .unwrap();
+        let bar = pci.settings_bar;
+        // Configure queues while status is zero. Ordinary register writes must
+        // not themselves trigger a reset merely because the device is inactive.
+        pci.write_bar(bar, COMMON_CONFIG_BAR_OFFSET + 0x1c, &1u16.to_le_bytes());
+        pci.write_bar(bar, COMMON_CONFIG_BAR_OFFSET + 0x16, &1u16.to_le_bytes());
+        pci.write_bar(bar, COMMON_CONFIG_BAR_OFFSET + 0x18, &128u16.to_le_bytes());
+        pci.write_bar(bar, COMMON_CONFIG_BAR_OFFSET + 0x1c, &1u16.to_le_bytes());
+        assert!(pci.queues.iter().all(QueueConfig::ready));
+        assert!(!pci.device_activated);
+
+        pci.write_bar(bar, COMMON_CONFIG_BAR_OFFSET + 0x14, &[0]);
+
+        assert!(pci.queues.iter().all(|q| !q.ready()));
+        assert!(pci.queues.iter().all(|q| q.size() == 256));
+        assert_eq!(pci.common_config.queue_select, 0);
+        assert_eq!(pci.common_config.driver_status, 0);
+    }
 
     #[cfg(feature = "pci-hotplug")]
     #[test]

@@ -234,6 +234,10 @@ where
     V: VcpuArch,
 {
     let mut interrupted_by_signal = false;
+    // Keep bringup diagnostics bounded and avoid flooding on repeated polling
+    // of an unbacked mapping. A false bus result otherwise silently reads zero
+    // or discards a write, which can look like a shared-memory coherency fault.
+    let mut unmapped_mmio = std::collections::BTreeSet::new();
 
     loop {
         // Start by checking for messages to process and the run state of the CPU.
@@ -400,11 +404,23 @@ where
                     if let Err(e) =
                         vcpu.handle_mmio(&mut |IoParams { address, operation }| match operation {
                             IoOperation::Read(data) => {
-                                mmio_bus.read(address, data);
+                                if !mmio_bus.read(address, data)
+                                    && unmapped_mmio.len() < 32
+                                    && unmapped_mmio.insert((address, false))
+                                {
+                                    warn!("MMIO-UNMAPPED: vcpu={} read gpa={:#x} len={}",
+                                          cpu_id, address, data.len());
+                                }
                                 Ok(())
                             }
                             IoOperation::Write(data) => {
-                                mmio_bus.write(address, data);
+                                if !mmio_bus.write(address, data)
+                                    && unmapped_mmio.len() < 32
+                                    && unmapped_mmio.insert((address, true))
+                                {
+                                    warn!("MMIO-UNMAPPED: vcpu={} write gpa={:#x} len={}",
+                                          cpu_id, address, data.len());
+                                }
                                 Ok(())
                             }
                         })
