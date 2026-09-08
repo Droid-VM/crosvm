@@ -4137,13 +4137,12 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
         let guest_mem = linux.vm.get_memory().clone();
-        let bpp: u32 = match sfb_cfg.format.as_str() {
-            "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
-            "r8g8b8" => 3,
-            "r5g6b5" => 2,
-            _ => 4,
-        };
-        let stride = sfb_cfg.width * bpp;
+        let bpp = arch::simplefb_bpp(sfb_cfg.format.as_str());
+        // Padded to the alignment the GPU transport needs (see `arch::simplefb_stride`). Taken from
+        // the same function that sized the region and wrote the device tree's `stride`, because a
+        // bridge that disagreed with either would hand the sink a sheared picture and report
+        // nothing -- the failure would look like a wrong image, not like an error.
+        let stride = arch::simplefb_stride(sfb_cfg.width, sfb_cfg.format.as_str());
         // The same DT string the guest reads, resolved once here rather than assumed downstream:
         // the bridge hands it to the sink as part of every frame it produces.
         let fourcc = simplefb_display::simplefb_format_fourcc(sfb_cfg.format.as_str());
