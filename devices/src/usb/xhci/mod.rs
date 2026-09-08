@@ -6,8 +6,11 @@
 
 mod command_ring_controller;
 mod device_slot;
+#[cfg(test)]
+pub(crate) use device_slot::test_util;
 mod event_ring;
 mod interrupter;
+mod intr_moderation_handler;
 mod intr_resample_handler;
 mod ring_buffer;
 mod ring_buffer_controller;
@@ -30,12 +33,17 @@ use std::thread;
 
 use base::debug;
 use base::error;
+use base::info;
+use base::warn;
 use remain::sorted;
+use std::time::Instant;
+
 use sync::Mutex;
 use thiserror::Error;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
+use crate::register_space::RegisterInterface;
 use crate::usb::backend::error::Error as BackendProviderError;
 use crate::usb::xhci::command_ring_controller::CommandRingController;
 use crate::usb::xhci::command_ring_controller::CommandRingControllerError;
@@ -43,9 +51,13 @@ use crate::usb::xhci::device_slot::DeviceSlots;
 use crate::usb::xhci::device_slot::Error as DeviceSlotError;
 use crate::usb::xhci::interrupter::Error as InterrupterError;
 use crate::usb::xhci::interrupter::Interrupter;
+use crate::usb::xhci::intr_moderation_handler::IntrModerationHandler;
 use crate::usb::xhci::intr_resample_handler::IntrResampleHandler;
+use crate::usb::xhci::ring_buffer_stop_cb::fallible_closure;
 use crate::usb::xhci::ring_buffer_stop_cb::RingBufferStopCallback;
+use crate::usb::xhci::usb_hub::Error as UsbHubError;
 use crate::usb::xhci::usb_hub::UsbHub;
+use crate::usb::xhci::xhci_abi::TrbCompletionCode;
 use crate::usb::xhci::xhci_backend_device_provider::XhciBackendDeviceProvider;
 use crate::usb::xhci::xhci_regs::*;
 use crate::utils::Error as UtilsError;
@@ -62,10 +74,16 @@ pub enum Error {
     CloneResampleEvent(base::Error),
     #[error("failed to create command ring controller: {0}")]
     CreateCommandRingController(CommandRingControllerError),
+    #[error("failed to create interrupter: {0}")]
+    CreateInterrupter(InterrupterError),
     #[error("failed to enable interrupter: {0}")]
     EnableInterrupter(InterrupterError),
     #[error("failed to get device slot: {0}")]
     GetDeviceSlot(u8),
+    #[error("failed to reset host hub: {0}")]
+    ResetHub(UsbHubError),
+    #[error("failed to reset interrupter: {0}")]
+    ResetInterrupter(InterrupterError),
     #[error("failed to reset port")]
     ResetPort,
     #[error("failed to ring doorbell: {0}")]
@@ -78,6 +96,8 @@ pub enum Error {
     SetupEventRing(InterrupterError),
     #[error("failed to start event loop: {0}")]
     StartEventLoop(UtilsError),
+    #[error("failed to start interrupt moderation handler")]
+    StartModerationHandler,
     #[error("failed to start backend provider: {0}")]
     StartProvider(BackendProviderError),
     #[error("failed to start resample handler")]
@@ -95,11 +115,15 @@ pub struct Xhci {
     device_slots: DeviceSlots,
     event_loop: Arc<EventLoop>,
     event_loop_join_handle: Option<thread::JoinHandle<()>>,
+    /// When the microframe counter last started from zero (controller reset).
+    mfindex_anchor: Arc<Mutex<Instant>>,
     // resample handler and device provider only lives on EventLoop to handle corresponding events.
     // By design, event loop only hold weak reference. We need to keep a strong reference here to
     // keep it alive.
     #[allow(dead_code)]
     intr_resample_handler: Arc<IntrResampleHandler>,
+    #[allow(dead_code)]
+    intr_moderation_handler: Arc<IntrModerationHandler>,
     #[allow(dead_code)]
     device_provider: Box<dyn XhciBackendDeviceProvider>,
 }
@@ -120,7 +144,9 @@ impl Xhci {
             .get_trigger()
             .try_clone()
             .map_err(Error::CloneIrqEvent)?;
-        let interrupter = Arc::new(Mutex::new(Interrupter::new(mem.clone(), irq_evt, &regs)));
+        let interrupter = Arc::new(Mutex::new(
+            Interrupter::new(mem.clone(), irq_evt, &regs).map_err(Error::CreateInterrupter)?,
+        ));
         let event_loop = Arc::new(event_loop);
         let irq_resample_evt = interrupt_evt
             .get_resample()
@@ -129,6 +155,9 @@ impl Xhci {
         let intr_resample_handler =
             IntrResampleHandler::start(&event_loop, interrupter.clone(), irq_resample_evt)
                 .ok_or(Error::StartResampleHandler)?;
+        let intr_moderation_handler =
+            IntrModerationHandler::start(&event_loop, interrupter.clone())
+                .ok_or(Error::StartModerationHandler)?;
         let hub = Arc::new(UsbHub::new(&regs, interrupter.clone()));
 
         let mut device_provider = device_provider;
@@ -155,18 +184,26 @@ impl Xhci {
             fail_handle,
             regs,
             intr_resample_handler,
+            intr_moderation_handler,
             interrupter,
             command_ring_controller,
             device_slots,
             device_provider,
             event_loop,
             event_loop_join_handle: Some(join_handle),
+            mfindex_anchor: Arc::new(Mutex::new(Instant::now())),
         });
         Self::init_reg_callbacks(&xhci);
         Ok(xhci)
     }
 
     fn init_reg_callbacks(xhci: &Arc<Xhci>) {
+        // MFINDEX ticks every 125 us from the last controller reset and wraps at 14 bits
+        // (spec 5.5.1).
+        let anchor = xhci.mfindex_anchor.clone();
+        xhci.regs
+            .mfindex
+            .set_read_cb(move || ((anchor.lock().elapsed().as_micros() / 125) & 0x3FFF) as u32);
         // All the callbacks will hold a weak reference to avoid memory leak. Thos weak upgrade
         // should never fail.
         let xhci_weak = Arc::downgrade(xhci);
@@ -257,10 +294,21 @@ impl Xhci {
 
     // Callback for usbcmd register write.
     fn usbcmd_callback(&self, value: u32) -> Result<u32> {
+        debug!("xhci_controller: usbcmd write {:#x}", value);
         if (value & USB_CMD_RESET) > 0 {
             debug!("xhci_controller: reset controller");
             self.reset();
-            return Ok(value & (!USB_CMD_RESET));
+            // USBCMD reads 0 once the reset is done (spec 5.4.1): R/S, INTE and the rest are for
+            // software to set again. HCRST reads 0 at once, even when the reset finishes later
+            // on the event loop because a ring was in flight -- resetting a running controller
+            // is undefined behaviour (5.4.1: software shall not set HCRST while HCH is 0), and
+            // every driver we run halts and waits for HCH first, so the two coincide for them.
+            // USBSTS.CNR is what says the reset is still in progress, and Linux and EDK2 wait on
+            // it. Keeping HCRST at 1 until the callback is not an option: `Register::write`
+            // stores this return value after the callback, so a callback that cleared the bit
+            // in between would be undone and HCRST pinned at 1 with CNR 0, which fails Linux's
+            // xhci_reset outright.
+            return Ok(0);
         }
 
         if (value & USB_CMD_RUNSTOP) > 0 {
@@ -283,19 +331,69 @@ impl Xhci {
         Ok(value)
     }
 
-    // Callback for crcr register write.
+    // Callback for crcr register write. The value it returns is what the guest reads back: CRR
+    // alone (spec 5.4.5: the pointer, RCS, CS and CA all read as zero), and CRR is the
+    // controller's -- set by doorbell 0, cleared by CS/CA, R/S=0 and HCRST -- so no guest write
+    // can leave the ring looking as if it were running. (A 64-bit register takes the low dword
+    // first and calls back on the high one, so the value stored in between is transient.)
     fn crcr_callback(&self, value: u64) -> u64 {
         let _trace = cros_tracing::trace_event!(USB, "crcr_callback", value);
-        if (self.regs.crcr.get_value() & CRCR_COMMAND_RING_RUNNING) == 0 {
+        let current = self.regs.crcr.get_value();
+        if (current & CRCR_COMMAND_RING_RUNNING) == 0 {
             self.command_ring_controller
                 .set_dequeue_pointer(GuestAddress(value & CRCR_COMMAND_RING_POINTER));
             self.command_ring_controller
                 .set_consumer_cycle_state((value & CRCR_RING_CYCLE_STATE) > 0);
-            value
-        } else {
-            error!("Write to crcr while command ring is running");
-            self.regs.crcr.get_value()
+            return 0;
         }
+        if (value & (CRCR_COMMAND_STOP | CRCR_COMMAND_ABORT)) == 0 {
+            // The pointer and RCS are ignored while the ring runs (spec 5.4.5).
+            warn!(
+                "xhci: crcr write {:#x} ignored while the command ring is running",
+                value
+            );
+            return CRCR_COMMAND_RING_RUNNING;
+        }
+        // Command Stop / Command Abort (spec 5.4.5, 4.6.1.2): the ring stops once the command
+        // being handled is done, CRR falls and a Command Ring Stopped event carries the dequeue
+        // pointer. Linux's command timeout (xhci_abort_cmd_ring) writes CA and polls CRR for
+        // 5 s; a CRR that never falls has it declare the host dead ("Abort failed to stop
+        // command ring") on every command that times out. The command ring handler tracks
+        // nothing across a command, so `stop` parks the ring before it returns -- waiting out a
+        // command being handled on the `state` lock -- and the callback runs right here. A
+        // command whose completion is still to come from a transfer ring (Disable Slot, Stop
+        // Endpoint, Reset Device) completes later as usual; the driver has marked it aborted by
+        // then and drops the mismatched completion.
+        info!(
+            "xhci: command ring {} requested (crcr write {:#x})",
+            if (value & CRCR_COMMAND_ABORT) != 0 {
+                "abort"
+            } else {
+                "stop"
+            },
+            value
+        );
+        let crcr = self.regs.crcr.clone();
+        let interrupter = self.interrupter.clone();
+        let command_ring_controller = self.command_ring_controller.clone();
+        self.command_ring_controller
+            .stop(RingBufferStopCallback::new(fallible_closure(
+                self.fail_handle.clone(),
+                move || -> Result<()> {
+                    crcr.clear_bits(CRCR_COMMAND_RING_RUNNING);
+                    interrupter
+                        .lock()
+                        .send_command_completion_trb(
+                            TrbCompletionCode::CommandRingStopped,
+                            0,
+                            command_ring_controller.get_dequeue_pointer(),
+                        )
+                        .map_err(Error::SendInterrupt)
+                },
+            )));
+        // The callback has run by now (see above); should a handler ever hold the ring in
+        // Stopping, CRR stays up until it does.
+        self.regs.crcr.get_value() & CRCR_COMMAND_RING_RUNNING
     }
 
     // Callback for portsc register write.
@@ -303,15 +401,54 @@ impl Xhci {
         let _trace = cros_tracing::trace_event!(USB, "portsc_callback", index, value);
         let mut value = value;
         let port_id = (index + 1) as u8;
-        // xHCI spec 4.19.5. Note: we might want to change this logic if we support USB 3.0.
+        let old = self.regs.portsc[index as usize].get_value();
+        // The link-state field only takes a write when the strobe is set (spec 5.4.8, LWS); any
+        // other write carries whatever the driver read back or zero. Windows writes zero, which
+        // left every empty SuperSpeed port claiming U0 with nothing attached -- a state its hub
+        // driver answers with a controller reset, ten times over, and the root hub is dead. The
+        // strobe itself always reads as zero.
+        let strobe = (value & PORTSC_PORT_LINK_STATE_WRITE_STROBE) != 0;
+        if !strobe {
+            value = (value & !PORTSC_PORT_LINK_STATE_MASK) | (old & PORTSC_PORT_LINK_STATE_MASK);
+        }
+        value &= !PORTSC_PORT_LINK_STATE_WRITE_STROBE;
+        let old_pls = (old & PORTSC_PORT_LINK_STATE_MASK) >> PORTSC_PORT_LINK_STATE_SHIFT;
+        let new_pls = (value & PORTSC_PORT_LINK_STATE_MASK) >> PORTSC_PORT_LINK_STATE_SHIFT;
+        // Resume completes when software brings a suspended (U3) or resuming port back to U0.
+        // The link is back at once here; software learns of it from the Port Link State Change
+        // bit and a port status change event (spec 4.15.2.2). Without them Windows' hub driver
+        // waits 500 ms for the event, declares the device gone and re-enumerates it, so the
+        // first use of any device after selective suspend fails.
+        if strobe
+            && new_pls == PORTSC_PLS_U0
+            && (old_pls == PORTSC_PLS_U3 || old_pls == PORTSC_PLS_RESUME)
+            && (value & PORTSC_CURRENT_CONNECT_STATUS) != 0
+        {
+            value |= PORTSC_PORT_LINK_STATE_CHANGE;
+            self.interrupter
+                .lock()
+                .send_port_status_change_trb(port_id)
+                .map_err(Error::SendInterrupt)?;
+        }
+        // xHCI spec 4.19.5.
         if (value & PORTSC_PORT_RESET) > 0 || (value & PORTSC_WARM_PORT_RESET) > 0 {
             self.device_slots
                 .reset_port(port_id)
                 .map_err(|_| Error::ResetPort)?;
-            value &= !PORTSC_PORT_LINK_STATE_MASK;
-            value &= !PORTSC_PORT_RESET;
-            value |= PORTSC_PORT_ENABLED;
+            let warm = (value & PORTSC_WARM_PORT_RESET) > 0;
+            value &= !(PORTSC_PORT_RESET | PORTSC_WARM_PORT_RESET | PORTSC_PORT_LINK_STATE_MASK);
+            // A reset ends with the link in U0 and the port enabled only when something is
+            // attached; an empty port goes back to RxDetect and stays disabled.
+            if (value & PORTSC_CURRENT_CONNECT_STATUS) > 0 {
+                value |= PORTSC_PORT_ENABLED | (PORTSC_PLS_U0 << PORTSC_PORT_LINK_STATE_SHIFT);
+            } else {
+                value &= !PORTSC_PORT_ENABLED;
+                value |= PORTSC_PLS_RXDETECT << PORTSC_PORT_LINK_STATE_SHIFT;
+            }
             value |= PORTSC_PORT_RESET_CHANGE;
+            if warm {
+                value |= PORTSC_WARM_RESET_CHANGE;
+            }
             self.interrupter
                 .lock()
                 .send_port_status_change_trb(port_id)
@@ -331,6 +468,10 @@ impl Xhci {
                 if target != 0 || stream_id != 0 {
                     return Ok(());
                 }
+                // CRR stays set once the ring parks itself on an empty ring (Stopped inside
+                // `on_event`); only CS/CA, R/S=0 and HCRST clear it, as in the spec. Parking on
+                // an empty ring is our own implementation detail, and a CRCR pointer write is
+                // refused while CRR is set.
                 self.regs.crcr.set_bits(CRCR_COMMAND_RING_RUNNING);
                 self.command_ring_controller.start();
             } else {
@@ -399,12 +540,79 @@ impl Xhci {
             .map_err(Error::SetupEventRing)
     }
 
+    /// Host controller reset (USBCMD.HCRST, spec 4.2 / 5.4.1): stop every ring, then put the
+    /// internal state machines and the operational and runtime registers back to their initial
+    /// values -- the command ring, CRCR, DCBAAP, CONFIG, DNCTRL, the interrupter with IMAN,
+    /// IMOD, ERSTSZ, ERSTBA and ERDP, every device slot and the hub. CNR is set for the duration
+    /// and HCH is set at the end.
+    ///
+    /// Runs on the vcpu thread. The callback below runs there too when every ring was idle
+    /// (all of it synchronously, before the usbcmd write returns), or on the event-loop thread
+    /// from inside the last in-flight ring's `on_event` once its transfer completes. Everything
+    /// in it goes through the Arc handles, and the interrupter lock is taken only for the
+    /// interrupter's own reset and released before the hub re-posts port changes through it.
+    /// On the event-loop thread the slot reset drops every transfer ring, the one whose
+    /// `on_event` this is included; the event loop drops its own reference to that ring before
+    /// it retakes its handlers lock (`EventLoop::start`), which the ring's drop needs, and
+    /// `DeviceSlot::set_trcs` drops the rings with the slot unlocked.
     fn reset(&self) {
+        info!("xhci: host controller reset");
+        *self.mfindex_anchor.lock() = Instant::now();
         self.regs.usbsts.set_bits(USB_STS_CONTROLLER_NOT_READY);
         let usbsts = self.regs.usbsts.clone();
-        self.device_slots.stop_all_and_reset(move || {
-            usbsts.clear_bits(USB_STS_CONTROLLER_NOT_READY);
-        });
+        let crcr = self.regs.crcr.clone();
+        let dcbaap = self.regs.dcbaap.clone();
+        let config = self.regs.config.clone();
+        let dnctrl = self.regs.dnctrl.clone();
+        let iman = self.regs.iman.clone();
+        let imod = self.regs.imod.clone();
+        let erstsz = self.regs.erstsz.clone();
+        let erstba = self.regs.erstba.clone();
+        let erdp = self.regs.erdp.clone();
+        let command_ring_controller = self.command_ring_controller.clone();
+        let interrupter = self.interrupter.clone();
+        let device_slots = self.device_slots.clone();
+        let callback = RingBufferStopCallback::new(fallible_closure(
+            self.fail_handle.clone(),
+            move || -> Result<()> {
+                // Every ring is stopped. The command ring is parked in Stopped with no callback
+                // pending, so its pointer can move: back to 0 with the initial cycle state, the
+                // state a CRCR write of 0 would give. Its register goes with it, CRR included --
+                // the guest's next CRCR write is what tells us where the new ring is.
+                command_ring_controller.set_dequeue_pointer(GuestAddress(0));
+                command_ring_controller.set_consumer_cycle_state(false);
+                crcr.reset();
+                dcbaap.reset();
+                config.reset();
+                dnctrl.reset();
+                // The interrupter forgets its event ring before the hub below re-announces its
+                // ports: those changes then wait in PORTSC (as they do before the guest set a
+                // ring up at all) rather than land in the ring the guest just gave up.
+                interrupter
+                    .lock()
+                    .reset()
+                    .map_err(Error::ResetInterrupter)?;
+                iman.reset();
+                imod.reset();
+                erstsz.reset();
+                erstba.reset();
+                erdp.reset();
+                // USBSTS back to its reset value, HCH alone (spec 5.4.2), with CNR kept up
+                // until the end; the hub below sets PCD again for the ports it re-announces.
+                usbsts.set_value(USB_STS_HALTED | USB_STS_CONTROLLER_NOT_READY);
+                device_slots.reset_all().map_err(Error::ResetHub)?;
+                usbsts.clear_bits(USB_STS_CONTROLLER_NOT_READY);
+                Ok(())
+            },
+        ));
+        // The command ring handler tracks nothing across a command (`TransferDescriptorHandler`
+        // defaults: `stop` true, `is_quiesced` true), so `stop` parks a Running-but-idle ring at
+        // once, and a command being handled is waited out by the `state` lock `on_event` holds
+        // until the handler returns. A command that completes later on another ring (Disable
+        // Slot, Stop Endpoint, ...) completes in the same wave of ring stops that releases this
+        // callback, ahead of it.
+        self.command_ring_controller.stop(callback.clone());
+        self.device_slots.stop_all(callback);
     }
 
     fn halt(&self) {

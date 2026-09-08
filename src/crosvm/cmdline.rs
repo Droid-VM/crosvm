@@ -3857,10 +3857,39 @@ impl TryFrom<RunCommand> for super::config::Config {
         };
 
         if !matches!(cfg.protection_type, ProtectionType::Unprotected) {
-            // USB devices only work for unprotected VMs.
-            cfg.usb = false;
             // Protected VMs can't trust the RNG device, so don't provide it.
             cfg.rng = false;
+        }
+
+        // The xHCI is an ordinary PCI device: its rings, contexts and transfer buffers are guest
+        // memory that this process reads through GuestMemory. In a memory-isolated VM the host
+        // reaches guest memory only through the swiotlb region, which the guest kernel bounces
+        // all PCI DMA through (the restricted-dma-pool node hangs off the PCI host bridge), so
+        // USB works whenever that region exists -- and it exists by default (sys/linux.rs gives
+        // protected VMs 64 MiB) unless `--swiotlb 0` removes it. A pseudo-unprotected VM shares
+        // its whole RAM with the host and never needs the pool. Upstream switched USB off for
+        // every non-Unprotected VM; that predates the pool and is what this replaces.
+        let usb_dma_reachable = match cfg.protection_type {
+            ProtectionType::Unprotected
+            | ProtectionType::UnprotectedWithFirmware
+            | ProtectionType::ProtectedPseudoUnprotected => true,
+            ProtectionType::Protected
+            | ProtectionType::ProtectedWithCustomFirmware
+            | ProtectionType::ProtectedWithoutFirmware => {
+                // Only the aarch64 build has a swiotlb region at all: `cfg.swiotlb` is assigned
+                // under cfg(target_arch = "aarch64") further up, so on every other target it
+                // is permanently None and would read as "pool present". Keep upstream's answer
+                // there. The variants are spelled out so that a new one is a compile error
+                // here rather than a silent guess.
+                cfg!(target_arch = "aarch64") && cfg.swiotlb.map_or(true, |mib| mib > 0)
+            }
+        };
+        if cfg.usb && !usb_dma_reachable {
+            log::warn!(
+                "USB disabled: protected VM without a swiotlb region has no path for the xHCI \
+                 to reach guest memory (pass --swiotlb N to enable USB)"
+            );
+            cfg.usb = false;
         }
 
         cfg.battery_config = cmd.battery;

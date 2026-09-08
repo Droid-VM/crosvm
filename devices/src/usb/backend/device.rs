@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::cmp;
 use std::mem;
 use std::mem::drop;
 use std::sync::Arc;
@@ -128,6 +129,23 @@ impl BackendDevice for BackendDeviceType {
             build_interrupt_transfer,
             ep_addr,
             transfer_buffer
+        )
+    }
+
+    fn build_isochronous_transfer(
+        &mut self,
+        ep_addr: u8,
+        transfer_buffer: TransferBuffer,
+        packet_lengths: &[u32],
+    ) -> Result<BackendTransferType> {
+        multi_dispatch!(
+            self,
+            BackendDeviceType,
+            HostDevice FidoDevice,
+            build_isochronous_transfer,
+            ep_addr,
+            transfer_buffer,
+            packet_lengths
         )
     }
 
@@ -483,15 +501,41 @@ impl BackendDeviceType {
         };
 
         let tmp_transfer = xhci_transfer.clone();
+        let control_transfer_state = self.get_control_transfer_state();
         let callback = move |t: BackendTransferType| {
             usb_trace!("setup token control transfer callback");
+            if t.status() == TransferStatus::Stalled {
+                // The endpoint halts here and the guest, once it has reset it, moves the ring
+                // past this whole TD: the STATUS stage that would have closed this transfer is
+                // never executed, so expect the next SETUP instead.
+                let mut state = control_transfer_state.write().unwrap();
+                state.executed = false;
+                state.ctl_ep_state = ControlEndpointState::SetupStage;
+            }
             update_transfer_state(&xhci_transfer, t.status())?;
             let state = xhci_transfer.state().lock();
             match *state {
                 XhciTransferState::Cancelled => {
+                    // What the device sent before the URB was unlinked is the guest's: the
+                    // Stopped event reports the data stage as moved that far. A control
+                    // transfer's buffer is always a `Vector` (the Completed arm below treats
+                    // `Dma` as unreachable), so the `if let` filters nothing real out.
+                    let actual_length = t.actual_length();
+                    if direction == ControlRequestDataPhaseTransferDirection::DeviceToHost {
+                        if let (TransferBuffer::Vector(v), Some(buffer)) = (t.buffer(), &buffer) {
+                            if let Some(control_request_data) =
+                                v.get(mem::size_of::<UsbRequestSetup>()..)
+                            {
+                                let moved = cmp::min(actual_length, control_request_data.len());
+                                buffer
+                                    .write(&control_request_data[..moved])
+                                    .map_err(Error::WriteBuffer)?;
+                            }
+                        }
+                    }
                     drop(state);
                     xhci_transfer
-                        .on_transfer_complete(&TransferStatus::Cancelled, 0)
+                        .on_transfer_complete(&TransferStatus::Cancelled, actual_length as u32)
                         .map_err(Error::TransferComplete)?;
                 }
                 XhciTransferState::Completed => {
@@ -567,19 +611,35 @@ impl BackendDeviceType {
                     .create_usb_request_setup()
                     .map_err(Error::CreateUsbRequestSetup)?;
                 if control_transfer_state.ctl_ep_state != ControlEndpointState::SetupStage {
-                    error!("Control endpoint is in an inconsistant state");
-                    return Ok(());
+                    // A SETUP always begins a new control transfer (USB 2.0 8.5.3): the stages
+                    // of the one before it were abandoned, typically because the guest reset a
+                    // halted endpoint and moved the ring past the failed TD. Start over rather
+                    // than drop this stage, which would leave the ring waiting for a completion
+                    // that never comes.
+                    warn!("xhci: SETUP arrived mid control transfer; starting a new one");
+                    control_transfer_state.executed = false;
                 }
                 usb_trace!("setup stage: setup buffer: {:?}", setup);
                 control_transfer_state.control_request_setup = setup;
+                // The eight setup bytes are this stage's transfer; an Event Data TRB behind the
+                // Setup TRB reports them as EDTLA and would read as a short TD otherwise.
                 xhci_transfer
-                    .on_transfer_complete(&TransferStatus::Completed, 0)
+                    .on_transfer_complete(&TransferStatus::Completed, 8)
                     .map_err(Error::TransferComplete)?;
                 control_transfer_state.ctl_ep_state = ControlEndpointState::DataStage;
             }
             XhciTransferType::DataStage => {
                 if control_transfer_state.ctl_ep_state != ControlEndpointState::DataStage {
-                    error!("Control endpoint is in an inconsistant state");
+                    error!(
+                        "Control endpoint is in an inconsistant state: DATA stage without SETUP"
+                    );
+                    // Fail it the way a device would, so the guest resets the endpoint and
+                    // retries from a SETUP instead of waiting on it forever.
+                    control_transfer_state.executed = false;
+                    control_transfer_state.ctl_ep_state = ControlEndpointState::SetupStage;
+                    xhci_transfer
+                        .on_transfer_complete(&TransferStatus::Stalled, 0)
+                        .map_err(Error::TransferComplete)?;
                     return Ok(());
                 }
                 // Requests with a DataStage will be executed here.
@@ -595,7 +655,13 @@ impl BackendDeviceType {
             }
             XhciTransferType::StatusStage => {
                 if control_transfer_state.ctl_ep_state == ControlEndpointState::SetupStage {
-                    error!("Control endpoint is in an inconsistant state");
+                    error!(
+                        "Control endpoint is in an inconsistant state: STATUS stage without SETUP"
+                    );
+                    control_transfer_state.executed = false;
+                    xhci_transfer
+                        .on_transfer_complete(&TransferStatus::Stalled, 0)
+                        .map_err(Error::TransferComplete)?;
                     return Ok(());
                 }
                 if control_transfer_state.executed {
@@ -690,12 +756,23 @@ impl BackendDeviceType {
                         Err(e) => {
                             error!("fail to submit transfer {:?}", e);
                             *state = XhciTransferState::Completed;
-                            TransferStatus::NoDevice
+                            // A refused isochronous URB costs one frame, not the device. usbfs
+                            // rejects a packet longer than the alt setting it currently has
+                            // selected, which a guest produces just by ringing the doorbell
+                            // before its SET_INTERFACE has landed; reporting NoDevice for that
+                            // would detach the port out from under a live stream.
+                            match xhci_transfer.get_transfer_type() {
+                                Ok(XhciTransferType::Isochronous) => TransferStatus::Completed,
+                                _ => TransferStatus::NoDevice,
+                            }
                         }
                         Ok(canceller) => {
                             let cancel_callback = Box::new(move || match canceller.cancel() {
                                 Ok(()) => {
                                     debug!("cancel issued to kernel");
+                                }
+                                Err(Error::TransferHandleAlreadyComplete) => {
+                                    debug!("XhciTransfer completed before it could be cancelled");
                                 }
                                 Err(e) => {
                                     error!("failed to cancel XhciTransfer: {}", e);
@@ -783,6 +860,14 @@ pub trait BackendDevice: Sync + Send {
         &mut self,
         ep_addr: u8,
         transfer_buffer: TransferBuffer,
+    ) -> Result<BackendTransferType>;
+    /// Requests the backend to build a backend-specific isochronous transfer request. Each entry
+    /// of `packet_lengths` describes one isochronous packet within `transfer_buffer`.
+    fn build_isochronous_transfer(
+        &mut self,
+        ep_addr: u8,
+        transfer_buffer: TransferBuffer,
+        packet_lengths: &[u32],
     ) -> Result<BackendTransferType>;
 
     /// Returns the `ControlTransferState` for the given backend device.

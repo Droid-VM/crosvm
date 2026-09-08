@@ -11,6 +11,7 @@ use sync::Mutex;
 use thiserror::Error;
 use usb_util::DeviceSpeed;
 
+use super::event_ring::Error as EventRingError;
 use super::interrupter::Error as InterrupterError;
 use super::interrupter::Interrupter;
 use super::xhci_backend_device::BackendType;
@@ -23,6 +24,7 @@ use super::xhci_regs::PORTSC_PORT_ENABLED;
 use super::xhci_regs::PORTSC_PORT_ENABLED_DISABLED_CHANGE;
 use super::xhci_regs::PORTSC_PORT_SPEED_MASK;
 use super::xhci_regs::PORTSC_PORT_SPEED_SHIFT;
+use super::xhci_regs::PORTSC_RESET_VALUE;
 use super::xhci_regs::USB2_PORTS_END;
 use super::xhci_regs::USB2_PORTS_START;
 use super::xhci_regs::USB3_PORTS_END;
@@ -123,7 +125,15 @@ impl UsbPort {
     }
 
     fn reset(&self) -> std::result::Result<(), InterrupterError> {
-        if self.is_attached() {
+        // A host controller reset puts the port back to its reset value -- an empty port has to
+        // read PLS = RxDetect again, not whatever link state the driver last wrote -- and then
+        // re-announces whatever is still plugged in.
+        let device = self.backend_device().clone();
+        self.portsc.clear_bits(!0u32);
+        self.portsc.set_bits(PORTSC_RESET_VALUE);
+        if let Some(device) = device {
+            let speed = device.lock().get_speed();
+            self.set_speed_bits(speed);
             self.send_device_connected_event()?;
         }
         Ok(())
@@ -138,8 +148,13 @@ impl UsbPort {
         let mut locked = self.backend_device();
         assert!(locked.is_none());
         *locked = Some(device);
+        self.set_speed_bits(speed);
+        self.send_device_connected_event()
+    }
+
+    // Speed mappings from xHCI spec 7.2.2.1.1 ("Default Speed ID Mapping").
+    fn set_speed_bits(&self, speed: Option<DeviceSpeed>) {
         self.portsc.clear_bits(PORTSC_PORT_SPEED_MASK);
-        // Speed mappings from xHCI spec 7.2.2.1.1 ("Default Speed ID Mapping")
         let speed_id: u32 = match speed {
             None => 0,
             Some(DeviceSpeed::Full) => 1,
@@ -149,7 +164,6 @@ impl UsbPort {
             Some(DeviceSpeed::SuperPlus) => 5,
         };
         self.portsc.set_bits(speed_id << PORTSC_PORT_SPEED_SHIFT);
-        self.send_device_connected_event()
     }
 
     /// Inform the guest kernel there is device connected to this port. It combines first few steps
@@ -163,9 +177,7 @@ impl UsbPort {
                 | PORTSC_PORT_ENABLED_DISABLED_CHANGE,
         );
         self.usbsts.set_bits(USB_STS_PORT_CHANGE_DETECT);
-        self.interrupter
-            .lock()
-            .send_port_status_change_trb(self.port_id)
+        self.post_port_change()
     }
 
     /// Inform the guest kernel that device has been detached.
@@ -175,9 +187,30 @@ impl UsbPort {
             .set_bits(PORTSC_CONNECT_STATUS_CHANGE | PORTSC_PORT_ENABLED_DISABLED_CHANGE);
         self.portsc.clear_bits(PORTSC_CURRENT_CONNECT_STATUS);
         self.usbsts.set_bits(USB_STS_PORT_CHANGE_DETECT);
-        self.interrupter
+        self.post_port_change()
+    }
+
+    /// Post the Port Status Change Event for a change already recorded in PORTSC.
+    ///
+    /// A device plugged in before the guest has set up its event ring is not an error: the
+    /// change bits stay set in PORTSC and USBSTS.PCD, and every xHCI driver reads them when it
+    /// brings the root hub up, exactly as for a device present at power-on. Failing the attach
+    /// here used to take the whole controller down.
+    fn post_port_change(&self) -> std::result::Result<(), InterrupterError> {
+        match self
+            .interrupter
             .lock()
             .send_port_status_change_trb(self.port_id)
+        {
+            Err(InterrupterError::AddEvent(EventRingError::Uninitialized)) => {
+                info!(
+                    "usb_hub: port {} changed before the guest set up its event ring; the change waits in PORTSC",
+                    self.port_id
+                );
+                Ok(())
+            }
+            other => other,
+        }
     }
 }
 
