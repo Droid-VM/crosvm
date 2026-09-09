@@ -97,7 +97,8 @@ pub fn new_absolute_mouse_config(
 }
 
 /// Instantiates a VirtioInputConfig object with the default configuration for a keyboard.
-/// It supports the same keys as a en-us keyboard and the CAPSLOCK, NUMLOCK and SCROLLLOCK leds.
+/// It supports every key code Linux defines for a keyboard (see `default_keyboard_events`) and
+/// the CAPSLOCK, NUMLOCK and SCROLLLOCK leds.
 pub fn new_keyboard_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
     let name = name
         .map(str::to_owned)
@@ -374,120 +375,17 @@ fn default_mouse_events() -> BTreeMap<u16, virtio_input_bitmap> {
 
 fn default_keyboard_events() -> BTreeMap<u16, virtio_input_bitmap> {
     let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
-    supported_events.insert(
-        EV_KEY,
-        virtio_input_bitmap::from_bits(&[
-            KEY_ESC,
-            KEY_1,
-            KEY_2,
-            KEY_3,
-            KEY_4,
-            KEY_5,
-            KEY_6,
-            KEY_7,
-            KEY_8,
-            KEY_9,
-            KEY_0,
-            KEY_MINUS,
-            KEY_EQUAL,
-            KEY_BACKSPACE,
-            KEY_TAB,
-            KEY_Q,
-            KEY_W,
-            KEY_E,
-            KEY_R,
-            KEY_T,
-            KEY_Y,
-            KEY_U,
-            KEY_I,
-            KEY_O,
-            KEY_P,
-            KEY_LEFTBRACE,
-            KEY_RIGHTBRACE,
-            KEY_ENTER,
-            KEY_LEFTCTRL,
-            KEY_A,
-            KEY_S,
-            KEY_D,
-            KEY_F,
-            KEY_G,
-            KEY_H,
-            KEY_J,
-            KEY_K,
-            KEY_L,
-            KEY_SEMICOLON,
-            KEY_APOSTROPHE,
-            KEY_GRAVE,
-            KEY_LEFTSHIFT,
-            KEY_BACKSLASH,
-            KEY_Z,
-            KEY_X,
-            KEY_C,
-            KEY_V,
-            KEY_B,
-            KEY_N,
-            KEY_M,
-            KEY_COMMA,
-            KEY_DOT,
-            KEY_SLASH,
-            KEY_RIGHTSHIFT,
-            KEY_KPASTERISK,
-            KEY_LEFTALT,
-            KEY_SPACE,
-            KEY_CAPSLOCK,
-            KEY_F1,
-            KEY_F2,
-            KEY_F3,
-            KEY_F4,
-            KEY_F5,
-            KEY_F6,
-            KEY_F7,
-            KEY_F8,
-            KEY_F9,
-            KEY_F10,
-            KEY_NUMLOCK,
-            KEY_SCROLLLOCK,
-            KEY_KP7,
-            KEY_KP8,
-            KEY_KP9,
-            KEY_KPMINUS,
-            KEY_KP4,
-            KEY_KP5,
-            KEY_KP6,
-            KEY_KPPLUS,
-            KEY_KP1,
-            KEY_KP2,
-            KEY_KP3,
-            KEY_KP0,
-            KEY_KPDOT,
-            KEY_F11,
-            KEY_F12,
-            KEY_KPENTER,
-            KEY_RIGHTCTRL,
-            KEY_KPSLASH,
-            KEY_SYSRQ,
-            KEY_RIGHTALT,
-            KEY_HOME,
-            KEY_UP,
-            KEY_PAGEUP,
-            KEY_LEFT,
-            KEY_RIGHT,
-            KEY_END,
-            KEY_DOWN,
-            KEY_PAGEDOWN,
-            KEY_INSERT,
-            KEY_DELETE,
-            KEY_PAUSE,
-            KEY_MENU,
-            KEY_PRINT,
-            KEY_POWER,
-            KEY_HOMEPAGE,
-            KEY_MUTE,
-            KEY_VOLUMEDOWN,
-            KEY_VOLUMEUP,
-            KEY_BACK,
-        ]),
-    );
+    // Every key code Linux gives a keyboard, KEY_ESC(1) through KEY_MICMUTE(248), rather than an
+    // en-us subset. The bitmap is not decoration: a guest drops an event whose code the device
+    // never advertised, so a key left out here cannot reach the guest by any route. The subset
+    // this used to be had no KEY_LEFTMETA, which is the Super/Windows key, so Win- and Super-
+    // shortcuts died in the guest's input core even when the host had forwarded them faithfully;
+    // KEY_102ND, the F13-F24 block, the Japanese and Korean keys and the media keys went the same
+    // way. A real USB keyboard advertises its whole range for the same reason, and the host is
+    // free to send only what it has. It stops at 248 because 0x100 upwards is the BTN_* block --
+    // mouse and gamepad buttons, which belong to the pointer devices, not here.
+    let keys: Vec<u16> = (KEY_ESC..=KEY_MICMUTE).collect();
+    supported_events.insert(EV_KEY, virtio_input_bitmap::from_bits(&keys));
     supported_events.insert(
         EV_REP,
         virtio_input_bitmap::from_bits(&[REP_DELAY, REP_PERIOD]),
