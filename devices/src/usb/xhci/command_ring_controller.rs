@@ -363,12 +363,20 @@ impl CommandRingTrbHandler {
         let slot_id = trb.get_slot_id();
         let endpoint_id = trb.get_endpoint_id();
         let stream_id = trb.get_stream_id();
+        let stream_context_type = trb.get_stream_context_type();
         // See Set TR Dequeue Pointer Trb in spec.
         let dequeue_ptr = trb.get_dequeue_ptr().get_gpa().offset();
+        let dequeue_cycle_state = trb.get_dequeue_cycle_state();
         let completion_code = {
             if valid_slot_id(slot_id) {
                 self.slot(slot_id)?
-                    .set_tr_dequeue_ptr(endpoint_id, stream_id, dequeue_ptr)
+                    .set_tr_dequeue_ptr(
+                        endpoint_id,
+                        stream_id,
+                        stream_context_type,
+                        dequeue_ptr,
+                        dequeue_cycle_state,
+                    )
                     .map_err(Error::SetDequeuePointer)?
             } else {
                 error!("stop endpoint trb has invalid slot id {}", slot_id);
@@ -430,5 +438,87 @@ impl TransferDescriptorHandler for CommandRingTrbHandler {
             }
         };
         command_result.context("command ring TRB failed")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use base::EventWaitResult;
+
+    use super::super::device_slot::test_util::*;
+    use super::super::xhci_abi::DeviceSlotState;
+    use super::super::xhci_abi::Trb;
+    use super::*;
+    use crate::utils::FailHandle;
+
+    fn signaled(event: &Event) -> bool {
+        matches!(
+            event.wait_timeout(Duration::from_millis(200)).unwrap(),
+            EventWaitResult::Signaled
+        )
+    }
+
+    /// Runs one command through the handler the way the command ring does and returns the
+    /// event it was handed to signal when done.
+    fn run(f: &Fixture, trb: Trb) -> Event {
+        let handler = CommandRingTrbHandler::new(f.slots.clone(), f.interrupter.clone());
+        let complete = Event::new().unwrap();
+        handler
+            .handle_transfer_descriptor(
+                vec![AddressedTrb {
+                    trb,
+                    gpa: COMMAND_TRB,
+                }],
+                complete.try_clone().unwrap(),
+            )
+            .unwrap();
+        complete
+    }
+
+    #[test]
+    fn a_rejected_command_still_completes() {
+        // Windows' loop: a command that came back as an error from the handler was never
+        // answered, the command ring's event handler was dropped, and every later command
+        // timed out. A guest mistake is a completion code, and the ring must go on.
+        let f = Fixture::new();
+        let mut ctx = f.device_context();
+        ctx.slot_context.set_slot_state(DeviceSlotState::Default);
+        f.set_device_context(ctx);
+        f.write_stream_endpoint_input_context(3, 3);
+        f.write_stream_context_array(1..16);
+
+        let complete = run(&f, f.configure_endpoint_command());
+        assert!(signaled(&complete), "the command ring must be released");
+        assert!(signaled(&f.irq));
+        let completions = f.command_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            completions[0].get_completion_code().unwrap(),
+            TrbCompletionCode::ContextStateError
+        );
+        assert_eq!(completions[0].get_trb_pointer(), COMMAND_TRB);
+        assert_eq!(completions[0].get_slot_id(), SLOT_ID);
+        assert!(!f.fail_handle.failed());
+    }
+
+    #[test]
+    fn configure_endpoint_with_not_valid_streams_returns_success_and_signals_event() {
+        let f = Fixture::new();
+        f.write_stream_endpoint_input_context(3, 3);
+        f.write_stream_context_array(1..9);
+
+        let complete = run(&f, f.configure_endpoint_command());
+        assert!(signaled(&complete));
+        assert!(signaled(&f.irq));
+        let completions = f.command_completions();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(
+            completions[0].get_completion_code().unwrap(),
+            TrbCompletionCode::Success
+        );
+        assert_eq!(completions[0].get_trb_pointer(), COMMAND_TRB);
+        assert!(!f.fail_handle.failed());
     }
 }

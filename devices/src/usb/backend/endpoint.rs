@@ -89,7 +89,9 @@ impl UsbEndpoint {
             .get_transfer_type()
             .map_err(Error::GetXhciTransferType)?
         {
-            XhciTransferType::Normal => transfer.create_buffer().map_err(Error::CreateBuffer)?,
+            XhciTransferType::Normal | XhciTransferType::Isochronous => {
+                transfer.create_buffer().map_err(Error::CreateBuffer)?
+            }
             XhciTransferType::Noop => {
                 return transfer
                     .on_transfer_complete(&TransferStatus::Completed, 0)
@@ -109,6 +111,9 @@ impl UsbEndpoint {
             }
             EndpointType::Interrupt => {
                 self.handle_interrupt_transfer(device, transfer, buffer)?;
+            }
+            EndpointType::Isochronous => {
+                self.handle_isochronous_transfer(device, transfer, buffer)?;
             }
             _ => {
                 return transfer
@@ -172,6 +177,42 @@ impl UsbEndpoint {
         self.do_handle_transfer(device, xhci_transfer, usb_transfer, buffer)
     }
 
+    fn handle_isochronous_transfer(
+        &self,
+        device: &mut BackendDeviceType,
+        xhci_transfer: XhciTransfer,
+        buffer: ScatterGatherBuffer,
+    ) -> Result<()> {
+        // An xHCI isochronous TD carries exactly one isochronous packet, so the whole TD becomes
+        // a single usbfs packet whose length is the TD's own length.
+        let len = buffer.len().map_err(Error::BufferLen)?;
+        let transfer_buffer = if len == 0 {
+            // A zero-length TD is a legal empty OUT packet: there is nothing to copy out of the
+            // scatter gather buffer, but usbfs still needs a packet descriptor for it.
+            device.request_transfer_buffer(len)
+        } else {
+            self.get_transfer_buffer(&buffer, device)?
+        };
+        let usb_transfer =
+            match device.build_isochronous_transfer(self.ep_addr(), transfer_buffer, &[len as u32])
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    // A frame the backend will not describe is one lost frame, not a lost
+                    // endpoint: propagating the error would drop the descriptor without ever
+                    // completing it, and take the ring controller off the event loop with it.
+                    error!(
+                        "cannot build isochronous transfer, dropping the frame: {}",
+                        e
+                    );
+                    return xhci_transfer
+                        .on_transfer_complete(&TransferStatus::Completed, 0)
+                        .map_err(Error::TransferComplete);
+                }
+            };
+        self.do_handle_transfer(device, xhci_transfer, usb_transfer, buffer)
+    }
+
     fn do_handle_transfer(
         &self,
         device: &mut BackendDeviceType,
@@ -181,6 +222,7 @@ impl UsbEndpoint {
     ) -> Result<()> {
         let xhci_transfer = Arc::new(xhci_transfer);
         let tmp_transfer = xhci_transfer.clone();
+        let is_isochronous = self.ty == EndpointType::Isochronous;
         match self.direction {
             EndpointDirection::HostToDevice => {
                 let _trace = cros_tracing::trace_event!(
@@ -195,14 +237,40 @@ impl UsbEndpoint {
                     match *state {
                         XhciTransferState::Cancelled => {
                             debug!("Xhci transfer has been cancelled");
+                            // What the device took before the URB was unlinked is what the
+                            // descriptor moved; the Stopped event reports the rest as residual.
+                            let actual_length = t.actual_length();
                             drop(state);
                             xhci_transfer
-                                .on_transfer_complete(&TransferStatus::Cancelled, 0)
+                                .on_transfer_complete(
+                                    &TransferStatus::Cancelled,
+                                    actual_length as u32,
+                                )
                                 .map_err(Error::TransferComplete)
                         }
                         XhciTransferState::Completed => {
                             let status = t.status();
                             let actual_length = t.actual_length();
+                            // An isochronous URB carries exactly one packet, and only that
+                            // packet's own descriptor says how much of the frame actually moved,
+                            // so the event is derived from it rather than from the URB totals.
+                            let (status, actual_length) =
+                                if is_isochronous && status == TransferStatus::Completed {
+                                    match t.iso_packet(0) {
+                                        Some((len, 0)) => (TransferStatus::Completed, len),
+                                        // A packet-level error drops that frame; v1 reports it as
+                                        // an empty short packet so the guest driver sees status 0
+                                        // with nothing received rather than a dead endpoint.
+                                        Some(_) => (TransferStatus::Completed, 0),
+                                        None => (status, actual_length),
+                                    }
+                                } else {
+                                    // A URB that failed as a whole keeps its own status. Its
+                                    // packet descriptor is still the zeroed one we submitted, so
+                                    // deriving the result from it would hide NoDevice, Stalled
+                                    // and Error from the detach and halt paths.
+                                    (status, actual_length)
+                                };
                             drop(state);
                             xhci_transfer
                                 .on_transfer_complete(&status, actual_length as u32)
@@ -243,14 +311,58 @@ impl UsbEndpoint {
                     match *state {
                         XhciTransferState::Cancelled => {
                             debug!("Xhci transfer has been cancelled");
+                            // What the device sent before the URB was unlinked is the guest's:
+                            // the Stopped event reports the descriptor as moved that far (spec
+                            // 6.4.2.1), so those bytes must be in its buffer.
+                            let actual_length = t.actual_length();
+                            let copied_length = match t.buffer() {
+                                TransferBuffer::Vector(v) => buffer
+                                    .write(&v[..cmp::min(actual_length, v.len())])
+                                    .map_err(Error::WriteBuffer)?,
+                                TransferBuffer::Dma(buf) => {
+                                    if let Some(buf) = buf.upgrade() {
+                                        let buf = buf.lock();
+                                        let data = buf.as_slice();
+                                        buffer
+                                            .write(&data[..cmp::min(actual_length, data.len())])
+                                            .map_err(Error::WriteBuffer)?
+                                    } else {
+                                        return Err(Error::GetDmaBuffer);
+                                    }
+                                }
+                            };
+                            let actual_length = cmp::min(actual_length, copied_length);
                             drop(state);
                             xhci_transfer
-                                .on_transfer_complete(&TransferStatus::Cancelled, 0)
+                                .on_transfer_complete(
+                                    &TransferStatus::Cancelled,
+                                    actual_length as u32,
+                                )
                                 .map_err(Error::TransferComplete)
                         }
                         XhciTransferState::Completed => {
                             let status = t.status();
                             let actual_length = t.actual_length();
+                            // An isochronous URB carries exactly one packet, and only that
+                            // packet's own descriptor says how much of the frame actually moved,
+                            // so the event is derived from it rather than from the URB totals.
+                            let (status, actual_length) =
+                                if is_isochronous && status == TransferStatus::Completed {
+                                    match t.iso_packet(0) {
+                                        Some((len, 0)) => (TransferStatus::Completed, len),
+                                        // A packet-level error drops that frame; v1 reports it as
+                                        // an empty short packet so the guest driver sees status 0
+                                        // with nothing received rather than a dead endpoint.
+                                        Some(_) => (TransferStatus::Completed, 0),
+                                        None => (status, actual_length),
+                                    }
+                                } else {
+                                    // A URB that failed as a whole keeps its own status. Its
+                                    // packet descriptor is still the zeroed one we submitted, so
+                                    // deriving the result from it would hide NoDevice, Stalled
+                                    // and Error from the detach and halt paths.
+                                    (status, actual_length)
+                                };
                             let copied_length = match t.buffer() {
                                 TransferBuffer::Vector(v) => {
                                     buffer.write(v.as_slice()).map_err(Error::WriteBuffer)?

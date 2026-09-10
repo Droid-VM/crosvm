@@ -76,9 +76,18 @@ impl RingBuffer {
                     .trb
                     .cast::<LinkTrb>()
                     .map_err(Error::CastTrb)?;
+                let from = self.dequeue_pointer;
                 self.dequeue_pointer = GuestAddress(link_trb.get_ring_segment_pointer());
                 self.consumer_cycle_state =
                     self.consumer_cycle_state != link_trb.get_toggle_cycle();
+                debug!(
+                    "xhci: {}: link trb at {:#x} -> {:#x}, toggle {}, cycle now {}",
+                    self.name,
+                    from.0,
+                    self.dequeue_pointer.0,
+                    link_trb.get_toggle_cycle(),
+                    self.consumer_cycle_state
+                );
                 continue;
             }
 
@@ -147,7 +156,11 @@ impl RingBuffer {
         // This trb is invalid.
         if trb.get_cycle() != self.consumer_cycle_state {
             debug!(
-                "xhci: cycle bit does not match, self cycle {}",
+                "xhci: {}: cycle bit does not match at {:#x} (trb cycle {}, type {:?}), self cycle {}",
+                self.name,
+                self.dequeue_pointer.0,
+                trb.get_cycle(),
+                trb.get_trb_type(),
                 self.consumer_cycle_state
             );
             Ok(None)

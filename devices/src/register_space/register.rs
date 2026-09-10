@@ -209,6 +209,9 @@ struct RegisterInner<T: RegisterValue> {
     spec: RegisterSpec<T>,
     value: T,
     write_cb: Option<Box<dyn Fn(T) -> T + Send>>,
+    /// Computes the value a guest read observes, for a register that reports something the
+    /// device does not store, such as a running counter.
+    read_cb: Option<Box<dyn Fn() -> T + Send>>,
 }
 
 /// Register is a thread safe struct. It can be safely changed from any thread.
@@ -224,6 +227,7 @@ impl<T: RegisterValue> Register<T> {
                 spec,
                 value: val,
                 write_cb: None,
+                read_cb: None,
             })),
         }
     }
@@ -246,7 +250,13 @@ impl<T: RegisterValue> RegisterInterface for Register<T> {
 
     fn read(&self, addr: RegisterOffset, data: &mut [u8]) {
         let val_range = self.range();
-        let value = self.lock().value;
+        let value = {
+            let locked = self.lock();
+            match &locked.read_cb {
+                Some(cb) => cb(),
+                None => locked.value,
+            }
+        };
         read_reg_helper(value, val_range, addr, data);
     }
 
@@ -337,6 +347,12 @@ impl<T: RegisterValue> Register<T> {
     /// Set a callback. It will be invoked when write happens.
     pub fn set_write_cb<C: 'static + Fn(T) -> T + Send>(&self, callback: C) {
         self.lock().write_cb = Some(Box::new(callback));
+    }
+
+    /// Set a callback that supplies the value of every guest read. The stored value (and
+    /// `get_value`) are untouched; the callback must not touch this register.
+    pub fn set_read_cb<C: 'static + Fn() -> T + Send>(&self, callback: C) {
+        self.lock().read_cb = Some(Box::new(callback));
     }
 
     /// Set value from device side. Callback won't be invoked.
@@ -595,5 +611,30 @@ mod tests {
         let data: [u8; 1] = [0xfc];
         r.write(3, &data);
         assert_eq!(*state.lock(), 0xc);
+    }
+
+    #[test]
+    fn register_read_callback() {
+        let r = register!(
+            name: "",
+            ty: u32,
+            offset: 0,
+            reset_value: 7,
+            guest_writeable_mask: 0,
+            guest_write_1_to_clear_mask: 0,);
+        let ticks = Arc::new(Mutex::new(0u32));
+        let t = ticks.clone();
+        r.set_read_cb(move || {
+            let mut t = t.lock();
+            *t += 1;
+            *t
+        });
+        let mut data = [0u8; 4];
+        r.read(0, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 1);
+        r.read(0, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 2);
+        // The stored value is not what the guest sees, and stays untouched.
+        assert_eq!(r.get_value(), 7);
     }
 }

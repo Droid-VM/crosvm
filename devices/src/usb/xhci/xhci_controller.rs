@@ -122,8 +122,16 @@ impl XhciController {
     /// Create new xhci controller.
     pub fn new(mem: GuestMemory, usb_provider: Box<dyn XhciBackendDeviceProvider>) -> Self {
         let config_regs = PciConfiguration::new(
-            0x01b73, // fresco logic, (google = 0x1ae0)
-            0x1400,  // fresco logic fl1400. This chip has broken msi. See kernel xhci-pci.c
+            // QEMU's xHCI id. Upstream borrowed Fresco Logic's FL1400 so that Linux would apply
+            // XHCI_BROKEN_MSI and never try MSI on a model that only raises INTx -- but this
+            // config space carries no MSI capability, so Linux falls back to the line interrupt
+            // on its own, and the model reports short transfers with COMP_SHORT_PACKET, so the
+            // TRUST_TX_LENGTH quirk that id also buys is not needed either. What FL1400 does
+            // cost is Windows: usbxhci.inf lists PCI\VEN_1B73&DEV_1400 under ExcludeID and the
+            // controller stays at CM_PROB_FAILED_INSTALL. 1b36:000d is what qemu-xhci presents,
+            // and both guests bind their generic xHCI driver to it.
+            0x1b36,
+            0x000d,
             PciClassCode::SerialBusController,
             &PciSerialBusSubClass::Usb,
             Some(&UsbControllerProgrammingInterface::Usb3HostController),

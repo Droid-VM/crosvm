@@ -267,14 +267,10 @@ fn gunyah_high_mmio_window_top(plat_mmio_base: u64) -> u64 {
 
 /// Compute the page-aligned framebuffer data size for simplefb.
 fn simplefb_data_size(sfb: &arch::SimplefbParams) -> u64 {
-    let bpp: u32 = match sfb.format.as_str() {
-        "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
-        "r8g8b8" => 3,
-        "r5g6b5" => 2,
-        _ => 4,
-    };
-    let stride = sfb.width * bpp;
-    let size = ((stride * sfb.height) as u64);
+    // The PADDED stride, not `width * bpp`: this number decides how much memory the region holds,
+    // and a region sized for a packed layout would leave the last rows of a padded one outside it.
+    let stride = arch::simplefb_stride(sfb.width, &sfb.format);
+    let size = (stride as u64) * (sfb.height as u64);
     (size + 0x1f_ffff) & !0x1f_ffff
 }
 
@@ -1925,13 +1921,7 @@ impl arch::LinuxArch for AArch64 {
             bat_mmio_base_and_irq,
             vmwdt_cfg,
             components.simplefb.as_ref().map(|sfb| {
-                let bpp: u32 = match sfb.format.as_str() {
-                    "a8r8g8b8" | "x8r8g8b8" | "a8b8g8r8" => 4,
-                    "r8g8b8" => 3,
-                    "r5g6b5" => 2,
-                    _ => 4,
-                };
-                let stride = sfb.width * bpp;
+                let stride = arch::simplefb_stride(sfb.width, &sfb.format);
                 let fb_addr = get_simplefb_addr(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
                 let fb_alloc = get_simplefb_size(sfb, vm_block, components.swiotlb, vm.get_hypervisor());
                 fdt::SimplefbDtConfig {

@@ -127,6 +127,13 @@ impl EventLoop {
                                 error!("removing event handler due to error: {:#}", e);
                                 remove = true;
                             }
+                            // This can be the last reference to the handler: its owner may have
+                            // let go of it from inside `on_event` -- a transfer ring whose stop
+                            // callback, run there, completed the host controller reset or a
+                            // Disable Slot that drops the ring. Its drop takes it off this loop,
+                            // which needs the handlers lock, so it goes before the lock is
+                            // retaken.
+                            drop(handler);
                             locked = fd_callbacks.lock();
                         } else {
                             // If the handler is already gone, we remove the fd.
