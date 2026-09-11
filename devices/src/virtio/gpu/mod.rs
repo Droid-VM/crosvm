@@ -663,8 +663,9 @@ impl Frontend {
             GpuCommand::ResourceAttachBacking(info) => {
                 let available_bytes = reader.available_bytes();
                 if available_bytes != 0 {
-                    let entry_count =
-                        checked_entry_count(info.nr_entries.to_native(), available_bytes)?;
+                    let resource_id = info.resource_id.to_native();
+                    let nr_entries = info.nr_entries.to_native();
+                    let entry_count = checked_entry_count(nr_entries, available_bytes)?;
                     let mut vecs = Vec::with_capacity(entry_count);
                     for _ in 0..entry_count {
                         match reader.read_obj::<virtio_gpu_mem_entry>() {
@@ -676,15 +677,43 @@ impl Frontend {
                             Err(_) => return Err(GpuResponse::ErrUnspec),
                         }
                     }
-                    self.virtio_gpu
-                        .attach_backing(info.resource_id.to_native(), mem, vecs)
+                    // The generic command-failure log carries no resource id, so a
+                    // rejected attach cannot be tied to a resource. Report the id,
+                    // the requested and accepted entry counts, and the first entry
+                    // so a guest-side page list can be checked against the guest's
+                    // own record of what it sent.
+                    let first = vecs.first().map(|&(a, l)| (a.0, l));
+                    let result = self.virtio_gpu.attach_backing(resource_id, mem, vecs);
+                    match &result {
+                        Ok(_) => info!(
+                            "GPU RESOURCE_ATTACH_BACKING complete id={} nr_entries={} first_entry={:?}",
+                            resource_id, entry_count, first
+                        ),
+                        Err(response) => {
+                            error!(
+                                "GPU RESOURCE_ATTACH_BACKING failed id={} nr_entries={} accepted={} \
+                                 available_bytes={} first_entry={:?} result={}",
+                                resource_id, nr_entries, entry_count, available_bytes, first, response
+                            );
+                        }
+                    }
+                    result
                 } else {
                     error!("missing data for command {:?}", cmd);
                     Err(GpuResponse::ErrUnspec)
                 }
             }
             GpuCommand::ResourceDetachBacking(info) => {
-                self.virtio_gpu.detach_backing(info.resource_id.to_native())
+                let resource_id = info.resource_id.to_native();
+                let result = self.virtio_gpu.detach_backing(resource_id);
+                match &result {
+                    Ok(_) => info!("GPU RESOURCE_DETACH_BACKING complete id={}", resource_id),
+                    Err(response) => error!(
+                        "GPU RESOURCE_DETACH_BACKING failed id={} result={}",
+                        resource_id, response
+                    ),
+                }
+                result
             }
             // pos is the guest's crtc_x/crtc_y for the cursor plane -- the image's top-left corner,
             // already hotspot-compensated, and SIGNED. Reading it unsigned turns a pointer against
@@ -744,8 +773,34 @@ impl Frontend {
                     flags: info.flags.to_native(),
                 };
 
-                self.virtio_gpu
-                    .resource_create_3d(resource_id, resource_create_3d)
+                info!(
+                    "GPU RESOURCE_CREATE_3D request id={} target={} format={} bind=0x{:08x} dims={}x{}x{} array={} last={} samples={} flags=0x{:08x}",
+                    resource_id,
+                    resource_create_3d.target,
+                    resource_create_3d.format,
+                    resource_create_3d.bind,
+                    resource_create_3d.width,
+                    resource_create_3d.height,
+                    resource_create_3d.depth,
+                    resource_create_3d.array_size,
+                    resource_create_3d.last_level,
+                    resource_create_3d.nr_samples,
+                    resource_create_3d.flags,
+                );
+                let result = self
+                    .virtio_gpu
+                    .resource_create_3d(resource_id, resource_create_3d);
+                match &result {
+                    Ok(response) => info!(
+                        "GPU RESOURCE_CREATE_3D response id={} result={}",
+                        resource_id, response
+                    ),
+                    Err(response) => error!(
+                        "GPU RESOURCE_CREATE_3D response id={} result={}",
+                        resource_id, response
+                    ),
+                }
+                result
             }
             GpuCommand::TransferToHost3d(info) => {
                 let ctx_id = info.hdr.ctx_id.to_native();
