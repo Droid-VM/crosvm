@@ -849,7 +849,29 @@ impl Rutabaga {
             .get_mut(&resource_id)
             .ok_or(RutabagaError::InvalidResourceId)?;
 
-        component.attach_backing(resource_id, &mut vecs)?;
+        // A create routed by classic_component() and an attach routed by
+        // component_of() can disagree, and a resource can already hold a backing
+        // store. Both surface as the same opaque component error, so record which
+        // component is being asked and whether this resource was attached before.
+        let already_attached = resource.backing_iovecs.is_some();
+        let mask = resource.component_mask;
+        // RutabagaComponentType has no Debug impl; report it as the numeric
+        // discriminant rather than deriving Debug on a shared public type.
+        let component_num = component_type as u8;
+        if let Err(error) = component.attach_backing(resource_id, &mut vecs) {
+            log::error!(
+                "rutabaga attach_backing failed id={} component={} component_mask=0x{:x} \
+                 already_attached={} blob={} iovec_count={} error={:?}",
+                resource_id,
+                component_num,
+                mask,
+                already_attached,
+                resource.blob,
+                vecs.len(),
+                error,
+            );
+            return Err(error);
+        }
         resource.backing_iovecs = Some(vecs);
         Ok(())
     }
