@@ -646,6 +646,23 @@ impl RutabagaComponent for VirglRenderer {
         // Safe because virglrenderer is initialized by now, and the return value is checked before
         // returning a new resource. The backing buffers are not supplied with this call.
         let ret = unsafe { virgl_renderer_resource_create(&mut args, null_mut(), 0) };
+        if ret != 0 {
+            error!(
+                "virgl RESOURCE_CREATE_3D failed id={} target={} format={} bind=0x{:08x} dims={}x{}x{} array={} last={} samples={} flags=0x{:08x} ret={}",
+                resource_id,
+                args.target,
+                args.format,
+                args.bind,
+                args.width,
+                args.height,
+                args.depth,
+                args.array_size,
+                args.last_level,
+                args.nr_samples,
+                args.flags,
+                ret,
+            );
+        }
         ret_to_res(ret)?;
 
         Ok(RutabagaResource {
