@@ -18,6 +18,7 @@ use anyhow::Context;
 use data_model::Le32;
 use base::error;
 use base::info;
+use base::warn;
 use base::linux::MemoryMappingBuilderUnix;
 use base::FromRawDescriptor;
 use base::MappedRegion;
@@ -35,7 +36,6 @@ use rutabaga_gfx::ResourceCreate3D;
 use rutabaga_gfx::ResourceCreateBlob;
 use rutabaga_gfx::Rutabaga;
 use rutabaga_gfx::RutabagaDescriptor;
-#[cfg(windows)]
 use rutabaga_gfx::RutabagaError;
 use rutabaga_gfx::RutabagaFence;
 use rutabaga_gfx::RutabagaFromRawDescriptor;
@@ -1813,6 +1813,10 @@ impl VirtioGpu {
     /// Gets rutabaga's capset information associated with `index`.
     pub fn get_capset_info(&self, index: u32) -> VirtioGpuResult {
         if let Ok((capset_id, version, size)) = self.rutabaga.get_capset_info(index) {
+            info!(
+                "GPU GET_CAPSET_INFO index={} id={} version={} size={}",
+                index, capset_id, version, size
+            );
             Ok(OkCapsetInfo {
                 capset_id,
                 version,
@@ -1836,6 +1840,12 @@ impl VirtioGpu {
     /// Gets a capset from rutabaga.
     pub fn get_capset(&self, capset_id: u32, version: u32) -> VirtioGpuResult {
         let capset = self.rutabaga.get_capset(capset_id, version)?;
+        info!(
+            "GPU GET_CAPSET id={} version={} payload_len={}",
+            capset_id,
+            version,
+            capset.len()
+        );
         Ok(OkCapset(capset))
     }
 
@@ -1868,8 +1878,24 @@ impl VirtioGpu {
         resource_id: u32,
         resource_create_3d: ResourceCreate3D,
     ) -> VirtioGpuResult {
-        self.rutabaga
-            .resource_create_3d(resource_id, resource_create_3d)?;
+        if let Err(error) = self.rutabaga.resource_create_3d(resource_id, resource_create_3d) {
+            error!(
+                "GPU RESOURCE_CREATE_3D renderer failure id={} target={} format={} bind=0x{:08x} dims={}x{}x{} array={} last={} samples={} flags=0x{:08x} error={:?}",
+                resource_id,
+                resource_create_3d.target,
+                resource_create_3d.format,
+                resource_create_3d.bind,
+                resource_create_3d.width,
+                resource_create_3d.height,
+                resource_create_3d.depth,
+                resource_create_3d.array_size,
+                resource_create_3d.last_level,
+                resource_create_3d.nr_samples,
+                resource_create_3d.flags,
+                error,
+            );
+            return Err(error.into());
+        }
 
         let resource = VirtioGpuResource::new(
             resource_id,
@@ -1898,7 +1924,23 @@ impl VirtioGpu {
             .ok_or(ErrInvalidResourceId)?;
 
         let rutabaga_iovecs = sglist_to_rutabaga_iovecs(&vecs[..], mem).map_err(|_| ErrUnspec)?;
-        self.rutabaga.attach_backing(resource_id, rutabaga_iovecs)?;
+        let retry_iovecs = rutabaga_iovecs.clone();
+        match self.rutabaga.attach_backing(resource_id, rutabaga_iovecs) {
+            Ok(()) => {}
+            // The Windows KMD can race its bootstrap scanout backing with the
+            // dxgkrnl MDL backing. The KMD sends a detach first, but a delayed
+            // bootstrap attach can still reach the renderer in between. Replace
+            // that stale backing and retry only virglrenderer's EINVAL result.
+            Err(RutabagaError::ComponentError(libc::EINVAL)) => {
+                warn!(
+                    "GPU RESOURCE_ATTACH_BACKING replacing stale backing id={}",
+                    resource_id
+                );
+                self.rutabaga.detach_backing(resource_id)?;
+                self.rutabaga.attach_backing(resource_id, retry_iovecs)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
         resource.backing_iovecs = Some(vecs);
         Ok(OkNoData)
     }
@@ -1910,8 +1952,13 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
+        let had_backing = resource.backing_iovecs.is_some();
         self.rutabaga.detach_backing(resource_id)?;
         resource.backing_iovecs = None;
+        info!(
+            "GPU detach_backing released id={} had_backing={}",
+            resource_id, had_backing
+        );
         Ok(OkNoData)
     }
 

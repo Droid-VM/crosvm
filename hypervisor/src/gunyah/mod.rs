@@ -488,8 +488,8 @@ impl GunyahVm {
                 let guest_base = region.guest_addr.offset();
 
                 if let Some(mthp_mode) = cfg.prepare_lend_mthp {
-                    // Full mTHP preparation: drop caches, enable mTHP,
-                    // populate in batches, cascading MADV_COLLAPSE, mlock.
+                    // Full preparation: drop caches, populate in batches,
+                    // MADV_COLLAPSE to 2 MiB (leave the rest at 4 KiB), mlock.
                     // SAFETY: host_ptr is a valid mapping of region_size bytes.
                     let prep = unsafe { mthp::prepare_lend_region(host_ptr, region_size) };
                     if !prep.populated {
@@ -632,9 +632,9 @@ impl GunyahVm {
                 };
 
                 // GPU pre-alloc pool: force order-9 backing (MADV_HUGEPAGE + populate +
-                // cascading COLLAPSE + mlock) BEFORE the SHARE so the gh_hugepage_reserve
+                // 2 MiB COLLAPSE + mlock) BEFORE the SHARE so the gh_hugepage_reserve
                 // supply hook serves the pool from reserved 2MB folios, exactly like the
-                // mTHP-prepared LEND'd guest RAM.
+                // prepared LEND'd guest RAM.
                 // Same gate as the guest-RAM LEND path below: this whole mechanism only
                 // exists for the Qualcomm reserve-pool hook, so it's opt-in via
                 // --prepare-lend-mthp-mode, not unconditional for every arm/aarch64 host.
@@ -682,10 +682,13 @@ impl GunyahVm {
                 // is no guest to accept anything until then.
                 //
                 // What does happen here is the folio preparation, and it is not optional: the
-                // reserve pool serves order-9 folios, and a parcel built from 4 KiB pages carries
-                // one mem_entry per page -- a 4 GiB window would be a million of them. The same
-                // preparation the LEND'd guest RAM of an ordinary protected VM gets, for the same
-                // reason.
+                // reserve pool serves order-9 folios. Stage-2 on 4 KiB granule has 2 MiB blocks
+                // and 4 KiB pages, nothing in between -- a 1 MiB folio is the worst of both
+                // (no block descriptor, and one mem_entry per folio instead of a coalesced run).
+                // Collapse therefore tries 2 MiB and stops; the rest stays 4 KiB and the host
+                // share module coalesces physically-contiguous runs. A 4 GiB window of unmerged
+                // 4 KiB pages would be a million mem_entries; coalesced, it is whatever the
+                // populate left contiguous.
                 #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
                 if region.options.purpose == MemoryRegionPurpose::SharedGuestRam {
                     // SAFETY: host_addr is a valid mapping of region.size bytes.
@@ -703,11 +706,26 @@ impl GunyahVm {
                         );
                         return Err(Error::new(libc::ENOMEM));
                     }
+                    let small = prep.need_small.iter().filter(|&&s| s).count();
+                    if small != 0 {
+                        warn!(
+                            "GH-SHIM: window gpa={:#x} size={:#x}: {} / {} of the 2 MiB chunks \
+                             are 4 KiB-backed (collapse ENOMEM) -- SHARE will coalesce runs; \
+                             accept may still fail as RM_ERROR_MAP_FAILED (0x9) if the \
+                             hypervisor cannot build the stage-2. Load gh_hugepage_reserve.ko.",
+                            region.guest_addr.offset(),
+                            full_size,
+                            small,
+                            prep.need_small.len(),
+                        );
+                    }
                     base::info!(
-                        "GH-SHIM: window gpa={:#x} size={:#x} prepared; it is shared after \
-                         GH_VM_START and accepted by the shim",
+                        "GH-SHIM: window gpa={:#x} size={:#x} prepared ({} / {} MB as 2 MiB \
+                         folios); it is shared after GH_VM_START and accepted by the shim",
                         region.guest_addr.offset(),
                         full_size,
+                        prep.large_page_bytes >> 20,
+                        full_size >> 20,
                     );
                     continue;
                 }
