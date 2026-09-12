@@ -777,6 +777,21 @@ pub struct MediaCodecDecoderSession {
     /// empty->held transition so the backstop fires even if the codec never wakes the worker
     /// again.
     deferred_since: Option<Instant>,
+    /// The grace has fired once in the current pending-format window without a `SOURCE_CHANGE`, so
+    /// no further `InputBufferDone` is held in this window: it is released as soon as it is noted
+    /// (D64). The hold exists to keep a client that stops feeding after the first buffer
+    /// (GStreamer's `wait_for_src_ch`) from emptying its `OUTPUT` queue before the event -- and
+    /// gst queues exactly one buffer, so only the *first* buffer ever needs holding. A client that
+    /// keeps feeding after the first buffer comes back (ffmpeg, one `OUTPUT` buffer in flight,
+    /// re-queuing it) is not gst-shaped and must not be re-throttled: holding its every buffer for
+    /// another [`ANNOUNCE_GRACE`] each rate-limited it to 4 packets/s for the whole announce delay
+    /// (7.5 s under encode contention), and the codec, fed that slow trickle and then flooded once
+    /// the client resumed, dropped a mid-stream band of ~30 input pictures (D64: 30 grace lines
+    /// correlated exactly with 30 lost frames; a client that queues many buffers, and so is never
+    /// throttled, lost none). Reset to `false` when a new pending-format window opens (a
+    /// mid-stream `awaiting_drc`) and on flush / stop / fail; the announcement closes the
+    /// window and releases whatever is held regardless.
+    grace_expired: bool,
     /// A parameter-set-only buffer was fed to the codec after the stream was already announced: it
     /// may carry a new SPS and raise a mid-stream `SOURCE_CHANGE`, so its `InputBufferDone` (and
     /// any queued behind it) is held like the initial one until that second `FormatChanged` (or
@@ -841,6 +856,7 @@ impl MediaCodecDecoderSession {
             pending: VecDeque::new(),
             deferred_input_done: VecDeque::new(),
             deferred_since: None,
+            grace_expired: false,
             awaiting_drc: false,
             grace,
             captures: VecDeque::new(),
@@ -877,6 +893,7 @@ impl MediaCodecDecoderSession {
         self.pending.clear();
         self.deferred_input_done.clear();
         self.deferred_since = None;
+        self.grace_expired = false;
         self.awaiting_drc = false;
         self.captures.clear();
         self.held_outputs.clear();
@@ -936,7 +953,11 @@ impl MediaCodecDecoderSession {
     /// then is exactly what emptied a waiting gst's queue (D55). After the announcement the buffer
     /// goes back at once.
     fn note_input_done(&mut self, index: u32) {
-        if self.awaiting_format() {
+        // The hold is one-shot per window (D64): once the grace has fired without an announce,
+        // `grace_expired` is set and every later buffer of this window is returned at once. Only
+        // the first buffer needs holding for gst's ordering (it queues one and waits); a client
+        // that keeps feeding is ffmpeg-shaped and must run at full rate, never re-throttled.
+        if self.awaiting_format() && !self.grace_expired {
             if self.deferred_since.is_none() {
                 let now = Instant::now();
                 self.deferred_since = Some(now);
@@ -981,6 +1002,11 @@ impl MediaCodecDecoderSession {
                 ANNOUNCE_GRACE
             );
             self.release_deferred_input_done();
+            // One-shot: stop holding subsequent InputBufferDone in this window, so a client that
+            // keeps feeding is not re-throttled to one buffer per grace (D64). The next window (a
+            // mid-stream `awaiting_drc`) clears this; the announcement, if it ever comes, closes
+            // the window through `awaiting_format` regardless.
+            self.grace_expired = true;
         }
     }
 
@@ -1525,6 +1551,7 @@ impl MediaCodecDecoderSession {
         // still held behind an initial `SOURCE_CHANGE` (D45) are dropped, not reported late.
         self.deferred_input_done.clear();
         self.deferred_since = None;
+        self.grace_expired = false;
         self.awaiting_drc = false;
         self.eos_queued = false;
         self.eos_seen = false;
@@ -1712,6 +1739,9 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             && is_parameter_sets_only(&data, self.nal)
         {
             self.awaiting_drc = true;
+            // A fresh pending-format window: the first buffer of it is held again, whatever an
+            // earlier window's grace did (D64 one-shot).
+            self.grace_expired = false;
         }
         self.pending.push_back(PendingInput::Bitstream {
             data,
@@ -1904,6 +1934,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         self.pending.clear();
         self.deferred_input_done.clear();
         self.deferred_since = None;
+        self.grace_expired = false;
         self.awaiting_drc = false;
         self.captures.clear();
         self.held_outputs.clear();
