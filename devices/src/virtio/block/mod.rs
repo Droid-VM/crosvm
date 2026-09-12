@@ -130,6 +130,18 @@ pub struct DiskOption {
     //or by default, use split virtqueue
     pub packed_queue: bool,
 
+    /// Number of entries in each of this device's virtqueues. Must be a power of two.
+    /// Falls back to the device's built-in default when unset.
+    ///
+    /// This device does not implement VIRTIO_RING_F_INDIRECT_DESC (see get_seg_max), so a
+    /// request's whole descriptor chain occupies the ring. The queue size therefore bounds
+    /// both seg_max and how many bytes a guest can keep in flight: a queue depth of d with
+    /// s data segments per request needs d*(s+2) descriptors. Raising it helps a guest that
+    /// splits transfers into per-page segments -- Windows viostor is capped near 1MB
+    /// outstanding by a 256-entry ring.
+    #[serde(default)]
+    pub queue_size: Option<u16>,
+
     /// Specify the boot index for this device that the BIOS will use when attempting to boot from
     /// bootable devices. For example, if bootindex=2, then the BIOS will attempt to boot from the
     /// device right after booting from the device with bootindex=1 fails.
@@ -155,6 +167,7 @@ impl Default for DiskOption {
             multiple_workers: false,
             async_executor: None,
             packed_queue: false,
+            queue_size: None,
             bootindex: None,
             pci_address: None,
         }

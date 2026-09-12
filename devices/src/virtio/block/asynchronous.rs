@@ -91,7 +91,15 @@ use crate::virtio::VirtioDevice;
 use crate::virtio::Writer;
 use crate::PciAddress;
 
-const DEFAULT_QUEUE_SIZE: u16 = 256;
+// 1024 (was 256). This device does not implement VIRTIO_RING_F_INDIRECT_DESC (see
+// get_seg_max), so a request's whole descriptor chain occupies the ring and the queue
+// size bounds both seg_max and how many bytes a guest can keep in flight: a queue depth
+// of d with s data segments per request needs d*(s+2) descriptors, i.e. at most
+// (size - 2d - 2) * PAGE_SIZE bytes outstanding -- about 1MB at 256 entries. A guest
+// that splits transfers into per-page segments (Windows viostor) is throttled by that;
+// 1024 entries lift it to about 4MB. Costs ~26KB of guest ring memory per queue.
+// Override per disk with `--block <path>,queue-size=N` (DiskOption::queue_size).
+const DEFAULT_QUEUE_SIZE: u16 = 1024;
 const DEFAULT_NUM_QUEUES: u16 = 16;
 
 const SECTOR_SHIFT: u8 = 9;

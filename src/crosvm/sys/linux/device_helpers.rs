@@ -329,7 +329,7 @@ impl VirtioDeviceBuilder for DiskConfig<'_> {
                 disk_image,
                 self.disk,
                 self.device_tube,
-                None,
+                self.disk.queue_size,
                 None,
             )
             .context("failed to create block device")?,
@@ -350,7 +350,7 @@ impl VirtioDeviceBuilder for DiskConfig<'_> {
                 disk_image,
                 disk,
                 self.device_tube,
-                None,
+                disk.queue_size,
                 None,
             )
             .context("failed to create block device")?,

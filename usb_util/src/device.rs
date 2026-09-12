@@ -116,6 +116,10 @@ pub struct Device {
     fd: Arc<File>,
     device_descriptor_tree: DeviceDescriptorTree,
     dma_buffer: Option<ManagedDmaBuffer>,
+    /// Largest request already reported as too big for `dma_buffer`. A device whose transfers
+    /// never fit asks again for every frame, so only a new maximum is worth a line: the log then
+    /// carries the size the device settles on instead of thousands of identical warnings.
+    reported_oversized: usize,
 }
 
 /// Transfer contains the information necessary to submit a USB request
@@ -160,6 +164,7 @@ impl Device {
             fd: Arc::new(fd),
             device_descriptor_tree,
             dma_buffer: None,
+            reported_oversized: 0,
         };
 
         let map = MemoryMappingBuilder::new(MMAP_SIZE)
@@ -222,7 +227,16 @@ impl Device {
 
     pub fn reserve_dma_buffer(&mut self, size: usize) -> Result<Weak<Mutex<DmaBuffer>>> {
         if let Some(managed) = &mut self.dma_buffer {
-            if managed.used.is_none() {
+            // The mapping is a fixed MMAP_SIZE window while `size` comes from the guest's
+            // transfer descriptor, so a longer request cannot be served from it. Every caller
+            // trusts DmaBuffer::size() to describe the mapping: as_mut_slice() would hand out a
+            // slice that runs off the end of it, and that slice's length is the only bound
+            // ScatterGatherBuffer::read() has -- a DisplayLink adapter's 1 MB+ bulk transfer
+            // wrote 64 KB past the mapping and killed crosvm. Ask the mapping rather than
+            // MMAP_SIZE, so the check still holds if the window ever stops being that constant.
+            // The caller falls back to a Vec of the requested size, which costs a copy into the
+            // kernel's own DMA buffer but is bounded.
+            if size <= managed.buf.size() && managed.used.is_none() {
                 let buf = Arc::new(Mutex::new(DmaBuffer {
                     addr: managed.buf.as_ptr() as u64,
                     size,
@@ -230,6 +244,15 @@ impl Device {
                 let ret = Ok(Arc::downgrade(&buf));
                 managed.used = Some(buf);
                 return ret;
+            }
+            if size > managed.buf.size() && size > self.reported_oversized {
+                warn!(
+                    "usb: a transfer of {} bytes does not fit the {} byte DMA window; \
+                     it goes through a plain buffer instead",
+                    size,
+                    managed.buf.size()
+                );
+                self.reported_oversized = size;
             }
         }
         Err(Error::GetDmaBufferFailed(size))
