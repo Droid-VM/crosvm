@@ -159,6 +159,12 @@ const PARAMETER_SET_SCAN_LIMIT: usize = 8192;
 /// ffmpeg allocates 20 regardless). Design §7.2 says "4 + a conservative margin"; the margin is
 /// 0 for the reason above.
 const MIN_CAPTURE_BUFFERS: u32 = 4;
+/// The output format key that carries how many output buffers the codec fills before it recycles
+/// the oldest -- the true CAPTURE minimum (D69). It is a CCodec/C2 format field with no
+/// `AMEDIAFORMAT_KEY_*` NDK symbol, read by its literal name; `c2.qti.avc.decoder` publishes
+/// `num-output-slots: 21` on 5566. Absent on a component that does not publish it, in which case
+/// the [`MIN_CAPTURE_BUFFERS`] floor stands.
+const NUM_OUTPUT_SLOTS_KEY: &std::ffi::CStr = c"num-output-slots";
 /// The size range offered for a codec whose `VideoCapabilities` the platform does not publish
 /// (the no-Store fallback of `android_codec::list_codecs`). Logged when used.
 const FALLBACK_SIZE_RANGE: SizeRange = SizeRange::new(16, 4096, 2);
@@ -741,6 +747,14 @@ pub struct MediaCodecDecoderSession {
     /// The coded size the codec announced (`FormatChanged`), which is what every `CAPTURE`
     /// buffer is laid out for; `None` before the stream is parsed.
     announced: Option<Announced>,
+    /// The CAPTURE minimum announced in every `FormatChanged` and answered by
+    /// `V4L2_CID_MIN_BUFFERS_FOR_CAPTURE`: `max(MIN_CAPTURE_BUFFERS, num-output-slots)` once the
+    /// codec has published its output format, [`MIN_CAPTURE_BUFFERS`] before that (D69). The
+    /// codec's own output-slot count (21 for `c2.qti.avc.decoder` on 5566) is what a client must
+    /// provide, not the bare `MIN_CAPTURE_BUFFERS` floor: a client that sized its CAPTURE pool
+    /// from the old constant, or ffmpeg's `-num_capture_buffers` below the need, got a silently
+    /// short decode (8 buffers -> 73/300 frames, rc 0, B12-acceptance §2/§15).
+    min_capture_buffers: u32,
     format_changes: u32,
     /// Input indices the codec offered and nothing has used yet.
     free_inputs: VecDeque<i32>,
@@ -789,6 +803,12 @@ pub struct MediaCodecDecoderSession {
     dead: bool,
     input_capacity: Option<usize>,
     layout_logged: bool,
+    /// One `warn!` per session when the codec has more outputs waiting than the guest has lent
+    /// CAPTURE buffers to place them in (D69): the client under-provisioned its CAPTURE pool and
+    /// its decode will run short. The backend never drops a held output -- it waits for a buffer
+    /// -- so the loss is the client's drain declaring itself done on an empty CAPTURE queue, but
+    /// it is silent, and this makes it loud.
+    warned_capture_shortfall: bool,
     /// Indices refused by the codec since the last seek, stale indices (a null buffer for an
     /// index a flush made void, D23) since the last seek, and seeks so far.
     refused: u32,
@@ -815,6 +835,7 @@ impl MediaCodecDecoderSession {
             chosen: None,
             nal: None,
             announced: None,
+            min_capture_buffers: MIN_CAPTURE_BUFFERS,
             format_changes: 0,
             free_inputs: VecDeque::new(),
             pending: VecDeque::new(),
@@ -831,6 +852,7 @@ impl MediaCodecDecoderSession {
             dead: false,
             input_capacity: None,
             layout_logged: false,
+            warned_capture_shortfall: false,
             refused: 0,
             stale: 0,
             stale_events_seen: 0,
@@ -1145,6 +1167,7 @@ impl MediaCodecDecoderSession {
             // until the guest takes it back with STREAMOFF(CAPTURE) and reallocates; the frame
             // waits with it.
             let Some(at) = self.captures.iter().position(|c| c.len >= need) else {
+                self.warn_capture_shortfall();
                 break;
             };
             let capture = self.captures.remove(at).expect("position was found above");
@@ -1190,6 +1213,33 @@ impl MediaCodecDecoderSession {
             self.finish_frame(capture.index, need as u32, info, is_eos);
         }
         self.codec = Some(codec);
+    }
+
+    /// Warn once when the codec has as many outputs waiting as its announced minimum but no lent
+    /// CAPTURE buffer can take them (D69): the guest has under-provisioned its CAPTURE pool. The
+    /// backend does not drop the held outputs -- they wait here for a buffer -- but a client whose
+    /// drain gives up on an empty CAPTURE queue (ffmpeg's `-num_capture_buffers` below the need)
+    /// loses the tail in silence, so the shortfall is made loud. Parked (a resolution change) is
+    /// not a shortfall: the outputs are meant to wait for the restart.
+    fn warn_capture_shortfall(&mut self) {
+        if self.warned_capture_shortfall || self.parked {
+            return;
+        }
+        let held = self
+            .held_outputs
+            .iter()
+            .filter(|h| matches!(h, Held::Output { .. }))
+            .count() as u32;
+        if self.captures.is_empty() && held >= self.min_capture_buffers {
+            self.warned_capture_shortfall = true;
+            warn!(
+                "decoder session {}: {} decoded output(s) waiting with no CAPTURE buffer lent; \
+                 the client queued fewer CAPTURE buffers than the codec needs (min {}). Frames \
+                 will be held until a buffer is queued, and a client that stops queueing will get \
+                 a short decode",
+                self.id, held, self.min_capture_buffers
+            );
+        }
     }
 
     fn finish_frame(
@@ -1332,12 +1382,12 @@ impl MediaCodecDecoderSession {
             visible.0,
             visible.1,
             from,
-            MIN_CAPTURE_BUFFERS
+            self.min_capture_buffers
         );
         self.events.push(DecoderEvent::FormatChanged {
             coded_size: coded,
             visible_rect: Rect::new(visible.0, visible.1, visible.2, visible.3),
-            min_capture_buffers: MIN_CAPTURE_BUFFERS,
+            min_capture_buffers: self.min_capture_buffers,
         });
         // A change the codec parsed mid-stream is the kernel's "Dynamic Resolution Change": the
         // last CAPTURE buffer of the old resolution goes back with `V4L2_BUF_FLAG_LAST` -- empty,
@@ -1419,6 +1469,24 @@ impl MediaCodecDecoderSession {
             }
             _ => (0, 0, width, height),
         };
+        // The codec's own output-slot count is the CAPTURE minimum a client must provide: the
+        // component fills that many output buffers before it recycles the oldest, so a client
+        // that lends fewer -- or honours the old `MIN_CAPTURE_BUFFERS` floor of 4 -- gets a
+        // silently short decode (D69). `c2.qti.avc.decoder` publishes `num-output-slots: 21` on
+        // 5566, in this very format. The key has no `AMEDIAFORMAT_KEY_*` symbol; it is read by
+        // its literal name. Only ever raise the announced minimum above the floor, never below.
+        if let Some(slots) = format.get_i32(NUM_OUTPUT_SLOTS_KEY) {
+            let slots = slots.max(0) as u32;
+            let min = slots.max(MIN_CAPTURE_BUFFERS);
+            if min != self.min_capture_buffers {
+                info!(
+                    "decoder session {}: codec wants {} output slots; announcing min {} CAPTURE \
+                     buffers (was {})",
+                    self.id, slots, min, self.min_capture_buffers
+                );
+                self.min_capture_buffers = min;
+            }
+        }
         info!("decoder session {}: output format: {}", self.id, format);
         self.announce((width, height), visible, "codec");
     }
@@ -1716,6 +1784,9 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         }
         // Whatever parked the session, the client is restarting the CAPTURE queue.
         self.parked = false;
+        // The client is re-provisioning CAPTURE; let the shortfall warning fire again if the new
+        // pool is still too small (D69).
+        self.warned_capture_shortfall = false;
         if self.events.len() > before {
             self.sink.signal();
         }
