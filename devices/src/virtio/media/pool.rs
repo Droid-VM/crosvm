@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use base::debug;
 use base::error;
 use base::info;
 use base::AsRawDescriptor;
@@ -148,6 +149,16 @@ impl PoolResponse {
 /// this long means the VMM is gone or wedged, and the helper's allocation fails with `EIO`
 /// rather than blocking a REQBUFS forever (the F5 rule: every wait bounded, by a named const).
 pub const POOL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The granularity at which the pool accounting line is emitted at `info!` rather than `debug!`
+/// (D65). R8-3's per-`Release` line was `info!`, and at the ~9 400 releases/s a CAPTURE-REQBUFS
+/// storm produces (B12-acceptance §11) it overwrites the whole 1 MiB `vm.sh log` ring in under a
+/// second, evicting every other message -- two B12 measurements were lost to exactly that. The
+/// line is now `debug!` per transaction and `info!` only when a lease's held bytes cross one of
+/// these steps up or down (plus always on `ReleaseAll`/sweep): a reader still sees "device X now
+/// holds ~N of S" at 32 MiB granularity -- a 4K decode's 225 MiB shows as a handful of lines, not
+/// 19 -- while a REQBUFS loop that never moves a step logs none.
+const POOL_LOG_STEP: u64 = 32 << 20;
 
 /// How many queued stale answers one pool round trip will drain before giving up on its own.
 /// A stale answer exists only where an earlier request timed out (its reply arrived after the
@@ -493,6 +504,7 @@ impl MediaPool {
             pool: Arc::clone(&self.inner),
             card,
             owner,
+            logged_step: 0,
         }
     }
 
@@ -604,7 +616,10 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &mut String) {
                 continue;
             }
             PoolRequest::Reserve { id, len } => match lease.reserve(len) {
-                Ok(offset) => PoolResponse::Reserved { id, offset },
+                Ok(offset) => {
+                    log_pool_usage(lease, card);
+                    PoolResponse::Reserved { id, offset }
+                }
                 Err(errno) => PoolResponse::Errno { id, errno },
             },
             PoolRequest::Release { id, offset } => {
@@ -619,7 +634,7 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &mut String) {
                 // `release_owner` without dropping the lease: everything this helper holds goes
                 // back (the reclaim line says how much), and the connection keeps serving.
                 let _ = lease.release_all();
-                log_pool_usage(lease, card);
+                log_pool_sweep(lease, card);
                 PoolResponse::Released { id }
             }
         };
@@ -636,13 +651,45 @@ fn serve_pool(tube: &Tube, lease: &mut PoolBufferAllocator, card: &mut String) {
     }
 }
 
-/// One line per release, so a log reader can watch the books move without a debugger: how much
-/// this device still holds, and how full the whole pool is (B12 acceptance item c reads it to
-/// see a guest's REQBUFS(0) land in the VMM's accounting). Cheap -- releases happen per
-/// REQBUFS/close, not per frame -- so it is `info!`.
-fn log_pool_usage(lease: &PoolBufferAllocator, card: &str) {
+/// Whether a lease now holding `held` bytes has crossed a [`POOL_LOG_STEP`] boundary since the
+/// last `info!` accounting line, updating `last_step` when it has (D65). The accounting line is
+/// otherwise `debug!` -- a REQBUFS-heavy client reserves and releases hundreds of buffers a
+/// second, and one `info!` per transaction overwrites the whole VM log ring (B12-acceptance §6,
+/// §11). One line per 32 MiB of movement is enough for a reader to follow the books; a loop that
+/// never moves a step (a REQBUFS(0) that frees a few pages, over and over) logs none.
+fn crosses_log_step(last_step: &mut u64, held: u64) -> bool {
+    let step = held / POOL_LOG_STEP;
+    if step != *last_step {
+        *last_step = step;
+        true
+    } else {
+        false
+    }
+}
+
+/// The accounting line a log reader watches to see the books move without a debugger: how much
+/// this device holds, and how full the whole pool is (B12 acceptance item c reads it to see a
+/// guest's REQBUFS(0) land in the VMM's accounting). Emitted at `info!` only when the held bytes
+/// cross a [`POOL_LOG_STEP`] boundary up or down (D65), `debug!` on every other transaction.
+fn log_pool_usage(lease: &mut PoolBufferAllocator, card: &str) {
     let (held, used, size) = lease.usage();
-    info!("virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size}");
+    if crosses_log_step(&mut lease.logged_step, held) {
+        info!("virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size}");
+    } else {
+        debug!("virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size}");
+    }
+}
+
+/// The accounting line for a `ReleaseAll`/sweep: always `info!`, whatever the step -- a device
+/// returning everything at once is a REQBUFS-scale event a reader wants to see, and it resets
+/// the step so the next reservation's climb is logged from zero (D65).
+fn log_pool_sweep(lease: &mut PoolBufferAllocator, card: &str) {
+    let (held, used, size) = lease.usage();
+    lease.logged_step = held / POOL_LOG_STEP;
+    info!(
+        "virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size} \
+         (released all)"
+    );
 }
 
 /// Block on the tube until it reaches EOF, discarding everything else. The connection is being
@@ -671,6 +718,10 @@ pub struct PoolBufferAllocator {
     /// The device's V4L2 card name, for the exhaustion log.
     card: String,
     owner: u64,
+    /// The [`POOL_LOG_STEP`] step this lease's held bytes were in the last time the accounting
+    /// line was emitted at `info!` (D65). Only a change here promotes the next line from `debug!`
+    /// to `info!`.
+    logged_step: u64,
 }
 
 impl PoolBufferAllocator {
@@ -1488,6 +1539,69 @@ mod tests {
         assert_eq!(used(&pool), 0);
         drop(client);
         server.join().unwrap();
+    }
+
+    /// D65: the accounting line is `info!` only on a [`POOL_LOG_STEP`] crossing, so a
+    /// REQBUFS-heavy client cannot flood the 1 MiB VM log ring. A 100-release loop -- reserve
+    /// 100 small buffers, release them one at a time -- must log `info!` at most a handful of
+    /// times (one per 32 MiB the held total moves), never once per release. The step decision is
+    /// `crosses_log_step`, exercised directly here so the assertion does not depend on a logger.
+    #[test]
+    fn the_accounting_line_is_not_logged_per_release() {
+        // Each buffer is 4 MiB, so 100 of them is 400 MiB of movement: 400 / 32 = ~12 step
+        // crossings up and the same down, ~25 total -- a quarter of the 100 releases, and it
+        // would stay a quarter however many more releases were added. The count is proportional
+        // to the bytes moved, not to the number of transactions, which is the whole fix.
+        let buf = 4u64 << 20;
+        let mut step = 0u64;
+
+        // Reserve 100 buffers: held climbs 0 -> 400 MiB. Count the info-level crossings.
+        let mut infos_up = 0usize;
+        let mut held = 0u64;
+        for _ in 0..100 {
+            held += buf;
+            if crosses_log_step(&mut step, held) {
+                infos_up += 1;
+            }
+        }
+        // Release them one at a time: held falls 400 MiB -> 0.
+        let mut infos_down = 0usize;
+        for _ in 0..100 {
+            held -= buf;
+            if crosses_log_step(&mut step, held) {
+                infos_down += 1;
+            }
+        }
+
+        let total = infos_up + infos_down;
+        assert!(
+            total <= 400 / 32 * 2 + 2,
+            "info lines ({total}) track the 400 MiB moved, not the 200 transactions"
+        );
+        assert!(
+            total < 100,
+            "the accounting line is not emitted per release ({total} of 200)"
+        );
+        assert_eq!(held, 0);
+
+        // The pathological case the defect named: a REQBUFS(0) that frees the same few pages
+        // over and over never moves a 32 MiB step, so it logs no info line at all.
+        let mut quiet_step = 0u64;
+        let small = pagesize() as u64;
+        let mut quiet_infos = 0usize;
+        for _ in 0..1000 {
+            // reserve one page, then release it -- held returns to 0 each time.
+            if crosses_log_step(&mut quiet_step, small) {
+                quiet_infos += 1;
+            }
+            if crosses_log_step(&mut quiet_step, 0) {
+                quiet_infos += 1;
+            }
+        }
+        assert_eq!(
+            quiet_infos, 0,
+            "a sub-step reserve/release loop logs nothing at info"
+        );
     }
 
     /// A tube error that is not EOF must not sweep the lease: the helper on the far end is
