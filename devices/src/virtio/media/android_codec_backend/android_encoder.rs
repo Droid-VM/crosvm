@@ -48,9 +48,10 @@
 //!   slice-height`). This mirrors the decoder's D48 staging on the input queue: once the guest is
 //!   told a frame is consumed it is owed that frame's encoding, so a `STREAMOFF(OUTPUT)` that lands
 //!   with copies still un-fed drains them through the codec rather than dropping an already-acked
-//!   frame (D78; `drain_for_streamoff`). Past a byte budget ([`INPUT_STAGE_BYTES`]) a frame waits
-//!   lent instead of copied -- the `OUTPUT`-queue backpressure a fast feeder would otherwise defeat
-//!   -- and is acked when a slot takes it.
+//!   frame (D78; `drain_for_streamoff`). Past one codec output window of un-fed copies, or past a
+//!   byte budget ([`INPUT_STAGE_BYTES`]), a frame waits lent instead of copied -- the
+//!   `OUTPUT`-queue backpressure a fast feeder would otherwise defeat (B16 open item 1) -- and is
+//!   acked when a slot takes it.
 //! * A coded frame is copied out of the codec's output buffer the moment it is delivered and the
 //!   buffer released (tens of kilobytes against the raw copy; the codec never waits on the guest
 //!   for an output slot), then written into the next lent `CAPTURE` buffer that holds it;
@@ -81,7 +82,10 @@
 //! item 3). Everything else goes into `configure` when the codec is created, from the
 //! `EncoderConfig` the device gathers.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -181,9 +185,36 @@ const ENCODER_STREAMOFF_DRAIN: Duration = Duration::from_secs(2);
 /// a fast feeder would otherwise hit -- but an owned NV12 copy is a megabyte or more, so a guest
 /// that floods `OUTPUT` faster than the codec drains would make the session hold unbounded raw
 /// frames. Past this budget a frame waits lent (the pre-staging backpressure the `OUTPUT` queue
-/// has) and is acked when a codec input slot takes it. 64 MiB is ~46 1080p or ~5 4K frames --
-/// deep enough to keep the codec fed, bounded enough to be safe.
+/// has) and is acked when a codec input slot takes it. The byte budget is the memory bound; the
+/// *pacing* bound is tighter -- one codec output window of un-fed copies (`encode`), because 64
+/// MiB of run-ahead let a fast feeder race its own EOF teardown and regressed 720p 4M from 287
+/// to ~256 across F19 (B16-acceptance §8, open item 1).
 const INPUT_STAGE_BYTES: usize = 64 << 20;
+/// The output format key that carries how many output buffers the codec fills before it
+/// recycles the oldest -- the same CCodec/C2 field the decoder reads at its `SOURCE_CHANGE`
+/// (D69, `android.rs`), which the encoder publishes too: `c2.qti.avc.encoder` reports
+/// `num-output-slots: 8` at 720p on 5566 (B15's vmlog, quoted in F19-encoder §2). It has no
+/// `AMEDIAFORMAT_KEY_*` NDK symbol and is read by its literal name. Absent on a component that
+/// does not publish it, in which case nothing is learned and no `CAPTURE` floor is reported.
+const NUM_OUTPUT_SLOTS_KEY: &std::ffi::CStr = c"num-output-slots";
+
+/// The `CAPTURE` floor reported to the device for a codec whose output-slot count is known:
+/// twice the codec's own window. One window covers the coded frames the codec can hand over in
+/// a single burst -- and it does burst, because the session copies coded frames out and holds
+/// them ready (`held_outputs`), so a freshly queued buffer is filled at once; the second window
+/// covers the buffers the client still holds un-requeued while it writes that burst out, so the
+/// queue never runs dry in between. ffmpeg's `h264_v4l2m2m` abandons its EOF drain the moment
+/// every CAPTURE buffer sits in userspace at once ("All capture buffers returned to
+/// userspace...", B16-acceptance §5.3) -- its default of 4 reaches that state under any burst,
+/// a two-window allocation does not. For the 8 slots the phone's encoder publishes this lands
+/// on the 16 that B16 measured as 300/300/300 on the very command that loses 40-54 frames at
+/// the default. Nothing here is a fixed count: the floor moves with the codec's own number,
+/// and that number is only ever what a real session's output format reported (a B17 read on
+/// the phone).
+fn capture_floor(slots: u32) -> u32 {
+    slots.saturating_mul(2)
+}
+
 /// The bitrate a session starts with when the guest sets none (`V4L2_CID_MPEG_VIDEO_BITRATE`'s
 /// default), clamped into the codec's range. ffmpeg always sets one; GStreamer's `v4l2h264enc`
 /// only with its `extra-controls`.
@@ -580,6 +611,16 @@ pub struct MediaCodecEncoderBackend {
     caps: EncoderCapabilities,
     /// Parallel to `caps.coded_formats`.
     codecs: Vec<ChosenEncoder>,
+    /// The output-slot count (`num-output-slots`) a session's codec last reported for a coded
+    /// fourcc, remembered across sessions in the helper process -- the encoder's twin of the
+    /// decoder backend's `learned_min` (D77). A client sizes its `CAPTURE` (bitstream) queue
+    /// with `REQBUFS` before `STREAMON` ever creates the codec, so the count a session learns
+    /// can only help the *next* session of the format: the device reads it back through
+    /// `min_capture_buffers` (as [`capture_floor`]) and raises a smaller `REQBUFS(CAPTURE)` to
+    /// it (B16-acceptance §5.3, the D78 residual). Shared through the `Clone` the device factory
+    /// makes at every start, so the count outlives a session. No number is hardcoded: it is only
+    /// ever what a real codec's output format reported.
+    learned_slots: Arc<Mutex<HashMap<u32, u32>>>,
 }
 
 impl MediaCodecEncoderBackend {
@@ -711,7 +752,11 @@ impl MediaCodecEncoderBackend {
                     .join(", "),
                 allow_sw
             );
-            return Ok(Self { caps, codecs });
+            return Ok(Self {
+                caps,
+                codecs,
+                learned_slots: Default::default(),
+            });
         }
         info!(
             "encoder: {} coded format(s) for the guest from {} ({} encoder(s) listed, \
@@ -726,7 +771,11 @@ impl MediaCodecEncoderBackend {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        Ok(Self { caps, codecs })
+        Ok(Self {
+            caps,
+            codecs,
+            learned_slots: Default::default(),
+        })
     }
 }
 
@@ -905,11 +954,30 @@ impl VideoEncoderBackend for MediaCodecEncoderBackend {
     }
 
     fn new_session(&mut self, id: u32, sink: EncoderSink) -> IoctlResult<MediaCodecEncoderSession> {
-        Ok(MediaCodecEncoderSession::new(id, sink, self.codecs.clone()))
+        Ok(MediaCodecEncoderSession::new(
+            id,
+            sink,
+            self.codecs.clone(),
+            Arc::clone(&self.learned_slots),
+        ))
     }
 
     fn close_session(&mut self, mut session: MediaCodecEncoderSession) {
         session.stop();
+    }
+
+    /// The `CAPTURE` floor for `fourcc`, once a session's codec has named its output-slot count
+    /// ([`capture_floor`] of it): what the device raises a smaller `REQBUFS(CAPTURE)` to, so
+    /// ffmpeg's fixed 4-buffer ask meets the codec's real need from the second encode of a
+    /// format on (B16-acceptance §5.3, the D78 residual -- the decoder's D77 pattern). `None`
+    /// until a codec has reported; the first session of a format runs unraised, exactly as the
+    /// decoder's does.
+    fn min_capture_buffers(&self, fourcc: PixelFormat) -> Option<u32> {
+        self.learned_slots
+            .lock()
+            .unwrap()
+            .get(&fourcc.to_u32())
+            .map(|slots| capture_floor(*slots))
     }
 }
 
@@ -1078,6 +1146,17 @@ pub struct MediaCodecEncoderSession {
     pending: VecDeque<PendingInput>,
     /// Bytes held in [`PendingInput::Staged`] copies in `pending`: the staging budget's tally.
     staged_bytes: usize,
+    /// The coded fourcc the running codec was created for (`start`'s config), the key the
+    /// learned output-slot count is remembered under.
+    coded_fourcc: Option<PixelFormat>,
+    /// The codec's own output-buffer window (`num-output-slots`), from the shared record at
+    /// `start` and from the codec's output format when it reports one (`note_output_slots`).
+    /// Bounds how many frames `encode` stages ahead of the codec; `None` until any codec of
+    /// this fourcc has reported.
+    output_slots: Option<u32>,
+    /// The helper-wide `fourcc -> num-output-slots` record shared with the backend (D77's
+    /// shape): what `min_capture_buffers` answers the device from.
+    learned_slots: Arc<Mutex<HashMap<u32, u32>>>,
     /// `CAPTURE` buffers lent by the device, oldest first.
     captures: VecDeque<OutputBuffer>,
     /// Coded outputs the codec delivered that no `CAPTURE` buffer has taken yet.
@@ -1110,7 +1189,12 @@ pub struct MediaCodecEncoderSession {
 }
 
 impl MediaCodecEncoderSession {
-    fn new(id: u32, sink: EncoderSink, codecs: Vec<ChosenEncoder>) -> Self {
+    fn new(
+        id: u32,
+        sink: EncoderSink,
+        codecs: Vec<ChosenEncoder>,
+        learned_slots: Arc<Mutex<HashMap<u32, u32>>>,
+    ) -> Self {
         Self {
             id,
             sink,
@@ -1124,6 +1208,9 @@ impl MediaCodecEncoderSession {
             free_inputs: VecDeque::new(),
             pending: VecDeque::new(),
             staged_bytes: 0,
+            coded_fourcc: None,
+            output_slots: None,
+            learned_slots,
             captures: VecDeque::new(),
             held_outputs: VecDeque::new(),
             joined_headers: None,
@@ -1194,6 +1281,43 @@ impl MediaCodecEncoderSession {
                 self.codec_name(),
                 self.refused
             ));
+        }
+    }
+
+    /// The codec's output format names its own output-buffer window (`num-output-slots`, the
+    /// C2 field the decoder reads at its `SOURCE_CHANGE`, D69): keep it for this session's
+    /// staging bound, and record it under the coded fourcc for the device's `CAPTURE` floor
+    /// (`min_capture_buffers` -> [`capture_floor`]) -- the decoder's D77 pattern, on the
+    /// encoder for the D78 residual (B16-acceptance §5.3). The client sized its `CAPTURE`
+    /// queue before the codec existed and never re-asks, so the record can only raise the
+    /// *next* session of the format; only ever raised, never lowered, like the decoder's.
+    fn note_output_slots(&mut self, format: &MediaFormat) {
+        let Some(slots) = format.get_i32(NUM_OUTPUT_SLOTS_KEY) else {
+            return;
+        };
+        let slots = slots.max(0) as u32;
+        if slots == 0 {
+            return;
+        }
+        if self.output_slots.unwrap_or(0) < slots {
+            info!(
+                "encoder session {}: codec fills {} output slots; CAPTURE floor {} for later \
+                 sessions of {}",
+                self.id,
+                slots,
+                capture_floor(slots),
+                self.coded_fourcc
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+        self.output_slots = Some(self.output_slots.unwrap_or(0).max(slots));
+        if let Some(fourcc) = self.coded_fourcc {
+            let mut learned = self.learned_slots.lock().unwrap();
+            let entry = learned.entry(fourcc.to_u32()).or_insert(slots);
+            if slots > *entry {
+                *entry = slots;
+            }
         }
     }
 
@@ -1414,6 +1538,9 @@ impl MediaCodecEncoderSession {
                     self.take_output(&mut codec, index, info);
                 }
                 CodecEvent::FormatChanged(format) => {
+                    if let Some(format) = &format {
+                        self.note_output_slots(format);
+                    }
                     info!(
                         "encoder session {}: output format: {}",
                         self.id,
@@ -1966,6 +2093,15 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
                 self.chosen = Some(chosen);
                 self.codec = Some(started.codec);
                 self.layout = Some(layout);
+                self.coded_fourcc = Some(config.coded_format);
+                // What an earlier codec of this fourcc reported: the staging bound starts at
+                // the real window instead of the pre-report cushion (`note_output_slots`).
+                self.output_slots = self
+                    .learned_slots
+                    .lock()
+                    .unwrap()
+                    .get(&config.coded_format.to_u32())
+                    .copied();
                 self.coded_size = config.coded_size;
                 self.visible = config.visible_rect;
                 self.header_mode = config.header_mode;
@@ -2017,11 +2153,29 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
         let before = self.events.len();
         // Stage the frame into an owned buffer and return the guest's OUTPUT buffer at once, so
         // the guest is not throttled by the codec's input slots and, once acked, is owed the
-        // frame's encoding even across a STREAMOFF (D48, D78). Past the byte budget the frame
-        // waits lent -- the OUTPUT-queue backpressure a fast feeder would otherwise defeat -- and
-        // is acked when a codec input slot takes it. A frame queued while a drain is in flight
-        // still waits behind the EOS, as the kernel's encoder interface says it must.
-        if self.staged_bytes.saturating_add(buffer.len) <= INPUT_STAGE_BYTES {
+        // frame's encoding even across a STREAMOFF (D48, D78). The staging is *bounded*, and the
+        // bound is the back-pressure: past the codec's own output window of un-fed copies
+        // (`output_slots`; the same pre-report cushion as `MIN_OUTPUT_BUFFERS` until a codec has
+        // named it), or past the byte budget, the frame waits lent and is acked only when a
+        // codec input slot takes it. F19 staged a flat 64 MiB -- ~46 720p frames of run-ahead --
+        // and a fast feeder raced its own EOF teardown into the D78 drain, regressing 720p 4M
+        // from 287 to ~256 (B16-acceptance §5.1/§8, open item 1); one window keeps the feeder
+        // paced to the codec while still absorbing a camera's jitter, and it keeps what a
+        // teardown drain owes the guest in the same order as the CAPTURE floor the device now
+        // guarantees the client allocated ([`capture_floor`]). A frame queued while a drain is
+        // in flight still waits behind the EOS, as the kernel's encoder interface says it must.
+        let stage_window = self
+            .output_slots
+            .map(|slots| slots.max(1) as usize)
+            .unwrap_or(MIN_OUTPUT_BUFFERS as usize);
+        let staged_frames = self
+            .pending
+            .iter()
+            .filter(|p| matches!(p, PendingInput::Staged { .. }))
+            .count();
+        if staged_frames < stage_window
+            && self.staged_bytes.saturating_add(buffer.len) <= INPUT_STAGE_BYTES
+        {
             // SAFETY: the device lends `len` readable bytes at `ptr` until we report
             // `InputBufferDone`, queued just below; the copy is made before this returns, and
             // nothing else reads or writes that region.
