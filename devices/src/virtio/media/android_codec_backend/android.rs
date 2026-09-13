@@ -70,9 +70,12 @@
 //!   `END_OF_STREAM` delivered after a flush ends nothing (review-m6 R6-3). After an EOS the codec
 //!   accepts no input until it is flushed, which the next `decode` does.
 
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -296,6 +299,17 @@ pub struct MediaCodecDecoderBackend {
     caps: DecoderCapabilities,
     /// Parallel to `caps.coded_formats`.
     codecs: Vec<ChosenCodec>,
+    /// The last `CAPTURE` minimum a decode session announced for a coded fourcc (the codec's
+    /// `num-output-slots`, `handle_format`), remembered across sessions in the helper process
+    /// (D77). A stateful decoder learns that count only at the `SOURCE_CHANGE`, but ffmpeg sizes
+    /// its `CAPTURE` pool with a fixed `REQBUFS(CAPTURE, 20)` *before* the announce and never
+    /// re-asks (B15 §3): the D72 floor cannot fire, and every ffmpeg decode runs one buffer below
+    /// the codec's need, which is why the backend must hold outputs at the announce at all
+    /// (B15 §2.6 candidate 3). Once one session has learned the count, the device raises a later
+    /// session's pre-announce `REQBUFS(CAPTURE)` to it. Shared through the `Clone` the device
+    /// factory makes at every start, so the count outlives a session. No number is hardcoded: it
+    /// is only ever what a real announce reported.
+    learned_min: Arc<Mutex<HashMap<u32, u32>>>,
 }
 
 impl MediaCodecDecoderBackend {
@@ -416,7 +430,11 @@ impl MediaCodecDecoderBackend {
                     .join(", "),
                 allow_sw
             );
-            return Ok(Self { caps, codecs });
+            return Ok(Self {
+                caps,
+                codecs,
+                learned_min: Arc::new(Mutex::new(HashMap::new())),
+            });
         }
         info!(
             "decoder: {} coded format(s) for the guest from {} ({} decoder(s) listed, \
@@ -431,7 +449,11 @@ impl MediaCodecDecoderBackend {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        Ok(Self { caps, codecs })
+        Ok(Self {
+            caps,
+            codecs,
+            learned_min: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 }
 
@@ -577,11 +599,27 @@ impl VideoDecoderBackend for MediaCodecDecoderBackend {
     }
 
     fn new_session(&mut self, id: u32, sink: DecoderSink) -> IoctlResult<MediaCodecDecoderSession> {
-        Ok(MediaCodecDecoderSession::new(id, sink, self.codecs.clone()))
+        Ok(MediaCodecDecoderSession::new(
+            id,
+            sink,
+            self.codecs.clone(),
+            Arc::clone(&self.learned_min),
+        ))
     }
 
     fn close_session(&mut self, mut session: MediaCodecDecoderSession) {
         session.stop();
+    }
+
+    /// The `CAPTURE` minimum an earlier session learned for `fourcc` at its `SOURCE_CHANGE`, if
+    /// any (D77): the floor the device raises a pre-announce `REQBUFS(CAPTURE)` to, so ffmpeg's
+    /// fixed short request meets the codec's output-slot count from the second decode on.
+    fn min_capture_buffers(&self, fourcc: PixelFormat) -> Option<u32> {
+        self.learned_min
+            .lock()
+            .unwrap()
+            .get(&fourcc.to_u32())
+            .copied()
     }
 }
 
@@ -755,6 +793,12 @@ pub struct MediaCodecDecoderSession {
     /// from the old constant, or ffmpeg's `-num_capture_buffers` below the need, got a silently
     /// short decode (8 buffers -> 73/300 frames, rc 0, B12-acceptance §2/§15).
     min_capture_buffers: u32,
+    /// The coded fourcc this session decodes (`start`), so a learned `CAPTURE` minimum is recorded
+    /// against the right format (D77). `None` until `start`.
+    coded_format: Option<PixelFormat>,
+    /// The backend's cross-session record of the `CAPTURE` minimum announced per coded fourcc
+    /// (D77); this session writes its announced count here for the next session to read.
+    learned_min: Arc<Mutex<HashMap<u32, u32>>>,
     format_changes: u32,
     /// Input indices the codec offered and nothing has used yet.
     free_inputs: VecDeque<i32>,
@@ -840,7 +884,12 @@ pub struct MediaCodecDecoderSession {
 }
 
 impl MediaCodecDecoderSession {
-    fn new(id: u32, sink: DecoderSink, codecs: Vec<ChosenCodec>) -> Self {
+    fn new(
+        id: u32,
+        sink: DecoderSink,
+        codecs: Vec<ChosenCodec>,
+        learned_min: Arc<Mutex<HashMap<u32, u32>>>,
+    ) -> Self {
         let grace = GraceTimer::spawn(sink.clone());
         Self {
             id,
@@ -851,6 +900,8 @@ impl MediaCodecDecoderSession {
             nal: None,
             announced: None,
             min_capture_buffers: MIN_CAPTURE_BUFFERS,
+            coded_format: None,
+            learned_min,
             format_changes: 0,
             free_inputs: VecDeque::new(),
             pending: VecDeque::new(),
@@ -1010,13 +1061,43 @@ impl MediaCodecDecoderSession {
         }
     }
 
+    /// Decoded outputs the codec has handed us that no `CAPTURE` buffer has taken yet -- the
+    /// count that must stay below the codec's output-slot count for it to keep decoding without
+    /// dropping (D64). `held_outputs` also holds format changes in between; only the frames count.
+    fn held_output_count(&self) -> usize {
+        self.held_outputs
+            .iter()
+            .filter(|h| matches!(h, Held::Output { .. }))
+            .count()
+    }
+
     /// Feed the codec from the pending FIFO while it offers input slots.
     fn pump_input(&mut self) {
         while !self.dead && !self.eos_queued {
+            // Back-pressure (D64). The codec has a fixed number of output slots
+            // (`num-output-slots`, which `handle_format` made `min_capture_buffers`); once we hold
+            // that many decoded outputs with no `CAPTURE` buffer to place them in, the codec has no
+            // free output slot and cannot decode more. Feeding it more bitstream then only fills
+            // its input queue with pictures it cannot turn into output, and under a concurrent
+            // encoder session competing for the shared codec hardware that backlog is dropped --
+            // the codec resumes at the next IDR, losing the head GOP (B15 §2: a standalone
+            // MediaCodec pair never drops, so the drop is provoked by *our* holding the slots while
+            // ffmpeg -- freed from the one-shot grace, D64/F17 -- floods all 300 packets before it
+            // has answered the `SOURCE_CHANGE` with `CAPTURE` buffers). So stop staging into the
+            // codec while its slots are saturated; the bitstream waits in `pending` (returned to
+            // the guest already, D28/D48) and is fed once a delivered frame frees a slot
+            // (`pump_output` -> the re-pump in `use_as_capture` / `take_events`). A client that
+            // keeps its `CAPTURE` queue supplied -- gst's 25 buffers, an uncontended ffmpeg --
+            // never reaches the cap and is not throttled. An `EOS` is never held: a drain must
+            // reach the codec even with outputs pending, or it could not finish.
+            let saturated = self.held_output_count() >= self.min_capture_buffers as usize;
             let (Some(&index), Some(head)) = (self.free_inputs.front(), self.pending.front_mut())
             else {
                 break;
             };
+            if saturated && matches!(head, PendingInput::Bitstream { .. }) {
+                break;
+            }
             let Some(codec) = self.codec.as_ref() else {
                 break;
             };
@@ -1512,6 +1593,17 @@ impl MediaCodecDecoderSession {
                 );
                 self.min_capture_buffers = min;
             }
+            // Remember the codec's output-slot count for this coded format so the next session's
+            // pre-announce `REQBUFS(CAPTURE)` can be raised to it (D77): a stateful decoder only
+            // learns the count here, at the `SOURCE_CHANGE`, but ffmpeg asks for its CAPTURE
+            // buffers before the announce and never re-asks. Only ever raised, never lowered.
+            if let Some(fourcc) = self.coded_format {
+                let mut learned = self.learned_min.lock().unwrap();
+                let entry = learned.entry(fourcc.to_u32()).or_insert(min);
+                if min > *entry {
+                    *entry = min;
+                }
+            }
         }
         info!("decoder session {}: output format: {}", self.id, format);
         self.announce((width, height), visible, "codec");
@@ -1677,6 +1769,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                     if chosen.low_latency { "on" } else { "off" }
                 );
                 self.nal = NalCodec::for_mime(&chosen.mime);
+                self.coded_format = Some(coded_format);
                 self.chosen = Some(chosen);
                 self.codec = Some(codec);
                 self.started_at = Some(Instant::now());
@@ -1764,6 +1857,9 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         self.captures.push_back(buffer);
         let before = self.events.len();
         self.pump_output();
+        // A delivered frame frees a codec output slot, so the back-pressure gate may now let more
+        // bitstream through (D64): feed it while a slot is free.
+        self.pump_input();
         if self.events.len() > before {
             self.sink.signal();
         }
@@ -2026,6 +2122,9 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             // looked for.
             self.pump_input();
             self.pump_output();
+            // A frame delivered by that `pump_output` freed a codec output slot; the back-pressure
+            // gate (D64) may now let more bitstream through, so feed again.
+            self.pump_input();
             if self.eos_seen && self.pending.iter().any(|p| !matches!(p, PendingInput::Eos)) {
                 // Bitstream that arrived during the drain: the codec restarts now that the LAST
                 // buffer is out.
