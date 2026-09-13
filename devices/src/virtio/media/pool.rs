@@ -36,6 +36,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use base::debug;
@@ -159,6 +160,20 @@ pub const POOL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// holds ~N of S" at 32 MiB granularity -- a 4K decode's 225 MiB shows as a handful of lines, not
 /// 19 -- while a REQBUFS loop that never moves a step logs none.
 const POOL_LOG_STEP: u64 = 32 << 20;
+
+/// The shortest gap between two `info!` accounting lines from one lease (D74).
+///
+/// [`POOL_LOG_STEP`] alone bounds the lines by the *bytes* a lease moves, and that is enough for
+/// a lease that climbs and stays put. It is not enough for one that oscillates *across* a step:
+/// B14-accept-B section 4 stormed `REQBUFS(0)`/`REQBUFS(6)` of 4K buffers for 60 s -- a 74.7 MiB
+/// lease crossing four boundaries per cycle, 56 503 cycles -- and got roughly 226 000 `info`
+/// lines, which filled the 1 MiB `vm.sh log` ring, wrapped it, and left 2.07 seconds of history:
+/// every `launched media helper`, `pool served by the VMM over fd` and `the pool connection for`
+/// line was gone. F16-codec section 1 named that caveat and this is the lever it pointed at
+/// (D51's `pr_warn_ratelimited` pattern). One line per lease per second bounds the accounting by
+/// *time* as well, so no storm can outrun the ring however fast it moves the books; the line that
+/// does go out says how many crossings were dropped, so nothing is silently lost.
+const POOL_LOG_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How many queued stale answers one pool round trip will drain before giving up on its own.
 /// A stale answer exists only where an earlier request timed out (its reply arrived after the
@@ -504,7 +519,7 @@ impl MediaPool {
             pool: Arc::clone(&self.inner),
             card,
             owner,
-            logged_step: 0,
+            rate: LogRate::default(),
         }
     }
 
@@ -667,28 +682,94 @@ fn crosses_log_step(last_step: &mut u64, held: u64) -> bool {
     }
 }
 
-/// The accounting line a log reader watches to see the books move without a debugger: how much
-/// this device holds, and how full the whole pool is (B12 acceptance item c reads it to see a
-/// guest's REQBUFS(0) land in the VMM's accounting). Emitted at `info!` only when the held bytes
-/// cross a [`POOL_LOG_STEP`] boundary up or down (D65), `debug!` on every other transaction.
-fn log_pool_usage(lease: &mut PoolBufferAllocator, card: &str) {
-    let (held, used, size) = lease.usage();
-    if crosses_log_step(&mut lease.logged_step, held) {
-        info!("virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size}");
-    } else {
-        debug!("virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size}");
+/// One lease's accounting-line state: which [`POOL_LOG_STEP`] it was in when a line last went out
+/// (D65), when that was, and how many step crossings have been dropped since (D74).
+#[derive(Default)]
+struct LogRate {
+    /// The step the lease's held bytes were in the last time the line was emitted at `info!`.
+    /// Only a change here promotes the next line from `debug!` to `info!`.
+    step: u64,
+    /// When the last `info!` accounting line went out. `None` until the first one, so a lease's
+    /// first crossing is never delayed.
+    last: Option<Instant>,
+    /// Step crossings that happened inside a [`POOL_LOG_INTERVAL`] window and were therefore not
+    /// logged. Carried into the next line that does go out and then cleared, so the reader is
+    /// told what it did not see rather than left to guess.
+    suppressed: u64,
+}
+
+/// Whether the accounting line for a lease now holding `held` bytes goes out at `info!`, and if
+/// so how many crossings were dropped since the last one (D65 + D74).
+///
+/// Two gates, in order: no [`POOL_LOG_STEP`] crossing means no `info!` line at all (the D65 rule,
+/// unchanged -- a loop that never moves a step still logs nothing), and a crossing inside
+/// [`POOL_LOG_INTERVAL`] of the last line is counted and dropped. `now` is a parameter rather than
+/// an `Instant::now()` inside, so the rate limit can be driven through simulated time by a test
+/// instead of by a sleep.
+fn info_line_due(rate: &mut LogRate, held: u64, now: Instant) -> Option<u64> {
+    if !crosses_log_step(&mut rate.step, held) {
+        return None;
+    }
+    match rate.last {
+        Some(last) if now.duration_since(last) < POOL_LOG_INTERVAL => {
+            rate.suppressed += 1;
+            None
+        }
+        _ => Some(rate.take_dropped(now)),
     }
 }
 
-/// The accounting line for a `ReleaseAll`/sweep: always `info!`, whatever the step -- a device
-/// returning everything at once is a REQBUFS-scale event a reader wants to see, and it resets
-/// the step so the next reservation's climb is logged from zero (D65).
+impl LogRate {
+    /// Open a new rate window at `now` and return the crossings dropped in the last one.
+    fn take_dropped(&mut self, now: Instant) -> u64 {
+        self.last = Some(now);
+        std::mem::take(&mut self.suppressed)
+    }
+
+    /// What a printed line says about the crossings it stands for: nothing when none were
+    /// dropped, so the ordinary line is unchanged.
+    fn dropped_suffix(dropped: u64) -> String {
+        if dropped == 0 {
+            String::new()
+        } else {
+            format!(" ({dropped} step crossings not logged)")
+        }
+    }
+}
+
+/// The accounting line a log reader watches to see the books move without a debugger: how much
+/// this device holds, and how full the whole pool is (B12 acceptance item c reads it to see a
+/// guest's REQBUFS(0) land in the VMM's accounting). Emitted at `info!` only when the held bytes
+/// cross a [`POOL_LOG_STEP`] boundary up or down (D65) and at most once a second per lease
+/// (D74), `debug!` on every other transaction.
+fn log_pool_usage(lease: &mut PoolBufferAllocator, card: &str) {
+    let (held, used, size) = lease.usage();
+    match info_line_due(&mut lease.rate, held, Instant::now()) {
+        Some(dropped) => {
+            let dropped = LogRate::dropped_suffix(dropped);
+            info!(
+                "virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of \
+                 {size}{dropped}"
+            );
+        }
+        None => {
+            debug!("virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size}")
+        }
+    }
+}
+
+/// The accounting line for a `ReleaseAll`/sweep: always `info!`, whatever the step and whatever
+/// the rate limit -- a device returning everything at once is a REQBUFS-scale event a reader
+/// wants to see, and it resets the step so the next reservation's climb is logged from zero
+/// (D65). It opens a fresh rate window and carries out whatever the window before it dropped
+/// (D74), so no suppressed crossing is lost to a sweep.
 fn log_pool_sweep(lease: &mut PoolBufferAllocator, card: &str) {
     let (held, used, size) = lease.usage();
-    lease.logged_step = held / POOL_LOG_STEP;
+    lease.rate.step = held / POOL_LOG_STEP;
+    let dropped = LogRate::dropped_suffix(lease.rate.take_dropped(Instant::now()));
     info!(
         "virtio-media: pool: \"{card}\" holds {held} bytes, pool used {used} of {size} \
-         (released all)"
+         (released all){dropped}"
     );
 }
 
@@ -718,10 +799,9 @@ pub struct PoolBufferAllocator {
     /// The device's V4L2 card name, for the exhaustion log.
     card: String,
     owner: u64,
-    /// The [`POOL_LOG_STEP`] step this lease's held bytes were in the last time the accounting
-    /// line was emitted at `info!` (D65). Only a change here promotes the next line from `debug!`
-    /// to `info!`.
-    logged_step: u64,
+    /// When this lease's accounting line may next go out at `info!`, and what it owes the reader
+    /// when it does (D65's step, D74's one-a-second window and its dropped count).
+    rate: LogRate,
 }
 
 impl PoolBufferAllocator {
@@ -1602,6 +1682,78 @@ mod tests {
             quiet_infos, 0,
             "a sub-step reserve/release loop logs nothing at info"
         );
+    }
+
+    /// D74: the accounting line is bounded in *time* as well as in bytes -- at most one `info!`
+    /// per lease per second -- so a lease that oscillates *across* a 32 MiB step cannot outrun
+    /// the 1 MiB VM log ring however fast it moves the books.
+    ///
+    /// D65's step rule bounds the lines by the bytes moved, which is no bound at all for the
+    /// storm B14-accept-B section 4 ran: `REQBUFS(0)`/`REQBUFS(6)` of 4K buffers, a 74.7 MiB
+    /// lease crossing four boundaries per cycle, ~226 000 `info` lines in 60 s and 2.07 seconds
+    /// of surviving history. Here 10 000 releases oscillate a 40 MiB lease across one boundary,
+    /// one every millisecond -- 10 seconds of simulated time, and 10 000 step crossings, every
+    /// one of which was an `info` line before this change. The clock is a parameter of
+    /// [`info_line_due`], so the rate limit is driven by simulated time and the test neither
+    /// sleeps nor depends on a logger.
+    #[test]
+    fn the_accounting_line_is_rate_limited_across_an_oscillating_step() {
+        let start = Instant::now();
+        let mut rate = LogRate::default();
+        // A lease of 40 MiB is in step 1, an empty one in step 0: every transaction crosses.
+        let lease = 40u64 << 20;
+        let mut printed = 0u64;
+        let mut reported = 0u64;
+        for i in 0..10_000u64 {
+            let now = start + Duration::from_millis(i);
+            let held = if i % 2 == 0 { lease } else { 0 };
+            if let Some(dropped) = info_line_due(&mut rate, held, now) {
+                printed += 1;
+                reported += dropped;
+            }
+        }
+
+        // One line at the start of each of the ten one-second windows (t = 0 ms, 1 000 ms, ...,
+        // 9 000 ms), and no more.
+        assert_eq!(
+            printed, 10,
+            "10 s of a 10 000-crossing storm is 10 info lines, not 10 000"
+        );
+        // And nothing is silently lost: every crossing was either printed or counted into the
+        // `(N step crossings not logged)` of a line that was.
+        assert_eq!(
+            printed + reported + rate.suppressed,
+            10_000,
+            "every crossing is either a line or a number on one"
+        );
+        assert_eq!(LogRate::dropped_suffix(0), "");
+        assert_eq!(
+            LogRate::dropped_suffix(999),
+            " (999 step crossings not logged)"
+        );
+
+        // D65 still gates first: a loop that never moves a step logs nothing, however much time
+        // passes between its transactions.
+        let mut quiet = LogRate::default();
+        let small = pagesize() as u64;
+        for i in 0..1_000u64 {
+            let now = start + Duration::from_secs(i);
+            assert!(info_line_due(&mut quiet, small, now).is_none());
+            assert!(info_line_due(&mut quiet, 0, now).is_none());
+        }
+        assert_eq!(quiet.suppressed, 0);
+
+        // A lease that climbs slower than the window loses nothing: every crossing is its own
+        // line, with no dropped count on it.
+        let mut slow = LogRate::default();
+        for step in 1..=5u64 {
+            let now = start + Duration::from_secs(step);
+            assert_eq!(
+                info_line_due(&mut slow, step * POOL_LOG_STEP, now),
+                Some(0),
+                "a crossing a whole window after the last line is logged in full"
+            );
+        }
     }
 
     /// A tube error that is not EOF must not sweep the lease: the helper on the far end is
