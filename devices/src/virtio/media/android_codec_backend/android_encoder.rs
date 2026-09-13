@@ -20,8 +20,8 @@
 //! ```text
 //!  device worker thread                                     NDK callback thread
 //!  ────────────────────                                     ───────────────────
-//!  encode(InputBuffer)     pack into getInputBuffer +       onAsyncInputAvailable  ─┐ push onto the
-//!                          queueInputBuffer, else FIFO      onAsyncOutputAvailable  │ Codec's queue,
+//!  encode(InputBuffer)     copy into an owned buffer,        onAsyncInputAvailable  ─┐ push onto the
+//!                          ack the guest, feed as slots free onAsyncOutputAvailable  │ Codec's queue,
 //!  use_as_capture(buf)     FIFO of lent CAPTURE buffers     onAsyncFormatChanged    │ then bump the
 //!  take_events()           drain the Codec's queue: feed    onAsyncError           ─┘ session eventfd
 //!                          frames, copy coded frames into                              (the wake hook)
@@ -40,11 +40,17 @@
 //!
 //! # Buffers
 //!
-//! * A raw frame is **copied** into the codec's input buffer as soon as an input slot is free --
-//!   the visible rectangle of the guest's tightly packed NV12, padded to the `stride` and
+//! * A raw frame is **staged**: copied into an owned buffer the moment the guest queues it
+//!   (`InputBufferDone` follows at once, so the guest gets its buffer back and is not throttled by
+//!   the codec's input slots), then packed into the codec's input buffer from that copy as a slot
+//!   frees -- the visible rectangle of the guest's tightly packed NV12, padded to the `stride` and
 //!   `slice-height` the codec published after `configure` (design §7.3; chroma at `stride *
-//!   slice-height`) -- and `InputBufferDone` follows at once, so the guest gets its buffer back
-//!   right after the copy. With no slot free it waits in a FIFO, still lent.
+//!   slice-height`). This mirrors the decoder's D48 staging on the input queue: once the guest is
+//!   told a frame is consumed it is owed that frame's encoding, so a `STREAMOFF(OUTPUT)` that lands
+//!   with copies still un-fed drains them through the codec rather than dropping an already-acked
+//!   frame (D78; `drain_for_streamoff`). Past a byte budget ([`INPUT_STAGE_BYTES`]) a frame waits
+//!   lent instead of copied -- the `OUTPUT`-queue backpressure a fast feeder would otherwise defeat
+//!   -- and is acked when a slot takes it.
 //! * A coded frame is copied out of the codec's output buffer the moment it is delivered and the
 //!   buffer released (tens of kilobytes against the raw copy; the codec never waits on the guest
 //!   for an output slot), then written into the next lent `CAPTURE` buffer that holds it;
@@ -163,6 +169,21 @@ use super::android::STALE_LOG_LIMIT;
 /// keep the copy pipelined. GStreamer sizes its upstream pool from this, ffmpeg allocates 16
 /// regardless. Same number as the decoder's `MIN_CAPTURE_BUFFERS`.
 const MIN_OUTPUT_BUFFERS: u32 = 4;
+/// A `STREAMOFF(OUTPUT)` that lands with frames the guest was already told `InputBufferDone` for
+/// finishes them through the codec and delivers the coded frames to the lent `CAPTURE` buffers
+/// before it lets go, waiting at most this long for the codec to emit the frames still in flight
+/// (D78; the device's [`VideoEncoderBackendSession::drain_for_streamoff`]). Same order as the
+/// codec start / flush / stop bounds.
+const ENCODER_STREAMOFF_DRAIN: Duration = Duration::from_secs(2);
+/// How many bytes of staged raw frames the session holds before it stops acking a queued
+/// `OUTPUT` frame and lets it wait lent instead. Staging returns the guest's frame the moment it
+/// is copied (the decoder's D48, on the input queue), which removes the codec-input-slot throttle
+/// a fast feeder would otherwise hit -- but an owned NV12 copy is a megabyte or more, so a guest
+/// that floods `OUTPUT` faster than the codec drains would make the session hold unbounded raw
+/// frames. Past this budget a frame waits lent (the pre-staging backpressure the `OUTPUT` queue
+/// has) and is acked when a codec input slot takes it. 64 MiB is ~46 1080p or ~5 4K frames --
+/// deep enough to keep the codec fed, bounded enough to be safe.
+const INPUT_STAGE_BYTES: usize = 64 << 20;
 /// The bitrate a session starts with when the guest sets none (`V4L2_CID_MPEG_VIDEO_BITRATE`'s
 /// default), clamped into the codec's range. ffmpeg always sets one; GStreamer's `v4l2h264enc`
 /// only with its `extra-controls`.
@@ -898,7 +919,21 @@ impl VideoEncoderBackend for MediaCodecEncoderBackend {
 
 /// A raw frame waiting for a codec input slot, or the end of the stream.
 enum PendingInput {
-    Frame(InputBuffer),
+    /// A raw frame copied into an owned buffer at [`MediaCodecEncoderSession::encode`] time; the
+    /// guest's `OUTPUT` buffer was returned (`InputBufferDone`) as soon as the copy was made, so
+    /// the guest believes the frame is consumed -- which it is, by us. The codec is fed from this
+    /// copy in [`MediaCodecEncoderSession::pump_input`] as input slots free, and a
+    /// `STREAMOFF(OUTPUT)` that lands with copies still un-fed drains them rather than dropping
+    /// an already-acked frame (D48's decoder staging, mirrored on the input queue; D78).
+    Staged {
+        data: Vec<u8>,
+        timestamp: bindings::timeval,
+    },
+    /// A guest `OUTPUT` frame held lent, un-acked: the staging budget ([`INPUT_STAGE_BYTES`]) was
+    /// full when it arrived, so it waits the pre-staging way -- the guest's `OUTPUT` buffer is
+    /// the backpressure a fast feeder would otherwise defeat -- and is acked when a codec input
+    /// slot takes it.
+    Lent(InputBuffer),
     Eos,
 }
 
@@ -1041,6 +1076,8 @@ pub struct MediaCodecEncoderSession {
     free_inputs: VecDeque<i32>,
     /// Raw frames waiting for an input index, oldest first.
     pending: VecDeque<PendingInput>,
+    /// Bytes held in [`PendingInput::Staged`] copies in `pending`: the staging budget's tally.
+    staged_bytes: usize,
     /// `CAPTURE` buffers lent by the device, oldest first.
     captures: VecDeque<OutputBuffer>,
     /// Coded outputs the codec delivered that no `CAPTURE` buffer has taken yet.
@@ -1086,6 +1123,7 @@ impl MediaCodecEncoderSession {
             header_mode: VideoHeaderMode::JoinedWith1stFrame,
             free_inputs: VecDeque::new(),
             pending: VecDeque::new(),
+            staged_bytes: 0,
             captures: VecDeque::new(),
             held_outputs: VecDeque::new(),
             joined_headers: None,
@@ -1118,6 +1156,7 @@ impl MediaCodecEncoderSession {
         error!("encoder session {}: {}", self.id, why);
         self.dead = true;
         self.pending.clear();
+        self.staged_bytes = 0;
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
@@ -1158,8 +1197,9 @@ impl MediaCodecEncoderSession {
         }
     }
 
-    /// Feed the codec from the pending FIFO while it offers input slots and the guest takes
-    /// what comes out.
+    /// Feed the codec from the pending FIFO while it offers input slots. A staged frame's guest
+    /// buffer was returned in `encode` (the copy was made then); a lent frame's is returned here,
+    /// when a slot takes it.
     fn pump_input(&mut self) {
         // The codec is taken out of `self` for the duration: the helpers below need `self`. It
         // goes back at the end, dead or not, so `stop` can stop it.
@@ -1167,15 +1207,47 @@ impl MediaCodecEncoderSession {
             return;
         };
         while !self.dead && !self.eos_queued && self.held_outputs.len() < HELD_OUTPUT_LIMIT {
-            let (Some(&index), Some(head)) = (self.free_inputs.front(), self.pending.front())
-            else {
+            let Some(&index) = self.free_inputs.front() else {
                 break;
             };
             let Some(layout) = self.layout else {
                 break;
             };
-            match *head {
-                PendingInput::Eos => match codec.queue_eos(index, 0) {
+            let (coded, visible) = (self.coded_size, self.visible);
+            // Read what the head needs without holding the borrow across the codec call or the
+            // pop: the raw pointer and length are copied out, and nothing mutates `pending`
+            // between here and `queue_input_with` returning, so the pointer stays valid.
+            enum Head {
+                Eos,
+                Staged {
+                    src: *const u8,
+                    src_len: usize,
+                    pts: u64,
+                },
+                Lent {
+                    src: *const u8,
+                    src_len: usize,
+                    pts: u64,
+                    index: u32,
+                },
+            }
+            let head = match self.pending.front() {
+                None => break,
+                Some(PendingInput::Eos) => Head::Eos,
+                Some(PendingInput::Staged { data, timestamp }) => Head::Staged {
+                    src: data.as_ptr(),
+                    src_len: data.len(),
+                    pts: pts_from(*timestamp),
+                },
+                Some(PendingInput::Lent(buffer)) => Head::Lent {
+                    src: buffer.ptr.as_ptr(),
+                    src_len: buffer.len,
+                    pts: pts_from(buffer.timestamp),
+                    index: buffer.index,
+                },
+            };
+            match head {
+                Head::Eos => match codec.queue_eos(index, 0) {
                     Ok(()) => {
                         self.free_inputs.pop_front();
                         self.pending.pop_front();
@@ -1190,23 +1262,53 @@ impl MediaCodecEncoderSession {
                         self.refused_index("input", index, &e);
                     }
                 },
-                PendingInput::Frame(buffer) => {
-                    let pts = pts_from(buffer.timestamp);
-                    let (coded, visible) = (self.coded_size, self.visible);
-                    let result = codec.queue_input_with(index, pts, 0, |dst| {
-                        // SAFETY: the device lends `len` readable bytes at `ptr` until
-                        // `InputBufferDone`, which is only reported below; `dst` is the codec's
-                        // own input buffer; the two never overlap.
-                        unsafe {
-                            pack_frame(
-                                buffer.ptr.as_ptr(),
-                                buffer.len,
-                                coded,
-                                visible,
-                                &layout,
-                                dst,
-                            )
+                Head::Staged { src, src_len, pts } => {
+                    // SAFETY: `src` points at `src_len` bytes of our own staged copy, alive in
+                    // `pending` until the pop below; nothing touches `pending` before
+                    // `queue_input_with` returns; `dst` is the codec's own buffer, disjoint.
+                    let result = codec.queue_input_with(index, pts, 0, |dst| unsafe {
+                        pack_frame(src, src_len, coded, visible, &layout, dst)
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.free_inputs.pop_front();
+                            if let Some(PendingInput::Staged { data, .. }) =
+                                self.pending.pop_front()
+                            {
+                                self.staged_bytes = self.staged_bytes.saturating_sub(data.len());
+                            }
+                            self.inputs += 1;
+                            if self.first_pts.is_none() {
+                                self.first_pts = Some(pts as i64);
+                            }
+                            // The guest was told `InputBufferDone` in `encode`, when the copy was
+                            // made: nothing to report here.
                         }
+                        // The frame does not fit the codec's layout or buffer: a configuration
+                        // the session cannot recover from, not a stale index.
+                        Err(e @ (CodecError::Fill(_) | CodecError::BufferTooSmall(..))) => {
+                            self.fail(format!(
+                                "cannot pack a staged frame into codec input {}: {}",
+                                index, e
+                            ));
+                        }
+                        Err(e) => {
+                            self.free_inputs.pop_front();
+                            self.refused_index("input", index, &e);
+                        }
+                    }
+                }
+                Head::Lent {
+                    src,
+                    src_len,
+                    pts,
+                    index: guest_index,
+                } => {
+                    // SAFETY: the device lends `src_len` readable bytes at `src` until we report
+                    // `InputBufferDone`, only on success below; nothing touches `pending` before
+                    // `queue_input_with` returns; `dst` is the codec's own buffer, disjoint.
+                    let result = codec.queue_input_with(index, pts, 0, |dst| unsafe {
+                        pack_frame(src, src_len, coded, visible, &layout, dst)
                     });
                     match result {
                         Ok(()) => {
@@ -1216,16 +1318,13 @@ impl MediaCodecEncoderSession {
                             if self.first_pts.is_none() {
                                 self.first_pts = Some(pts as i64);
                             }
-                            // The frame is in the codec's buffer: the guest's goes back.
-                            self.events
-                                .push(EncoderEvent::InputBufferDone(buffer.index));
+                            // Held lent for backpressure: the guest's buffer goes back now.
+                            self.events.push(EncoderEvent::InputBufferDone(guest_index));
                         }
-                        // The frame does not fit the codec's layout, or the codec's buffer: a
-                        // configuration the session cannot recover from, not a stale index.
                         Err(e @ (CodecError::Fill(_) | CodecError::BufferTooSmall(..))) => {
                             self.fail(format!(
                                 "cannot pack OUTPUT buffer {} into codec input {}: {}",
-                                buffer.index, index, e
+                                guest_index, index, e
                             ));
                         }
                         Err(e) => {
@@ -1237,6 +1336,190 @@ impl MediaCodecEncoderSession {
             }
         }
         self.codec = Some(codec);
+    }
+
+    /// Drop the codec's `END_OF_STREAM` marker from `held_outputs` and return whether one was
+    /// there: during a `STREAMOFF(OUTPUT)` drain the `EOS` output is only the codec's "I have
+    /// emitted everything" signal, not a `LAST` buffer the guest asked for (it issued no drain),
+    /// so an empty `LAST` is dropped and a coded frame that carried the flag is delivered as an
+    /// ordinary frame.
+    fn strip_streamoff_last(&mut self) -> bool {
+        let mut found = false;
+        let mut kept: VecDeque<Held> = VecDeque::with_capacity(self.held_outputs.len());
+        while let Some(held) = self.held_outputs.pop_front() {
+            match held {
+                Held::EmptyLast { .. } => found = true,
+                Held::Coded {
+                    bytes,
+                    pts_us,
+                    key,
+                    is_last,
+                } => {
+                    found |= is_last;
+                    kept.push_back(Held::Coded {
+                        bytes,
+                        pts_us,
+                        key,
+                        is_last: false,
+                    });
+                }
+                other => kept.push_back(other),
+            }
+        }
+        self.held_outputs = kept;
+        found
+    }
+
+    /// Drain the codec's own events without waiting (`wait = None`) or waiting up to a bound for
+    /// the first (`wait = Some`), pushing coded outputs into `held_outputs` and freed input slots
+    /// into `free_inputs`. The codec-event half of [`take_events`], shared with the
+    /// `STREAMOFF(OUTPUT)` drain.
+    fn pump_codec(&mut self, wait: Option<Duration>) {
+        let Some(mut codec) = self.codec.take() else {
+            return;
+        };
+        let events = match wait {
+            Some(timeout) => codec.wait_events(timeout).unwrap_or_default(),
+            None => codec.take_events(),
+        };
+        for event in events {
+            match event {
+                CodecEvent::InputAvailable(index) => {
+                    if self.input_capacity.is_none() {
+                        if let Ok(capacity) = codec.input_capacity(index) {
+                            self.input_capacity = Some(capacity);
+                            info!(
+                                "encoder session {}: input buffers hold {} bytes",
+                                self.id, capacity
+                            );
+                            if let Some(layout) = self.layout {
+                                if capacity < layout.frame_size() {
+                                    self.fail(format!(
+                                        "{} offers {}-byte input buffers for a padded frame of \
+                                         {} bytes (stride {}, slice-height {})",
+                                        codec.name(),
+                                        capacity,
+                                        layout.frame_size(),
+                                        layout.stride,
+                                        layout.slice_height
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.free_inputs.push_back(index);
+                }
+                CodecEvent::OutputAvailable { index, info } => {
+                    self.take_output(&mut codec, index, info);
+                }
+                CodecEvent::FormatChanged(format) => {
+                    info!(
+                        "encoder session {}: output format: {}",
+                        self.id,
+                        format
+                            .map(|f| f.to_string())
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                }
+                CodecEvent::Error {
+                    status,
+                    action_code,
+                    detail,
+                } => {
+                    self.fail(format!(
+                        "{} reported error {} ({}), action {}: {}",
+                        codec.name(),
+                        status,
+                        media_status_name(status),
+                        action_code,
+                        detail
+                    ));
+                    break;
+                }
+            }
+        }
+        self.codec = Some(codec);
+    }
+
+    /// A `STREAMOFF(OUTPUT)` landed with frames the guest was already told `InputBufferDone` for:
+    /// finish them through the codec and write the coded frames into the `CAPTURE` buffers still
+    /// lent, before the caller's `flush` lets go of the codec. Bounded by
+    /// [`ENCODER_STREAMOFF_DRAIN`]; a frame that finds no `CAPTURE` buffer -- the guest never
+    /// streamed `CAPTURE`, or the bound passed with the queue full -- is dropped, its count
+    /// logged. See [`VideoEncoderBackendSession::drain_for_streamoff`] for why an encoder must
+    /// finish rather than discard an acked frame.
+    fn drain_output_for_streamoff(&mut self) {
+        if self.dead || self.codec.is_none() {
+            return;
+        }
+        let staged = self
+            .pending
+            .iter()
+            .filter(|p| matches!(p, PendingInput::Staged { .. } | PendingInput::Lent(_)))
+            .count();
+        // Nothing lent to write coded frames into: the guest is not reading `CAPTURE` (it never
+        // streamed it, or stopped). There is nowhere to place the accepted frames, so queuing an
+        // `EOS` would only make the codec produce frames with no home; report and let `flush`
+        // drop them.
+        if self.captures.is_empty() {
+            let held = self
+                .held_outputs
+                .iter()
+                .filter(|h| matches!(h, Held::Coded { .. }))
+                .count();
+            if staged + held > 0 {
+                warn!(
+                    "encoder session {}: STREAMOFF(OUTPUT) with no CAPTURE buffer lent: {} \
+                     accepted frame(s) and {} coded frame(s) cannot be delivered and are dropped",
+                    self.id, staged, held
+                );
+            }
+            return;
+        }
+        // Feed everything staged and queue the `EOS` whose output tells us the codec has emitted
+        // the frames still in flight.
+        if !self.eos_queued && !self.pending.iter().any(|p| matches!(p, PendingInput::Eos)) {
+            self.pending.push_back(PendingInput::Eos);
+        }
+        let deadline = Instant::now() + ENCODER_STREAMOFF_DRAIN;
+        let mut drained = false;
+        loop {
+            self.pump_input();
+            drained |= self.strip_streamoff_last();
+            self.pump_output();
+            if self.dead {
+                return;
+            }
+            // The codec has emitted its end marker and everything it produced is delivered, or
+            // there is no `CAPTURE` buffer left for the tail: either way we are done.
+            if drained && (self.held_outputs.is_empty() || self.captures.is_empty()) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            self.pump_codec(Some(remaining.min(Duration::from_millis(50))));
+        }
+        let dropped = self
+            .pending
+            .iter()
+            .filter(|p| matches!(p, PendingInput::Staged { .. } | PendingInput::Lent(_)))
+            .count()
+            + self
+                .held_outputs
+                .iter()
+                .filter(|h| matches!(h, Held::Coded { .. }))
+                .count();
+        if dropped > 0 {
+            warn!(
+                "encoder session {}: STREAMOFF(OUTPUT) drain could not place {} frame(s) within \
+                 {:?} (CAPTURE queue full and not drained); dropped",
+                self.id, dropped, ENCODER_STREAMOFF_DRAIN
+            );
+        }
     }
 
     /// `onAsyncOutputAvailable`: copy the output out of the codec and give the buffer back,
@@ -1688,6 +1971,7 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
                 self.header_mode = config.header_mode;
                 self.free_inputs.clear();
                 self.held_outputs.clear();
+                self.staged_bytes = 0;
                 self.joined_headers = None;
                 self.eos_queued = false;
                 self.input_capacity = None;
@@ -1730,10 +2014,29 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
         if self.codec.is_none() {
             return Err(libc::EINVAL);
         }
-        // A frame queued while a drain is in flight waits here, as the kernel's encoder
-        // interface says it must; the device holds the ones after the LAST buffer itself.
-        self.pending.push_back(PendingInput::Frame(buffer));
         let before = self.events.len();
+        // Stage the frame into an owned buffer and return the guest's OUTPUT buffer at once, so
+        // the guest is not throttled by the codec's input slots and, once acked, is owed the
+        // frame's encoding even across a STREAMOFF (D48, D78). Past the byte budget the frame
+        // waits lent -- the OUTPUT-queue backpressure a fast feeder would otherwise defeat -- and
+        // is acked when a codec input slot takes it. A frame queued while a drain is in flight
+        // still waits behind the EOS, as the kernel's encoder interface says it must.
+        if self.staged_bytes.saturating_add(buffer.len) <= INPUT_STAGE_BYTES {
+            // SAFETY: the device lends `len` readable bytes at `ptr` until we report
+            // `InputBufferDone`, queued just below; the copy is made before this returns, and
+            // nothing else reads or writes that region.
+            let data =
+                unsafe { std::slice::from_raw_parts(buffer.ptr.as_ptr(), buffer.len) }.to_vec();
+            self.staged_bytes += data.len();
+            self.pending.push_back(PendingInput::Staged {
+                data,
+                timestamp: buffer.timestamp,
+            });
+            self.events
+                .push(EncoderEvent::InputBufferDone(buffer.index));
+        } else {
+            self.pending.push_back(PendingInput::Lent(buffer));
+        }
         self.pump_input();
         if self.events.len() > before {
             self.sink.signal();
@@ -1795,14 +2098,17 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
     }
 
     fn flush(&mut self) -> IoctlResult<()> {
-        // STREAMOFF(OUTPUT), or V4L2_ENC_CMD_START after a finished drain. The frames still
-        // waiting for an input slot are dropped, not reported: on STREAMOFF the device takes
-        // every OUTPUT buffer back itself right after this returns, and an `InputBufferDone`
-        // delivered later would land on a buffer the guest may have queued again by then (the
-        // decoder's rule, for the same reason). The coded frames already copied out stay: the
-        // CAPTURE queue keeps streaming.
+        // STREAMOFF(OUTPUT), or V4L2_ENC_CMD_START after a finished drain. On a STREAMOFF the
+        // device runs `drain_for_streamoff` first, so what is left here is only what the codec
+        // could not finish or the CAPTURE queue could not take (D78). The frames still waiting
+        // for an input slot are dropped, not reported: on STREAMOFF the device takes every OUTPUT
+        // buffer back itself right after this returns, and an `InputBufferDone` delivered later
+        // would land on a buffer the guest may have queued again by then (the decoder's rule, for
+        // the same reason). The coded frames already copied out stay: the CAPTURE queue keeps
+        // streaming.
         let pending = self.pending.len();
         self.pending.clear();
+        self.staged_bytes = 0;
         self.events
             .retain(|e| !matches!(e, EncoderEvent::InputBufferDone(_)));
         let held = self.held_outputs.len();
@@ -1856,6 +2162,7 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
 
     fn stop(&mut self) {
         self.pending.clear();
+        self.staged_bytes = 0;
         self.captures.clear();
         self.held_outputs.clear();
         self.free_inputs.clear();
@@ -1890,72 +2197,17 @@ impl VideoEncoderBackendSession for MediaCodecEncoderSession {
     }
 
     fn take_events(&mut self) -> Vec<EncoderEvent> {
-        if let Some(mut codec) = self.codec.take() {
-            for event in codec.take_events() {
-                match event {
-                    CodecEvent::InputAvailable(index) => {
-                        if self.input_capacity.is_none() {
-                            if let Ok(capacity) = codec.input_capacity(index) {
-                                self.input_capacity = Some(capacity);
-                                info!(
-                                    "encoder session {}: input buffers hold {} bytes",
-                                    self.id, capacity
-                                );
-                                if let Some(layout) = self.layout {
-                                    if capacity < layout.frame_size() {
-                                        self.fail(format!(
-                                            "{} offers {}-byte input buffers for a padded frame \
-                                             of {} bytes (stride {}, slice-height {})",
-                                            codec.name(),
-                                            capacity,
-                                            layout.frame_size(),
-                                            layout.stride,
-                                            layout.slice_height
-                                        ));
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        self.free_inputs.push_back(index);
-                    }
-                    CodecEvent::OutputAvailable { index, info } => {
-                        self.take_output(&mut codec, index, info);
-                    }
-                    CodecEvent::FormatChanged(format) => {
-                        info!(
-                            "encoder session {}: output format: {}",
-                            self.id,
-                            format
-                                .map(|f| f.to_string())
-                                .unwrap_or_else(|| "-".to_string())
-                        );
-                    }
-                    CodecEvent::Error {
-                        status,
-                        action_code,
-                        detail,
-                    } => {
-                        self.fail(format!(
-                            "{} reported error {} ({}), action {}: {}",
-                            codec.name(),
-                            status,
-                            media_status_name(status),
-                            action_code,
-                            detail
-                        ));
-                        break;
-                    }
-                }
-            }
-            self.codec = Some(codec);
-        }
+        self.pump_codec(None);
         if !self.dead {
             // Output first: a coded frame delivered frees the input the limit was holding.
             self.pump_output();
             self.pump_input();
         }
         std::mem::take(&mut self.events)
+    }
+
+    fn drain_for_streamoff(&mut self) {
+        self.drain_output_for_streamoff()
     }
 }
 
