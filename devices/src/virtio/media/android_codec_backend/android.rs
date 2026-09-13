@@ -1061,43 +1061,13 @@ impl MediaCodecDecoderSession {
         }
     }
 
-    /// Decoded outputs the codec has handed us that no `CAPTURE` buffer has taken yet -- the
-    /// count that must stay below the codec's output-slot count for it to keep decoding without
-    /// dropping (D64). `held_outputs` also holds format changes in between; only the frames count.
-    fn held_output_count(&self) -> usize {
-        self.held_outputs
-            .iter()
-            .filter(|h| matches!(h, Held::Output { .. }))
-            .count()
-    }
-
     /// Feed the codec from the pending FIFO while it offers input slots.
     fn pump_input(&mut self) {
         while !self.dead && !self.eos_queued {
-            // Back-pressure (D64). The codec has a fixed number of output slots
-            // (`num-output-slots`, which `handle_format` made `min_capture_buffers`); once we hold
-            // that many decoded outputs with no `CAPTURE` buffer to place them in, the codec has no
-            // free output slot and cannot decode more. Feeding it more bitstream then only fills
-            // its input queue with pictures it cannot turn into output, and under a concurrent
-            // encoder session competing for the shared codec hardware that backlog is dropped --
-            // the codec resumes at the next IDR, losing the head GOP (B15 §2: a standalone
-            // MediaCodec pair never drops, so the drop is provoked by *our* holding the slots while
-            // ffmpeg -- freed from the one-shot grace, D64/F17 -- floods all 300 packets before it
-            // has answered the `SOURCE_CHANGE` with `CAPTURE` buffers). So stop staging into the
-            // codec while its slots are saturated; the bitstream waits in `pending` (returned to
-            // the guest already, D28/D48) and is fed once a delivered frame frees a slot
-            // (`pump_output` -> the re-pump in `use_as_capture` / `take_events`). A client that
-            // keeps its `CAPTURE` queue supplied -- gst's 25 buffers, an uncontended ffmpeg --
-            // never reaches the cap and is not throttled. An `EOS` is never held: a drain must
-            // reach the codec even with outputs pending, or it could not finish.
-            let saturated = self.held_output_count() >= self.min_capture_buffers as usize;
             let (Some(&index), Some(head)) = (self.free_inputs.front(), self.pending.front_mut())
             else {
                 break;
             };
-            if saturated && matches!(head, PendingInput::Bitstream { .. }) {
-                break;
-            }
             let Some(codec) = self.codec.as_ref() else {
                 break;
             };
@@ -1857,9 +1827,6 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         self.captures.push_back(buffer);
         let before = self.events.len();
         self.pump_output();
-        // A delivered frame frees a codec output slot, so the back-pressure gate may now let more
-        // bitstream through (D64): feed it while a slot is free.
-        self.pump_input();
         if self.events.len() > before {
             self.sink.signal();
         }
@@ -2122,9 +2089,6 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             // looked for.
             self.pump_input();
             self.pump_output();
-            // A frame delivered by that `pump_output` freed a codec output slot; the back-pressure
-            // gate (D64) may now let more bitstream through, so feed again.
-            self.pump_input();
             if self.eos_seen && self.pending.iter().any(|p| !matches!(p, PendingInput::Eos)) {
                 // Bitstream that arrived during the drain: the codec restarts now that the LAST
                 // buffer is out.
