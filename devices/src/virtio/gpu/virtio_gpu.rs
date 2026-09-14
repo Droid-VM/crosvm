@@ -923,6 +923,18 @@ impl VirtioGpuScanout {
         let readback: VirtioGpuResult = (|| {
             let packed_stride = self.width as usize * 4;
             let fb_stride = fb.stride() as usize;
+            if gpu_diag_enabled() {
+                base::warn!(
+                    "DISPLAY-COPY res={} dims={}x{} fourcc=0x{:x} packed_stride={} fb_stride={} fb_size={}",
+                    resource.resource_id,
+                    self.width,
+                    self.height,
+                    transfer_fourcc,
+                    packed_stride,
+                    fb_stride,
+                    fb.as_volatile_slice().size(),
+                );
+            }
             if fb_stride == packed_stride && fb.can_copy_direct_from(transfer_fourcc) {
                 let mut transfer = Transfer3D::new_2d(0, 0, self.width, self.height, 0);
                 transfer.stride = fb.stride();
