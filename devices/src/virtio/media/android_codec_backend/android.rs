@@ -518,6 +518,20 @@ pub(super) fn choose<'a>(
         .collect();
     eligible.sort_by(|a, b| {
         b.0.cmp(&a.0)
+            // AV1 (VA2k): prefer the `.low_latency` variant over the base component. Our
+            // force-show OBU feed needs decode-order output; the plain `c2.qti.av1.decoder`
+            // ignores KEY_LOW_LATENCY on this firmware and holds a reorder tail that wedges
+            // deep-B-pyramid (libaom/YouTube) streams mid-stream. The dedicated `.low_latency`
+            // component honours low latency by design, so it emits in decode order.
+            .then_with(|| {
+                if mime == "video/av01" {
+                    b.2.name
+                        .ends_with(".low_latency")
+                        .cmp(&a.2.name.ends_with(".low_latency"))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then(a.2.name.len().cmp(&b.2.name.len()))
             .then(a.1.cmp(&b.1))
     });
