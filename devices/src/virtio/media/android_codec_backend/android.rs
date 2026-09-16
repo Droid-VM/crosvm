@@ -1238,12 +1238,22 @@ impl MediaCodecDecoderSession {
                     break;
                 }
             };
-            let need = nv12_size(canvas.0 as usize, canvas.1 as usize);
+            // The destination luma stride is the buffer's own (VA2g): the coded width when the
+            // guest did not pad, or a wider 64-aligned stride the guest negotiated via
+            // S_FMT(CAPTURE) so its GPU-importable dma-bufs' export pitch equals their bo stride at
+            // a non-16-aligned width (854 -> 896). `nv12_size(stride, h)` is the buffer that holds:
+            // luma `stride*h`, chroma `stride*ceil(h/2)`. All lent buffers share the session's
+            // stride, so the size a candidate must hold is a function of its own stride.
+            let need_for = |stride: usize| nv12_size(stride, canvas.1 as usize);
             // The first lent buffer that holds a frame of the announced size. A smaller one --
             // lent for the placeholder size before the SOURCE_CHANGE -- stays lent and unfilled
             // until the guest takes it back with STREAMOFF(CAPTURE) and reallocates; the frame
             // waits with it.
-            let Some(at) = self.captures.iter().position(|c| c.len >= need) else {
+            let Some(at) = self
+                .captures
+                .iter()
+                .position(|c| c.len >= need_for(c.stride))
+            else {
                 self.warn_capture_shortfall();
                 break;
             };
@@ -1254,20 +1264,27 @@ impl MediaCodecDecoderSession {
                 image.width as usize,
                 image.height as usize,
             );
-            // The chroma rows are `2 * ceil(cw / 2)` bytes wide, one byte more than the luma
-            // stride for an odd width, as `nv12_size` counts them and `tight_nv12_rows` hands
-            // them out (review-m6 R6-10): `ceil(h / 2)` of them end at
-            // `chroma_base + ceil(ch / 2) * chroma_stride <= need`.
-            let chroma_stride = 2 * cw.div_ceil(2);
-            let chroma_base = cw * canvas.1 as usize;
+            // The destination row stride: >= cw. When the guest did not pad it equals cw and this
+            // whole block is byte-for-byte the tight repack; when it padded (VA2g) each row lands
+            // at the wider stride with the extra bytes left as slack the GPU never samples.
+            let dst_stride = capture.stride.max(cw);
+            let need = need_for(dst_stride);
+            // The source chroma rows are `2 * ceil(cw / 2)` bytes wide, one byte more than the luma
+            // stride for an odd width, as `nv12_size` counts them and `tight_nv12_rows` hands them
+            // out (review-m6 R6-10). The destination lays them out at `dst_stride`, `ceil(h / 2)`
+            // of them from `chroma_base = dst_stride * canvas.1` (the luma plane is `canvas.1`
+            // rows tall at `dst_stride`, which is exactly the chroma offset the guest's QBUF and
+            // its exported descriptor use).
+            let src_chroma_w = 2 * cw.div_ceil(2);
+            let chroma_base = dst_stride * canvas.1 as usize;
             let mut row = 0usize;
             let copied = tight_nv12_rows(&image, src, |bytes| {
-                let (at, width) = if row < h {
-                    (row * cw, w)
+                let (at, copy_w) = if row < h {
+                    (row * dst_stride, w)
                 } else {
-                    (chroma_base + (row - h) * chroma_stride, chroma_stride)
+                    (chroma_base + (row - h) * dst_stride, src_chroma_w)
                 };
-                let n = bytes.len().min(width);
+                let n = bytes.len().min(copy_w);
                 // SAFETY: `at + n <= need <= capture.len`, and the device lends `len` writable
                 // bytes at `ptr` until `FrameDecoded`; `bytes` is a row of the codec's buffer or
                 // a scratch row; the two never overlap.
