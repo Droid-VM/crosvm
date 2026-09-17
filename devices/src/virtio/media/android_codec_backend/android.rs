@@ -1711,25 +1711,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             keys::MAX_INPUT_SIZE,
             input_size.min(i32::MAX as usize) as i32,
         );
-        // VA2j: the QTI stateful AV1 decoder reorders its output (by order_hint)
-        // and holds a ~6-frame reorder tail even when every frame is marked
-        // show_frame=1 -- which is how libva-v4l2 feeds it: VA does not carry
-        // show_existing_frame, so the backend force-shows every decoded frame to
-        // get one CAPTURE output per decode op (libva-v4l2 VA2c). A stateless-VA
-        // client (ffmpeg, Firefox) syncs surfaces in DECODE order and cannot feed
-        // past the held tail, so it wedges mid-stream on a deep B-pyramid
-        // (libaom/YouTube AV1) while SVT-AV1 and low-delay streams (reorder depth
-        // ~0) never do; the same native stream fed straight to the device
-        // (gst v4l2av1dec) decodes 300/300, so the codec itself is fine. The tail
-        // cannot be shaken loose in libva: a mid-stream DEC_CMD_STOP drain would,
-        // but it resets AV1's DPB and breaks the reference chain (VA2d/VA2e), so
-        // it is disabled. KEY_LOW_LATENCY makes the decoder emit in decode order
-        // with no reorder buffering, which is exactly what the force-show feed
-        // needs -- set it for AV1 regardless of FEATURE_LowLatency (the plain
-        // c2.qti.av1.decoder honours the key; the feature only advertises the
-        // dedicated .low_latency variant, which choose() passes over).
-        let low_latency = chosen.low_latency || coded_format == PixelFormat::from_fourcc(b"AV01");
-        if low_latency {
+        if chosen.low_latency {
             format.set_i32(keys::LOW_LATENCY, 1);
         }
         info!(
@@ -1771,7 +1753,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                     coded_size.0,
                     coded_size.1,
                     input_size,
-                    if low_latency { "on" } else { "off" }
+                    if chosen.low_latency { "on" } else { "off" }
                 );
                 self.nal = NalCodec::for_mime(&chosen.mime);
                 self.coded_format = Some(coded_format);
