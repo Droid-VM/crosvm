@@ -651,6 +651,18 @@ pub mod keys {
     pub const LEVEL: &CStr = c"level";
     pub const MAX_INPUT_SIZE: &CStr = c"max-input-size";
     pub const LOW_LATENCY: &CStr = c"low-latency";
+    /// Qualcomm's decoder-side "emit in picture (decode) order, do not hold pictures back for
+    /// display reorder" switch, measured on `c2.qti.avc.decoder` in WP `D91-lowlat-probe`: it
+    /// turns display-order output (`0 3 2 1 4 6 5 ...`) into decode-order output (`0 1 2 3 ...`)
+    /// while every decoded frame stays bit-identical once aligned by PTS (300/300, §6). Two
+    /// things about it are easy to get wrong. It only takes effect when it is already in the
+    /// `MediaFormat` handed to `configure()`: an `AMediaCodec_setParameters` after `start()`
+    /// reports success and changes nothing (§3). And the component does not echo it on the
+    /// input format, it reflects it on the OUTPUT one, so
+    /// [`output_format`](crate::Codec::output_format) is the only place it can be verified
+    /// (§2.2 -- reading the input format is what made an earlier probe record this key as
+    /// unsupported).
+    pub const QTI_PICTURE_ORDER: &CStr = c"vendor.qti-ext-dec-picture-order.enable";
     pub const CSD_0: &CStr = c"csd-0";
     pub const CSD_1: &CStr = c"csd-1";
     pub const DISPLAY_CROP: &CStr = c"crop";
