@@ -1714,6 +1714,26 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         if chosen.low_latency {
             format.set_i32(keys::LOW_LATENCY, 1);
         }
+        // D91: the QTI AVC decoder emits in DISPLAY order, holding each picture until the
+        // reorder window lets it out, and that is what deadlocks an adaptive/MSE client: it
+        // blocks on the very picture it just submitted, and the picture needs 7 more access
+        // units to come back (self-delay p95 7, 54 of 300 pictures at the maximum, 3 never
+        // released before EOS) against a feed-ahead budget measured at 7-8 AUs (D85 §3.3,
+        // D91-lowlat-probe §5). This vendor switch makes the component emit in DECODE order
+        // instead: self-delay p50 = p95 = 1, nothing held, `nonmono` 157 -> 0, the EOS tail
+        // 3 -> 0, and all 300 frames bit-identical per PTS -- the pictures do not change, only
+        // the order they leave in (§4, §6). Decode order is what this backend wants anyway:
+        // every CAPTURE buffer is claimed by its access unit's own timestamp tag and the VA
+        // client reorders by POC itself, so display order is something the guest side has to
+        // undo (D91 §5.1). Note what this is NOT: `KEY_LOW_LATENCY` and the `.low_latency`
+        // sibling are both inert here, neither moves the reorder by a single frame, and the
+        // sibling also costs two thirds of the bitrate ceiling (§2, §4). It has to be set here,
+        // before `configure()`: a `setParameters` after `start()` is accepted and ignored (§3).
+        // AVC only -- the key survives readback on HEVC/VP9/AV1 as well, but its effect there
+        // is unmeasured, so those keep the behaviour they ship with today (§8).
+        if chosen.mime == "video/avc" {
+            format.set_i32(keys::QTI_PICTURE_ORDER, 1);
+        }
         info!(
             "decoder session {}: creating {} for {} at {}x{}: {}",
             self.id, chosen.name, coded_format, coded_size.0, coded_size.1, format
@@ -1738,9 +1758,19 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         });
         match created {
             Some(Ok(codec)) => {
+                // Report what the component gives back, not what we asked for: a vendor key it
+                // does not know is dropped in silence (`configure` still returns OK), and the
+                // one it does know is reflected on the OUTPUT format, never the input one
+                // (D91-lowlat-probe §2.2). A missing or unreadable key therefore reads as off,
+                // which is exactly the state that leaves the reorder deadlock in place.
+                let picture_order = codec
+                    .output_format()
+                    .ok()
+                    .and_then(|out| out.get_i32(keys::QTI_PICTURE_ORDER))
+                    .unwrap_or(0);
                 info!(
                     "decoder session {}: {} ({}{}) started for {} at {}x{}: max-input-size {}, \
-                     low-latency {}",
+                     low-latency {}, picture-order {}",
                     self.id,
                     codec.name(),
                     if chosen.hardware {
@@ -1753,7 +1783,8 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                     coded_size.0,
                     coded_size.1,
                     input_size,
-                    if chosen.low_latency { "on" } else { "off" }
+                    if chosen.low_latency { "on" } else { "off" },
+                    if picture_order != 0 { "on" } else { "off" }
                 );
                 self.nal = NalCodec::for_mime(&chosen.mime);
                 self.coded_format = Some(coded_format);
