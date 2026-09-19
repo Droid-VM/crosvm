@@ -145,9 +145,7 @@ use virtio_media::devices::video_encoder::VideoEncoderBackendSession;
 use virtio_media::ioctl::IoctlResult;
 use virtio_media::v4l2r::bindings;
 use virtio_media::v4l2r::controls::codec::VideoBitrateMode;
-use virtio_media::v4l2r::controls::codec::VideoH264Level;
 use virtio_media::v4l2r::controls::codec::VideoH264Profile;
-use virtio_media::v4l2r::controls::codec::VideoHEVCLevel;
 use virtio_media::v4l2r::controls::codec::VideoHEVCProfile;
 use virtio_media::v4l2r::controls::codec::VideoHeaderMode;
 use virtio_media::v4l2r::PixelFormat;
@@ -159,12 +157,16 @@ use super::android::errno_for;
 use super::android::has_feature;
 use super::android::honest_height_max;
 use super::android::is_hardware;
+use super::android::profile_pairs;
+use super::android::profiles_and_levels;
 use super::android::pts_from;
 use super::android::timeval_from;
 use super::android::CODEC_FLUSH_TIMEOUT;
 use super::android::CODEC_START_TIMEOUT;
 use super::android::CODEC_STOP_TIMEOUT;
 use super::android::CODED_FORMATS;
+use super::android::H264_LEVELS;
+use super::android::HEVC_LEVELS;
 use super::android::MAX_REFUSED_INDICES;
 use super::android::STALE_LOG_LIMIT;
 
@@ -245,35 +247,6 @@ const AV01: PixelFormat = PixelFormat::from_fourcc(b"AV01");
 // MediaCodec <-> V4L2 value maps
 // ---------------------------------------------------------------------------------------------
 
-/// `(MediaCodec profile constant, V4L2 profile menu value)` for a mime: the
-/// `MediaCodecConstants.h` values `android_codec::profile_table` probes with, against the
-/// kernel's `v4l2_mpeg_video_*_profile` enums (through v4l2r's). Profiles the kernel has no
-/// value for (HDR variants) are not listed and so never offered.
-fn profile_pairs(mime: &str) -> &'static [(i32, i32)] {
-    match mime {
-        "video/avc" => &[
-            (0x01, VideoH264Profile::Baseline as i32),
-            (0x02, VideoH264Profile::Main as i32),
-            (0x04, VideoH264Profile::Extended as i32),
-            (0x08, VideoH264Profile::High as i32),
-            (0x10, VideoH264Profile::High10 as i32),
-            (0x20, VideoH264Profile::High422 as i32),
-            (0x40, VideoH264Profile::High444Predictive as i32),
-            (0x10000, VideoH264Profile::ConstrainedBaseline as i32),
-            (0x80000, VideoH264Profile::ConstrainedHigh as i32),
-        ],
-        "video/hevc" => &[
-            (0x01, VideoHEVCProfile::Main as i32),
-            (0x02, VideoHEVCProfile::Main10 as i32),
-            (0x04, VideoHEVCProfile::MainStill as i32),
-        ],
-        // `VP8ProfileMain` is the one VP8 profile; V4L2 numbers them 0..3.
-        "video/x-vnd.on2.vp8" => &[(0x01, 0)],
-        "video/x-vnd.on2.vp9" => &[(0x01, 0), (0x02, 1), (0x04, 2), (0x08, 3)],
-        _ => &[],
-    }
-}
-
 /// The profile a session starts with when the guest sets none: the one the codec picks for
 /// itself (`c2.qti.avc.encoder` answers High, `c2.qti.hevc.encoder` Main,
 /// `logs/vpu_wp/scratch-b5/codec/b5codec/enc_*.txt`), as a V4L2 value.
@@ -282,64 +255,6 @@ fn preferred_profile(mime: &str) -> Option<i32> {
         "video/avc" => Some(VideoH264Profile::High as i32),
         "video/hevc" => Some(VideoHEVCProfile::Main as i32),
         "video/x-vnd.on2.vp8" | "video/x-vnd.on2.vp9" => Some(0),
-        _ => None,
-    }
-}
-
-/// The 20 H.264 levels in the order both `MediaCodecConstants.h` (`AVCLevel1 = 1 <<
-/// index`) and the kernel (`V4L2_MPEG_VIDEO_H264_LEVEL_1_0 = index`) list them.
-const H264_LEVELS: [VideoH264Level; 20] = [
-    VideoH264Level::L1_0,
-    VideoH264Level::L1B,
-    VideoH264Level::L1_1,
-    VideoH264Level::L1_2,
-    VideoH264Level::L1_3,
-    VideoH264Level::L2_0,
-    VideoH264Level::L2_1,
-    VideoH264Level::L2_2,
-    VideoH264Level::L3_0,
-    VideoH264Level::L3_1,
-    VideoH264Level::L3_2,
-    VideoH264Level::L4_0,
-    VideoH264Level::L4_1,
-    VideoH264Level::L4_2,
-    VideoH264Level::L5_0,
-    VideoH264Level::L5_1,
-    VideoH264Level::L5_2,
-    VideoH264Level::L6_0,
-    VideoH264Level::L6_1,
-    VideoH264Level::L6_2,
-];
-
-/// The 13 HEVC levels in the kernel's order; `MediaCodecConstants.h` lists each twice
-/// (`HEVCMainTierLevelN = 1 << (2 * index)`, `HEVCHighTierLevelN = 1 << (2 * index + 1)`) and
-/// the kernel keeps the tier in a control of its own, so both map to the same value.
-const HEVC_LEVELS: [VideoHEVCLevel; 13] = [
-    VideoHEVCLevel::L1_0,
-    VideoHEVCLevel::L2_0,
-    VideoHEVCLevel::L2_1,
-    VideoHEVCLevel::L3_0,
-    VideoHEVCLevel::L3_1,
-    VideoHEVCLevel::L4_0,
-    VideoHEVCLevel::L4_1,
-    VideoHEVCLevel::L5_0,
-    VideoHEVCLevel::L5_1,
-    VideoHEVCLevel::L5_2,
-    VideoHEVCLevel::L6_0,
-    VideoHEVCLevel::L6_1,
-    VideoHEVCLevel::L6_2,
-];
-
-/// A MediaCodec level constant as the V4L2 level menu value, for the codecs the device has a
-/// level control for (H.264 and HEVC).
-fn level_to_v4l2(mime: &str, mc: i32) -> Option<i32> {
-    if mc <= 0 || mc.count_ones() != 1 {
-        return None;
-    }
-    let bit = mc.trailing_zeros() as usize;
-    match mime {
-        "video/avc" => H264_LEVELS.get(bit).map(|l| *l as i32),
-        "video/hevc" => HEVC_LEVELS.get(bit / 2).map(|l| *l as i32),
         _ => None,
     }
 }
@@ -891,31 +806,16 @@ fn describe(info: &CodecInfo, fourcc: PixelFormat, mime: &str) -> (CodedFormat, 
     };
 
     // Profiles as probed, the codec's own default first; levels as the union over the profiles,
-    // highest first (the default, see `ChosenEncoder::default_level`).
-    let pairs = profile_pairs(mime);
-    let mut profiles: Vec<i32> = Vec::new();
-    let mut levels: Vec<i32> = Vec::new();
-    for p in &info.profiles {
-        if let Some((_, v4l2)) = pairs.iter().find(|(mc, _)| *mc == p.profile) {
-            if !profiles.contains(v4l2) {
-                profiles.push(*v4l2);
-            }
-        }
-        for l in &p.levels {
-            if let Some(v4l2) = level_to_v4l2(mime, l.level) {
-                if !levels.contains(&v4l2) {
-                    levels.push(v4l2);
-                }
-            }
-        }
-    }
+    // highest first (the default, see `ChosenEncoder::default_level`). The mapping itself is
+    // shared with the decoder backend (`android::profiles_and_levels`); what is the encoder's own
+    // is which profile it starts a session with.
+    let (mut profiles, levels) = profiles_and_levels(info, mime);
     if let Some(preferred) = preferred_profile(mime) {
         if let Some(at) = profiles.iter().position(|p| *p == preferred) {
             profiles.remove(at);
             profiles.insert(0, preferred);
         }
     }
-    levels.sort_unstable_by(|a, b| b.cmp(a));
     let qp = has_feature(info, FEATURE_QP_BOUNDS).then_some(QP_RANGE);
 
     let format = CodedFormat {
