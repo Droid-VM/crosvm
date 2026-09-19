@@ -8,6 +8,25 @@
 pub const FEATURE: u32 = 7;
 pub const CONFIG_SIZE: usize = 32;
 
+// DroidVM feature bit 8: host3d VRAM budget at config bytes 48..64. The
+// Windows KMD sizes its BlobHost3D VidMm segment (DXGI DedicatedVideoMemory
+// and the VidMm commit limit) from it instead of a built-in 16 GiB. Fixed at
+// device creation: dxgkrnl reads segment descriptors once at adapter start.
+pub const VRAM_FEATURE: u32 = 8;
+pub const VRAM_CONFIG_OFFSET: usize = 16 + CONFIG_SIZE;
+pub const VRAM_CONFIG_SIZE: usize = 16;
+pub const VRAM_MIN_BYTES: u64 = 256 << 20;
+
+pub fn vram_descriptor(bytes: u64) -> Option<[u8; VRAM_CONFIG_SIZE]> {
+    if bytes < VRAM_MIN_BYTES || bytes & ((1 << 20) - 1) != 0 {
+        return None;
+    }
+    let mut out = [0; VRAM_CONFIG_SIZE];
+    out[0..8].copy_from_slice(b"DVMVRAM1");
+    out[8..16].copy_from_slice(&bytes.to_le_bytes());
+    Some(out)
+}
+
 pub fn descriptor(base: u64, size: u64) -> Option<[u8; CONFIG_SIZE]> {
     if base == 0 || size == 0 || (base | size) & 4095 != 0
         || base.checked_add(size).is_none() || size > (1u64 << 32)
@@ -26,6 +45,16 @@ pub fn descriptor(base: u64, size: u64) -> Option<[u8; CONFIG_SIZE]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vram_layout_and_limits() {
+        let d = vram_descriptor(2048 << 20).unwrap();
+        assert_eq!(&d[..8], b"DVMVRAM1");
+        assert_eq!(u64::from_le_bytes(d[8..16].try_into().unwrap()), 2048 << 20);
+        assert!(vram_descriptor(0).is_none());
+        assert!(vram_descriptor(255 << 20).is_none());
+        assert!(vram_descriptor((256 << 20) + 1).is_none());
+    }
 
     #[test]
     fn wire_layout_and_invalid_ranges() {

@@ -1869,6 +1869,7 @@ impl DisplayBackend {
 
 pub struct Gpu {
     boot_drm_pool: Option<[u8; boot_pool::CONFIG_SIZE]>,
+    vram_budget: Option<[u8; boot_pool::VRAM_CONFIG_SIZE]>,
     exit_evt_wrtube: SendTube,
     pub gpu_control_tube: Option<Tube>,
     mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>>,
@@ -1984,6 +1985,9 @@ fn set_gpu_worker_rt_prio() {
     }
 }
 
+/// DroidVM default host3d VRAM budget (MiB) when `--gpu vram-mb=` is absent.
+const DEFAULT_VRAM_MB: u64 = 2048;
+
 impl Gpu {
     /// Describe a fixed DRM arena shared at boot. The caller obtains the range
     /// from the VM layout, never from a blob response or a guest address.
@@ -2078,6 +2082,9 @@ impl Gpu {
         let mapper: Arc<Mutex<Option<Box<dyn SharedMemoryMapper>>>> = Arc::new(Mutex::new(None));
         Gpu {
             boot_drm_pool: None,
+            vram_budget: boot_pool::vram_descriptor(
+                gpu_parameters.vram_mb.unwrap_or(DEFAULT_VRAM_MB) << 20,
+            ),
             exit_evt_wrtube,
             gpu_control_tube: Some(gpu_control_tube),
             mapper,
@@ -2416,6 +2423,9 @@ impl VirtioDevice for Gpu {
         if self.boot_drm_pool.is_some() {
             virtio_gpu_features |= 1 << boot_pool::FEATURE;
         }
+        if self.vram_budget.is_some() {
+            virtio_gpu_features |= 1 << boot_pool::VRAM_FEATURE;
+        }
 
         // If a non-2D component is specified, enable 3D features.  It is possible to run display
         // contexts without 3D backend (i.e, gfxstream / virglrender), so check for that too.
@@ -2443,10 +2453,13 @@ impl VirtioDevice for Gpu {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        let mut config = [0u8; 16 + boot_pool::CONFIG_SIZE];
+        let mut config = [0u8; boot_pool::VRAM_CONFIG_OFFSET + boot_pool::VRAM_CONFIG_SIZE];
         config[..16].copy_from_slice(self.get_config().as_bytes());
         if let Some(pool) = self.boot_drm_pool {
-            config[16..].copy_from_slice(&pool);
+            config[16..boot_pool::VRAM_CONFIG_OFFSET].copy_from_slice(&pool);
+        }
+        if let Some(vram) = self.vram_budget {
+            config[boot_pool::VRAM_CONFIG_OFFSET..].copy_from_slice(&vram);
         }
         copy_config(data, 0, &config, offset);
     }
