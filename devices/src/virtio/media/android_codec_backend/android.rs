@@ -118,6 +118,10 @@ use virtio_media::devices::video_decoder::VideoDecoderBackend;
 use virtio_media::devices::video_decoder::VideoDecoderBackendSession;
 use virtio_media::ioctl::IoctlResult;
 use virtio_media::v4l2r::bindings;
+use virtio_media::v4l2r::controls::codec::VideoH264Level;
+use virtio_media::v4l2r::controls::codec::VideoH264Profile;
+use virtio_media::v4l2r::controls::codec::VideoHEVCLevel;
+use virtio_media::v4l2r::controls::codec::VideoHEVCProfile;
 use virtio_media::v4l2r::PixelFormat;
 use virtio_media::v4l2r::Rect;
 
@@ -326,8 +330,14 @@ impl MediaCodecDecoderBackend {
     pub fn new(allow_sw: bool) -> anyhow::Result<Self> {
         let list = list_codecs(&ListOptions {
             include_non_video: false,
-            // Profiles and per-size rates are M5's; a first STREAMON must not wait for them.
-            probe_profiles: false,
+            // The profile and level menus the device publishes are this probe's answers
+            // (VA1b, design §7.6 item 2): `isFormatSupported` per candidate profile, then per
+            // level at the profiles that passed. They are in-process checks against the store's
+            // own tables, not binder round trips -- the encoder backend has paid for them since
+            // M7 -- so a helper start can afford them, and this runs once per helper, not per
+            // `STREAMON`. Per-size rate checks stay off (`sizes` empty): those do cost, and
+            // nothing the decoder device publishes needs them.
+            probe_profiles: true,
             sizes: Vec::new(),
         })
         .context("cannot enumerate the platform's codecs")?;
@@ -351,9 +361,13 @@ impl MediaCodecDecoderBackend {
             match choose(&list.codecs, CodecKind::Decoder, mime, allow_sw) {
                 Some((chosen, passed_over)) => {
                     let (width, height) = size_ranges(chosen, fourcc);
+                    // The profile and level menus the device will publish for this format: the
+                    // codec store's answers, mapped to the kernel's menu values. A codec whose
+                    // table maps to nothing leaves these empty and gets no control (VA1b).
+                    let (profiles, levels) = profiles_and_levels(chosen, mime);
                     info!(
-                        "decoder: {} -> {} ({}, {}{}), {}..{} x {}..{} step {}x{}, {} fps; \
-                         passed over: {}",
+                        "decoder: {} -> {} ({}, {}{}), {}..{} x {}..{} step {}x{}, {} fps, \
+                         profiles {:?}, levels {:?}; passed over: {}",
                         fourcc,
                         chosen.name,
                         mime,
@@ -374,6 +388,8 @@ impl MediaCodecDecoderBackend {
                             .as_ref()
                             .map(|v| format!("{}..{}", v.frame_rates.0, v.frame_rates.1))
                             .unwrap_or_else(|| "?".to_string()),
+                        profiles,
+                        levels,
                         if passed_over.is_empty() {
                             "none".to_string()
                         } else {
@@ -386,6 +402,8 @@ impl MediaCodecDecoderBackend {
                         height,
                         // Every one of these codecs carries its resolution in the bitstream.
                         dynamic_resolution: true,
+                        profiles,
+                        levels,
                     });
                     codecs.push(ChosenCodec {
                         fourcc,
@@ -660,6 +678,147 @@ enum PendingInput {
 struct Announced {
     coded: (u32, u32),
     visible: (i32, i32, u32, u32),
+}
+
+// ---------------------------------------------------------------------------------------------
+// MediaCodec <-> V4L2 profile and level maps (shared with the encoder backend)
+// ---------------------------------------------------------------------------------------------
+
+/// `(MediaCodec profile constant, V4L2 profile menu value)` for a mime: the
+/// `MediaCodecConstants.h` values `android_codec::profile_table` probes with, against the
+/// kernel's `v4l2_mpeg_video_*_profile` enums (through v4l2r's, except AV1's, which v4l2r has no
+/// enum for). Profiles the kernel has no value for (the HDR variants) are not listed and so
+/// never offered: a menu item a V4L2 client cannot interpret is worse than one less item.
+pub(super) fn profile_pairs(mime: &str) -> &'static [(i32, i32)] {
+    match mime {
+        "video/avc" => &[
+            (0x01, VideoH264Profile::Baseline as i32),
+            (0x02, VideoH264Profile::Main as i32),
+            (0x04, VideoH264Profile::Extended as i32),
+            (0x08, VideoH264Profile::High as i32),
+            (0x10, VideoH264Profile::High10 as i32),
+            (0x20, VideoH264Profile::High422 as i32),
+            (0x40, VideoH264Profile::High444Predictive as i32),
+            (0x10000, VideoH264Profile::ConstrainedBaseline as i32),
+            (0x80000, VideoH264Profile::ConstrainedHigh as i32),
+        ],
+        "video/hevc" => &[
+            (0x01, VideoHEVCProfile::Main as i32),
+            (0x02, VideoHEVCProfile::Main10 as i32),
+            (0x04, VideoHEVCProfile::MainStill as i32),
+        ],
+        // `VP8ProfileMain` is the one VP8 profile; V4L2 numbers them 0..3.
+        "video/x-vnd.on2.vp8" => &[(0x01, 0)],
+        "video/x-vnd.on2.vp9" => &[(0x01, 0), (0x02, 1), (0x04, 2), (0x08, 3)],
+        // AV1: MediaCodec names the bit depth (`AV1ProfileMain8`, `AV1ProfileMain10`) where V4L2
+        // names the bitstream's `seq_profile`, and both of those are `seq_profile 0`, so both map
+        // to `V4L2_MPEG_VIDEO_AV1_PROFILE_MAIN` and the menu ends up with the one item the codec
+        // actually decodes. `HIGH` (`seq_profile 1`, 4:4:4) and `PROFESSIONAL` (2, 4:2:2 / 12-bit)
+        // have no MediaCodec constant to probe with, so they are never offered. The V4L2 values
+        // are `enum v4l2_mpeg_video_av1_profile` from `v4l2-controls.h`, through the generated
+        // bindings (v4l2r publishes no Rust enum for AV1).
+        "video/av01" => &[
+            (
+                0x1,
+                bindings::v4l2_mpeg_video_av1_profile_V4L2_MPEG_VIDEO_AV1_PROFILE_MAIN as i32,
+            ),
+            (
+                0x2,
+                bindings::v4l2_mpeg_video_av1_profile_V4L2_MPEG_VIDEO_AV1_PROFILE_MAIN as i32,
+            ),
+        ],
+        _ => &[],
+    }
+}
+
+/// The 20 H.264 levels in the order both `MediaCodecConstants.h` (`AVCLevel1 = 1 <<
+/// index`) and the kernel (`V4L2_MPEG_VIDEO_H264_LEVEL_1_0 = index`) list them.
+pub(super) const H264_LEVELS: [VideoH264Level; 20] = [
+    VideoH264Level::L1_0,
+    VideoH264Level::L1B,
+    VideoH264Level::L1_1,
+    VideoH264Level::L1_2,
+    VideoH264Level::L1_3,
+    VideoH264Level::L2_0,
+    VideoH264Level::L2_1,
+    VideoH264Level::L2_2,
+    VideoH264Level::L3_0,
+    VideoH264Level::L3_1,
+    VideoH264Level::L3_2,
+    VideoH264Level::L4_0,
+    VideoH264Level::L4_1,
+    VideoH264Level::L4_2,
+    VideoH264Level::L5_0,
+    VideoH264Level::L5_1,
+    VideoH264Level::L5_2,
+    VideoH264Level::L6_0,
+    VideoH264Level::L6_1,
+    VideoH264Level::L6_2,
+];
+
+/// The 13 HEVC levels in the kernel's order; `MediaCodecConstants.h` lists each twice
+/// (`HEVCMainTierLevelN = 1 << (2 * index)`, `HEVCHighTierLevelN = 1 << (2 * index + 1)`) and
+/// the kernel keeps the tier in a control of its own, so both map to the same value.
+pub(super) const HEVC_LEVELS: [VideoHEVCLevel; 13] = [
+    VideoHEVCLevel::L1_0,
+    VideoHEVCLevel::L2_0,
+    VideoHEVCLevel::L2_1,
+    VideoHEVCLevel::L3_0,
+    VideoHEVCLevel::L3_1,
+    VideoHEVCLevel::L4_0,
+    VideoHEVCLevel::L4_1,
+    VideoHEVCLevel::L5_0,
+    VideoHEVCLevel::L5_1,
+    VideoHEVCLevel::L5_2,
+    VideoHEVCLevel::L6_0,
+    VideoHEVCLevel::L6_1,
+    VideoHEVCLevel::L6_2,
+];
+
+/// A MediaCodec level constant as the V4L2 level menu value, for the codecs the device has a
+/// level control for (H.264 and HEVC).
+pub(super) fn level_to_v4l2(mime: &str, mc: i32) -> Option<i32> {
+    if mc <= 0 || mc.count_ones() != 1 {
+        return None;
+    }
+    let bit = mc.trailing_zeros() as usize;
+    match mime {
+        "video/avc" => H264_LEVELS.get(bit).map(|l| *l as i32),
+        "video/hevc" => HEVC_LEVELS.get(bit / 2).map(|l| *l as i32),
+        _ => None,
+    }
+}
+
+/// The V4L2 profile and level menu values a codec supports, from the profile and level table
+/// `android_codec`'s probe built for it (`isFormatSupported` per candidate profile, then per
+/// level at the profiles that passed -- `CodecInfo::profiles`).
+///
+/// Profiles keep the store's own order, deduplicated; levels are the union over the profiles,
+/// **highest first**, because what a level says about a decoder is the most it can handle and
+/// what it says about an encoder is the most it may emit -- either way the device takes the first
+/// value of each list as the menu's default. A MediaCodec profile or level the kernel has no menu
+/// value for is dropped ([`profile_pairs`], [`level_to_v4l2`]), so a codec whose whole table is
+/// unmappable comes back empty and the device gives that format no control at all.
+pub(super) fn profiles_and_levels(info: &CodecInfo, mime: &str) -> (Vec<i32>, Vec<i32>) {
+    let pairs = profile_pairs(mime);
+    let mut profiles: Vec<i32> = Vec::new();
+    let mut levels: Vec<i32> = Vec::new();
+    for p in &info.profiles {
+        if let Some((_, v4l2)) = pairs.iter().find(|(mc, _)| *mc == p.profile) {
+            if !profiles.contains(v4l2) {
+                profiles.push(*v4l2);
+            }
+        }
+        for l in &p.levels {
+            if let Some(v4l2) = level_to_v4l2(mime, l.level) {
+                if !levels.contains(&v4l2) {
+                    levels.push(v4l2);
+                }
+            }
+        }
+    }
+    levels.sort_unstable_by(|a, b| b.cmp(a));
+    (profiles, levels)
 }
 
 /// The errno a guest's ioctl gets for a codec call that failed.
