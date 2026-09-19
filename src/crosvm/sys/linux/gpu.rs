@@ -307,6 +307,10 @@ pub fn create_gpu_device(
         dev.set_boot_drm_pool(base, size)?;
         base::info!("GPU-BOOT-POOL: config from VM layout gpa={:#x} size={:#x}", base, size);
     }
+    base::info!(
+        "GPU-VRAM-BUDGET: {} MiB advertised to the guest KMD (--gpu vram-mb)",
+        gpu_params.vram_mb.unwrap_or(2048)
+    );
     #[cfg(any(feature = "vnc", feature = "android_display"))]
     if !transport_cap.allows_gpu_copy() {
         dev.cap_transport_to_cpu();

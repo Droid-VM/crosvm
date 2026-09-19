@@ -126,6 +126,10 @@ pub struct GpuParameters {
     // (other proxy variants may follow). Ignored when udmabuf=false (whole pool is host-owned).
     // Plumbed to gfxstream as GFXSTREAM_POOL_HOST_MB.
     pub gfx_host_pre_alloc_mb: Option<u64>,
+    // DroidVM: host3d VRAM budget advertised to the Windows KMD (BlobHost3D segment
+    // size = DXGI DedicatedVideoMemory = VidMm commit limit). Fixed value, not derived
+    // from host memory: dxgkrnl reads it once at adapter start. Default 2048.
+    pub vram_mb: Option<u64>,
     // gunyah-pvm: gate the Gunyah pVM-specific gfxstream behavior (pin RingBlob backing so the
     // permanent Gunyah SHARE mapping stays stable). Only Qualcomm/Gunyah needs it; leave off on
     // other SoCs (MediaTek, Tensor, ...). Plumbed to GFXSTREAM_GUNYAH_PIN_RINGBLOB.
@@ -172,6 +176,7 @@ impl Default for GpuParameters {
             vram_exceed_policy: None,
             pool_blob_max_kb: None,
             gfx_host_pre_alloc_mb: None,
+            vram_mb: None,
             gunyah_pvm: None,
         }
     }
