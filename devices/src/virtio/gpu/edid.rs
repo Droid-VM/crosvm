@@ -8,6 +8,9 @@
 use std::fmt;
 use std::fmt::Debug;
 
+use base::info;
+use base::warn;
+
 use super::protocol::GpuResponse::*;
 use super::protocol::VirtioGpuResult;
 use crate::virtio::gpu::GpuDisplayParameters;
@@ -19,6 +22,14 @@ const DEFAULT_HORIZONTAL_FRONT_PORCH: u16 = 64;
 const DEFAULT_VERTICAL_FRONT_PORCH: u16 = 1;
 const DEFAULT_HORIZONTAL_SYNC_PULSE: u16 = 192;
 const DEFAULT_VERTICAL_SYNC_PULSE: u16 = 3;
+// VESA CVT reduced blanking (RBv2). Blanking means nothing for a virtual scanout, so this is only
+// used when the default 560-pixel blanking pushes the pixel clock past what a detailed timing
+// descriptor can carry (see `DisplayInfo::fit_pixel_clock`).
+const REDUCED_HORIZONTAL_BLANKING: u16 = 80;
+const REDUCED_HORIZONTAL_FRONT_PORCH: u16 = 8;
+const REDUCED_HORIZONTAL_SYNC_PULSE: u16 = 32;
+// The detailed timing pixel clock is a u16 in 10 kHz units, i.e. at most 655.35 MHz.
+const MAX_PIXEL_CLOCK_10KHZ: u64 = u16::MAX as u64;
 const MILLIMETERS_PER_INCH: f32 = 25.4;
 
 /// This class is used to create the Extended Display Identification Data (EDID), which will be
@@ -136,7 +147,7 @@ impl DisplayInfo {
             0
         };
 
-        Self {
+        let mut info = Self {
             resolution: Resolution::new(width, height),
             refresh_rate: params.refresh_rate,
             horizontal_blanking: DEFAULT_HORIZONTAL_BLANKING,
@@ -147,7 +158,58 @@ impl DisplayInfo {
             vertical_sync: DEFAULT_VERTICAL_SYNC_PULSE,
             width_millimeters,
             height_millimeters,
+        };
+        info.fit_pixel_clock();
+        info
+    }
+
+    fn total_pixels(&self) -> u64 {
+        let htotal = self.width() as u64 + self.horizontal_blanking as u64;
+        let vtotal = self.height() as u64 + self.vertical_blanking as u64;
+        htotal * vtotal
+    }
+
+    /// Pixel clock of the detailed timing in 10 kHz units (before rounding).
+    fn pixel_clock_10khz(&self) -> u64 {
+        self.refresh_rate as u64 * self.total_pixels() / 10000
+    }
+
+    /// Keep the pixel clock inside the u16 the detailed timing descriptor has for it. With the
+    /// default blanking a mode like 2772x1280@165 needs 731 MHz; the old u16 cast wrapped that to
+    /// 75 MHz, which decodes to 17 Hz -- out of the guest KMD's accepted range, so it silently
+    /// fell back to 60 Hz and Windows only ever offered 60 Hz. Blanking is meaningless for a
+    /// virtual scanout, so first drop to CVT reduced blanking; only if the mode still doesn't fit
+    /// (e.g. 4K@240) lower the refresh rate to the highest one that does.
+    fn fit_pixel_clock(&mut self) {
+        if self.pixel_clock_10khz() <= MAX_PIXEL_CLOCK_10KHZ {
+            return;
         }
+        let requested_mhz = self.pixel_clock_10khz() / 100;
+        self.horizontal_blanking = REDUCED_HORIZONTAL_BLANKING;
+        self.horizontal_front = REDUCED_HORIZONTAL_FRONT_PORCH;
+        self.horizontal_sync = REDUCED_HORIZONTAL_SYNC_PULSE;
+        if self.pixel_clock_10khz() <= MAX_PIXEL_CLOCK_10KHZ {
+            info!(
+                "EDID: {}x{}@{} Hz needs a {} MHz pixel clock with default blanking, above the \
+                 655 MHz a detailed timing can carry; using reduced blanking",
+                self.width(),
+                self.height(),
+                self.refresh_rate,
+                requested_mhz
+            );
+            return;
+        }
+        let max_refresh_rate = (MAX_PIXEL_CLOCK_10KHZ * 10000 / self.total_pixels()) as u32;
+        warn!(
+            "EDID: {}x{}@{} Hz needs a {} MHz pixel clock, above the 655 MHz a detailed timing \
+             can carry even with reduced blanking; advertising {} Hz instead",
+            self.width(),
+            self.height(),
+            self.refresh_rate,
+            requested_mhz,
+            max_refresh_rate
+        );
+        self.refresh_rate = max_refresh_rate;
     }
 
     pub fn width(&self) -> u32 {
@@ -213,11 +275,9 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &DisplayInfo) {
     //    if flags & DBLSCAN: refresh /= 2
     //    if vscan > 1: refresh /= vscan
     //
-    let htotal = info.width() + (info.horizontal_blanking as u32);
-    let vtotal = info.height() + (info.vertical_blanking as u32);
-    let mut clock: u16 = ((info.refresh_rate * htotal * vtotal) / 10000) as u16;
-    // Round to nearest 10khz.
-    clock = ((clock + 5) / 10) * 10;
+    // Round to nearest 100khz. `DisplayInfo::fit_pixel_clock` already made sure the value fits
+    // in the u16 field; the clamp only guards the rounding from pushing 65535 past the top.
+    let clock = ((info.pixel_clock_10khz() + 5) / 10 * 10).min(MAX_PIXEL_CLOCK_10KHZ) as u16;
     edid_block[0..2].copy_from_slice(&clock.to_le_bytes());
 
     let width_lsb: u8 = (info.width() & 0xFF) as u8;
