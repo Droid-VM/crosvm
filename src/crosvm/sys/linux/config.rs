@@ -44,7 +44,16 @@ pub fn check_serial_params(_serial_params: &SerialParameters) -> Result<(), Stri
     Ok(())
 }
 
-pub fn validate_config(_cfg: &mut Config) -> std::result::Result<(), String> {
+pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
+    if cfg.protection_type == hypervisor::ProtectionType::ProtectedPseudoUnprotected {
+        #[cfg(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah"))]
+        let supported = matches!(cfg.hypervisor, Some(HypervisorKind::Gunyah { .. }));
+        #[cfg(not(all(any(target_arch = "arm", target_arch = "aarch64"), feature = "gunyah")))]
+        let supported = false;
+        if !supported {
+            return Err("--protected-vm-pseudo-unprotected requires --hypervisor gunyah".to_string());
+        }
+    }
     Ok(())
 }
 
