@@ -46,6 +46,7 @@ use crate::AARCH64_GIC_CPUI_SIZE;
 use crate::AARCH64_GIC_DIST_BASE;
 use crate::AARCH64_GIC_DIST_SIZE;
 use crate::AARCH64_GIC_REDIST_SIZE;
+use crate::AARCH64_PHYS_MEM_START;
 use crate::AARCH64_PMU_IRQ;
 use crate::AARCH64_PROTECTED_VM_FW_START;
 // These are GPIO (PL061) related constants
@@ -102,6 +103,10 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
     // floor is described by the pool's own reserved-memory node instead, and everything above it
     // is address space the guest only reaches through a grant.
     //
+    // A framebuffer below the RAM base is a standalone device mapping, not system RAM. Keep
+    // it in the framebuffer node only; otherwise firmware reading the first /memory range
+    // mistakes the framebuffer for RAM. Gunyah carves its framebuffer out of RAM instead,
+    // so that region remains described here and reserved by its no-map node.
     // Non-growable pools stay in `/memory` exactly as before, marked no-map by their node -- the
     // arrangement every existing pool boots with.
     // A pseudo-unprotected VM's window is left out for the same reason and one more: nothing has
@@ -112,6 +117,8 @@ fn create_memory_node(fdt: &mut Fdt, guest_mem: &GuestMemory) -> Result<()> {
         .regions()
         .filter(|r| {
             r.options.step_size != 0
+                || (r.options.purpose == MemoryRegionPurpose::SharedFramebuffer
+                    && r.guest_addr.offset() < AARCH64_PHYS_MEM_START)
                 || matches!(
                     r.options.purpose,
                     MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::ShimHandoff
@@ -1250,6 +1257,58 @@ pub fn create_fdt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_framebuffer_is_not_system_memory() {
+        use vm_memory::MemoryRegionOptions;
+
+        let mem = GuestMemory::new_with_options(&[
+            (
+                GuestAddress(0x5000_0000),
+                0x1000,
+                MemoryRegionOptions::new().purpose(MemoryRegionPurpose::SharedFramebuffer),
+            ),
+            (
+                GuestAddress(AARCH64_PHYS_MEM_START),
+                0x2000,
+                MemoryRegionOptions::new(),
+            ),
+        ])
+        .unwrap();
+        let mut fdt = Fdt::new(&[]);
+        create_memory_node(&mut fdt, &mem).unwrap();
+        let node = fdt.get_node("/memory").unwrap();
+        assert_eq!(
+            node.get_prop::<Vec<u64>>("reg").unwrap(),
+            [AARCH64_PHYS_MEM_START, 0x2000]
+        );
+    }
+
+    #[test]
+    fn framebuffer_carved_from_ram_remains_in_memory() {
+        use vm_memory::MemoryRegionOptions;
+
+        let mem = GuestMemory::new_with_options(&[
+            (
+                GuestAddress(AARCH64_PHYS_MEM_START),
+                0x1000,
+                MemoryRegionOptions::new(),
+            ),
+            (
+                GuestAddress(AARCH64_PHYS_MEM_START + 0x1000),
+                0x1000,
+                MemoryRegionOptions::new().purpose(MemoryRegionPurpose::SharedFramebuffer),
+            ),
+        ])
+        .unwrap();
+        let mut fdt = Fdt::new(&[]);
+        create_memory_node(&mut fdt, &mem).unwrap();
+        let node = fdt.get_node("/memory").unwrap();
+        assert_eq!(
+            node.get_prop::<Vec<u64>>("reg").unwrap(),
+            [AARCH64_PHYS_MEM_START, 0x2000]
+        );
+    }
 
     #[test]
     fn pflash_node() {
