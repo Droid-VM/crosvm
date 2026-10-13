@@ -205,10 +205,15 @@ struct FenceDescriptor {
 pub struct FenceState {
     descs: Vec<FenceDescriptor>,
     completed_fences: BTreeMap<VirtioGpuRing, u64>,
+    // Renderer IDs must not be reused when a guest resets its fence counters.
+    // Response headers still carry the guest's original fence ID.
+    last_fence_id: u64,
 }
 
 #[derive(Serialize, Deserialize)]
 struct FenceStateSnapshot {
+    #[serde(default)]
+    last_fence_id: u64,
     // Customize serialization to avoid errors when trying to use objects as keys in JSON
     // dictionaries.
     #[serde(
@@ -219,9 +224,27 @@ struct FenceStateSnapshot {
 }
 
 impl FenceState {
+    fn allocate_fence_id(&mut self, ring: &VirtioGpuRing) -> Option<u64> {
+        let id = self.last_fence_id.checked_add(1)?;
+        // The legacy virgl global-fence callback carries only 32 bits. Never
+        // wrap it into an ID that could refer to another queue generation.
+        if *ring == VirtioGpuRing::Global && id > u32::MAX as u64 {
+            return None;
+        }
+        self.last_fence_id = id;
+        Some(id)
+    }
+
+    fn reset(&mut self) {
+        self.descs.clear();
+        self.completed_fences.clear();
+        // Keep last_fence_id: a renderer callback may arrive after reactivation.
+    }
+
     fn snapshot(&self) -> FenceStateSnapshot {
         assert!(self.descs.is_empty(), "can't snapshot with pending fences");
         FenceStateSnapshot {
+            last_fence_id: self.last_fence_id,
             completed_fences: self.completed_fences.clone(),
         }
     }
@@ -229,6 +252,10 @@ impl FenceState {
     fn restore(&mut self, snapshot: FenceStateSnapshot) {
         assert!(self.descs.is_empty(), "can't restore activated device");
         self.completed_fences = snapshot.completed_fences;
+        self.last_fence_id = self
+            .last_fence_id
+            .max(snapshot.last_fence_id)
+            .max(self.completed_fences.values().copied().max().unwrap_or(0));
     }
 }
 
@@ -439,9 +466,11 @@ where
                 }
 
                 // Update the last completed fence for this context
-                fence_state
+                let last_completed = fence_state
                     .completed_fences
-                    .insert(ring, completed_fence.fence_id);
+                    .entry(ring)
+                    .or_default();
+                *last_completed = (*last_completed).max(completed_fence.fence_id);
             }
 
             if signal {
@@ -454,6 +483,110 @@ where
 pub struct ReturnDescriptor {
     pub desc_chain: DescriptorChain,
     pub len: u32,
+}
+
+#[cfg(test)]
+mod fence_reset_tests {
+    use super::*;
+    use crate::virtio::descriptor_utils::create_descriptor_chain;
+    use crate::virtio::descriptor_utils::DescriptorType;
+    use std::sync::atomic::AtomicUsize;
+    use vm_memory::GuestAddress;
+
+    #[derive(Clone, Default)]
+    struct TestQueue(Arc<AtomicUsize>);
+
+    impl QueueReader for TestQueue {
+        fn pop(&self) -> Option<DescriptorChain> {
+            None
+        }
+        fn add_used(&self, _: DescriptorChain, _: u32) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn signal_used(&self) {}
+    }
+
+    #[test]
+    fn reset_drops_old_descriptors_and_late_callbacks_cannot_complete_new_work() {
+        for ring in [
+            VirtioGpuRing::Global,
+            VirtioGpuRing::ContextSpecific { ctx_id: 9, ring_idx: 1 },
+        ] {
+            let mem = GuestMemory::new(&[(GuestAddress(0), 0x1000)]).unwrap();
+            let queue = TestQueue::default();
+            let resources = Arc::new(Mutex::new(Some(FenceHandlerActivationResources {
+                mem: mem.clone(),
+                ctrl_queue: queue.clone(),
+            })));
+            let state = Arc::new(Mutex::new(FenceState::default()));
+            let handler = create_fence_handler(resources.clone(), state.clone());
+            let enqueue = || {
+                let mut state = state.lock();
+                let id = state.allocate_fence_id(&ring).unwrap();
+                state.descs.push(FenceDescriptor {
+                    ring: ring.clone(),
+                    fence_id: id,
+                    desc_chain: create_descriptor_chain(
+                        &mem,
+                        GuestAddress(0x100),
+                        GuestAddress(0x400),
+                        vec![(DescriptorType::Writable, 24)],
+                        0,
+                    ).unwrap(),
+                    len: 24,
+                });
+                id
+            };
+            let complete = |fence_id| {
+                let (flags, ctx_id, ring_idx) = match ring {
+                    VirtioGpuRing::Global => (0, 0, 0),
+                    VirtioGpuRing::ContextSpecific { ctx_id, ring_idx } =>
+                        (VIRTIO_GPU_FLAG_INFO_RING_IDX, ctx_id, ring_idx),
+                };
+                handler.call(RutabagaFence { flags, fence_id, ctx_id, ring_idx });
+            };
+            let old = enqueue();
+            resources.lock().take();
+            state.lock().reset();
+            *resources.lock() = Some(FenceHandlerActivationResources {
+                mem: mem.clone(),
+                ctrl_queue: queue.clone(),
+            });
+            let new = enqueue();
+            complete(old);
+            assert_eq!(queue.0.load(Ordering::SeqCst), 0);
+            complete(new);
+            complete(old);
+            complete(new);
+            assert_eq!(queue.0.load(Ordering::SeqCst), 1);
+            assert_eq!(state.lock().completed_fences[&ring], new);
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_ids_and_legacy_snapshot_uses_completed_watermark() {
+        let mut state = FenceState::default();
+        let first = state.allocate_fence_id(&VirtioGpuRing::Global).unwrap();
+        let snapshot = state.snapshot();
+        state.reset();
+        state.restore(snapshot);
+        assert!(state.allocate_fence_id(&VirtioGpuRing::Global).unwrap() > first);
+        state.restore(FenceStateSnapshot {
+            last_fence_id: 0,
+            completed_fences: BTreeMap::from([(VirtioGpuRing::Global, 100)]),
+        });
+        assert_eq!(state.allocate_fence_id(&VirtioGpuRing::Global), Some(101));
+    }
+
+    #[test]
+    fn fence_ids_never_wrap_in_renderer_callbacks() {
+        let mut state = FenceState { last_fence_id: u32::MAX as u64, ..Default::default() };
+        assert_eq!(state.allocate_fence_id(&VirtioGpuRing::Global), None);
+        let ring = VirtioGpuRing::ContextSpecific { ctx_id: 9, ring_idx: 1 };
+        assert_eq!(state.allocate_fence_id(&ring), Some(u32::MAX as u64 + 1));
+        state.last_fence_id = u64::MAX;
+        assert_eq!(state.allocate_fence_id(&ring), None);
+    }
 }
 
 /// A RESOURCE_FLUSH whose virtio fence completion is parked on a display fence: the zero-copy
@@ -1060,6 +1193,7 @@ impl Frontend {
 
         if writer.available_bytes() != 0 {
             let mut fence_id = 0;
+            let mut renderer_fence_id = 0;
             let mut ctx_id = 0;
             let mut flags = 0;
             let mut ring_idx = 0;
@@ -1083,12 +1217,23 @@ impl Frontend {
                     ctx_id = ctrl_hdr.ctx_id.to_native();
                     ring_idx = ctrl_hdr.ring_idx;
 
-                    if let Some(fence) = flip_fence {
+                    let ring = match flags & VIRTIO_GPU_FLAG_INFO_RING_IDX {
+                        0 => VirtioGpuRing::Global,
+                        _ => VirtioGpuRing::ContextSpecific { ctx_id, ring_idx },
+                    };
+                    let allocated_id = self.fence_state.lock().allocate_fence_id(&ring);
+                    if let Some(id) = allocated_id {
+                        renderer_fence_id = id;
+                    }
+
+                    if allocated_id.is_none() {
+                        gpu_response = GpuResponse::ErrUnspec;
+                    } else if let Some(fence) = flip_fence {
                         deferred_flip = Some(fence);
                     } else {
                         let fence = RutabagaFence {
                             flags,
-                            fence_id,
+                            fence_id: renderer_fence_id,
                             ctx_id,
                             ring_idx,
                         };
@@ -1120,13 +1265,13 @@ impl Frontend {
                 };
                 self.fence_state.lock().descs.push(FenceDescriptor {
                     ring: ring.clone(),
-                    fence_id,
+                    fence_id: renderer_fence_id,
                     desc_chain,
                     len,
                 });
                 self.pending_flip_fences.push(PendingFlipFence {
                     ring,
-                    fence_id,
+                    fence_id: renderer_fence_id,
                     fence,
                     deadline: std::time::Instant::now() + FLIP_FENCE_TIMEOUT,
                     registered: false,
@@ -1143,10 +1288,10 @@ impl Frontend {
                 // In case the fence is signaled immediately after creation, don't add a return
                 // FenceDescriptor.
                 let mut fence_state = self.fence_state.lock();
-                if fence_id > *fence_state.completed_fences.get(&ring).unwrap_or(&0) {
+                if renderer_fence_id > *fence_state.completed_fences.get(&ring).unwrap_or(&0) {
                     fence_state.descs.push(FenceDescriptor {
                         ring,
-                        fence_id,
+                        fence_id: renderer_fence_id,
                         desc_chain,
                         len,
                     });
@@ -1473,6 +1618,11 @@ impl Worker {
         // so an unpaired resume is safe.)
         self.fence_handler_resources.lock().take();
         self.activation_resources = None;
+        // Descriptors and display fences belong to the queues being reset.
+        // Never return them through the replacement control queue. Renderer
+        // IDs keep increasing so late callbacks cannot retire new submissions.
+        self.fence_state.lock().reset();
+        self.state.pending_flip_fences.clear();
         // Drop all guest resources/contexts so the next guest (e.g. the OS after UEFI firmware
         // used then reset the device) can recreate resource ids from a clean slate.
         self.state
