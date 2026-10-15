@@ -19,6 +19,8 @@ pub(crate) mod pci_hotplug_helpers;
 pub(crate) mod pci_hotplug_manager;
 #[cfg(feature = "vnc")]
 mod simplefb_display;
+#[cfg(all(feature = "kms_display", target_os = "android"))]
+pub(crate) mod kms_takeover;
 #[cfg(feature = "audio")]
 mod vcpu;
 
