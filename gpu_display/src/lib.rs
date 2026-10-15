@@ -33,6 +33,8 @@ mod event_device;
 mod gpu_display_android;
 #[cfg(feature = "android_display_stub")]
 mod gpu_display_android_stub;
+#[cfg(feature = "kms_display")]
+mod gpu_display_kms;
 mod gpu_display_stub;
 #[cfg(feature = "vnc")]
 mod gpu_display_vnc;
@@ -831,6 +833,18 @@ impl GpuDisplay {
         }
         #[cfg(not(feature = "android_display"))]
         Err(GpuDisplayError::Unsupported)
+    }
+
+    #[cfg(feature = "kms_display")]
+    pub fn open_kms(path: &std::path::Path, split: bool) -> GpuDisplayResult<GpuDisplay> {
+        let display = gpu_display_kms::DisplayKms::new(path, split)?;
+        let wait_ctx = WaitContext::new()?;
+        wait_ctx.add(&display, DisplayEventToken::Display)?;
+        Ok(GpuDisplay {
+            inner: Box::new(display), next_id: 1,
+            event_devices: Default::default(), surfaces: Default::default(),
+            dmabuf_import_capped: false, wait_ctx,
+        })
     }
 
     pub fn open_stub() -> GpuDisplayResult<GpuDisplay> {

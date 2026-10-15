@@ -29,6 +29,7 @@ rust_library {
     edition: "2021",
     features: [
         "android_display",
+        "kms_display",
         "gfxstream",
         "vnc",
     ],

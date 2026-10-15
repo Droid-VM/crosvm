@@ -28,6 +28,7 @@ rust_test {
     edition: "2021",
     features: [
         "android_display",
+        "kms_display",
         "android_display_stub",
         "audio",
         "audio_aaudio",
@@ -139,6 +140,7 @@ rust_test {
     edition: "2021",
     features: [
         "android_display",
+        "kms_display",
         "android_display_stub",
         "audio",
         "audio_aaudio",
@@ -238,6 +240,7 @@ rust_library {
     edition: "2021",
     features: [
         "android_display",
+        "kms_display",
         "android_display_stub",
         "audio",
         "audio_aaudio",

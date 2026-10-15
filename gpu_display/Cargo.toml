@@ -5,6 +5,7 @@ authors = ["The ChromiumOS Authors"]
 edition = "2021"
 
 [features]
+kms_display = []
 x = []
 kiwi = []
 vulkan_display = [ "vulkano", "ash", "rand", "protos", "protobuf", "euclid", "smallvec"]

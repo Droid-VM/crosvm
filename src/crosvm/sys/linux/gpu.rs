@@ -18,7 +18,7 @@ use serde_keyvalue::FromKeyValues;
 
 use super::*;
 use crate::crosvm::config::Config;
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 use crate::crosvm::config::DisplayScreen;
 #[cfg(feature = "vnc")]
 use crate::crosvm::config::DEFAULT_VNC_HOST;
@@ -232,7 +232,7 @@ pub fn create_gpu_device(
     // it belongs to. At most one of the two arms below runs (config rejects two exporters on one
     // screen), so there is exactly one answer here, and no binding at all means the default: take
     // whatever gets negotiated.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     let mut transport_cap = crate::crosvm::config::TransportCap::Auto;
 
     #[cfg(feature = "android_display")]
@@ -268,6 +268,15 @@ pub fn create_gpu_device(
             },
         );
         transport_cap = vnc_cfg.transport_cap;
+    }
+
+    #[cfg(feature = "kms_display")]
+    if let Some(kms) = &cfg.kms_display {
+        // A configured KMS failure is fatal: never leave Android stopped while using a stub.
+        display_backends = vec![virtio::DisplayBackend::Kms {
+            card: kms.card.clone(),
+            split: kms.planes == crate::crosvm::config::KmsPlanes::Split,
+        }];
     }
 
     // Use the unnamed socket for GPU display screens.
@@ -311,7 +320,7 @@ pub fn create_gpu_device(
         "GPU-VRAM-BUDGET: {} MiB advertised to the guest KMD (--gpu vram-mb)",
         gpu_params.vram_mb.unwrap_or(2048)
     );
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     if !transport_cap.allows_gpu_copy() {
         dev.cap_transport_to_cpu();
     }

@@ -41,6 +41,7 @@ rust_binary {
     features: [
         "android-sparse",
         "android_display",
+        "kms_display",
         "android_display_stub",
         "audio",
         "audio_aaudio",

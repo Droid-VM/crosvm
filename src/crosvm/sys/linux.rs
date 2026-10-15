@@ -208,7 +208,7 @@ use vm_memory::MemoryRegionOptions;
 use x86_64::X8664arch as Arch;
 
 use crate::crosvm::config::Config;
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 use crate::crosvm::config::DisplayScreen;
 #[cfg(feature = "vnc")]
 use crate::crosvm::config::DEFAULT_VNC_HOST;
@@ -2593,6 +2593,18 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         Ok(limit) => info!("open files limit {} (hard {})", limit.rlim_cur, limit.rlim_max),
         Err(e) => warn!("could not raise the open files limit: {}", e),
     }
+    #[cfg(all(feature = "kms_display", target_os = "android"))]
+    let _kms_takeover = cfg.kms_display.as_ref().map(|_| kms_takeover::Takeover::begin()).transpose()?;
+    #[cfg(all(feature = "kms_display", target_os = "android"))]
+    if let Some(kms) = &cfg.kms_display {
+        // Check master, native mode and all required properties before allocating guest RAM.
+        // The worker subsequently opens its own card; Android remains stopped under the guard.
+        drop(gpu_display::GpuDisplay::open_kms(
+            &kms.card, kms.planes == crate::crosvm::config::KmsPlanes::Split,
+        ).context("KMS preflight")?);
+    }
+
+
     // Bridge the `--pre-alloc` GPU pool sizes to the env the in-process renderer + early memory
     // setup expect (NCTX_GFX_POOL_MB), BEFORE any of guest_memory_layout, the gpu device, or the
     // gunyah size-max reads them. The user sets `--pre-alloc`; crosvm no longer requires a
@@ -4397,7 +4409,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     //
     // The guest maps it with ioremap_wc(), so it is write-combining: visibility of guest writes to
     // a GPU reader is a real question here, not a formality.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
         let guest_mem = linux.vm.get_memory().clone();
