@@ -20,6 +20,8 @@ pub(crate) mod pci_hotplug_manager;
 mod simplefb_display;
 #[cfg(feature = "audio")]
 pub(crate) mod snd_helper;
+#[cfg(all(feature = "kms_display", target_os = "android"))]
+pub(crate) mod kms_takeover;
 mod vcpu;
 
 #[cfg(all(feature = "pvclock", target_arch = "aarch64"))]

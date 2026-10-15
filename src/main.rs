@@ -976,6 +976,12 @@ fn install_fatal_signal_handlers() {
 
 fn main() {
     syslog::early_init();
+    #[cfg(all(feature = "kms_display", target_os = "android"))]
+    if std::env::args().nth(1).as_deref() == Some("kms-sentinel") {
+        let result = crosvm::sys::linux::kms_takeover::sentinel_main();
+        if let Err(e) = &result { eprintln!("kms-sentinel: {e:#}"); }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
     install_fatal_signal_handlers();
     debug!("crosvm started.");
     let res = crosvm_main(std::env::args());
