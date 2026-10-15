@@ -586,6 +586,12 @@ pub fn parse_touch_device_option(s: &str) -> Result<TouchDeviceOption, String> {
 pub enum InputDeviceOption {
     Evdev {
         path: PathBuf,
+        /// Physical touch surface width in mm; must be paired with height-mm.
+        #[serde(rename = "width-mm")]
+        width_mm: Option<std::num::NonZeroU32>,
+        /// Physical touch surface height in mm; overrides missing/incorrect evdev resolution.
+        #[serde(rename = "height-mm")]
+        height_mm: Option<std::num::NonZeroU32>,
     },
     // `name` is here for a different reason than the touch devices' below, and the difference is
     // worth stating because it looks like the same field. A keyboard reports no coordinates, so it

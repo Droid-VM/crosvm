@@ -904,15 +904,26 @@ pub fn create_vinput_device(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,
     dev_path: &Path,
+    width_mm: Option<std::num::NonZeroU32>,
+    height_mm: Option<std::num::NonZeroU32>,
 ) -> DeviceResult {
+    let physical_size_mm = match (width_mm, height_mm) {
+        (Some(w), Some(h)) => Some((w, h)),
+        (None, None) => None,
+        _ => bail!("evdev width-mm and height-mm must be specified together"),
+    };
     let dev_file = OpenOptions::new()
         .read(true)
         .write(true)
         .open(dev_path)
         .with_context(|| format!("failed to open vinput device {}", dev_path.display()))?;
 
-    let dev = virtio::input::new_evdev(dev_file, virtio::base_features(protection_type))
-        .context("failed to set up input device")?;
+    let dev = virtio::input::new_evdev(
+        dev_file,
+        virtio::base_features(protection_type),
+        physical_size_mm,
+    )
+    .context("failed to set up input device")?;
 
     Ok(VirtioDeviceStub {
         dev: Box::new(dev),

@@ -157,6 +157,8 @@ pub struct virtio_input_absinfo {
     max: Le32,
     fuzz: Le32,
     flat: Le32,
+    #[serde(default)]
+    res: Le32,
 }
 
 impl virtio_input_absinfo {
@@ -166,6 +168,7 @@ impl virtio_input_absinfo {
             max: Le32::from(max),
             fuzz: Le32::from(fuzz),
             flat: Le32::from(flat),
+            res: Le32::from(0),
         }
     }
 }
@@ -499,7 +502,11 @@ impl<T: EventSource> Worker<T> {
         };
 
         'wait: loop {
-            let wait_events = match wait_ctx.wait() {
+            let waited = match self.event_source.idle_timeout() {
+                Some(timeout) => wait_ctx.wait_timeout(timeout),
+                None => wait_ctx.wait(),
+            };
+            let wait_events = match waited {
                 Ok(wait_events) => wait_events,
                 Err(e) => {
                     error!("failed polling for events: {}", e);
@@ -546,6 +553,8 @@ impl<T: EventSource> Worker<T> {
                 }
             }
 
+            self.event_source.idle_report();
+            eventq_needs_interrupt |= self.send_events();
             if eventq_needs_interrupt {
                 self.event_queue.trigger_interrupt();
             }
@@ -690,7 +699,11 @@ where
 }
 
 /// Creates a new virtio input device from an event device node
-pub fn new_evdev<T>(source: T, virtio_features: u64) -> Result<Input<EvdevEventSource<T>>>
+pub fn new_evdev<T>(
+    source: T,
+    virtio_features: u64,
+    physical_size_mm: Option<(std::num::NonZeroU32, std::num::NonZeroU32)>,
+) -> Result<Input<EvdevEventSource<T>>>
 where
     T: Read + Write + AsRawDescriptor + Send + 'static,
 {
@@ -705,7 +718,23 @@ where
                 info.max = Le32::from(axis_scale::AxisScale::MAX);
                 info.fuzz = Le32::from(scale.distance(info.fuzz.into()));
                 info.flat = Le32::from(scale.distance(info.flat.into()));
+                let resolution = u32::from(info.res);
+                if resolution != 0 {
+                    info.res = Le32::from(scale.distance(resolution).max(1));
+                }
                 scales.insert(code, scale);
+            }
+            if let Some((width, height)) = physical_size_mm {
+                let mm = if code == ABS_X || code == ABS_MT_POSITION_X {
+                    width
+                } else {
+                    height
+                };
+                let span = u32::from(info.max).saturating_sub(u32::from(info.min));
+                info.res = Le32::from(
+                    ((u64::from(span) + u64::from(mm.get()) / 2) / u64::from(mm.get()))
+                        .max(1) as u32,
+                );
             }
         }
     }

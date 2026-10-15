@@ -838,10 +838,16 @@ fn create_virtio_devices(
     let mut custom_idx = 0;
     for input in &cfg.virtio_input {
         let input_dev = match input {
-            InputDeviceOption::Evdev { path } => create_vinput_device(
+            InputDeviceOption::Evdev {
+                path,
+                width_mm,
+                height_mm,
+            } => create_vinput_device(
                 cfg.protection_type,
                 cfg.jail_config.as_ref(),
                 path.as_path(),
+                *width_mm,
+                *height_mm,
             )?,
             InputDeviceOption::Keyboard { path, name } => {
                 // One of these per screen with input enabled, not one per VM: `keyboard_idx`

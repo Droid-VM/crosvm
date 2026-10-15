@@ -3563,7 +3563,11 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.virtio_input.extend(
                 cmd.evdev
                     .into_iter()
-                    .map(|path| InputDeviceOption::Evdev { path }),
+                    .map(|path| InputDeviceOption::Evdev {
+                        path,
+                        width_mm: None,
+                        height_mm: None,
+                    }),
             );
         }
 
