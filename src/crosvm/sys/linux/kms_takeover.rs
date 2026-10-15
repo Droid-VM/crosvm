@@ -61,11 +61,15 @@ impl HangWatchdog {
             .0
             .trim()
             .parse()?;
-        let uptime: f64 = fs::read_to_string("/proc/uptime")?
-            .split_whitespace()
-            .next()
-            .context("uptime")?
-            .parse()?;
+        // printk timestamps exclude suspend time. /proc/uptime includes it and
+        // would reject fresh watchdog status after the phone has slept.
+        let mut now: libc::timespec = unsafe { std::mem::zeroed() };
+        // SAFETY: now points to a writable timespec; CLOCK_MONOTONIC is supported.
+        ensure!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0,
+            "read monotonic clock: {}", std::io::Error::last_os_error()
+        );
+        let uptime = now.tv_sec as f64 + now.tv_nsec as f64 / 1_000_000_000.0;
         ensure!(
             (0.0..=45.0).contains(&(uptime - timestamp)),
             "stale hangdetect status"
