@@ -165,7 +165,14 @@ pub fn serial_name<T: AsRawDescriptor>(descriptor: &T) -> Result<String> {
         unsafe { ioctl_with_mut_ref(descriptor, EVIOCGUNIQ, &mut uniq) }
     };
     if len < 0 {
-        return Err(InputError::EvdevSerialError(errno()));
+        let error = errno();
+        // input_dev.uniq is optional. evdev returns ENOENT for devices without a
+        // serial (for example built-in goodix touchscreens); this is not a failed
+        // device. Preserve real ioctl errors such as EBADF and ENOTTY.
+        if error.errno() == libc::ENOENT {
+            return Ok(String::new());
+        }
+        return Err(InputError::EvdevSerialError(error));
     }
     string_from_bytes_with_nul(&uniq.buffer, len as usize)
 }
