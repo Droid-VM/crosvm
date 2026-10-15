@@ -383,8 +383,27 @@ pub(crate) struct Takeover {
     sentinel: Child,
 }
 
+// This backend inherits the active command-mode panel; a suspend wake lock
+// does not turn on a panel that Android has already blanked.
+fn require_lit_panel() -> Result<()> {
+    let brightness: u32 = fs::read_to_string(
+        "/sys/class/backlight/panel0-backlight/brightness",
+    )
+    .context("read KMS panel brightness")?
+    .trim()
+    .parse()
+    .context("invalid KMS panel brightness")?;
+    ensure!(
+        brightness > 0,
+        "KMS takeover requires a lit Android display; wake the screen before starting the VM"
+    );
+    Ok(())
+}
+
 impl Takeover {
     pub(crate) fn begin() -> Result<Self> {
+        // Reject screen-off launches before arming restoration or mutating Android.
+        require_lit_panel()?;
         let s = snapshot()?;
         let mut sentinel = Command::new(std::env::current_exe()?)
             .arg0("/system/bin/crosvm-kms-sentinel")
@@ -425,6 +444,8 @@ impl Takeover {
             set_property(key, "false")?;
         }
         signal_server(&s, libc::SIGSTOP)?;
+        // Recheck after freezing the framework in case it blanked during startup.
+        require_lit_panel()?;
         service(SF, false)?;
         // Stopping SF can restart the HAL; wait for init to settle before stopping it.
         std::thread::sleep(Duration::from_secs(2));
