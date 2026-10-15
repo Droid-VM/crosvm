@@ -131,6 +131,7 @@ struct Snapshot {
     server: i32,
     server_start: String,
     suspend_running: bool,
+    secondary_running: bool,
     stability: Vec<(String, String)>,
 }
 
@@ -237,6 +238,7 @@ fn snapshot() -> Result<Snapshot> {
         parent: std::process::id() as i32,
         server,
         server_start: process_start(server)?,
+        secondary_running: property("init.svc.zygote_secondary")? == "running",
         suspend_running: property(&format!("init.svc.{SUSPEND}"))? == "running",
         stability,
     })
@@ -264,9 +266,31 @@ fn restore(s: &Snapshot) -> Result<()> {
             failures.push(format!("{label}: {e:#}"));
         }
     };
+    // SF cannot safely reuse this framework's old layer handles. Explicitly
+    // rebuild Android userspace on return; the host kernel and sentinel survive.
+    if s.secondary_running {
+        attempt("stop secondary zygote", service("zygote_secondary", false));
+    }
+    let stopped = service("zygote", false);
+    if stopped.is_err() {
+        // Do not leave the old framework frozen if init refused the stop.
+        attempt("resume old system_server", signal_server(s, libc::SIGCONT));
+    }
+    attempt("stop zygote", stopped);
+    attempt("old framework exit", (|| -> Result<()> {
+        let until = Instant::now() + Duration::from_secs(8);
+        while process_start(s.server).ok().as_deref() == Some(s.server_start.as_str()) {
+            ensure!(Instant::now() < until, "old system_server did not exit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Ok(())
+    })());
     attempt("composer", service(COMPOSER, true));
     attempt("surfaceflinger", service(SF, true));
-    attempt("system_server", signal_server(s, libc::SIGCONT));
+    attempt("start zygote", service("zygote", true));
+    if s.secondary_running {
+        attempt("start secondary zygote", service("zygote_secondary", true));
+    }
     attempt(
         "wake unlock",
         fs::write("/sys/power/wake_unlock", WAKE).map_err(Into::into),
@@ -283,6 +307,75 @@ fn restore(s: &Snapshot) -> Result<()> {
         failures.join("; ")
     );
     Ok(())
+}
+
+// "running" only means init forked a process. Require a new framework, its
+// compositor boot handshake, and ten seconds without a display/framework restart.
+fn verify_restoration(s: &Snapshot, watchdog: &HangWatchdog) -> Result<()> {
+    let sf_pid = property("init.svc_debug_pid.surfaceflinger")?;
+    let composer_pid = property(&format!("init.svc_debug_pid.{COMPOSER}"))?;
+    ensure!(
+        !sf_pid.is_empty() && !composer_pid.is_empty(),
+        "missing restored service PID"
+    );
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let mut stable: Option<(i32, String, Instant)> = None;
+    loop {
+        watchdog.kick(120)?;
+        ensure!(
+            property(&format!("init.svc.{SF}"))? == "running"
+                && property(&format!("init.svc.{COMPOSER}"))? == "running"
+                && property("init.svc_debug_pid.surfaceflinger")? == sf_pid
+                && property(&format!("init.svc_debug_pid.{COMPOSER}"))? == composer_pid,
+            "Android display service died/restarted during restoration"
+        );
+        let mut server = None;
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            if fs::read_to_string(entry.path().join("comm"))
+                .unwrap_or_default()
+                .trim()
+                == "system_server"
+            {
+                if let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|p| p.parse::<i32>().ok())
+                {
+                    if let Ok(start) = process_start(pid) {
+                        server = Some((pid, start));
+                    }
+                }
+            }
+        }
+        let ready = property("service.bootanim.exit")? == "1"
+            && property("init.svc.bootanim")? == "stopped"
+            && property("sys.boot_completed")? == "1";
+        if let Some((pid, start)) = server {
+            ensure!(
+                pid != s.server || start != s.server_start,
+                "old system_server survived framework restart"
+            );
+            if let Some((expected_pid, expected_start, since)) = &stable {
+                ensure!(
+                    pid == *expected_pid && start == *expected_start && ready,
+                    "Android framework became unstable after boot"
+                );
+                if since.elapsed() >= Duration::from_secs(10) {
+                    return Ok(());
+                }
+            } else if ready {
+                stable = Some((pid, start, Instant::now()));
+            }
+        } else {
+            ensure!(stable.is_none(), "Android framework exited after boot");
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Android framework boot did not complete within 90 seconds"
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 pub(crate) struct Takeover {
@@ -337,7 +430,7 @@ impl Takeover {
         std::thread::sleep(Duration::from_secs(2));
         service(COMPOSER, false)?;
         base::info!(
-            "kms: Android display stopped; sentinel pid={}",
+            "kms: Android display stopped; framework will restart on exit; sentinel pid={}",
             guard.sentinel.id()
         );
         Ok(guard)
@@ -429,7 +522,7 @@ pub(crate) fn sentinel_main() -> Result<()> {
         }
         break;
     }
-    let restored = restore(&s);
+    let restored = restore(&s).and_then(|_| verify_restoration(&s, &watchdog));
     let watchdog_restored = watchdog.restore();
     restored?;
     watchdog_restored?;
