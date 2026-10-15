@@ -42,6 +42,8 @@ pub trait EventSource: AsRawDescriptor {
     /// consumption by reading from this object. Returns the number of new non filtered events
     /// received. This function may block waiting for events to be available.
     fn receive_events(&mut self) -> Result<usize>;
+    fn idle_timeout(&self) -> Option<std::time::Duration> { None }
+    fn idle_report(&mut self) {}
     /// Returns the number of received events that have not been filtered or consumed yet.
     fn available_events_count(&self) -> usize;
     /// Returns the next available event
@@ -199,6 +201,12 @@ where
 pub struct EvdevEventSource<T> {
     evt_source_impl: EventSourceImpl<T>,
     scales: BTreeMap<u16, AxisScale>,
+    diagnostic_start: Option<std::time::Instant>,
+    keepalive: bool,
+    slot: i32,
+    contacts: std::collections::BTreeSet<i32>,
+    report_complete: bool,
+    last_report: std::time::Instant,
 }
 
 impl<T> EvdevEventSource<T>
@@ -209,6 +217,13 @@ where
         EvdevEventSource {
             evt_source_impl: EventSourceImpl::new(source, 16 * input_event::SIZE),
             scales,
+            diagnostic_start: (std::env::var_os("CROSVM_TOUCH_TRACE").is_some())
+                .then(std::time::Instant::now),
+            keepalive: std::env::var_os("CROSVM_TOUCH_KEEPALIVE").is_some(),
+            slot: 0,
+            contacts: Default::default(),
+            report_complete: true,
+            last_report: std::time::Instant::now(),
         }
     }
 }
@@ -223,6 +238,22 @@ impl<T> EventSource for EvdevEventSource<T>
 where
     T: Read + Write + AsRawDescriptor,
 {
+    fn idle_timeout(&self) -> Option<std::time::Duration> {
+        (self.keepalive && !self.contacts.is_empty())
+            .then_some(std::time::Duration::from_millis(40))
+    }
+
+    fn idle_report(&mut self) {
+        if self.idle_timeout().is_some() && self.report_complete
+            && self.evt_source_impl.queue.is_empty() && self.evt_source_impl.read_idx == 0
+            && self.last_report.elapsed() >= std::time::Duration::from_millis(40)
+        {
+            self.evt_source_impl.queue.push_back(virtio_input_event {
+                type_: EV_SYN.into(), code: SYN_REPORT.into(), value: 0.into(),
+            });
+        }
+    }
+
     fn init(&mut self) -> Result<()> {
         grab_evdev(self)
     }
@@ -241,10 +272,24 @@ where
 
     fn pop_available_event(&mut self) -> Option<virtio_input_event> {
         let mut event = self.evt_source_impl.pop_available_event()?;
+        let kind = u16::from(event.type_);
+        let code = u16::from(event.code);
+        let value = i32::from(event.value);
+        if kind == EV_ABS && code == ABS_MT_SLOT { self.slot = value; }
+        if kind == EV_ABS && code == ABS_MT_TRACKING_ID {
+            if value < 0 { self.contacts.remove(&self.slot); }
+            else { self.contacts.insert(self.slot); }
+        }
+        self.report_complete = kind == EV_SYN && code == SYN_REPORT;
+        if self.report_complete { self.last_report = std::time::Instant::now(); }
         if u16::from(event.type_) == EV_ABS {
             if let Some(scale) = self.scales.get(&u16::from(event.code)) {
                 event.value = scale.position(i32::from(event.value)).into();
             }
+        }
+        if let Some(start) = self.diagnostic_start {
+            eprintln!("KMS_TOUCH,{},{},{},{}", start.elapsed().as_micros(),
+                u16::from(event.type_), u16::from(event.code), i32::from(event.value));
         }
         Some(event)
     }
