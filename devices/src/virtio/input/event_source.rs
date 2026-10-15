@@ -2,7 +2,10 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
+
+use super::axis_scale::AxisScale;
 use std::io::Read;
 use std::io::Write;
 
@@ -195,15 +198,17 @@ where
 /// Encapsulates an event device node as an event source
 pub struct EvdevEventSource<T> {
     evt_source_impl: EventSourceImpl<T>,
+    scales: BTreeMap<u16, AxisScale>,
 }
 
 impl<T> EvdevEventSource<T>
 where
     T: Read + Write + AsRawDescriptor,
 {
-    pub fn new(source: T) -> EvdevEventSource<T> {
+    pub(super) fn new(source: T, scales: BTreeMap<u16, AxisScale>) -> EvdevEventSource<T> {
         EvdevEventSource {
             evt_source_impl: EventSourceImpl::new(source, 16 * input_event::SIZE),
+            scales,
         }
     }
 }
@@ -235,7 +240,13 @@ where
     }
 
     fn pop_available_event(&mut self) -> Option<virtio_input_event> {
-        self.evt_source_impl.pop_available_event()
+        let mut event = self.evt_source_impl.pop_available_event()?;
+        if u16::from(event.type_) == EV_ABS {
+            if let Some(scale) = self.scales.get(&u16::from(event.code)) {
+                event.value = scale.position(i32::from(event.value)).into();
+            }
+        }
+        Some(event)
     }
 
     fn send_event(&mut self, vio_evt: &virtio_input_event) -> Result<()> {

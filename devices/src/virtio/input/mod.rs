@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+mod axis_scale;
 #[allow(dead_code)]
 mod defaults;
 mod evdev;
@@ -693,10 +694,25 @@ pub fn new_evdev<T>(source: T, virtio_features: u64) -> Result<Input<EvdevEventS
 where
     T: Read + Write + AsRawDescriptor + Send + 'static,
 {
+    let mut config = VirtioInputConfig::from_evdev(&source)?;
+    let mut scales = BTreeMap::new();
+    for code in [ABS_X, ABS_Y, ABS_MT_POSITION_X, ABS_MT_POSITION_Y] {
+        if let Some(info) = config.axis_info.get_mut(&code) {
+            if let Some(scale) = axis_scale::AxisScale::new(
+                u32::from(info.min) as i32, u32::from(info.max) as i32,
+            ) {
+                info.min = Le32::from(0);
+                info.max = Le32::from(axis_scale::AxisScale::MAX);
+                info.fuzz = Le32::from(scale.distance(info.fuzz.into()));
+                info.flat = Le32::from(scale.distance(info.flat.into()));
+                scales.insert(code, scale);
+            }
+        }
+    }
     Ok(Input {
         worker_thread: None,
-        config: VirtioInputConfig::from_evdev(&source)?,
-        source: Some(EvdevEventSource::new(source)),
+        config,
+        source: Some(EvdevEventSource::new(source, scales)),
         virtio_features,
     })
 }
