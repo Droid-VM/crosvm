@@ -154,7 +154,7 @@ pub struct CpuOptions {
 /// for the user is what produced the silent race this replaces, where a VNC server and an Android
 /// display service configured together left the app's Surface waiting forever on a binder that was
 /// never registered.
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DisplayScreen {
     /// virtio-gpu scanout 0.
@@ -169,7 +169,7 @@ pub enum DisplayScreen {
     Simplefb,
 }
 
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 impl DisplayScreen {
     /// The name this screen is written as on the command line, for error messages that have to
     /// quote back what the user typed (or what the compat default resolved to).
@@ -202,7 +202,7 @@ impl DisplayScreen {
 ///
 /// This is a debugging control, not a product setting (plan §4.6). What a panel shows the user is
 /// the negotiated *result*, read-only.
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportCap {
@@ -224,7 +224,7 @@ pub enum TransportCap {
     GpuHw,
 }
 
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 impl TransportCap {
     /// Whether this ceiling leaves the dmabuf import available at all.
     ///
@@ -334,6 +334,28 @@ impl VncConfig {
         !self.view_only
     }
 }
+
+/// Direct scanout owns the Android display for the lifetime of this VM.
+#[cfg(feature = "kms_display")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct KmsDisplayConfig {
+    pub card: PathBuf,
+    pub screen: DisplayScreen,
+    pub takeover: KmsTakeoverMode,
+    #[serde(default)]
+    pub planes: KmsPlanes,
+}
+
+#[cfg(feature = "kms_display")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KmsTakeoverMode { Display }
+
+#[cfg(feature = "kms_display")]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KmsPlanes { #[default] Split, Single }
 
 /// One Android display service: the name crosvm registers with the service manager, and which
 /// screen's frames go into the Surface the app hands back through it.
@@ -1090,6 +1112,8 @@ pub struct Config {
     pub jail_config: Option<JailConfig>,
     #[cfg(windows)]
     pub kernel_log_file: Option<String>,
+    #[cfg(feature = "kms_display")]
+    pub kms_display: Option<KmsDisplayConfig>,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub lock_guest_memory: bool,
     #[cfg(windows)]
@@ -1234,6 +1258,8 @@ impl Default for Config {
             acpi_tables: Vec::new(),
             #[cfg(feature = "android_display")]
             android_display_service: Vec::new(),
+            #[cfg(feature = "kms_display")]
+            kms_display: None,
             android_fstab: None,
             async_executor: None,
             #[cfg(feature = "balloon")]
@@ -1498,7 +1524,7 @@ impl Config {
 /// line configured, and that is only settled once everything has been folded into the `Config`.
 /// The answer is written back into the entry, so no consumer downstream ever has to decide again
 /// what an unspecified screen meant -- and none of them can decide it differently.
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     // Which screens exist. `validate_gpu_config` has already run and given a GPU with no
     // `displays=` its one default display, so the presence of the device is the whole question.
@@ -1507,6 +1533,22 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     #[cfg(not(feature = "gpu"))]
     let has_gpu_screen = false;
     let has_simplefb_screen = cfg.simplefb.is_some();
+    #[cfg(feature = "kms_display")]
+    if let Some(kms) = &cfg.kms_display {
+        if !cfg!(target_os = "android") {
+            return Err("kms-display takeover requires Android".into());
+        }
+        if kms.screen != DisplayScreen::Gpu0 || !has_gpu_screen {
+            return Err("kms-display requires screen=gpu-0 and --gpu".into());
+        }
+        if cfg.jail_config.is_some() {
+            return Err("kms-display requires --disable-sandbox".into());
+        }
+        if !kms.card.is_absolute() || !cfg.wayland_socket_paths.is_empty() {
+            return Err("kms-display requires an absolute card path and no Wayland exporter".into());
+        }
+    }
+
 
     let screen_exists = |screen: DisplayScreen| match screen {
         DisplayScreen::Gpu0 => has_gpu_screen,
@@ -1619,6 +1661,10 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
             .filter(|s| s.screen == Some(screen))
         {
             exporters.push(format!("`android-display-service` `{}`", service.name));
+        }
+        #[cfg(feature = "kms_display")]
+        if cfg.kms_display.as_ref().map(|k| k.screen) == Some(screen) {
+            exporters.push("`kms-display`".into());
         }
         if exporters.len() > 1 {
             return Err(format!(
@@ -1847,7 +1893,7 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
 
     // After the display devices are all known: which screens exist is exactly the input this
     // needs, and it writes each exporter's resolved screen back into the config.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     validate_display_exporters(cfg)?;
 
     // Validate platform specific things
@@ -1927,13 +1973,13 @@ mod tests {
 
     /// Same as `config_from_args` but keeps a validation failure instead of panicking on it, so a
     /// test can say which rule rejected the command line and not merely that something did.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     fn config_from_args_result(args: &[&str]) -> std::result::Result<Config, String> {
         Config::try_from(crate::crosvm::cmdline::RunCommand::from_args(&[], args).unwrap())
     }
 
     /// A `--simplefb` that parses; the geometry is never used by these tests, only its presence.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     const SIMPLEFB_ARG: &str = "width=1280,height=720";
 
     #[test]

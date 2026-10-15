@@ -121,6 +121,7 @@ tokio = { version = "1.29.1", features = ["net", "rt-multi-thread", "time", "syn
 snapshot = { path = "snapshot" }
 
 [features]
+kms_display = ["gpu", "devices/kms_display"]
 ## Default features of crosvm. This selection is somewhat arbitrary for historical reasons.
 default = ["audio", "balloon", "config-file", "document-features", "gpu", "qcow", "usb", "libvda-stub", "net", "slirp"]
 

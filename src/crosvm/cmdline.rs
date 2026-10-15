@@ -919,6 +919,11 @@ fn vnc_server_from_str(s: &str) -> Result<VncConfig, String> {
     from_key_values(s)
 }
 
+#[cfg(feature = "kms_display")]
+fn kms_display_from_str(s: &str) -> Result<crate::crosvm::config::KmsDisplayConfig, String> {
+    serde_keyvalue::from_key_values(s).map_err(|e| e.to_string())
+}
+
 /// Parse an Android display service option. `name` is the first field of the struct, so a bare
 /// service name parses as `name=<that>` and the older form of this option keeps working unchanged.
 #[cfg(feature = "android_display")]
@@ -979,6 +984,7 @@ fn android_display_service_from_str(s: &str) -> Result<AndroidDisplayServiceConf
 #[argh(subcommand, name = "run", description = "Start a new crosvm instance")]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RunCommand {
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[argh(switch)]
     #[serde(default)]
@@ -1669,6 +1675,13 @@ pub struct RunCommand {
     #[merge(strategy = append)]
     /// path to a socket from where to read keyboard input events and write status updates to
     pub keyboard: Vec<PathBuf>,
+
+    #[cfg(feature = "kms_display")]
+    #[argh(option, from_str_fn(kms_display_from_str))]
+    #[serde(default)]
+    #[merge(strategy = overwrite_option)]
+    /// direct SDE command-mode scanout: card=PATH,screen=gpu-0,takeover=display[,planes=split|single]
+    pub kms_display: Option<crate::crosvm::config::KmsDisplayConfig>,
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(option, arg_name = "PATH")]
@@ -3646,6 +3659,9 @@ impl TryFrom<RunCommand> for super::config::Config {
                 cfg.gpu_server_cgroup_path = cmd.gpu_server_cgroup_path;
             }
         }
+
+        #[cfg(feature = "kms_display")]
+        { cfg.kms_display = cmd.kms_display; }
 
         // Exporters bind to screens, and a screen can come from the GPU device or from simplefb,
         // so these no longer live inside the `gpu` block that used to decide whether to keep them.

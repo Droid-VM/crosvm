@@ -1915,6 +1915,8 @@ pub enum DisplayBackend {
     /// using the name given here. The entity holding the surface is expected to locate the service
     /// via this name, and pass the surface to it.
     Android(String),
+    #[cfg(feature = "kms_display")]
+    Kms { card: PathBuf, split: bool },
     #[cfg(feature = "vnc")]
     /// Start a VNC server for remote display access on a TCP address.
     ///
@@ -1958,6 +1960,8 @@ impl DisplayBackend {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             DisplayBackend::X(_) => "x",
             DisplayBackend::Stub => "stub",
+            #[cfg(feature = "kms_display")]
+            DisplayBackend::Kms { .. } => "kms",
             #[cfg(windows)]
             DisplayBackend::WinApi => "winapi",
             #[cfg(feature = "android_display")]
@@ -1978,6 +1982,8 @@ impl DisplayBackend {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             DisplayBackend::X(display) => GpuDisplay::open_x(display.as_deref()),
             DisplayBackend::Stub => GpuDisplay::open_stub(),
+            #[cfg(feature = "kms_display")]
+            DisplayBackend::Kms { card, split } => GpuDisplay::open_kms(card, *split),
             #[cfg(windows)]
             DisplayBackend::WinApi => match wndproc_thread.take() {
                 Some(wndproc_thread) => GpuDisplay::open_winapi(
