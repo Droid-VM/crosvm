@@ -287,6 +287,12 @@ impl Plane {
         req.add(self.id, self.props["CRTC_ID"].0, 0);
     }
     fn set(&self, req: &mut Request, crtc: u32, fb: u32, src: [u32; 4], dst: [i32; 4]) {
+        // SDE retains Android's private scaler/pixel-extension state after detach.
+        // A null scaler_v2 pointer clears that state and lets the driver derive
+        // scaling from this frame's source/destination rectangles.
+        if let Some((scaler, _)) = self.props.get("scaler_v2") {
+            req.add(self.id, *scaler, 0);
+        }
         for (name, value) in [
             ("FB_ID", fb as u64),
             ("CRTC_ID", crtc as u64),
