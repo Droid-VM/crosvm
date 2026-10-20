@@ -1,0 +1,2274 @@
+// Copyright 2026 The DroidVM Authors
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file.
+
+//! The MediaCodec NDK behind the virtio-media video encoder device (`VPU_DESIGN.md` §7.3).
+//!
+//! [`MediaCodecEncoderBackend`] is the platform's list of hardware video encoders, read once
+//! from `AMediaCodecStore` through the `android_codec` crate and turned into the
+//! `EncoderCapabilities` the device answers `ENUM_FMT` / `ENUM_FRAMESIZES` /
+//! `ENUM_FRAMEINTERVALS` and the `V4L2_CID_MPEG_VIDEO_*` control ranges and menus from: nothing
+//! about what the phone can encode is written down here. [`MediaCodecEncoderSession`] is one
+//! encode: an `AMediaCodec` in asynchronous mode, created when both queues stream (the device
+//! decides when, `logs/vpu_wp/M7-crate.md` §1), fed the guest's raw NV12 frames and emptied
+//! into the guest's `CAPTURE` (bitstream) buffers.
+//!
+//! # Threads
+//!
+//! The decoder's shape (`android.rs`), mirrored:
+//!
+//! ```text
+//!  device worker thread                                     NDK callback thread
+//!  ────────────────────                                     ───────────────────
+//!  encode(InputBuffer)     copy into an owned buffer,        onAsyncInputAvailable  ─┐ push onto the
+//!                          ack the guest, feed as slots free onAsyncOutputAvailable  │ Codec's queue,
+//!  use_as_capture(buf)     FIFO of lent CAPTURE buffers     onAsyncFormatChanged    │ then bump the
+//!  take_events()           drain the Codec's queue: feed    onAsyncError           ─┘ session eventfd
+//!                          frames, copy coded frames into                              (the wake hook)
+//!                          lent buffers, releaseOutputBuffer
+//!  start / flush / stop    on a short-lived thread, waited for at most a named bound
+//! ```
+//!
+//! Everything that touches a guest or pool buffer happens on the worker thread, inside the trait
+//! calls; the four NDK callbacks only queue an event and bump the device session's eventfd
+//! (`android_codec`'s wake hook). There is no encoder thread and nothing to join for §2.5: once
+//! [`VideoEncoderBackendSession::flush`] or [`VideoEncoderBackendSession::stop`] has emptied the
+//! session's own FIFOs, no code path can touch a lent buffer any more. The NDK calls that can
+//! block -- `createCodecByName` + `configure` + `start`, `flush` + `start`, `stop` + `delete` --
+//! run on a thread of their own, waited for at most `CODEC_START_TIMEOUT`, `CODEC_FLUSH_TIMEOUT`
+//! or `CODEC_STOP_TIMEOUT` (`logs/vpu_wp/F5-crosvm.md` §2's rule; the bounds are the decoder's).
+//!
+//! # Buffers
+//!
+//! * A raw frame is **staged**: copied into an owned buffer the moment the guest queues it
+//!   (`InputBufferDone` follows at once, so the guest gets its buffer back and is not throttled by
+//!   the codec's input slots), then packed into the codec's input buffer from that copy as a slot
+//!   frees -- the visible rectangle of the guest's tightly packed NV12, padded to the `stride` and
+//!   `slice-height` the codec published after `configure` (design §7.3; chroma at `stride *
+//!   slice-height`). This mirrors the decoder's D48 staging on the input queue: once the guest is
+//!   told a frame is consumed it is owed that frame's encoding, so a `STREAMOFF(OUTPUT)` that lands
+//!   with copies still un-fed drains them through the codec rather than dropping an already-acked
+//!   frame (D78; `drain_for_streamoff`). Past one codec output window of un-fed copies, or past a
+//!   byte budget ([`INPUT_STAGE_BYTES`]), a frame waits lent instead of copied -- the
+//!   `OUTPUT`-queue backpressure a fast feeder would otherwise defeat (B16 open item 1) -- and is
+//!   acked when a slot takes it.
+//! * A coded frame is copied out of the codec's output buffer the moment it is delivered and the
+//!   buffer released (tens of kilobytes against the raw copy; the codec never waits on the guest
+//!   for an output slot), then written into the next lent `CAPTURE` buffer that holds it;
+//!   `bytesused`, the frame's timestamp (the input's `presentationTimeUs`, carried through by the
+//!   codec) and `KEYFRAME` from `BUFFER_FLAG_KEY_FRAME` go to the device. With no `CAPTURE` buffer
+//!   lent the frame is held, up to a limit past which no raw frame is fed.
+//! * The stream headers (`BUFFER_FLAG_CODEC_CONFIG`: SPS/PPS, VPS/SPS/PPS) follow the device's
+//!   `V4L2_CID_MPEG_VIDEO_HEADER_MODE`: `SEPARATE` puts them in a `CAPTURE` buffer of their own
+//!   (`FrameKind::Headers`, the first frame's timestamp), `JOINED_WITH_1ST_FRAME` in front of the
+//!   next frame (unless that frame already starts with them, which `PREPEND_SPSPPS_TO_IDR` makes
+//!   the codec do).
+//! * Drain is an empty `END_OF_STREAM` input; the output that carries the flag -- usually empty --
+//!   becomes the guest's `LAST` buffer. `flush` (`STREAMOFF(OUTPUT)`, and `V4L2_ENC_CMD_START`
+//!   after a drain) is `AMediaCodec_flush` then `start`, the async rule; `stop`
+//!   (`STREAMOFF(CAPTURE)`, close) deletes the codec, and the next `start` creates a new one.
+//! * A flush voids every index the codec handed out. `android_codec` stamps events with a
+//!   generation and drops the old ones; the callback the NDK looper had already queued arrives
+//!   anyway, with a dead index, and a null `getInputBuffer` / `getOutputBuffer` on it is skipped at
+//!   debug level, never a session error (`logs/vpu_wp/B5-acceptance.md` D23).
+//!
+//! # Controls
+//!
+//! The two that change while the codec runs are forwarded as `setParameters`:
+//! `V4L2_CID_MPEG_VIDEO_BITRATE` as `video-bitrate`, `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME` as
+//! `request-sync`, applied at once: the next frame the component processes is the keyframe,
+//! which is the frame a kernel driver's control lands on too, and not necessarily the frame the
+//! guest queues next when frames are waiting for an input slot (`logs/vpu_wp/M7-backend.md` §10
+//! item 3). Everything else goes into `configure` when the codec is created, from the
+//! `EncoderConfig` the device gathers.
+
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
+
+use android_codec::color_format_name;
+use android_codec::keys;
+use android_codec::list_codecs;
+use android_codec::media_status_name;
+use android_codec::BufferInfo;
+use android_codec::Codec;
+use android_codec::CodecError;
+use android_codec::CodecEvent;
+use android_codec::CodecInfo;
+use android_codec::CodecKind;
+use android_codec::ListOptions;
+use android_codec::MediaFormat;
+use android_codec::BITRATE_MODE_CBR;
+use android_codec::BITRATE_MODE_CQ;
+use android_codec::BITRATE_MODE_VBR;
+use android_codec::BUFFER_FLAG_CODEC_CONFIG;
+use android_codec::BUFFER_FLAG_END_OF_STREAM;
+use android_codec::BUFFER_FLAG_KEY_FRAME;
+use android_codec::COLOR_FORMAT_YUV420_FLEXIBLE;
+use android_codec::COLOR_FORMAT_YUV420_PACKED_PLANAR;
+use android_codec::COLOR_FORMAT_YUV420_PACKED_SEMI_PLANAR;
+use android_codec::COLOR_FORMAT_YUV420_PLANAR;
+use android_codec::COLOR_FORMAT_YUV420_SEMI_PLANAR;
+use android_codec::COLOR_QCOM_FORMAT_YUV420_SEMI_PLANAR;
+use android_codec::COLOR_RANGE_FULL;
+use android_codec::COLOR_RANGE_LIMITED;
+use android_codec::COLOR_STANDARD_BT2020;
+use android_codec::COLOR_STANDARD_BT601_NTSC;
+use android_codec::COLOR_STANDARD_BT601_PAL;
+use android_codec::COLOR_STANDARD_BT709;
+use android_codec::COLOR_TRANSFER_LINEAR;
+use android_codec::COLOR_TRANSFER_SDR_VIDEO;
+use android_codec::COLOR_TRANSFER_ST2084;
+use anyhow::Context;
+use base::debug;
+use base::error;
+use base::info;
+use base::warn;
+use virtio_media::devices::video_encoder::CodedFormat;
+use virtio_media::devices::video_encoder::Colorimetry;
+use virtio_media::devices::video_encoder::ControlRange;
+use virtio_media::devices::video_encoder::EncoderCapabilities;
+use virtio_media::devices::video_encoder::EncoderConfig;
+use virtio_media::devices::video_encoder::EncoderEvent;
+use virtio_media::devices::video_encoder::EncoderSink;
+use virtio_media::devices::video_encoder::FrameKind;
+use virtio_media::devices::video_encoder::FrameRateRange;
+use virtio_media::devices::video_encoder::InputBuffer;
+use virtio_media::devices::video_encoder::OutputBuffer;
+use virtio_media::devices::video_encoder::QpRange;
+use virtio_media::devices::video_encoder::SizeRange;
+use virtio_media::devices::video_encoder::VideoEncoderBackend;
+use virtio_media::devices::video_encoder::VideoEncoderBackendSession;
+use virtio_media::ioctl::IoctlResult;
+use virtio_media::v4l2r::bindings;
+use virtio_media::v4l2r::controls::codec::VideoBitrateMode;
+use virtio_media::v4l2r::controls::codec::VideoH264Profile;
+use virtio_media::v4l2r::controls::codec::VideoHEVCProfile;
+use virtio_media::v4l2r::controls::codec::VideoHeaderMode;
+use virtio_media::v4l2r::PixelFormat;
+use virtio_media::v4l2r::Rect;
+
+use super::android::bounded;
+use super::android::choose;
+use super::android::errno_for;
+use super::android::has_feature;
+use super::android::honest_height_max;
+use super::android::is_hardware;
+use super::android::profile_pairs;
+use super::android::profiles_and_levels;
+use super::android::pts_from;
+use super::android::timeval_from;
+use super::android::CODEC_FLUSH_TIMEOUT;
+use super::android::CODEC_START_TIMEOUT;
+use super::android::CODEC_STOP_TIMEOUT;
+use super::android::CODED_FORMATS;
+use super::android::H264_LEVELS;
+use super::android::HEVC_LEVELS;
+use super::android::MAX_REFUSED_INDICES;
+use super::android::STALE_LOG_LIMIT;
+
+/// `V4L2_CID_MIN_BUFFERS_FOR_OUTPUT`: raw frames are copied into the codec's own input buffer as
+/// soon as a slot is free and returned at once, so the encoder never pins a guest frame; a few
+/// keep the copy pipelined. GStreamer sizes its upstream pool from this, ffmpeg allocates 16
+/// regardless. Same number as the decoder's `MIN_CAPTURE_BUFFERS`.
+const MIN_OUTPUT_BUFFERS: u32 = 4;
+/// A `STREAMOFF(OUTPUT)` that lands with frames the guest was already told `InputBufferDone` for
+/// finishes them through the codec and delivers the coded frames to the lent `CAPTURE` buffers
+/// before it lets go, waiting at most this long for the codec to emit the frames still in flight
+/// (D78; the device's [`VideoEncoderBackendSession::drain_for_streamoff`]). Same order as the
+/// codec start / flush / stop bounds.
+const ENCODER_STREAMOFF_DRAIN: Duration = Duration::from_secs(2);
+/// How many bytes of staged raw frames the session holds before it stops acking a queued
+/// `OUTPUT` frame and lets it wait lent instead. Staging returns the guest's frame the moment it
+/// is copied (the decoder's D48, on the input queue), which removes the codec-input-slot throttle
+/// a fast feeder would otherwise hit -- but an owned NV12 copy is a megabyte or more, so a guest
+/// that floods `OUTPUT` faster than the codec drains would make the session hold unbounded raw
+/// frames. Past this budget a frame waits lent (the pre-staging backpressure the `OUTPUT` queue
+/// has) and is acked when a codec input slot takes it. The byte budget is the memory bound; the
+/// *pacing* bound is tighter -- one codec output window of un-fed copies (`encode`), because 64
+/// MiB of run-ahead let a fast feeder race its own EOF teardown and regressed 720p 4M from 287
+/// to ~256 across F19 (B16-acceptance §8, open item 1).
+const INPUT_STAGE_BYTES: usize = 64 << 20;
+/// The output format key that carries how many output buffers the codec fills before it
+/// recycles the oldest -- the same CCodec/C2 field the decoder reads at its `SOURCE_CHANGE`
+/// (D69, `android.rs`), which the encoder publishes too: `c2.qti.avc.encoder` reports
+/// `num-output-slots: 8` at 720p on 5566 (B15's vmlog, quoted in F19-encoder §2). It has no
+/// `AMEDIAFORMAT_KEY_*` NDK symbol and is read by its literal name. Absent on a component that
+/// does not publish it, in which case nothing is learned and no `CAPTURE` floor is reported.
+const NUM_OUTPUT_SLOTS_KEY: &std::ffi::CStr = c"num-output-slots";
+
+/// The `CAPTURE` floor reported to the device for a codec whose output-slot count is known:
+/// twice the codec's own window. One window covers the coded frames the codec can hand over in
+/// a single burst -- and it does burst, because the session copies coded frames out and holds
+/// them ready (`held_outputs`), so a freshly queued buffer is filled at once; the second window
+/// covers the buffers the client still holds un-requeued while it writes that burst out, so the
+/// queue never runs dry in between. ffmpeg's `h264_v4l2m2m` abandons its EOF drain the moment
+/// every CAPTURE buffer sits in userspace at once ("All capture buffers returned to
+/// userspace...", B16-acceptance §5.3) -- its default of 4 reaches that state under any burst,
+/// a two-window allocation does not. For the 8 slots the phone's encoder publishes this lands
+/// on the 16 that B16 measured as 300/300/300 on the very command that loses 40-54 frames at
+/// the default. Nothing here is a fixed count: the floor moves with the codec's own number,
+/// and that number is only ever what a real session's output format reported (a B17 read on
+/// the phone).
+fn capture_floor(slots: u32) -> u32 {
+    slots.saturating_mul(2)
+}
+
+/// The bitrate a session starts with when the guest sets none (`V4L2_CID_MPEG_VIDEO_BITRATE`'s
+/// default), clamped into the codec's range. ffmpeg always sets one; GStreamer's `v4l2h264enc`
+/// only with its `extra-controls`.
+const DEFAULT_BITRATE: i32 = 2_000_000;
+/// `V4L2_CID_MPEG_VIDEO_GOP_SIZE`'s range: MediaCodec takes the keyframe interval in seconds
+/// (`KEY_I_FRAME_INTERVAL`, converted with the frame rate at `configure`; 0 = every frame a
+/// keyframe), so the range is a driver's choice -- venus's `0..65535`, default 30 (one keyframe
+/// per second at the default 30 fps).
+const GOP_RANGE: ControlRange = ControlRange::new(0, 65_535, 30);
+/// The quantiser range an 8-bit H.264 / HEVC codec accepts; offered only when the codec reports
+/// `FEATURE_QpBounds`, and passed to it only when the guest narrows it.
+const QP_RANGE: QpRange = QpRange { min: 0, max: 51 };
+/// Offered for a codec whose `VideoCapabilities` the platform does not publish (the no-Store
+/// fallback of `android_codec::list_codecs`). Logged when used.
+const FALLBACK_SIZE_RANGE: SizeRange = SizeRange::new(16, 4096, 2);
+const FALLBACK_FRAME_RATE: FrameRateRange = FrameRateRange { min: 1, max: 240 };
+const FALLBACK_BITRATE: (i32, i32) = (1, 100_000_000);
+
+/// `AMediaCodecInfo_FEATURE_QpBounds`: the codec honours `KEY_VIDEO_QP_MIN` / `_MAX`.
+const FEATURE_QP_BOUNDS: &str = "qp-bounds";
+
+/// The AV1 fourcc `AV01` (`V4L2_PIX_FMT_AV1`, D54): offered only with `allow_sw`
+/// (`logs/vpu_wp/M7-crate.md` §8 item 1:
+/// `v4l2-compliance` does not know AV1 as a stateful-encoder format and would fail two tests).
+const AV01: PixelFormat = PixelFormat::from_fourcc(b"AV01");
+
+// ---------------------------------------------------------------------------------------------
+// MediaCodec <-> V4L2 value maps
+// ---------------------------------------------------------------------------------------------
+
+/// The profile a session starts with when the guest sets none: the one the codec picks for
+/// itself (`c2.qti.avc.encoder` answers High, `c2.qti.hevc.encoder` Main,
+/// `logs/vpu_wp/scratch-b5/codec/b5codec/enc_*.txt`), as a V4L2 value.
+fn preferred_profile(mime: &str) -> Option<i32> {
+    match mime {
+        "video/avc" => Some(VideoH264Profile::High as i32),
+        "video/hevc" => Some(VideoHEVCProfile::Main as i32),
+        "video/x-vnd.on2.vp8" | "video/x-vnd.on2.vp9" => Some(0),
+        _ => None,
+    }
+}
+
+/// The way back: a V4L2 level menu value as the MediaCodec constant `KEY_LEVEL` takes (the main
+/// tier for HEVC).
+fn level_to_mc(mime: &str, v4l2: i32) -> Option<i32> {
+    match mime {
+        "video/avc" => H264_LEVELS
+            .iter()
+            .position(|l| *l as i32 == v4l2)
+            .map(|i| 1 << i),
+        "video/hevc" => HEVC_LEVELS
+            .iter()
+            .position(|l| *l as i32 == v4l2)
+            .map(|i| 1 << (2 * i)),
+        _ => None,
+    }
+}
+
+/// `V4L2_CID_MPEG_VIDEO_BITRATE_MODE` as `KEY_BITRATE_MODE` (`ABitrateMode`, written straight
+/// into `"bitrate-mode"`).
+fn bitrate_mode_to_mc(mode: VideoBitrateMode) -> i32 {
+    match mode {
+        VideoBitrateMode::VariableBitrate => BITRATE_MODE_VBR,
+        VideoBitrateMode::ConstantBitrate => BITRATE_MODE_CBR,
+        VideoBitrateMode::ConstantQuality => BITRATE_MODE_CQ,
+    }
+}
+
+/// The V4L2 colorimetry of the raw frames as MediaCodec's `(color-standard, color-range,
+/// color-transfer)`, each `None` where V4L2 has no value the codec could be told. `DEFAULT`
+/// follows the kernel's own defaulting rules for a YUV format: the transfer function of the
+/// colorspace (`V4L2_MAP_XFER_FUNC_DEFAULT`: SDR for every SDR colorspace) and limited range
+/// (`V4L2_MAP_QUANTIZATION_DEFAULT`).
+fn color_aspects(c: &Colorimetry) -> (Option<i32>, Option<i32>, Option<i32>) {
+    let sdr = matches!(
+        c.colorspace,
+        bindings::v4l2_colorspace_V4L2_COLORSPACE_REC709
+            | bindings::v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M
+            | bindings::v4l2_colorspace_V4L2_COLORSPACE_470_SYSTEM_M
+            | bindings::v4l2_colorspace_V4L2_COLORSPACE_470_SYSTEM_BG
+            | bindings::v4l2_colorspace_V4L2_COLORSPACE_BT2020
+    );
+    let standard = match c.colorspace {
+        bindings::v4l2_colorspace_V4L2_COLORSPACE_REC709 => Some(COLOR_STANDARD_BT709),
+        bindings::v4l2_colorspace_V4L2_COLORSPACE_SMPTE170M
+        | bindings::v4l2_colorspace_V4L2_COLORSPACE_470_SYSTEM_M => Some(COLOR_STANDARD_BT601_NTSC),
+        bindings::v4l2_colorspace_V4L2_COLORSPACE_470_SYSTEM_BG => Some(COLOR_STANDARD_BT601_PAL),
+        bindings::v4l2_colorspace_V4L2_COLORSPACE_BT2020 => Some(COLOR_STANDARD_BT2020),
+        _ => None,
+    };
+    let range = match c.quantization {
+        bindings::v4l2_quantization_V4L2_QUANTIZATION_FULL_RANGE => Some(COLOR_RANGE_FULL),
+        bindings::v4l2_quantization_V4L2_QUANTIZATION_LIM_RANGE => Some(COLOR_RANGE_LIMITED),
+        bindings::v4l2_quantization_V4L2_QUANTIZATION_DEFAULT if sdr => Some(COLOR_RANGE_LIMITED),
+        _ => None,
+    };
+    let transfer = match c.xfer_func {
+        bindings::v4l2_xfer_func_V4L2_XFER_FUNC_709 => Some(COLOR_TRANSFER_SDR_VIDEO),
+        bindings::v4l2_xfer_func_V4L2_XFER_FUNC_SMPTE2084 => Some(COLOR_TRANSFER_ST2084),
+        bindings::v4l2_xfer_func_V4L2_XFER_FUNC_NONE => Some(COLOR_TRANSFER_LINEAR),
+        bindings::v4l2_xfer_func_V4L2_XFER_FUNC_DEFAULT if sdr => Some(COLOR_TRANSFER_SDR_VIDEO),
+        _ => None,
+    };
+    (standard, range, transfer)
+}
+
+/// `KEY_I_FRAME_INTERVAL` for a GOP: seconds between keyframes at the frame rate, which
+/// `CCodecConfig` turns back into frames as `interval * rate + 0.5` (`CCodecConfig.cpp:1743`),
+/// so a fractional interval round-trips to the GOP the guest set. `0` = every frame a keyframe,
+/// on both sides.
+fn i_frame_interval(gop_size: u32, fps: f32) -> f32 {
+    if gop_size == 0 || fps <= 0.0 {
+        0.0
+    } else {
+        gop_size as f32 / fps
+    }
+}
+
+/// Write `value` under `key` as the int the Java world writes when it is whole, as a float
+/// otherwise (`KEY_FRAME_RATE` and `KEY_I_FRAME_INTERVAL` are "int or float").
+fn set_number(format: &mut MediaFormat, key: &std::ffi::CStr, value: f32) {
+    if value.fract() == 0.0 && value.abs() < i32::MAX as f32 {
+        format.set_i32(key, value as i32);
+    } else {
+        format.set_f32(key, value);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The input layout and the copy into it
+// ---------------------------------------------------------------------------------------------
+
+/// How the codec wants its input buffer laid out, read back from `AMediaCodec_getInputFormat`
+/// after `configure` (`CCodec.cpp:2004-2053`): rows padded to `stride`, the chroma plane
+/// `slice_height` rows down, interleaved (NV12, `COLOR_FormatYUV420SemiPlanar`) or as two planes
+/// of `stride / 2` bytes per row (`COLOR_FormatYUV420Planar`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InputLayout {
+    color_format: i32,
+    stride: usize,
+    slice_height: usize,
+    semiplanar: bool,
+}
+
+impl InputLayout {
+    /// Bytes the padded frame occupies: what `queueInputBuffer` is given as the size. The chroma
+    /// plane is `ceil(slice_height / 2)` rows of `stride`: half a row more than `luma / 2` for
+    /// an odd slice height, which `pack_frame` writes and the bound must count (review-m7 R7-6).
+    fn frame_size(&self) -> usize {
+        self.stride * self.slice_height + self.stride * self.slice_height.div_ceil(2)
+    }
+}
+
+/// Bytes of one tightly packed NV12 frame of `width` x `height` (`bytesperline = width`; odd
+/// dimensions round the chroma plane up), the device's `OUTPUT` frame contract.
+fn nv12_size(width: usize, height: usize) -> usize {
+    width * height + 2 * width.div_ceil(2) * height.div_ceil(2)
+}
+
+/// Copy `visible` of the tightly packed NV12 frame at `src` (`coded.0` bytes per luma row,
+/// chroma at `coded.0 * coded.1`, `src_len` bytes in all) into `dst` as `layout` says, and
+/// return the bytes used. Bytes in the padding are left as they were.
+///
+/// The crop's origin is held to even coordinates, so its chroma samples exist as a whole; the
+/// codec was configured with the visible size, so what it gets is the visible picture alone.
+///
+/// # Safety
+///
+/// `src` must point at `src_len` readable bytes that stay mapped for the duration of the call.
+unsafe fn pack_frame(
+    src: *const u8,
+    src_len: usize,
+    coded: (u32, u32),
+    visible: Rect,
+    layout: &InputLayout,
+    dst: &mut [u8],
+) -> Result<usize, String> {
+    let (cw, ch) = (coded.0 as usize, coded.1 as usize);
+    let left = (visible.left.max(0) as usize & !1).min(cw);
+    let top = (visible.top.max(0) as usize & !1).min(ch);
+    let w = (visible.width as usize).min(cw - left);
+    let h = (visible.height as usize).min(ch - top);
+    if w == 0 || h == 0 {
+        return Err(format!(
+            "an empty visible rectangle ({:?} of {}x{})",
+            visible, cw, ch
+        ));
+    }
+    if src_len < nv12_size(cw, ch) {
+        return Err(format!(
+            "a {}-byte OUTPUT buffer holds no {}x{} NV12 frame ({} bytes)",
+            src_len,
+            cw,
+            ch,
+            nv12_size(cw, ch)
+        ));
+    }
+    if layout.stride < w || layout.slice_height < h {
+        return Err(format!(
+            "the codec's input layout (stride {}, slice-height {}) does not cover a {}x{} picture",
+            layout.stride, layout.slice_height, w, h
+        ));
+    }
+    let needed = layout.frame_size();
+    if dst.len() < needed {
+        return Err(format!(
+            "the codec's input buffer holds {} bytes, the padded {}x{} frame needs {}",
+            dst.len(),
+            layout.stride,
+            layout.slice_height,
+            needed
+        ));
+    }
+    let chroma_src = cw * ch;
+    let chroma_row_src = 2 * cw.div_ceil(2);
+    let chroma_rows = h.div_ceil(2);
+    let chroma_w = 2 * w.div_ceil(2);
+    let chroma_dst = layout.stride * layout.slice_height;
+    // The bound the raw-pointer copies below rely on, stated on its own rather than derived
+    // from `needed` (review-m7 R7-6): the last chroma row written ends at
+    // `chroma_dst + (chroma_rows - 1) * stride + chroma_w`, and `chroma_w` may exceed the stride
+    // by one for an odd width at an odd stride. `input_layout` refuses an odd stride, so this
+    // is a check on the arithmetic, not a path.
+    let chroma_end = chroma_dst + (chroma_rows - 1) * layout.stride + chroma_w;
+    if chroma_w > layout.stride || chroma_end > dst.len() {
+        return Err(format!(
+            "the {}x{} picture's chroma rows ({} bytes at a {} stride) do not fit the codec's \
+             {}-byte input buffer",
+            w,
+            h,
+            chroma_w,
+            layout.stride,
+            dst.len()
+        ));
+    }
+
+    for row in 0..h {
+        // SAFETY: `src` holds `nv12_size(cw, ch)` bytes (checked above); this row of the luma
+        // plane lies inside it; `dst` is a slice we hold exclusively; the two never overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.add((top + row) * cw + left),
+                dst.as_mut_ptr().add(row * layout.stride),
+                w,
+            )
+        };
+    }
+    if layout.semiplanar {
+        for row in 0..chroma_rows {
+            // SAFETY: as above, for a row of the interleaved chroma plane.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add(chroma_src + (top / 2 + row) * chroma_row_src + left),
+                    dst.as_mut_ptr().add(chroma_dst + row * layout.stride),
+                    chroma_w,
+                )
+            };
+        }
+    } else {
+        let half = layout.stride / 2;
+        let v_plane = chroma_dst + half * (layout.slice_height / 2);
+        let mut row_buf = vec![0u8; chroma_w];
+        for row in 0..chroma_rows {
+            // SAFETY: as above; the row goes through a scratch buffer to be de-interleaved.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.add(chroma_src + (top / 2 + row) * chroma_row_src + left),
+                    row_buf.as_mut_ptr(),
+                    chroma_w,
+                )
+            };
+            for (col, pair) in row_buf.chunks_exact(2).enumerate() {
+                dst[chroma_dst + row * half + col] = pair[0];
+                dst[v_plane + row * half + col] = pair[1];
+            }
+        }
+    }
+    Ok(needed)
+}
+
+// ---------------------------------------------------------------------------------------------
+// The backend: enumeration
+// ---------------------------------------------------------------------------------------------
+
+/// One codec the backend picked for a coded format: what the session creates.
+#[derive(Clone, Debug)]
+struct ChosenEncoder {
+    fourcc: PixelFormat,
+    mime: String,
+    /// The canonical name, the one `AMediaCodec_createCodecByName` takes.
+    name: String,
+    hardware: bool,
+    vendor: bool,
+    /// The codec honours `KEY_VIDEO_QP_MIN` / `_MAX`.
+    qp_bounds: bool,
+    /// The level the device's control starts at (the highest the codec supports). A session at
+    /// that value does not pass `KEY_LEVEL`, so the codec picks the level its size and rate
+    /// need -- a stream stamped with the maximum level would be refused by players that check
+    /// levels; a guest that sets another level gets exactly that one.
+    default_level: Option<i32>,
+}
+
+/// The platform's hardware encoders as `EncoderCapabilities`, enumerated once. Cheap to clone:
+/// the device factory builds a device from it on the worker thread at every start.
+#[derive(Clone, Debug)]
+pub struct MediaCodecEncoderBackend {
+    caps: EncoderCapabilities,
+    /// Parallel to `caps.coded_formats`.
+    codecs: Vec<ChosenEncoder>,
+    /// The output-slot count (`num-output-slots`) a session's codec last reported for a coded
+    /// fourcc, remembered across sessions in the helper process -- the encoder's twin of the
+    /// decoder backend's `learned_min` (D77). A client sizes its `CAPTURE` (bitstream) queue
+    /// with `REQBUFS` before `STREAMON` ever creates the codec, so the count a session learns
+    /// can only help the *next* session of the format: the device reads it back through
+    /// `min_capture_buffers` (as [`capture_floor`]) and raises a smaller `REQBUFS(CAPTURE)` to
+    /// it (B16-acceptance §5.3, the D78 residual). Shared through the `Clone` the device factory
+    /// makes at every start, so the count outlives a session. No number is hardcoded: it is only
+    /// ever what a real codec's output format reported.
+    learned_slots: Arc<Mutex<HashMap<u32, u32>>>,
+}
+
+impl MediaCodecEncoderBackend {
+    /// Enumerate the encoders and choose one per coded format, with the profiles and levels
+    /// each supports. Loads the NDK, which starts this process's binder thread pool, and walks
+    /// the codec store's lazily built tables, which have no lock: call it once, from one thread,
+    /// after the uid drop (design §7.2, §7.3).
+    ///
+    /// Software encoders are left out unless `allow_sw`, and so is AV1 (`AV01`) altogether; a
+    /// format with no eligible encoder is simply not offered. A platform with no eligible
+    /// encoder at all still gets its device, with no coded format (`ENUM_FMT` lists nothing and
+    /// the device refuses every session with `ENODEV`): a helper that exits is a VM that does
+    /// not boot, which the app cannot foresee (`logs/vpu_wp/A4.md` §10 item 2).
+    pub fn new(allow_sw: bool) -> anyhow::Result<Self> {
+        let list = list_codecs(&ListOptions {
+            include_non_video: false,
+            // The profile and level menus need the probe (`isFormatSupported` per candidate,
+            // `logs/vpu_wp/M6-probe.md` §3): in-process checks on the store's tables, not binder
+            // round trips, so a helper start can afford them.
+            probe_profiles: true,
+            sizes: Vec::new(),
+        })
+        .context("cannot enumerate the platform's codecs")?;
+        if !list.missing_symbols.is_empty() {
+            warn!(
+                "encoder: {} optional NDK symbol(s) missing; codecs listed by {}",
+                list.missing_symbols.len(),
+                list.source
+            );
+        }
+        let encoders = list
+            .codecs
+            .iter()
+            .filter(|c| c.kind == CodecKind::Encoder)
+            .count();
+
+        let mut caps = EncoderCapabilities {
+            coded_formats: Vec::new(),
+            min_output_buffers: MIN_OUTPUT_BUFFERS,
+        };
+        let mut codecs = Vec::new();
+        for (fourcc, mime) in CODED_FORMATS {
+            let fourcc = PixelFormat::from_fourcc(fourcc);
+            if fourcc == AV01 && !allow_sw {
+                info!(
+                    "encoder: {} is offered only with allow_sw=true (v4l2-compliance does not \
+                     know AV1 as a stateful-encoder format)",
+                    fourcc
+                );
+                continue;
+            }
+            match choose(&list.codecs, CodecKind::Encoder, mime, allow_sw) {
+                Some((chosen, passed_over)) => {
+                    let (format, codec) = describe(chosen, fourcc, mime);
+                    info!(
+                        "encoder: {} -> {} ({}, {}{}), {}..{} x {}..{} step {}x{}, {}..{} fps, \
+                         {}..{} bit/s, modes {}, profiles {:?}, levels {:?}, qp {}; passed over: {}",
+                        fourcc,
+                        chosen.name,
+                        mime,
+                        if codec.hardware {
+                            "hardware"
+                        } else {
+                            "software"
+                        },
+                        if codec.vendor { ", vendor" } else { "" },
+                        format.width.min,
+                        format.width.max,
+                        format.height.min,
+                        format.height.max,
+                        format.width.step,
+                        format.height.step,
+                        format.frame_rate.min,
+                        format.frame_rate.max,
+                        format.bitrate.min,
+                        format.bitrate.max,
+                        format
+                            .bitrate_modes
+                            .iter()
+                            .map(|m| format!("{:?}", m))
+                            .collect::<Vec<_>>()
+                            .join("/"),
+                        format.profiles,
+                        format.levels,
+                        match format.qp {
+                            Some(qp) => format!("{}..{}", qp.min, qp.max),
+                            None => "none".to_string(),
+                        },
+                        if passed_over.is_empty() {
+                            "none".to_string()
+                        } else {
+                            passed_over.join(", ")
+                        }
+                    );
+                    caps.coded_formats.push(format);
+                    codecs.push(codec);
+                }
+                None => {
+                    let software: Vec<&str> = list
+                        .codecs
+                        .iter()
+                        .filter(|c| c.kind == CodecKind::Encoder && c.mime == mime)
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    if software.is_empty() {
+                        info!("encoder: {} has no encoder on this platform", fourcc);
+                    } else {
+                        info!(
+                            "encoder: {} has no usable hardware encoder (only {}; \
+                             allow_sw=true would include software)",
+                            fourcc,
+                            software.join(", ")
+                        );
+                    }
+                }
+            }
+        }
+        if caps.coded_formats.is_empty() {
+            warn!(
+                "encoder: no usable video encoder: the codec store ({}) lists {} encoder(s), \
+                 none of them hardware for {} (allow_sw={}); the device is served with no coded \
+                 format, and every session on it is refused with ENODEV",
+                list.source,
+                encoders,
+                CODED_FORMATS
+                    .iter()
+                    .map(|(_, mime)| *mime)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                allow_sw
+            );
+            return Ok(Self {
+                caps,
+                codecs,
+                learned_slots: Default::default(),
+            });
+        }
+        info!(
+            "encoder: {} coded format(s) for the guest from {} ({} encoder(s) listed, \
+             allow_sw={}): {}",
+            caps.coded_formats.len(),
+            list.source,
+            encoders,
+            allow_sw,
+            codecs
+                .iter()
+                .map(|c| format!("{} {}", c.fourcc, c.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ok(Self {
+            caps,
+            codecs,
+            learned_slots: Default::default(),
+        })
+    }
+}
+
+/// A chosen codec as the `CodedFormat` the device advertises and the `ChosenEncoder` the
+/// session creates: every range, menu and default from what the store said, with a logged
+/// fallback where it said nothing.
+fn describe(info: &CodecInfo, fourcc: PixelFormat, mime: &str) -> (CodedFormat, ChosenEncoder) {
+    let (width, height, frame_rate, bitrate) = match &info.video {
+        Some(v) => {
+            let size = |lo: i32, hi: i32, step: i32| {
+                let lo = lo.max(1) as u32;
+                SizeRange::new(lo, hi.max(lo as i32) as u32, step.max(1) as u32)
+            };
+            let frame_rate = if v.frame_rates.1 <= 0 {
+                warn!(
+                    "encoder: {} ({}) publishes no frame-rate range; offering {}..{} fps",
+                    fourcc, info.name, FALLBACK_FRAME_RATE.min, FALLBACK_FRAME_RATE.max
+                );
+                FALLBACK_FRAME_RATE
+            } else {
+                let min = v.frame_rates.0.max(1) as u32;
+                FrameRateRange {
+                    min,
+                    max: (v.frame_rates.1 as u32).max(min),
+                }
+            };
+            let bitrate = if v.bitrates.1 <= 0 {
+                warn!(
+                    "encoder: {} ({}) publishes no bitrate range; offering {}..{} bit/s",
+                    fourcc, info.name, FALLBACK_BITRATE.0, FALLBACK_BITRATE.1
+                );
+                FALLBACK_BITRATE
+            } else {
+                (v.bitrates.0.max(1), v.bitrates.1.max(v.bitrates.0.max(1)))
+            };
+            // The rectangle the codec honours, not the store's two ranges as if independent:
+            // `8192 x 8192` on 5566 is `8192 x 4320` (B5 §5.1 item 4, follow-up 6; review-m7
+            // R7-5). A frame past it is refused by `S_FMT` here instead of by `configure` at
+            // `STREAMON`, with no word about which dimension was wrong.
+            let height_max = match honest_height_max(v) {
+                Some(hi) => {
+                    info!(
+                        "encoder: {} ({}) takes {} x {} at most, not {} x {}: the height is \
+                         published as {}..{}",
+                        fourcc, info.name, v.widths.1, hi, v.widths.1, v.heights.1, v.heights.0, hi
+                    );
+                    hi
+                }
+                None => v.heights.1,
+            };
+            (
+                size(v.widths.0, v.widths.1, v.width_alignment),
+                size(v.heights.0, height_max, v.height_alignment),
+                frame_rate,
+                bitrate,
+            )
+        }
+        None => {
+            warn!(
+                "encoder: {} ({}) publishes no video capabilities; offering {}..{} step {} in \
+                 both dimensions, {}..{} fps, {}..{} bit/s",
+                fourcc,
+                info.name,
+                FALLBACK_SIZE_RANGE.min,
+                FALLBACK_SIZE_RANGE.max,
+                FALLBACK_SIZE_RANGE.step,
+                FALLBACK_FRAME_RATE.min,
+                FALLBACK_FRAME_RATE.max,
+                FALLBACK_BITRATE.0,
+                FALLBACK_BITRATE.1
+            );
+            (
+                FALLBACK_SIZE_RANGE,
+                FALLBACK_SIZE_RANGE,
+                FALLBACK_FRAME_RATE,
+                FALLBACK_BITRATE,
+            )
+        }
+    };
+
+    // The bitrate modes the store says the codec takes, VBR (the default) before CBR. Constant
+    // quality is not offered: MediaCodec's CQ needs `KEY_QUALITY`, which the device has no
+    // control for (`V4L2_CID_MPEG_VIDEO_CONSTANT_QUALITY` is not in its table).
+    let bitrate_modes = match &info.encoder {
+        Some(caps) => {
+            let supported = |name: &str| caps.bitrate_modes.iter().any(|(n, s)| n == name && *s);
+            let mut modes = Vec::new();
+            if supported("VBR") {
+                modes.push(VideoBitrateMode::VariableBitrate);
+            }
+            if supported("CBR") {
+                modes.push(VideoBitrateMode::ConstantBitrate);
+            }
+            if modes.is_empty() {
+                warn!(
+                    "encoder: {} ({}) supports neither VBR nor CBR ({:?}); offering VBR",
+                    fourcc, info.name, caps.bitrate_modes
+                );
+                modes.push(VideoBitrateMode::VariableBitrate);
+            }
+            modes
+        }
+        None => {
+            warn!(
+                "encoder: {} ({}) publishes no encoder capabilities; offering VBR and CBR",
+                fourcc, info.name
+            );
+            vec![
+                VideoBitrateMode::VariableBitrate,
+                VideoBitrateMode::ConstantBitrate,
+            ]
+        }
+    };
+
+    // Profiles as probed, the codec's own default first; levels as the union over the profiles,
+    // highest first (the default, see `ChosenEncoder::default_level`). The mapping itself is
+    // shared with the decoder backend (`android::profiles_and_levels`); what is the encoder's own
+    // is which profile it starts a session with.
+    let (mut profiles, levels) = profiles_and_levels(info, mime);
+    if let Some(preferred) = preferred_profile(mime) {
+        if let Some(at) = profiles.iter().position(|p| *p == preferred) {
+            profiles.remove(at);
+            profiles.insert(0, preferred);
+        }
+    }
+    let qp = has_feature(info, FEATURE_QP_BOUNDS).then_some(QP_RANGE);
+
+    let format = CodedFormat {
+        fourcc,
+        width,
+        height,
+        frame_rate,
+        bitrate: ControlRange::new(
+            bitrate.0,
+            bitrate.1,
+            DEFAULT_BITRATE.clamp(bitrate.0, bitrate.1),
+        ),
+        gop_size: GOP_RANGE,
+        bitrate_modes,
+        profiles,
+        levels: levels.clone(),
+        qp,
+    };
+    let codec = ChosenEncoder {
+        fourcc,
+        mime: mime.to_string(),
+        name: info.name.clone(),
+        hardware: is_hardware(info),
+        vendor: info.is_vendor,
+        qp_bounds: qp.is_some(),
+        default_level: levels.first().copied(),
+    };
+    (format, codec)
+}
+
+impl VideoEncoderBackend for MediaCodecEncoderBackend {
+    type Session = MediaCodecEncoderSession;
+
+    fn capabilities(&self) -> &EncoderCapabilities {
+        &self.caps
+    }
+
+    fn new_session(&mut self, id: u32, sink: EncoderSink) -> IoctlResult<MediaCodecEncoderSession> {
+        Ok(MediaCodecEncoderSession::new(
+            id,
+            sink,
+            self.codecs.clone(),
+            Arc::clone(&self.learned_slots),
+        ))
+    }
+
+    fn close_session(&mut self, mut session: MediaCodecEncoderSession) {
+        session.stop();
+    }
+
+    /// The `CAPTURE` floor for `fourcc`, once a session's codec has named its output-slot count
+    /// ([`capture_floor`] of it): what the device raises a smaller `REQBUFS(CAPTURE)` to, so
+    /// ffmpeg's fixed 4-buffer ask meets the codec's real need from the second encode of a
+    /// format on (B16-acceptance §5.3, the D78 residual -- the decoder's D77 pattern). `None`
+    /// until a codec has reported; the first session of a format runs unraised, exactly as the
+    /// decoder's does.
+    fn min_capture_buffers(&self, fourcc: PixelFormat) -> Option<u32> {
+        self.learned_slots
+            .lock()
+            .unwrap()
+            .get(&fourcc.to_u32())
+            .map(|slots| capture_floor(*slots))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The session
+// ---------------------------------------------------------------------------------------------
+
+/// A raw frame waiting for a codec input slot, or the end of the stream.
+enum PendingInput {
+    /// A raw frame copied into an owned buffer at [`MediaCodecEncoderSession::encode`] time; the
+    /// guest's `OUTPUT` buffer was returned (`InputBufferDone`) as soon as the copy was made, so
+    /// the guest believes the frame is consumed -- which it is, by us. The codec is fed from this
+    /// copy in [`MediaCodecEncoderSession::pump_input`] as input slots free, and a
+    /// `STREAMOFF(OUTPUT)` that lands with copies still un-fed drains them rather than dropping
+    /// an already-acked frame (D48's decoder staging, mirrored on the input queue; D78).
+    Staged {
+        data: Vec<u8>,
+        timestamp: bindings::timeval,
+    },
+    /// A guest `OUTPUT` frame held lent, un-acked: the staging budget ([`INPUT_STAGE_BYTES`]) was
+    /// full when it arrived, so it waits the pre-staging way -- the guest's `OUTPUT` buffer is
+    /// the backpressure a fast feeder would otherwise defeat -- and is acked when a codec input
+    /// slot takes it.
+    Lent(InputBuffer),
+    Eos,
+}
+
+/// What the codec delivered and no `CAPTURE` buffer has taken yet, in delivery order. Every
+/// coded output is copied out of the codec's buffer as it arrives and the buffer released at
+/// once (a coded frame is tens of kilobytes against the megabyte raw copy, and the codec never
+/// waits on the guest for an output slot), so what is held here is the session's own and
+/// survives a flush.
+enum Held {
+    /// The stream headers alone (`SEPARATE` mode): a `CAPTURE` buffer of their own.
+    Headers { bytes: Vec<u8>, pts_us: i64 },
+    /// A coded frame; `is_last` when it carried the codec's `END_OF_STREAM`.
+    Coded {
+        bytes: Vec<u8>,
+        pts_us: i64,
+        key: bool,
+        is_last: bool,
+    },
+    /// An empty `LAST` buffer owed to the guest: the `END_OF_STREAM` output was empty.
+    EmptyLast { pts_us: i64 },
+}
+
+/// Coded frames held back because no `CAPTURE` buffer is lent, beyond which no raw frame is
+/// fed: a guest that streams `OUTPUT` without ever queueing a `CAPTURE` buffer would otherwise
+/// have the session hold a growing bitstream for it. Its raw frames stay lent, which is the
+/// backpressure V4L2 has.
+const HELD_OUTPUT_LIMIT: usize = 32;
+
+/// What `start`'s bounded thread hands back.
+struct Started {
+    codec: Codec,
+    input_format: MediaFormat,
+    /// The `KEY_COLOR_FORMAT` the codec accepted.
+    color_format: i32,
+}
+
+/// The input layout the codec published after `configure`, or why the codec is refused. The
+/// stride falls back to the width as the framework's own client does
+/// (`MediaCodec_sanity_test.cpp:357`); the slice height does not: its absence means the chroma
+/// offset is not a whole number of strides, so the `Y[stride * slice_height]` packing would be
+/// wrong (design §7.3, `android_codec::InputLayout`). An odd stride is refused too (a 4:2:0
+/// chroma row is two bytes per sample pair, so `stride / 2` planes and `chroma_w <= stride`
+/// both need it even), and so is an odd slice height for a planar layout, whose Cr plane sits
+/// `stride / 2 * slice_height / 2` bytes into the chroma area (review-m7 R7-6).
+///
+/// A read-back of `COLOR_FormatYUV420Flexible` says nothing about the layout. It is taken as
+/// semi-planar only for a vendor hardware codec, on the strength of B5 §5.4 (byte-identical
+/// bitstreams from `SemiPlanar` and `Flexible` on `c2.qti.avc.encoder`); for anything else --
+/// the software `c2.android.*` encoders, whose flexible layout is I420 planar (B5 follow-up 5)
+/// -- it is refused rather than guessed, since a wrong guess is a stream with its chroma
+/// scrambled that only a visual check finds (review-m7 R7-9).
+fn input_layout(
+    format: &MediaFormat,
+    requested: i32,
+    width: u32,
+    height: u32,
+    vendor_hardware: bool,
+) -> Result<InputLayout, String> {
+    let color_format = format.get_i32(keys::COLOR_FORMAT).unwrap_or(requested);
+    let semiplanar = match color_format {
+        COLOR_FORMAT_YUV420_SEMI_PLANAR
+        | COLOR_FORMAT_YUV420_PACKED_SEMI_PLANAR
+        | COLOR_QCOM_FORMAT_YUV420_SEMI_PLANAR => true,
+        COLOR_FORMAT_YUV420_PLANAR | COLOR_FORMAT_YUV420_PACKED_PLANAR => false,
+        COLOR_FORMAT_YUV420_FLEXIBLE if vendor_hardware => true,
+        COLOR_FORMAT_YUV420_FLEXIBLE => {
+            return Err(format!(
+                "reads its input back as {}, which says nothing about the layout, and it is not \
+                 a vendor hardware codec whose flexible layout is known to be semi-planar (input \
+                 format: {})",
+                color_format_name(color_format),
+                format
+            ))
+        }
+        other => {
+            return Err(format!(
+                "wants input color-format {}, which is neither semi-planar nor planar 4:2:0 \
+                 (input format: {})",
+                color_format_name(other),
+                format
+            ))
+        }
+    };
+    let stride = format.get_i32(keys::STRIDE).unwrap_or(width as i32);
+    let Some(slice_height) = format.get_i32(keys::SLICE_HEIGHT) else {
+        return Err(format!(
+            "publishes no slice-height for {}x{} (input format: {}), so the chroma offset \
+             cannot be derived (design 7.3)",
+            width, height, format
+        ));
+    };
+    if stride < width as i32 || slice_height < height as i32 {
+        return Err(format!(
+            "publishes stride {} and slice-height {} for a {}x{} picture (input format: {})",
+            stride, slice_height, width, height, format
+        ));
+    }
+    if stride % 2 != 0 || (!semiplanar && slice_height % 2 != 0) {
+        return Err(format!(
+            "publishes an odd stride {} or, for a planar layout, an odd slice-height {} (input \
+             format: {}), which no 4:2:0 packing can honour",
+            stride, slice_height, format
+        ));
+    }
+    Ok(InputLayout {
+        color_format,
+        stride: stride as usize,
+        slice_height: slice_height as usize,
+        semiplanar,
+    })
+}
+
+/// `setParameters(request-sync)`: the next frame the component processes is a keyframe -- the
+/// same moment a kernel driver's `V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME` takes effect.
+fn request_sync(id: u32, codec: &Codec) {
+    let result = MediaFormat::new().and_then(|mut params| {
+        params.set_i32(keys::REQUEST_SYNC_FRAME, 0);
+        codec.set_parameters(&params)
+    });
+    match result {
+        Ok(()) => info!("encoder session {}: keyframe requested", id),
+        Err(e) => warn!("encoder session {}: request-sync: {}", id, e),
+    }
+}
+
+/// One encode: see the module documentation.
+pub struct MediaCodecEncoderSession {
+    id: u32,
+    sink: EncoderSink,
+    codecs: Vec<ChosenEncoder>,
+    /// The codec, from `start` to `stop`.
+    codec: Option<Codec>,
+    chosen: Option<ChosenEncoder>,
+    /// How the codec wants its input buffers filled, read back after `configure`.
+    layout: Option<InputLayout>,
+    coded_size: (u32, u32),
+    visible: Rect,
+    header_mode: VideoHeaderMode,
+    /// Input indices the codec offered and nothing has used yet.
+    free_inputs: VecDeque<i32>,
+    /// Raw frames waiting for an input index, oldest first.
+    pending: VecDeque<PendingInput>,
+    /// Bytes held in [`PendingInput::Staged`] copies in `pending`: the staging budget's tally.
+    staged_bytes: usize,
+    /// The coded fourcc the running codec was created for (`start`'s config), the key the
+    /// learned output-slot count is remembered under.
+    coded_fourcc: Option<PixelFormat>,
+    /// The codec's own output-buffer window (`num-output-slots`), from the shared record at
+    /// `start` and from the codec's output format when it reports one (`note_output_slots`).
+    /// Bounds how many frames `encode` stages ahead of the codec; `None` until any codec of
+    /// this fourcc has reported.
+    output_slots: Option<u32>,
+    /// The helper-wide `fourcc -> num-output-slots` record shared with the backend (D77's
+    /// shape): what `min_capture_buffers` answers the device from.
+    learned_slots: Arc<Mutex<HashMap<u32, u32>>>,
+    /// `CAPTURE` buffers lent by the device, oldest first.
+    captures: VecDeque<OutputBuffer>,
+    /// Coded outputs the codec delivered that no `CAPTURE` buffer has taken yet.
+    held_outputs: VecDeque<Held>,
+    /// The stream headers in `JOINED_WITH_1ST_FRAME` mode, waiting for the next frame.
+    joined_headers: Option<Vec<u8>>,
+    /// For the device, in order.
+    events: Vec<EncoderEvent>,
+    /// An `END_OF_STREAM` input is queued: the codec takes no more input until a flush. Also
+    /// the only state under which an `END_OF_STREAM` output means anything: the flag on a
+    /// callback delivered after a flush is stale (review-m7 R7-1).
+    eos_queued: bool,
+    /// The codec is gone (error, timeout); the device has been or is being told.
+    dead: bool,
+    input_capacity: Option<usize>,
+    /// The timestamp of the first frame queued since the codec started: what a headers-only
+    /// buffer carries (`V4L2_MPEG_VIDEO_HEADER_MODE_SEPARATE`).
+    first_pts: Option<i64>,
+    /// Since the last flush: indices the codec refused, and stale indices ignored (D23).
+    refused: u32,
+    stale: u32,
+    /// `Codec::stale_events` as of the last flush: what the crate's generation stamp dropped.
+    stale_events_seen: u64,
+    flushes: u32,
+    inputs: u64,
+    frames: u64,
+    keyframes: u64,
+    bytes: u64,
+    started_at: Option<Instant>,
+}
+
+impl MediaCodecEncoderSession {
+    fn new(
+        id: u32,
+        sink: EncoderSink,
+        codecs: Vec<ChosenEncoder>,
+        learned_slots: Arc<Mutex<HashMap<u32, u32>>>,
+    ) -> Self {
+        Self {
+            id,
+            sink,
+            codecs,
+            codec: None,
+            chosen: None,
+            layout: None,
+            coded_size: (0, 0),
+            visible: Rect::new(0, 0, 0, 0),
+            header_mode: VideoHeaderMode::JoinedWith1stFrame,
+            free_inputs: VecDeque::new(),
+            pending: VecDeque::new(),
+            staged_bytes: 0,
+            coded_fourcc: None,
+            output_slots: None,
+            learned_slots,
+            captures: VecDeque::new(),
+            held_outputs: VecDeque::new(),
+            joined_headers: None,
+            events: Vec::new(),
+            eos_queued: false,
+            dead: false,
+            input_capacity: None,
+            first_pts: None,
+            refused: 0,
+            stale: 0,
+            stale_events_seen: 0,
+            flushes: 0,
+            inputs: 0,
+            frames: 0,
+            keyframes: 0,
+            bytes: 0,
+            started_at: None,
+        }
+    }
+
+    fn codec_name(&self) -> &str {
+        self.chosen.as_ref().map(|c| c.name.as_str()).unwrap_or("-")
+    }
+
+    /// The session is over: the device hears `Error` (and ends it), nothing is lent any more.
+    fn fail(&mut self, why: String) {
+        if self.dead {
+            return;
+        }
+        error!("encoder session {}: {}", self.id, why);
+        self.dead = true;
+        self.pending.clear();
+        self.staged_bytes = 0;
+        self.captures.clear();
+        self.held_outputs.clear();
+        self.free_inputs.clear();
+        self.joined_headers = None;
+        self.events.push(EncoderEvent::Error(why));
+        self.sink.signal();
+    }
+
+    /// A refused input or output index. A null buffer (`CodecError::Null` from `getInputBuffer`
+    /// / `getOutputBuffer`) is a stale index -- a callback the NDK looper had queued before a
+    /// flush and delivered after it (D23) -- and is skipped: counted for the flush line, a debug
+    /// line, never a session error. Anything else is the codec refusing an index it handed out
+    /// (`queueInputBuffer`, or `releaseOutputBuffer` for an output with no bytes to fetch first,
+    /// which is how a stale empty `END_OF_STREAM` shows), tolerated up to
+    /// [`MAX_REFUSED_INDICES`] per flush.
+    fn refused_index(&mut self, what: &str, index: i32, e: &CodecError) {
+        if matches!(e, CodecError::Null(_)) {
+            self.stale += 1;
+            debug!(
+                "encoder session {}: stale {} index {} after a flush ignored ({})",
+                self.id, what, index, e
+            );
+            return;
+        }
+        self.refused += 1;
+        if self.refused <= STALE_LOG_LIMIT {
+            warn!(
+                "encoder session {}: {} index {} refused: {}",
+                self.id, what, index, e
+            );
+        }
+        if self.refused > MAX_REFUSED_INDICES {
+            self.fail(format!(
+                "{} refused {} indices since the last flush; the codec is not taking buffers",
+                self.codec_name(),
+                self.refused
+            ));
+        }
+    }
+
+    /// The codec's output format names its own output-buffer window (`num-output-slots`, the
+    /// C2 field the decoder reads at its `SOURCE_CHANGE`, D69): keep it for this session's
+    /// staging bound, and record it under the coded fourcc for the device's `CAPTURE` floor
+    /// (`min_capture_buffers` -> [`capture_floor`]) -- the decoder's D77 pattern, on the
+    /// encoder for the D78 residual (B16-acceptance §5.3). The client sized its `CAPTURE`
+    /// queue before the codec existed and never re-asks, so the record can only raise the
+    /// *next* session of the format; only ever raised, never lowered, like the decoder's.
+    fn note_output_slots(&mut self, format: &MediaFormat) {
+        let Some(slots) = format.get_i32(NUM_OUTPUT_SLOTS_KEY) else {
+            return;
+        };
+        let slots = slots.max(0) as u32;
+        if slots == 0 {
+            return;
+        }
+        if self.output_slots.unwrap_or(0) < slots {
+            info!(
+                "encoder session {}: codec fills {} output slots; CAPTURE floor {} for later \
+                 sessions of {}",
+                self.id,
+                slots,
+                capture_floor(slots),
+                self.coded_fourcc
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+        self.output_slots = Some(self.output_slots.unwrap_or(0).max(slots));
+        if let Some(fourcc) = self.coded_fourcc {
+            let mut learned = self.learned_slots.lock().unwrap();
+            let entry = learned.entry(fourcc.to_u32()).or_insert(slots);
+            if slots > *entry {
+                *entry = slots;
+            }
+        }
+    }
+
+    /// Feed the codec from the pending FIFO while it offers input slots. A staged frame's guest
+    /// buffer was returned in `encode` (the copy was made then); a lent frame's is returned here,
+    /// when a slot takes it.
+    fn pump_input(&mut self) {
+        // The codec is taken out of `self` for the duration: the helpers below need `self`. It
+        // goes back at the end, dead or not, so `stop` can stop it.
+        let Some(codec) = self.codec.take() else {
+            return;
+        };
+        while !self.dead && !self.eos_queued && self.held_outputs.len() < HELD_OUTPUT_LIMIT {
+            let Some(&index) = self.free_inputs.front() else {
+                break;
+            };
+            let Some(layout) = self.layout else {
+                break;
+            };
+            let (coded, visible) = (self.coded_size, self.visible);
+            // Read what the head needs without holding the borrow across the codec call or the
+            // pop: the raw pointer and length are copied out, and nothing mutates `pending`
+            // between here and `queue_input_with` returning, so the pointer stays valid.
+            enum Head {
+                Eos,
+                Staged {
+                    src: *const u8,
+                    src_len: usize,
+                    pts: u64,
+                },
+                Lent {
+                    src: *const u8,
+                    src_len: usize,
+                    pts: u64,
+                    index: u32,
+                },
+            }
+            let head = match self.pending.front() {
+                None => break,
+                Some(PendingInput::Eos) => Head::Eos,
+                Some(PendingInput::Staged { data, timestamp }) => Head::Staged {
+                    src: data.as_ptr(),
+                    src_len: data.len(),
+                    pts: pts_from(*timestamp),
+                },
+                Some(PendingInput::Lent(buffer)) => Head::Lent {
+                    src: buffer.ptr.as_ptr(),
+                    src_len: buffer.len,
+                    pts: pts_from(buffer.timestamp),
+                    index: buffer.index,
+                },
+            };
+            match head {
+                Head::Eos => match codec.queue_eos(index, 0) {
+                    Ok(()) => {
+                        self.free_inputs.pop_front();
+                        self.pending.pop_front();
+                        self.eos_queued = true;
+                        info!(
+                            "encoder session {}: drain: EOS queued after {} frames",
+                            self.id, self.inputs
+                        );
+                    }
+                    Err(e) => {
+                        self.free_inputs.pop_front();
+                        self.refused_index("input", index, &e);
+                    }
+                },
+                Head::Staged { src, src_len, pts } => {
+                    // SAFETY: `src` points at `src_len` bytes of our own staged copy, alive in
+                    // `pending` until the pop below; nothing touches `pending` before
+                    // `queue_input_with` returns; `dst` is the codec's own buffer, disjoint.
+                    let result = codec.queue_input_with(index, pts, 0, |dst| unsafe {
+                        pack_frame(src, src_len, coded, visible, &layout, dst)
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.free_inputs.pop_front();
+                            if let Some(PendingInput::Staged { data, .. }) =
+                                self.pending.pop_front()
+                            {
+                                self.staged_bytes = self.staged_bytes.saturating_sub(data.len());
+                            }
+                            self.inputs += 1;
+                            if self.first_pts.is_none() {
+                                self.first_pts = Some(pts as i64);
+                            }
+                            // The guest was told `InputBufferDone` in `encode`, when the copy was
+                            // made: nothing to report here.
+                        }
+                        // The frame does not fit the codec's layout or buffer: a configuration
+                        // the session cannot recover from, not a stale index.
+                        Err(e @ (CodecError::Fill(_) | CodecError::BufferTooSmall(..))) => {
+                            self.fail(format!(
+                                "cannot pack a staged frame into codec input {}: {}",
+                                index, e
+                            ));
+                        }
+                        Err(e) => {
+                            self.free_inputs.pop_front();
+                            self.refused_index("input", index, &e);
+                        }
+                    }
+                }
+                Head::Lent {
+                    src,
+                    src_len,
+                    pts,
+                    index: guest_index,
+                } => {
+                    // SAFETY: the device lends `src_len` readable bytes at `src` until we report
+                    // `InputBufferDone`, only on success below; nothing touches `pending` before
+                    // `queue_input_with` returns; `dst` is the codec's own buffer, disjoint.
+                    let result = codec.queue_input_with(index, pts, 0, |dst| unsafe {
+                        pack_frame(src, src_len, coded, visible, &layout, dst)
+                    });
+                    match result {
+                        Ok(()) => {
+                            self.free_inputs.pop_front();
+                            self.pending.pop_front();
+                            self.inputs += 1;
+                            if self.first_pts.is_none() {
+                                self.first_pts = Some(pts as i64);
+                            }
+                            // Held lent for backpressure: the guest's buffer goes back now.
+                            self.events.push(EncoderEvent::InputBufferDone(guest_index));
+                        }
+                        Err(e @ (CodecError::Fill(_) | CodecError::BufferTooSmall(..))) => {
+                            self.fail(format!(
+                                "cannot pack OUTPUT buffer {} into codec input {}: {}",
+                                guest_index, index, e
+                            ));
+                        }
+                        Err(e) => {
+                            self.free_inputs.pop_front();
+                            self.refused_index("input", index, &e);
+                        }
+                    }
+                }
+            }
+        }
+        self.codec = Some(codec);
+    }
+
+    /// Drop the codec's `END_OF_STREAM` marker from `held_outputs` and return whether one was
+    /// there: during a `STREAMOFF(OUTPUT)` drain the `EOS` output is only the codec's "I have
+    /// emitted everything" signal, not a `LAST` buffer the guest asked for (it issued no drain),
+    /// so an empty `LAST` is dropped and a coded frame that carried the flag is delivered as an
+    /// ordinary frame.
+    fn strip_streamoff_last(&mut self) -> bool {
+        let mut found = false;
+        let mut kept: VecDeque<Held> = VecDeque::with_capacity(self.held_outputs.len());
+        while let Some(held) = self.held_outputs.pop_front() {
+            match held {
+                Held::EmptyLast { .. } => found = true,
+                Held::Coded {
+                    bytes,
+                    pts_us,
+                    key,
+                    is_last,
+                } => {
+                    found |= is_last;
+                    kept.push_back(Held::Coded {
+                        bytes,
+                        pts_us,
+                        key,
+                        is_last: false,
+                    });
+                }
+                other => kept.push_back(other),
+            }
+        }
+        self.held_outputs = kept;
+        found
+    }
+
+    /// Drain the codec's own events without waiting (`wait = None`) or waiting up to a bound for
+    /// the first (`wait = Some`), pushing coded outputs into `held_outputs` and freed input slots
+    /// into `free_inputs`. The codec-event half of [`take_events`], shared with the
+    /// `STREAMOFF(OUTPUT)` drain.
+    fn pump_codec(&mut self, wait: Option<Duration>) {
+        let Some(mut codec) = self.codec.take() else {
+            return;
+        };
+        let events = match wait {
+            Some(timeout) => codec.wait_events(timeout).unwrap_or_default(),
+            None => codec.take_events(),
+        };
+        for event in events {
+            match event {
+                CodecEvent::InputAvailable(index) => {
+                    if self.input_capacity.is_none() {
+                        if let Ok(capacity) = codec.input_capacity(index) {
+                            self.input_capacity = Some(capacity);
+                            info!(
+                                "encoder session {}: input buffers hold {} bytes",
+                                self.id, capacity
+                            );
+                            if let Some(layout) = self.layout {
+                                if capacity < layout.frame_size() {
+                                    self.fail(format!(
+                                        "{} offers {}-byte input buffers for a padded frame of \
+                                         {} bytes (stride {}, slice-height {})",
+                                        codec.name(),
+                                        capacity,
+                                        layout.frame_size(),
+                                        layout.stride,
+                                        layout.slice_height
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    self.free_inputs.push_back(index);
+                }
+                CodecEvent::OutputAvailable { index, info } => {
+                    self.take_output(&mut codec, index, info);
+                }
+                CodecEvent::FormatChanged(format) => {
+                    if let Some(format) = &format {
+                        self.note_output_slots(format);
+                    }
+                    info!(
+                        "encoder session {}: output format: {}",
+                        self.id,
+                        format
+                            .map(|f| f.to_string())
+                            .unwrap_or_else(|| "-".to_string())
+                    );
+                }
+                CodecEvent::Error {
+                    status,
+                    action_code,
+                    detail,
+                } => {
+                    self.fail(format!(
+                        "{} reported error {} ({}), action {}: {}",
+                        codec.name(),
+                        status,
+                        media_status_name(status),
+                        action_code,
+                        detail
+                    ));
+                    break;
+                }
+            }
+        }
+        self.codec = Some(codec);
+    }
+
+    /// A `STREAMOFF(OUTPUT)` landed with frames the guest was already told `InputBufferDone` for:
+    /// finish them through the codec and write the coded frames into the `CAPTURE` buffers still
+    /// lent, before the caller's `flush` lets go of the codec. Bounded by
+    /// [`ENCODER_STREAMOFF_DRAIN`]; a frame that finds no `CAPTURE` buffer -- the guest never
+    /// streamed `CAPTURE`, or the bound passed with the queue full -- is dropped, its count
+    /// logged. See [`VideoEncoderBackendSession::drain_for_streamoff`] for why an encoder must
+    /// finish rather than discard an acked frame.
+    fn drain_output_for_streamoff(&mut self) {
+        if self.dead || self.codec.is_none() {
+            return;
+        }
+        let staged = self
+            .pending
+            .iter()
+            .filter(|p| matches!(p, PendingInput::Staged { .. } | PendingInput::Lent(_)))
+            .count();
+        // Nothing lent to write coded frames into: the guest is not reading `CAPTURE` (it never
+        // streamed it, or stopped). There is nowhere to place the accepted frames, so queuing an
+        // `EOS` would only make the codec produce frames with no home; report and let `flush`
+        // drop them.
+        if self.captures.is_empty() {
+            let held = self
+                .held_outputs
+                .iter()
+                .filter(|h| matches!(h, Held::Coded { .. }))
+                .count();
+            if staged + held > 0 {
+                warn!(
+                    "encoder session {}: STREAMOFF(OUTPUT) with no CAPTURE buffer lent: {} \
+                     accepted frame(s) and {} coded frame(s) cannot be delivered and are dropped",
+                    self.id, staged, held
+                );
+            }
+            return;
+        }
+        // Feed everything staged and queue the `EOS` whose output tells us the codec has emitted
+        // the frames still in flight.
+        if !self.eos_queued && !self.pending.iter().any(|p| matches!(p, PendingInput::Eos)) {
+            self.pending.push_back(PendingInput::Eos);
+        }
+        let deadline = Instant::now() + ENCODER_STREAMOFF_DRAIN;
+        let mut drained = false;
+        loop {
+            self.pump_input();
+            drained |= self.strip_streamoff_last();
+            self.pump_output();
+            if self.dead {
+                return;
+            }
+            // The codec has emitted its end marker and everything it produced is delivered, or
+            // there is no `CAPTURE` buffer left for the tail: either way we are done.
+            if drained && (self.held_outputs.is_empty() || self.captures.is_empty()) {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            self.pump_codec(Some(remaining.min(Duration::from_millis(50))));
+        }
+        let dropped = self
+            .pending
+            .iter()
+            .filter(|p| matches!(p, PendingInput::Staged { .. } | PendingInput::Lent(_)))
+            .count()
+            + self
+                .held_outputs
+                .iter()
+                .filter(|h| matches!(h, Held::Coded { .. }))
+                .count();
+        if dropped > 0 {
+            warn!(
+                "encoder session {}: STREAMOFF(OUTPUT) drain could not place {} frame(s) within \
+                 {:?} (CAPTURE queue full and not drained); dropped",
+                self.id, dropped, ENCODER_STREAMOFF_DRAIN
+            );
+        }
+    }
+
+    /// `onAsyncOutputAvailable`: copy the output out of the codec and give the buffer back,
+    /// then hold what it was for a `CAPTURE` buffer.
+    ///
+    /// The `END_OF_STREAM` flag means the end of the stream only while the drain that asked for
+    /// it is in flight: a callback the NDK looper had queued before a flush is delivered after
+    /// it with the *pre-flush* `BufferInfo`, and the ordinary empty EOS output never touches
+    /// `getOutputBuffer`, so D23's null-index skip cannot see it -- taken at its word it would
+    /// end the guest's encode at the first resume after a drain (review-m7 R7-1). So the flag
+    /// counts only under `eos_queued`, and an empty output whose index the codec will not
+    /// release either was never handed out since the flush: the whole event is dropped.
+    fn take_output(&mut self, codec: &mut Codec, index: i32, info: BufferInfo) {
+        let eos_flagged = info.flags & BUFFER_FLAG_END_OF_STREAM != 0;
+        let is_eos = self.eos_queued && eos_flagged;
+        let is_config = info.flags & BUFFER_FLAG_CODEC_CONFIG != 0;
+        let key = info.flags & BUFFER_FLAG_KEY_FRAME != 0;
+        let size = info.size.max(0) as usize;
+        let bytes = if size > 0 {
+            match codec.output_buffer(index) {
+                Ok(src) => src[..size.min(src.len())].to_vec(),
+                Err(e) => {
+                    self.refused_index("output", index, &e);
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        if let Err(e) = codec.release_output(index) {
+            self.refused_index("output", index, &e);
+            if bytes.is_empty() {
+                return;
+            }
+        }
+        if eos_flagged && !is_eos {
+            debug!(
+                "encoder session {}: END_OF_STREAM on output {} with no drain in flight ignored \
+                 (a callback from before a flush)",
+                self.id, index
+            );
+        }
+        let pts_us = info.presentation_time_us;
+        if is_config {
+            self.take_headers(bytes, pts_us);
+        } else if !bytes.is_empty() {
+            self.held_outputs.push_back(Held::Coded {
+                bytes,
+                pts_us,
+                key,
+                is_last: is_eos,
+            });
+            return;
+        }
+        if is_eos {
+            self.held_outputs.push_back(Held::EmptyLast { pts_us });
+        }
+    }
+
+    /// The stream headers (`BUFFER_FLAG_CODEC_CONFIG`: SPS/PPS, VPS/SPS/PPS), placed as the
+    /// device's `V4L2_CID_MPEG_VIDEO_HEADER_MODE` says. An empty one -- which no codec should
+    /// produce -- is dropped: as a `CAPTURE` buffer of its own it would be a `bytesused == 0`
+    /// buffer, which ffmpeg's dequeue loop reads as the end of the stream (review-m7 R7-14).
+    fn take_headers(&mut self, bytes: Vec<u8>, pts_us: i64) {
+        if bytes.is_empty() {
+            warn!(
+                "encoder session {}: an empty CODEC_CONFIG output from {}; ignored",
+                self.id,
+                self.codec_name()
+            );
+            return;
+        }
+        let pts_us = self.first_pts.unwrap_or(pts_us);
+        info!(
+            "encoder session {}: stream headers: {} bytes, {}",
+            self.id,
+            bytes.len(),
+            match self.header_mode {
+                VideoHeaderMode::Separate => "in a CAPTURE buffer of their own",
+                VideoHeaderMode::JoinedWith1stFrame => "in front of the next frame",
+            }
+        );
+        match self.header_mode {
+            VideoHeaderMode::Separate => {
+                self.held_outputs.push_back(Held::Headers { bytes, pts_us })
+            }
+            VideoHeaderMode::JoinedWith1stFrame => self.joined_headers = Some(bytes),
+        }
+    }
+
+    /// Write every held output into a lent `CAPTURE` buffer that can take it.
+    fn pump_output(&mut self) {
+        while !self.dead {
+            // Whether the headers go in front of this frame: only in `JOINED` mode, and not
+            // when the frame already starts with them (`PREPEND_SPSPPS_TO_IDR` makes the codec
+            // do that itself).
+            let prefix = match self.held_outputs.front() {
+                None => break,
+                Some(Held::Coded { bytes, .. }) => match &self.joined_headers {
+                    Some(headers) if !bytes.starts_with(headers) => headers.len(),
+                    _ => 0,
+                },
+                Some(Held::Headers { .. } | Held::EmptyLast { .. }) => 0,
+            };
+            let need = prefix
+                + match self.held_outputs.front() {
+                    Some(Held::Coded { bytes, .. } | Held::Headers { bytes, .. }) => bytes.len(),
+                    _ => 0,
+                };
+            // The first lent buffer that holds it.
+            let Some(at) = self.captures.iter().position(|c| c.len >= need) else {
+                if !self.captures.is_empty() {
+                    // The kernel would return the buffer with V4L2_BUF_FLAG_ERROR and go on;
+                    // the trait has no error flag (M7-crate §9 item 2), and a truncated frame
+                    // would be a corrupt stream: the session ends, saying why.
+                    let largest = self.captures.iter().map(|c| c.len).max().unwrap_or(0);
+                    self.fail(format!(
+                        "a {}-byte coded frame fits none of the {} lent CAPTURE buffer(s) (the \
+                         largest holds {} bytes): the guest's S_FMT(CAPTURE) sizeimage is too \
+                         small for this stream",
+                        need,
+                        self.captures.len(),
+                        largest
+                    ));
+                }
+                break;
+            };
+            let capture = self.captures.remove(at).expect("position was found above");
+            let held = self.held_outputs.pop_front().expect("checked above");
+            let out = capture.ptr.as_ptr();
+            let (bytesused, pts_us, kind, is_last) = match held {
+                Held::Headers { bytes, pts_us } => {
+                    // SAFETY: `bytes.len() == need <= capture.len`, and the device lends `len`
+                    // writable bytes at `ptr` until `FrameEncoded`; the source is ours.
+                    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len()) };
+                    (bytes.len(), pts_us, FrameKind::Headers, false)
+                }
+                Held::Coded {
+                    bytes,
+                    pts_us,
+                    key,
+                    is_last,
+                } => {
+                    if prefix > 0 {
+                        let headers = self.joined_headers.take().unwrap_or_default();
+                        // SAFETY: as above, `prefix + bytes.len() == need <= capture.len`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(headers.as_ptr(), out, headers.len())
+                        };
+                    } else {
+                        // Delivered inside the frame, or not wanted any more.
+                        self.joined_headers = None;
+                    }
+                    // SAFETY: as above.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.add(prefix), bytes.len())
+                    };
+                    self.frames += 1;
+                    self.bytes += (prefix + bytes.len()) as u64;
+                    if key {
+                        self.keyframes += 1;
+                    }
+                    (
+                        prefix + bytes.len(),
+                        pts_us,
+                        if key {
+                            FrameKind::Key
+                        } else {
+                            FrameKind::Inter
+                        },
+                        is_last,
+                    )
+                }
+                Held::EmptyLast { pts_us } => (0, pts_us, FrameKind::Inter, true),
+            };
+            self.events.push(EncoderEvent::FrameEncoded {
+                index: capture.index,
+                bytesused: bytesused as u32,
+                timestamp: timeval_from(pts_us),
+                kind,
+                is_last,
+            });
+            if is_last {
+                info!(
+                    "encoder session {}: EOS reached after {} coded frames ({} bytes in the LAST \
+                     buffer)",
+                    self.id, self.frames, bytesused
+                );
+            }
+        }
+    }
+
+    /// `AMediaCodec_flush` + `start`, bounded; drops every codec-side index this session holds.
+    fn flush_codec(&mut self, what: &'static str) -> IoctlResult<()> {
+        let Some(codec) = self.codec.take() else {
+            return Ok(());
+        };
+        self.free_inputs.clear();
+        self.eos_queued = false;
+        self.refused = 0;
+        self.stale = 0;
+        let id = self.id;
+        match bounded("encoder", id, what, CODEC_FLUSH_TIMEOUT, move || {
+            let mut codec = codec;
+            let result = codec.flush_and_restart();
+            (codec, result)
+        }) {
+            Some((codec, Ok(()))) => {
+                self.codec = Some(codec);
+                Ok(())
+            }
+            Some((codec, Err(e))) => {
+                // The codec is back but did not flush: it is stopped like any dead codec.
+                let errno = errno_for(&e);
+                self.stop_codec(codec);
+                self.fail(format!("{} failed: {}", what, e));
+                Err(errno)
+            }
+            None => {
+                self.fail(format!("{} timed out", what));
+                Err(libc::ETIMEDOUT)
+            }
+        }
+    }
+
+    /// `AMediaCodec_stop` + `delete` on a thread, waited for at most [`CODEC_STOP_TIMEOUT`].
+    fn stop_codec(&mut self, codec: Codec) {
+        let id = self.id;
+        let name = codec.name().to_string();
+        if bounded("encoder", id, "stop", CODEC_STOP_TIMEOUT, move || {
+            let mut codec = codec;
+            if let Err(e) = codec.stop() {
+                warn!("encoder session {}: AMediaCodec_stop: {}", id, e);
+            }
+            drop(codec);
+        })
+        .is_none()
+        {
+            warn!(
+                "encoder session {}: {} is still stopping on a detached thread",
+                id, name
+            );
+        }
+    }
+}
+
+impl VideoEncoderBackendSession for MediaCodecEncoderSession {
+    fn start(&mut self, config: &EncoderConfig) -> IoctlResult<()> {
+        if self.codec.is_some() {
+            return Ok(());
+        }
+        if self.dead {
+            return Err(libc::ENODEV);
+        }
+        let chosen = self
+            .codecs
+            .iter()
+            .find(|c| c.fourcc == config.coded_format)
+            .cloned()
+            .ok_or(libc::EINVAL)?;
+        // The codec is created for the visible picture: that is what it is given (the copy
+        // crops), and what the stream says.
+        let width = config.visible_rect.width.clamp(1, i32::MAX as u32);
+        let height = config.visible_rect.height.clamp(1, i32::MAX as u32);
+        let fps = config.frame_rate.num as f32 / config.frame_rate.den.max(1) as f32;
+        let mut format = MediaFormat::new().map_err(|e| errno_for(&e))?;
+        format
+            .set_str(keys::MIME, &chosen.mime)
+            .map_err(|e| errno_for(&e))?;
+        format.set_i32(keys::WIDTH, width as i32);
+        format.set_i32(keys::HEIGHT, height as i32);
+        format.set_i32(keys::COLOR_FORMAT, COLOR_FORMAT_YUV420_SEMI_PLANAR);
+        format.set_i32(keys::BIT_RATE, config.bitrate.min(i32::MAX as u32) as i32);
+        format.set_i32(keys::BITRATE_MODE, bitrate_mode_to_mc(config.bitrate_mode));
+        set_number(&mut format, keys::FRAME_RATE, fps);
+        set_number(
+            &mut format,
+            keys::I_FRAME_INTERVAL,
+            i_frame_interval(config.gop_size, fps),
+        );
+        let profile = config.profile.and_then(|p| {
+            profile_pairs(&chosen.mime)
+                .iter()
+                .find(|(_, v4l2)| *v4l2 == p)
+                .map(|(mc, _)| *mc)
+        });
+        if let Some(p) = profile {
+            format.set_i32(keys::PROFILE, p);
+        }
+        let level = config
+            .level
+            .filter(|l| Some(*l) != chosen.default_level)
+            .and_then(|l| level_to_mc(&chosen.mime, l));
+        if let Some(l) = level {
+            format.set_i32(keys::LEVEL, l);
+        }
+        if config.prepend_sps_pps_to_idr {
+            format.set_i32(keys::PREPEND_HEADER_TO_SYNC_FRAMES, 1);
+        }
+        if chosen.qp_bounds {
+            if let Some((lo, hi)) = config.qp {
+                if lo > QP_RANGE.min {
+                    format.set_i32(keys::VIDEO_QP_MIN, lo);
+                }
+                if hi < QP_RANGE.max {
+                    format.set_i32(keys::VIDEO_QP_MAX, hi);
+                }
+            }
+        }
+        let (standard, range, transfer) = color_aspects(&config.colorimetry);
+        if let Some(s) = standard {
+            format.set_i32(keys::COLOR_STANDARD, s);
+        }
+        if let Some(r) = range {
+            format.set_i32(keys::COLOR_RANGE, r);
+        }
+        if let Some(t) = transfer {
+            format.set_i32(keys::COLOR_TRANSFER, t);
+        }
+        info!(
+            "encoder session {}: creating {} for {} at {}x{} ({:?} of {}x{}): {}",
+            self.id,
+            chosen.name,
+            config.coded_format,
+            width,
+            height,
+            config.visible_rect,
+            config.coded_size.0,
+            config.coded_size.1,
+            format
+        );
+
+        let sink = self.sink.clone();
+        let name = chosen.name.clone();
+        let id = self.id;
+        let created = bounded("encoder", id, "start", CODEC_START_TIMEOUT, move || {
+            let mut format = format;
+            let mut codec = Codec::create_by_name(&name)?;
+            // Every callback bumps the device session's eventfd once it has queued its event:
+            // that is the whole wake-up path, no thread in between -- so a codec that will not
+            // take the hook is a session nothing would ever wake (review-m6 R6-17).
+            let no_hook = || {
+                CodecError::Event(
+                    "the codec already had a wake hook; nothing would wake the session".into(),
+                )
+            };
+            let hook = sink.clone();
+            if !codec.set_wake_hook(Box::new(move || hook.signal())) {
+                return Err(no_hook());
+            }
+            let color_format = match codec.configure(&format, true) {
+                Ok(()) => COLOR_FORMAT_YUV420_SEMI_PLANAR,
+                Err(first) => {
+                    // A failed configure resets the codec to INITIALIZED
+                    // (`MediaCodec::configure`, "configure failed ... resetting"), but whether
+                    // the async callback survives that reset is nowhere written down: a fresh
+                    // codec is certain, and this path is once per session.
+                    info!(
+                        "encoder session {}: {} does not take COLOR_FormatYUV420SemiPlanar \
+                         ({}); trying COLOR_FormatYUV420Flexible on a fresh codec",
+                        id, name, first
+                    );
+                    drop(codec);
+                    codec = Codec::create_by_name(&name)?;
+                    if !codec.set_wake_hook(Box::new(move || sink.signal())) {
+                        return Err(no_hook());
+                    }
+                    format.set_i32(keys::COLOR_FORMAT, COLOR_FORMAT_YUV420_FLEXIBLE);
+                    codec.configure(&format, true)?;
+                    COLOR_FORMAT_YUV420_FLEXIBLE
+                }
+            };
+            let input_format = codec.input_format()?;
+            codec.start()?;
+            Ok::<Started, CodecError>(Started {
+                codec,
+                input_format,
+                color_format,
+            })
+        });
+        match created {
+            Some(Ok(started)) => {
+                let layout = match input_layout(
+                    &started.input_format,
+                    started.color_format,
+                    width,
+                    height,
+                    chosen.vendor && chosen.hardware,
+                ) {
+                    Ok(layout) => layout,
+                    Err(why) => {
+                        error!(
+                            "encoder session {}: {} for {} {}; the codec is refused",
+                            self.id, chosen.name, config.coded_format, why
+                        );
+                        self.stop_codec(started.codec);
+                        return Err(libc::EINVAL);
+                    }
+                };
+                info!(
+                    "encoder session {}: {} ({}{}) started for {} at {}x{}: input {} stride {} \
+                     slice-height {} ({}, {} bytes per frame), {} bit/s {:?}, {} fps, gop {}, \
+                     headers {}{}{}{}",
+                    self.id,
+                    started.codec.name(),
+                    if chosen.hardware {
+                        "hardware"
+                    } else {
+                        "software"
+                    },
+                    if chosen.vendor { ", vendor" } else { "" },
+                    config.coded_format,
+                    width,
+                    height,
+                    color_format_name(layout.color_format),
+                    layout.stride,
+                    layout.slice_height,
+                    if layout.semiplanar {
+                        "semi-planar"
+                    } else {
+                        "planar"
+                    },
+                    layout.frame_size(),
+                    config.bitrate,
+                    config.bitrate_mode,
+                    fps,
+                    config.gop_size,
+                    match config.header_mode {
+                        VideoHeaderMode::Separate => "separate",
+                        VideoHeaderMode::JoinedWith1stFrame => "joined",
+                    },
+                    if config.prepend_sps_pps_to_idr {
+                        ", prepended to every IDR"
+                    } else {
+                        ""
+                    },
+                    profile
+                        .map(|p| format!(", profile {:#x}", p))
+                        .unwrap_or_default(),
+                    level
+                        .map(|l| format!(", level {:#x}", l))
+                        .unwrap_or_default()
+                );
+                self.chosen = Some(chosen);
+                self.codec = Some(started.codec);
+                self.layout = Some(layout);
+                self.coded_fourcc = Some(config.coded_format);
+                // What an earlier codec of this fourcc reported: the staging bound starts at
+                // the real window instead of the pre-report cushion (`note_output_slots`).
+                self.output_slots = self
+                    .learned_slots
+                    .lock()
+                    .unwrap()
+                    .get(&config.coded_format.to_u32())
+                    .copied();
+                self.coded_size = config.coded_size;
+                self.visible = config.visible_rect;
+                self.header_mode = config.header_mode;
+                self.free_inputs.clear();
+                self.held_outputs.clear();
+                self.staged_bytes = 0;
+                self.joined_headers = None;
+                self.eos_queued = false;
+                self.input_capacity = None;
+                self.first_pts = None;
+                self.refused = 0;
+                self.stale = 0;
+                self.stale_events_seen = 0;
+                self.flushes = 0;
+                self.inputs = 0;
+                self.frames = 0;
+                self.keyframes = 0;
+                self.bytes = 0;
+                self.started_at = Some(Instant::now());
+                Ok(())
+            }
+            Some(Err(e)) => {
+                error!(
+                    "encoder session {}: cannot start {} for {}: {}",
+                    self.id, chosen.name, config.coded_format, e
+                );
+                Err(errno_for(&e))
+            }
+            // The codec is still being built on a detached thread: a second `STREAMON` must
+            // not build another next to it, so the session ends, as `bounded`'s message says
+            // (review-m6 R6-12's shape).
+            None => {
+                self.fail(format!(
+                    "{} did not start within {:?}",
+                    chosen.name, CODEC_START_TIMEOUT
+                ));
+                Err(libc::ETIMEDOUT)
+            }
+        }
+    }
+
+    fn encode(&mut self, buffer: InputBuffer) -> IoctlResult<()> {
+        if self.dead {
+            return Err(libc::ENODEV);
+        }
+        if self.codec.is_none() {
+            return Err(libc::EINVAL);
+        }
+        let before = self.events.len();
+        // Stage the frame into an owned buffer and return the guest's OUTPUT buffer at once, so
+        // the guest is not throttled by the codec's input slots and, once acked, is owed the
+        // frame's encoding even across a STREAMOFF (D48, D78). The staging is *bounded*, and the
+        // bound is the back-pressure: past the codec's own output window of un-fed copies
+        // (`output_slots`; the same pre-report cushion as `MIN_OUTPUT_BUFFERS` until a codec has
+        // named it), or past the byte budget, the frame waits lent and is acked only when a
+        // codec input slot takes it. F19 staged a flat 64 MiB -- ~46 720p frames of run-ahead --
+        // and a fast feeder raced its own EOF teardown into the D78 drain, regressing 720p 4M
+        // from 287 to ~256 (B16-acceptance §5.1/§8, open item 1); one window keeps the feeder
+        // paced to the codec while still absorbing a camera's jitter, and it keeps what a
+        // teardown drain owes the guest in the same order as the CAPTURE floor the device now
+        // guarantees the client allocated ([`capture_floor`]). A frame queued while a drain is
+        // in flight still waits behind the EOS, as the kernel's encoder interface says it must.
+        let stage_window = self
+            .output_slots
+            .map(|slots| slots.max(1) as usize)
+            .unwrap_or(MIN_OUTPUT_BUFFERS as usize);
+        let staged_frames = self
+            .pending
+            .iter()
+            .filter(|p| matches!(p, PendingInput::Staged { .. }))
+            .count();
+        if staged_frames < stage_window
+            && self.staged_bytes.saturating_add(buffer.len) <= INPUT_STAGE_BYTES
+        {
+            // SAFETY: the device lends `len` readable bytes at `ptr` until we report
+            // `InputBufferDone`, queued just below; the copy is made before this returns, and
+            // nothing else reads or writes that region.
+            let data =
+                unsafe { std::slice::from_raw_parts(buffer.ptr.as_ptr(), buffer.len) }.to_vec();
+            self.staged_bytes += data.len();
+            self.pending.push_back(PendingInput::Staged {
+                data,
+                timestamp: buffer.timestamp,
+            });
+            self.events
+                .push(EncoderEvent::InputBufferDone(buffer.index));
+        } else {
+            self.pending.push_back(PendingInput::Lent(buffer));
+        }
+        self.pump_input();
+        if self.events.len() > before {
+            self.sink.signal();
+        }
+        Ok(())
+    }
+
+    fn use_as_capture(&mut self, buffer: OutputBuffer) -> IoctlResult<()> {
+        if self.dead {
+            return Err(libc::ENODEV);
+        }
+        self.captures.push_back(buffer);
+        let before = self.events.len();
+        self.pump_output();
+        // A CAPTURE buffer may have been what held the input back.
+        self.pump_input();
+        if self.events.len() > before {
+            self.sink.signal();
+        }
+        Ok(())
+    }
+
+    fn set_bitrate(&mut self, bitrate: u32) -> IoctlResult<()> {
+        if self.dead {
+            return Err(libc::ENODEV);
+        }
+        // Before the codec exists the device keeps the value for `start`.
+        let Some(codec) = self.codec.as_ref() else {
+            return Ok(());
+        };
+        let result = MediaFormat::new().and_then(|mut params| {
+            params.set_i32(keys::VIDEO_BITRATE, bitrate.min(i32::MAX as u32) as i32);
+            codec.set_parameters(&params)
+        });
+        match result {
+            Ok(()) => {
+                info!("encoder session {}: bitrate -> {} bit/s", self.id, bitrate);
+                Ok(())
+            }
+            Err(e) => {
+                warn!(
+                    "encoder session {}: video-bitrate {}: {}",
+                    self.id, bitrate, e
+                );
+                Err(errno_for(&e))
+            }
+        }
+    }
+
+    fn force_keyframe(&mut self) -> IoctlResult<()> {
+        if self.dead {
+            return Err(libc::ENODEV);
+        }
+        // Before the codec exists the first frame is a keyframe anyway.
+        if let Some(codec) = self.codec.as_ref() {
+            request_sync(self.id, codec);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> IoctlResult<()> {
+        // STREAMOFF(OUTPUT), or V4L2_ENC_CMD_START after a finished drain. On a STREAMOFF the
+        // device runs `drain_for_streamoff` first, so what is left here is only what the codec
+        // could not finish or the CAPTURE queue could not take (D78). The frames still waiting
+        // for an input slot are dropped, not reported: on STREAMOFF the device takes every OUTPUT
+        // buffer back itself right after this returns, and an `InputBufferDone` delivered later
+        // would land on a buffer the guest may have queued again by then (the decoder's rule, for
+        // the same reason). The coded frames already copied out stay: the CAPTURE queue keeps
+        // streaming.
+        let pending = self.pending.len();
+        self.pending.clear();
+        self.staged_bytes = 0;
+        self.events
+            .retain(|e| !matches!(e, EncoderEvent::InputBufferDone(_)));
+        let held = self.held_outputs.len();
+        let refused = self.refused;
+        let stale = self.stale;
+        self.flushes += 1;
+        let result = self.flush_codec("flush");
+        // What the crate's generation stamp dropped at this flush (D23): events queued before
+        // the flush that nobody had taken yet.
+        let stale_events = self
+            .codec
+            .as_ref()
+            .map(|codec| codec.stale_events())
+            .unwrap_or(self.stale_events_seen);
+        let dropped_by_flush = stale_events.saturating_sub(self.stale_events_seen);
+        self.stale_events_seen = stale_events;
+        info!(
+            "encoder session {}: flush #{}: {} pending frame(s) dropped, {} held coded frame(s) \
+             kept, {} stale index(es) ignored and {} refused since the last flush, {} queued \
+             event(s) dropped by this flush{}",
+            self.id,
+            self.flushes,
+            pending,
+            held,
+            stale,
+            refused,
+            dropped_by_flush,
+            match result {
+                Ok(()) => "".to_string(),
+                Err(errno) => format!("; the flush failed with errno {errno}"),
+            }
+        );
+        result
+    }
+
+    fn drain(&mut self) -> IoctlResult<()> {
+        if self.dead {
+            return Err(libc::ENODEV);
+        }
+        if self.eos_queued || self.pending.iter().any(|p| matches!(p, PendingInput::Eos)) {
+            return Ok(());
+        }
+        self.pending.push_back(PendingInput::Eos);
+        let before = self.events.len();
+        self.pump_input();
+        if self.events.len() > before {
+            self.sink.signal();
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) {
+        self.pending.clear();
+        self.staged_bytes = 0;
+        self.captures.clear();
+        self.held_outputs.clear();
+        self.free_inputs.clear();
+        self.joined_headers = None;
+        // The device reads `InputBufferDone` after this call to return the raw frames the codec
+        // finished (its `stop_codec`), so those stay; a `FrameEncoded` would land on a CAPTURE
+        // buffer the device is taking back, so those go.
+        self.events
+            .retain(|e| matches!(e, EncoderEvent::InputBufferDone(_) | EncoderEvent::Error(_)));
+        self.layout = None;
+        self.eos_queued = false;
+        self.input_capacity = None;
+        self.first_pts = None;
+        if let Some(codec) = self.codec.take() {
+            let name = codec.name().to_string();
+            self.stop_codec(codec);
+            info!(
+                "encoder session {}: {} stopped after {:?}: {} frames in, {} coded frames out \
+                 ({} keyframes, {} bytes), {} flush(es)",
+                self.id,
+                name,
+                self.started_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or(Duration::ZERO),
+                self.inputs,
+                self.frames,
+                self.keyframes,
+                self.bytes,
+                self.flushes
+            );
+        }
+    }
+
+    fn take_events(&mut self) -> Vec<EncoderEvent> {
+        self.pump_codec(None);
+        if !self.dead {
+            // Output first: a coded frame delivered frees the input the limit was holding.
+            self.pump_output();
+            self.pump_input();
+        }
+        std::mem::take(&mut self.events)
+    }
+
+    fn drain_for_streamoff(&mut self) {
+        self.drain_output_for_streamoff()
+    }
+}
+
+impl Drop for MediaCodecEncoderSession {
+    fn drop(&mut self) {
+        // `stop` is the normal path (the device calls it before `close_session`); a session
+        // dropped without it still must not run `AMediaCodec_delete` unbounded on the worker.
+        self.stop();
+    }
+}

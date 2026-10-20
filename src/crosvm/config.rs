@@ -799,6 +799,33 @@ pub struct PreAllocConfig {
     /// `--gpu backend=virglrenderer,context-types=venus`.
     pub venus_host_mb: Option<u64>,
 
+    /// virtio-media HOST-allocated buffer pool size (MB): the region the media device
+    /// sub-allocates every host-owned V4L2 buffer from -- camera frames, decoded frames, encoded
+    /// bitstreams -- so the guest maps them pool-relative and the host fills them in place.
+    ///
+    /// Absent/0 => the device falls back to the upstream shape, a memfd per buffer mapped into a
+    /// 4 GiB PCI shared-memory BAR. That works under KVM and is what a media device does without
+    /// a pool; on Gunyah it does not, because the 64-bit MMIO window holds one such BAR and the
+    /// GPU already has it, so a media device there is refused at startup rather than started
+    /// without buffers. Its own MediaPool region + `media_host` DT node.
+    ///
+    /// No prealloc/step/max-grants keys: this pool is fully pre-shared. A growable one would need
+    /// runtime grants over `/dev/gunyah_share`, which the development device does not load, and it
+    /// would take a second growable pool's `pool_id` ordering with it. See `VPU_DESIGN.md` §2.2.
+    pub media_host_mb: Option<u64>,
+    /// virtio-media GUEST-allocated buffer pool size (MB): a SHARE-blessed region the guest
+    /// virtio-media driver owns and sub-allocates with drm_buddy, holding the buffers the guest
+    /// produces -- bitstreams to decode, raw frames to encode -- which it then hands the host as
+    /// USERPTR scatter-gather lists.
+    ///
+    /// Absent/0 => the guest driver allocates those buffers from ordinary guest memory instead
+    /// (`dma_alloc_pages`, landing in the restricted-dma-pool on a protected VM), which works and
+    /// is the only option under KVM. The pool exists so that on a protected VM the host can reach
+    /// them without a bounce. Unlike the host pools this is additive to `--mem`, like
+    /// `gpu-guest-mb`: it is the VM's memory, deliberately sized. Its own MediaPoolGuest region +
+    /// `media_guest` DT node. Fully pre-shared, for the same reasons as `media-host-mb`.
+    pub media_guest_mb: Option<u64>,
+
     /// Growable TEST pool: total window size (MB). Declared to the guest whole but backed only up
     /// to `test-pool-prealloc-mb`; the rest is granted at runtime as the guest asks, a
     /// `test-pool-step-mb` multiple at a time.
@@ -816,6 +843,88 @@ pub struct PreAllocConfig {
     /// 1024 for the whole VM -- so this is not "how much to allocate at once", it is the smallest
     /// piece the guest can ever release. Small steps buy fine-grained release and spend quota.
     pub test_pool_step_mb: Option<u64>,
+}
+
+/// What a `--virtio-media` device is. Defined next to the device, because the vhost-user media
+/// helper is told the same thing in its parameters.
+#[cfg(feature = "media")]
+pub use devices::virtio::media::MediaDeviceKind;
+
+/// One `--virtio-media KEY=VALUE,...` device (`VPU_DESIGN.md` §3.5).
+///
+/// Every kind parses; which of them can be created, and whether in the VMM or in a helper, is
+/// [`MediaDeviceKind::support`]'s table, and a kind nothing implements fails at device creation
+/// with a "not implemented yet" error rather than silently making something else. Keys are
+/// `snake_case` on the command line, like `--virtio-snd`'s.
+#[cfg(feature = "media")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields)]
+pub struct MediaDeviceConfig {
+    pub kind: MediaDeviceKind,
+    /// The V4L2 card name the guest sees (31 bytes at most; longer is truncated). Each kind has
+    /// a default.
+    #[serde(default)]
+    pub card: Option<String>,
+    /// Which host camera to expose (`kind=camera`).
+    #[serde(default)]
+    pub camera_id: Option<String>,
+    /// `main` or `aux` (`kind=camera`).
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Offer the platform's software codecs as well as its hardware ones (`kind=decoder`,
+    /// `kind=encoder`; `VPU_DESIGN.md` §7.4). Off by default: a guest asking for a "hardware"
+    /// decoder should get one.
+    #[serde(default)]
+    pub allow_sw: bool,
+    /// Run the device's backend in its own process under this host uid, the way `--virtio-snd`
+    /// does, because the host's camera and codec services decide from the real uid. Unset keeps
+    /// the device in the VMM's process. Only meaningful for `camera`, `decoder` and `encoder`.
+    #[serde(default)]
+    pub uid: Option<u32>,
+    /// Group for that process. Defaults to `uid`.
+    #[serde(default)]
+    pub gid: Option<u32>,
+}
+
+#[cfg(all(test, feature = "media"))]
+mod media_device_config_tests {
+    use super::*;
+
+    #[test]
+    fn parses_every_kind_and_only_known_keys() {
+        let cfg: MediaDeviceConfig = from_key_values("kind=loopback,card=lb0").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Loopback);
+        assert_eq!(cfg.card.as_deref(), Some("lb0"));
+        assert_eq!(cfg.uid, None);
+
+        let cfg: MediaDeviceConfig = from_key_values("kind=simple").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Simple);
+
+        let cfg: MediaDeviceConfig =
+            from_key_values("kind=camera,camera_id=0,role=main,uid=10123,gid=10123").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Camera);
+        assert_eq!(cfg.camera_id.as_deref(), Some("0"));
+        assert_eq!(cfg.role.as_deref(), Some("main"));
+        assert_eq!((cfg.uid, cfg.gid), (Some(10123), Some(10123)));
+
+        for kind in ["decoder", "encoder"] {
+            assert!(from_key_values::<MediaDeviceConfig>(&format!("kind={kind}")).is_ok());
+        }
+        let cfg: MediaDeviceConfig =
+            from_key_values("kind=decoder,allow_sw=true,uid=10123").unwrap();
+        assert_eq!(cfg.kind, MediaDeviceKind::Decoder);
+        assert!(cfg.allow_sw);
+        assert!(
+            !from_key_values::<MediaDeviceConfig>("kind=decoder")
+                .unwrap()
+                .allow_sw
+        );
+
+        // `kind` is required, and a key that is not one of ours is an error, not ignored.
+        assert!(from_key_values::<MediaDeviceConfig>("card=x").is_err());
+        assert!(from_key_values::<MediaDeviceConfig>("kind=webcam").is_err());
+        assert!(from_key_values::<MediaDeviceConfig>("kind=simple,pool=1").is_err());
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, FromKeyValues)]
@@ -1211,6 +1320,8 @@ pub struct Config {
     pub virt_cpufreq: bool,
     pub virt_cpufreq_v2: bool,
     pub virtio_input: Vec<InputDeviceOption>,
+    #[cfg(feature = "media")]
+    pub virtio_media: Vec<MediaDeviceConfig>,
     #[cfg(feature = "audio")]
     #[serde(skip)]
     pub virtio_snds: Vec<SndParameters>,
@@ -1452,6 +1563,8 @@ impl Default for Config {
             virt_cpufreq: false,
             virt_cpufreq_v2: false,
             virtio_input: Vec::new(),
+            #[cfg(feature = "media")]
+            virtio_media: Vec::new(),
             #[cfg(feature = "audio")]
             virtio_snds: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]

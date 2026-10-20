@@ -82,6 +82,12 @@ pub(crate) fn run_command(command: Commands, _log_args: LogArgs) -> anyhow::Resu
 }
 
 pub(crate) fn init_log(log_config: LogConfig, _cfg: &Config) -> anyhow::Result<()> {
+    // Record the filter before `init_with` consumes the config: `device_helper::launch` replays it
+    // on the command line of every helper the VMM exec's, so a helper logs at the level the VMM
+    // was asked for instead of the hardcoded `info` default (defect D57).
+    crate::crosvm::sys::linux::device_helper::set_vmm_log_filter(
+        log_config.log_args.filter.clone(),
+    );
     if let Err(e) = syslog::init_with(log_config) {
         eprintln!("failed to initialize syslog: {}", e);
         return Err(anyhow!("failed to initialize syslog: {}", e));

@@ -12,10 +12,26 @@
 //!
 //! ```text
 //! camera_probe list  [--uid N]
+//! camera_probe controls --id 0 [--uid N]
 //! camera_probe capture --id 0 --size 1280x720 --frames 90 [--uid N] [--zoom R]
 //!                      [--flash off|single|torch] [--af off|auto|continuous-video|continuous-picture]
-//!                      [--fps MIN:MAX] [--dump PATH]
+//!                      [--fps MIN:MAX] [--exposure NS --iso N] [--af-trigger] [--watch]
+//!                      [--dump PATH]
 //! ```
+//!
+//! `controls` prints the ranges and menus the V4L2 camera device builds its controls from
+//! (`VPU_DESIGN.md` §7.1): what the acceptance records. `capture` also reports what the
+//! capture-result callbacks saw -- every autofocus and auto-exposure state transition, the lens
+//! in use -- which is the pipeline the device's `V4L2_EVENT_CTRL` comes from; `--af-trigger`
+//! fires one AF scan a second in, `--exposure`/`--iso` take the exposure manual.
+//!
+//! `--watch` asks for each of `CONTROL_AWB_MODE`, `CONTROL_EFFECT_MODE` and
+//! `CONTROL_SCENE_MODE` in turn -- mid-stream, with the repeating request already running --
+//! and prints what the capture result says the camera *used*, and how many results the new
+//! request took to reach it. That is the D36 decider: those three set and read back through
+//! V4L2 without moving a pixel on 5566, and only the result says whether the camera took the
+//! request entry and rendered nothing (the HAL's business) or never saw it at all (ours). It
+//! is also the D47 decider, because it measures the very case the guest hits, without a guest.
 //!
 //! `--uid` drops to that uid before touching the camera, the way `snd_helper` does for AAudio:
 //! `cameraserver` resolves the client package from the real uid, and uid 0 resolves to none.
@@ -27,9 +43,22 @@ use std::process::ExitCode;
 use std::time::Duration;
 use std::time::Instant;
 
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use android_camera::AeMode;
 use android_camera::AfMode;
+use android_camera::AfTrigger;
+use android_camera::AntibandingMode;
+use android_camera::AwbMode;
 use android_camera::Camera;
+use android_camera::CaptureResult;
+use android_camera::EffectMode;
 use android_camera::FlashMode;
+use android_camera::RequestUpdate;
+use android_camera::ResultListener;
+use android_camera::SceneMode;
+use android_camera::VideoStabilizationMode;
 use android_camera::YuvLayout;
 
 struct Args {
@@ -44,6 +73,13 @@ struct Args {
     af: Option<AfMode>,
     fps: Option<(i32, i32)>,
     dump: Option<String>,
+    /// Manual exposure: `SENSOR_EXPOSURE_TIME` in ns and `SENSOR_SENSITIVITY`, under
+    /// `AE_MODE_OFF`.
+    exposure_ns: Option<i64>,
+    iso: Option<i32>,
+    af_trigger: bool,
+    /// Report what the capture result says of the three modes of D36.
+    watch: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -61,6 +97,10 @@ fn parse_args() -> Result<Args, String> {
         af: None,
         fps: None,
         dump: None,
+        exposure_ns: None,
+        iso: None,
+        af_trigger: false,
+        watch: false,
     };
     while let Some(flag) = argv.next() {
         let mut value = || {
@@ -107,6 +147,12 @@ fn parse_args() -> Result<Args, String> {
                 ));
             }
             "--dump" => args.dump = Some(value()?),
+            "--exposure" => {
+                args.exposure_ns = Some(value()?.parse().map_err(|e| format!("--exposure: {}", e))?)
+            }
+            "--iso" => args.iso = Some(value()?.parse().map_err(|e| format!("--iso: {}", e))?),
+            "--af-trigger" => args.af_trigger = true,
+            "--watch" => args.watch = true,
             other => return Err(format!("unknown flag {:?}", other)),
         }
     }
@@ -152,6 +198,134 @@ fn use_case_name(value: i64) -> String {
         6 => "CROPPED_RAW".to_owned(),
         other => format!("vendor(0x{:x})", other),
     }
+}
+
+/// A byte list as names, one per value, with the numbers this crate cannot name kept as such.
+fn names<T: std::fmt::Debug>(values: &[u8], name: impl Fn(u8) -> Option<T>) -> String {
+    if values.is_empty() {
+        return "(read returned nothing)".to_owned();
+    }
+    values
+        .iter()
+        .map(|&v| match name(v) {
+            Some(n) => format!("{:?}({})", n, v),
+            None => format!("?({})", v),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The characteristics the V4L2 camera device derives its controls from, for one camera.
+fn cmd_controls(args: &Args) -> Result<(), String> {
+    let cameras = android_camera::list_cameras().map_err(|e| e.to_string())?;
+    let c = cameras
+        .iter()
+        .find(|c| c.id == args.id)
+        .ok_or_else(|| format!("camera {:?} is not one this uid can see", args.id))?;
+    println!("camera {} ({:?})", c.id, c.facing);
+    println!(
+        "  zoom ratio range         {}",
+        match c.zoom_ratio_range {
+            Some((lo, hi)) => format!(
+                "{:.2}..{:.2}  -> ZOOM_ABSOLUTE {}..{} (x100)",
+                lo,
+                hi,
+                (lo * 100.0).ceil() as i64,
+                (hi * 100.0).floor() as i64
+            ),
+            None => "(none: no ZOOM_ABSOLUTE)".to_owned(),
+        }
+    );
+    println!(
+        "  af available modes       {}",
+        names(&c.af_modes, AfMode::from_u8)
+    );
+    println!("  flash available          {}", c.flash_available);
+    println!(
+        "  ae available modes       {}  (Off and On -> EXPOSURE_AUTO / ISO_SENSITIVITY_AUTO)",
+        names(&c.ae_modes, AeMode::from_u8)
+    );
+    println!(
+        "  exposure time range      {}",
+        match c.exposure_time_range_ns {
+            Some((lo, hi)) => format!(
+                "{}..{} ns  -> EXPOSURE_ABSOLUTE {}..{} (100 us)",
+                lo,
+                hi,
+                (lo as u64).div_ceil(100_000).max(1),
+                (hi as u64) / 100_000
+            ),
+            None => "(none)".to_owned(),
+        }
+    );
+    println!(
+        "  sensitivity range        {}",
+        match c.sensitivity_range {
+            Some((lo, hi)) => format!("ISO {}..{}  -> ISO_SENSITIVITY menu", lo, hi),
+            None => "(none)".to_owned(),
+        }
+    );
+    println!(
+        "  ae compensation          {}",
+        match (c.ae_compensation_range, c.ae_compensation_step) {
+            (Some((lo, hi)), Some((num, den))) => format!(
+                "{}..{} steps of {}/{} EV  -> AUTO_EXPOSURE_BIAS menu of {} items",
+                lo,
+                hi,
+                num,
+                den,
+                (hi as i64 - lo as i64 + 1).max(0)
+            ),
+            (range, step) => format!("range {:?}, step {:?}", range, step),
+        }
+    );
+    println!(
+        "  awb available modes      {}",
+        names(&c.awb_modes, AwbMode::from_u8)
+    );
+    println!(
+        "  antibanding modes        {}",
+        names(&c.antibanding_modes, AntibandingMode::from_u8)
+    );
+    println!(
+        "  available effects        {}",
+        names(&c.effects, EffectMode::from_u8)
+    );
+    println!(
+        "  available scene modes    {}",
+        names(&c.scene_modes, SceneMode::from_u8)
+    );
+    let stabilization = names(
+        &c.video_stabilization_modes,
+        VideoStabilizationMode::from_u8,
+    );
+    println!("  video stabilization      {}", stabilization);
+    println!(
+        "  max regions AE/AWB/AF    {:?}  (non-zero -> the private regions controls)",
+        c.max_regions
+    );
+    println!(
+        "  active array             {}",
+        match c.active_array {
+            Some(r) => format!(
+                "left {} top {} width {} height {}  (the regions' coordinate system)",
+                r.left, r.top, r.width, r.height
+            ),
+            None => "(none: no regions controls)".to_owned(),
+        }
+    );
+    println!(
+        "  physical lenses          {}",
+        if c.physical_ids.is_empty() {
+            "(none)".to_owned()
+        } else {
+            format!(
+                "{}  (-> the private active-physical-id menu)",
+                c.physical_ids.join(", ")
+            )
+        }
+    );
+    Ok(())
 }
 
 fn cmd_list() -> Result<(), String> {
@@ -215,12 +389,61 @@ fn cmd_list() -> Result<(), String> {
                     .join(", ")
             }
         );
+        // Every size, each with the minimum frame duration reported for it and the frame rate
+        // that duration allows. These two lists are what the V4L2 camera device answers
+        // `ENUM_FRAMESIZES` and `ENUM_FRAMEINTERVALS` from, and M4's acceptance is asked to
+        // record both, so all of it is printed: this used to stop after 8 sizes and 4 durations
+        // and the rest could only be inferred from the guest (defect D20).
+        let duration_of = |size: &(i32, i32)| {
+            c.yuv_min_frame_durations
+                .iter()
+                .find(|(s, _)| s == size)
+                .map(|&(_, ns)| ns)
+        };
         println!("    YUV_420_888 sizes   {}", c.yuv_sizes.len());
-        for (w, h) in c.yuv_sizes.iter().take(8) {
-            println!("      {}x{}", w, h);
+        for size in &c.yuv_sizes {
+            let (w, h) = *size;
+            match duration_of(size) {
+                Some(ns) if ns > 0 => {
+                    let fps = 1e9 / ns as f64;
+                    println!("      {}x{}: {} ns ({:.1} fps max)", w, h, ns, fps)
+                }
+                // A duration of zero or less is not a rate; say so rather than divide by it.
+                Some(ns) => println!("      {}x{}: {} ns (not a rate)", w, h, ns),
+                None => println!("      {}x{}: (no min frame duration reported)", w, h),
+            }
         }
-        if c.yuv_sizes.len() > 8 {
-            println!("      ... and {} more", c.yuv_sizes.len() - 8);
+        println!(
+            "    fps ranges          {}",
+            if c.fps_ranges.is_empty() {
+                "(read returned nothing)".to_owned()
+            } else {
+                c.fps_ranges
+                    .iter()
+                    .map(|(lo, hi)| format!("{}-{}", lo, hi))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        );
+        // The V4L2 device caps ENUM_FRAMEINTERVALS at each size by these. They are printed with
+        // the sizes above; the two lists come from different metadata keys, so a duration for a
+        // size that is not an output size is worth seeing on its own.
+        let orphans: Vec<_> = c
+            .yuv_min_frame_durations
+            .iter()
+            .filter(|(size, _)| !c.yuv_sizes.contains(size))
+            .collect();
+        println!(
+            "    min frame durations {} for YUV_420_888{}",
+            c.yuv_min_frame_durations.len(),
+            if orphans.is_empty() {
+                " (all shown with the sizes above)"
+            } else {
+                ""
+            }
+        );
+        for ((w, h), ns) in orphans {
+            println!("      {}x{}: {} ns -- no such output size", w, h, ns);
         }
     }
     Ok(())
@@ -306,12 +529,304 @@ fn dump_frame(path: &str, frame: &android_camera::Frame<'_>) -> Result<(), Strin
     Ok(())
 }
 
+/// What the capture-result callbacks reported: every transition of the three states the V4L2
+/// device turns into `V4L2_EVENT_CTRL`, with the frame it happened at.
+#[derive(Default)]
+struct Transitions {
+    results: u64,
+    af: Option<android_camera::AfState>,
+    ae: Option<android_camera::AeState>,
+    lens: Option<String>,
+    log: Vec<String>,
+    /// The three modes of D36 as the *result* carries them -- the values the camera says it
+    /// used -- kept at their latest rather than only on change, so `--watch` can read them back
+    /// after a set. `CONTROL_MODE` comes with the scene: a scene applies only under
+    /// `USE_SCENE_MODE`.
+    awb: Option<AwbMode>,
+    effect: Option<EffectMode>,
+    scene: Option<SceneMode>,
+    control_mode: Option<android_camera::ControlMode>,
+    /// What `--watch` last asked for and what became of it; see [`Pending`].
+    pending: Option<Pending>,
+}
+
+/// One mode `--watch` has just asked for mid-stream, waiting for the camera's answer.
+///
+/// The answer is not "what the next result says": a repeating request replaced while the camera
+/// runs takes a few captures to reach the sensor, and the results still in the pipeline
+/// legitimately carry the old value. The answer is the first result whose *own request* carries
+/// what was asked for -- from then on the result is the camera's verdict on that entry. Reading
+/// a fixed number of results later instead is what made D47: on 5566 the request needs between
+/// two and seven of them, and the backend looked after six.
+struct Pending {
+    want: Wanted,
+    /// `Transitions::results` at the submission, so the wait can be reported in results.
+    armed_at: u64,
+    settled: Option<Settled>,
+}
+
+/// The entry `--watch` asked for, in the shape the request carries it.
+#[derive(Clone, Copy)]
+enum Wanted {
+    Awb(AwbMode),
+    Effect(EffectMode),
+    /// A scene and the `CONTROL_MODE` it needs: a scene applies only under `USE_SCENE_MODE`.
+    Scene(SceneMode, android_camera::ControlMode),
+}
+
+/// The camera's answer: how many results the request took to come back, whether the result
+/// echoed the value, and what it said instead when it did not.
+struct Settled {
+    after: u64,
+    echoed: bool,
+    got: String,
+}
+
+fn result_listener(seen: Arc<Mutex<Transitions>>) -> ResultListener {
+    Box::new(move |result: &CaptureResult<'_>| {
+        let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        seen.results += 1;
+        let n = seen.results;
+        if let Some(af) = result.af_state() {
+            if seen.af != Some(af) {
+                seen.af = Some(af);
+                seen.log.push(format!("result {}: AF_STATE {:?}", n, af));
+            }
+        }
+        if let Some(ae) = result.ae_state() {
+            if seen.ae != Some(ae) {
+                seen.ae = Some(ae);
+                seen.log.push(format!(
+                    "result {}: AE_STATE {:?} (exposure {:?} ns, iso {:?}, zoom {:?})",
+                    n,
+                    ae,
+                    result.exposure_time_ns(),
+                    result.sensitivity(),
+                    result.zoom_ratio()
+                ));
+            }
+        }
+        if let Some(lens) = result.active_physical_id() {
+            if seen.lens.as_deref() != Some(lens.as_str()) {
+                seen.log
+                    .push(format!("result {}: ACTIVE_PHYSICAL_ID {}", n, lens));
+                seen.lens = Some(lens);
+            }
+        }
+        // What the camera says it used for the three modes of D36. Logged on change, kept at
+        // their latest for `--watch`.
+        let (awb, effect) = (result.awb_mode(), result.effect_mode());
+        let (scene, control_mode) = (result.scene_mode(), result.control_mode());
+        if awb.is_some() && seen.awb != awb {
+            seen.log.push(format!("result {}: AWB_MODE {:?}", n, awb));
+        }
+        if effect.is_some() && seen.effect != effect {
+            seen.log
+                .push(format!("result {}: EFFECT_MODE {:?}", n, effect));
+        }
+        if (scene.is_some() || control_mode.is_some())
+            && (seen.scene != scene || seen.control_mode != control_mode)
+        {
+            seen.log.push(format!(
+                "result {}: SCENE_MODE {:?} under CONTROL_MODE {:?}",
+                n, scene, control_mode
+            ));
+        }
+        if awb.is_some() {
+            seen.awb = awb;
+        }
+        if effect.is_some() {
+            seen.effect = effect;
+        }
+        if scene.is_some() {
+            seen.scene = scene;
+        }
+        if control_mode.is_some() {
+            seen.control_mode = control_mode;
+        }
+        // `--watch`: the first result whose own request carries what was just asked for is the
+        // camera's answer to that entry; everything before it is a capture that was already in
+        // the pipeline when the request was replaced (D47).
+        if let Some(pending) = seen.pending.as_mut() {
+            if pending.settled.is_none() {
+                let after = n.saturating_sub(pending.armed_at);
+                pending.settled = match pending.want {
+                    Wanted::Awb(want) => {
+                        (result.requested_awb_mode() == Some(want)).then(|| Settled {
+                            after,
+                            echoed: awb == Some(want),
+                            got: format!("{awb:?}"),
+                        })
+                    }
+                    Wanted::Effect(want) => {
+                        (result.requested_effect_mode() == Some(want)).then(|| Settled {
+                            after,
+                            echoed: effect == Some(want),
+                            got: format!("{effect:?}"),
+                        })
+                    }
+                    Wanted::Scene(want, mode) => (result.requested_scene_mode() == Some(want)
+                        && result.requested_control_mode() == Some(mode))
+                    .then(|| Settled {
+                        after,
+                        echoed: scene == Some(want) && control_mode == Some(mode),
+                        got: format!("{scene:?} under CONTROL_MODE {control_mode:?}"),
+                    }),
+                };
+            }
+        }
+    })
+}
+
+/// How many frames one `--watch` set waits for the camera's answer before giving up: a second
+/// at 30 fps, many times the two-to-seven results the request itself needs.
+const WATCH_DEADLINE_FRAMES: u32 = 30;
+
+/// The D36 decider, and since B8 the D47 one too: with the repeating request already running,
+/// ask for each of the three modes a guest can set and this camera may ignore, then print what
+/// the camera did with the entry and how long it took to run it.
+///
+/// `ECHOED` means the camera ran the request entry and reported the value back, so a picture
+/// that does not change is the HAL's rendering and the honest answer is to document it
+/// (D36 advisory). `DROPPED` means the camera ran the entry and used a different value.
+/// `NOT SENT` means no capture request ever carried it, which would be a defect on our side of
+/// the NDK -- and is what D47 looked like when the answer was read a fixed six results after
+/// the set, before the request had reached the sensor.
+///
+/// Every set here happens mid-stream, which is the case the guest hits and the one B8 could
+/// only measure through V4L2: `camera_probe capture --watch` settles it without a guest.
+fn watch_modes(
+    camera: &mut Camera,
+    seen: &Arc<Mutex<Transitions>>,
+    info: &android_camera::CameraInfo,
+) -> Result<(), String> {
+    // Two values of each, the first ones the camera offers that are not its neutral setting.
+    let awbs: Vec<AwbMode> = info
+        .awb_modes
+        .iter()
+        .filter_map(|&v| AwbMode::from_u8(v))
+        .filter(|m| !matches!(m, AwbMode::Auto | AwbMode::Off))
+        .take(2)
+        .collect();
+    let effects: Vec<EffectMode> = info
+        .effects
+        .iter()
+        .filter_map(|&v| EffectMode::from_u8(v))
+        .filter(|m| !matches!(m, EffectMode::Off))
+        .take(2)
+        .collect();
+    let scenes: Vec<SceneMode> = info
+        .scene_modes
+        .iter()
+        .filter_map(|&v| SceneMode::from_u8(v))
+        .filter(|m| !matches!(m, SceneMode::Disabled))
+        .take(2)
+        .collect();
+
+    println!();
+    println!("D36/D47 echo test: the three modes set mid-stream, and what the camera did");
+    for mode in &awbs {
+        let line = watch_one(
+            camera,
+            seen,
+            RequestUpdate::new().awb_mode(*mode),
+            Wanted::Awb(*mode),
+        )?;
+        println!("  CONTROL_AWB_MODE     requested {:<16?} {}", mode, line);
+    }
+    for mode in &effects {
+        let line = watch_one(
+            camera,
+            seen,
+            RequestUpdate::new().effect_mode(*mode),
+            Wanted::Effect(*mode),
+        )?;
+        println!("  CONTROL_EFFECT_MODE  requested {:<16?} {}", mode, line);
+    }
+    for mode in &scenes {
+        // A scene has no effect at all unless the control mode says to use it.
+        let line = watch_one(
+            camera,
+            seen,
+            RequestUpdate::new()
+                .control_mode(android_camera::ControlMode::UseSceneMode)
+                .scene_mode(*mode),
+            Wanted::Scene(*mode, android_camera::ControlMode::UseSceneMode),
+        )?;
+        println!("  CONTROL_SCENE_MODE   requested {:<16?} {}", mode, line);
+    }
+    // Back to the neutral settings, so the rest of the run is not measured under a scene.
+    let restore = RequestUpdate::new()
+        .awb_mode(AwbMode::Auto)
+        .effect_mode(EffectMode::Off)
+        .control_mode(android_camera::ControlMode::Auto)
+        .scene_mode(SceneMode::Disabled);
+    watch_one(
+        camera,
+        seen,
+        restore,
+        Wanted::Scene(SceneMode::Disabled, android_camera::ControlMode::Auto),
+    )?;
+    Ok(())
+}
+
+/// Submit `update` on the running camera, keep the frames flowing, and answer with the verdict
+/// on `want` as one printable clause.
+fn watch_one(
+    camera: &mut Camera,
+    seen: &Arc<Mutex<Transitions>>,
+    update: RequestUpdate,
+    want: Wanted,
+) -> Result<String, String> {
+    {
+        let mut state = seen.lock().unwrap_or_else(|e| e.into_inner());
+        let armed_at = state.results;
+        state.pending = Some(Pending {
+            want,
+            armed_at,
+            settled: None,
+        });
+    }
+    camera.apply(&update).map_err(|e| e.to_string())?;
+    for _ in 0..WATCH_DEADLINE_FRAMES {
+        if camera
+            .next_frame(Duration::from_millis(2000))
+            .map_err(|e| e.to_string())?
+            .is_none()
+        {
+            return Err("no frame within 2s while waiting for the camera's answer".to_owned());
+        }
+        let state = seen.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(settled) = state.pending.as_ref().and_then(|p| p.settled.as_ref()) {
+            return Ok(format!(
+                "result {:<28} {}  (the request the camera ran carried it {} result(s) after \
+                 the set)",
+                settled.got,
+                if settled.echoed { "ECHOED" } else { "DROPPED" },
+                settled.after
+            ));
+        }
+    }
+    Ok(format!(
+        "NOT SENT  (no capture request carried it within {WATCH_DEADLINE_FRAMES} frames)"
+    ))
+}
+
 fn cmd_capture(args: &Args) -> Result<(), String> {
     // Depth 4: enough that acquiring one frame does not stall the camera, small enough that a leak
     // shows up immediately as a stall rather than as growing memory.
     let opened = Instant::now();
-    let mut camera =
-        Camera::open(&args.id, args.width, args.height, 4).map_err(|e| e.to_string())?;
+    let seen = Arc::new(Mutex::new(Transitions::default()));
+    let mut camera = Camera::open_with(
+        &args.id,
+        args.width,
+        args.height,
+        4,
+        None,
+        Some(result_listener(Arc::clone(&seen))),
+        &RequestUpdate::new(),
+    )
+    .map_err(|e| e.to_string())?;
     println!(
         "opened camera {} at {}x{} in {:?}",
         args.id, args.width, args.height, opened.elapsed()
@@ -320,6 +835,21 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
     if let Some((lo, hi)) = args.fps {
         camera.set_fps_range(lo, hi).map_err(|e| e.to_string())?;
         println!("fps range set to {}:{}", lo, hi);
+    }
+    if args.exposure_ns.is_some() || args.iso.is_some() {
+        // Manual exposure is AE off with both values written, in one submission.
+        let mut update = RequestUpdate::new().ae_mode(AeMode::Off);
+        if let Some(ns) = args.exposure_ns {
+            update = update.exposure_time_ns(ns);
+        }
+        if let Some(iso) = args.iso {
+            update = update.sensitivity(iso);
+        }
+        camera.apply(&update).map_err(|e| e.to_string())?;
+        println!(
+            "manual exposure: {:?} ns, iso {:?} (AE_MODE_OFF)",
+            args.exposure_ns, args.iso
+        );
     }
     if let Some(mode) = args.af {
         camera.set_af_mode(mode).map_err(|e| e.to_string())?;
@@ -334,6 +864,15 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
         println!("flash mode set to {:?}", mode);
     }
 
+    if args.watch {
+        let cameras = android_camera::list_cameras().map_err(|e| e.to_string())?;
+        let info = cameras
+            .iter()
+            .find(|c| c.id == args.id)
+            .ok_or_else(|| format!("camera {:?} is not one this uid can see", args.id))?;
+        watch_modes(&mut camera, &seen, info)?;
+    }
+
     let start = Instant::now();
     let mut first_frame: Option<Duration> = None;
     let mut digests = std::collections::HashSet::new();
@@ -344,7 +883,17 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
     let mut luma_min = f64::MAX;
     let mut luma_max = f64::MIN;
 
+    let mut af_fired = false;
     while received < args.frames {
+        // One AF scan, a second in, once the stream has settled. Before the frame is acquired:
+        // a held frame borrows the camera.
+        if args.af_trigger && received >= 30 && !af_fired {
+            camera
+                .trigger_af(AfTrigger::Start)
+                .map_err(|e| e.to_string())?;
+            println!("  AF trigger START fired at frame {}", received);
+            af_fired = true;
+        }
         let frame = match camera
             .next_frame(Duration::from_millis(2000))
             .map_err(|e| e.to_string())?
@@ -419,6 +968,22 @@ fn cmd_capture(args: &Args) -> Result<(), String> {
     println!("listener callbacks    {}", camera.frames_signalled());
     println!("distinct luma digests {} of {}", digests.len(), received);
     println!("luma mean range       {:.1}..{:.1}", luma_min, luma_max);
+    let stats = camera.results();
+    println!(
+        "capture results       {} completed, {} failed, {} buffers lost",
+        stats.completed, stats.failed, stats.buffers_lost
+    );
+    {
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+        println!(
+            "result transitions    {} (from {} results read in the callback)",
+            seen.log.len(),
+            seen.results
+        );
+        for line in &seen.log {
+            println!("  {}", line);
+        }
+    }
 
     // The two ways this can pass without the camera working: every frame identical (a frozen or
     // never-filled buffer), or every pixel zero (a black frame that still has the right shape).
@@ -461,8 +1026,12 @@ fn run() -> Result<(), String> {
     println!("running as uid {}", unsafe { libc::getuid() });
     match args.command.as_str() {
         "list" => cmd_list(),
+        "controls" => cmd_controls(&args),
         "capture" => cmd_capture(&args),
-        other => Err(format!("unknown command {:?}; want list or capture", other)),
+        other => Err(format!(
+            "unknown command {:?}; want list, controls or capture",
+            other
+        )),
     }
 }
 

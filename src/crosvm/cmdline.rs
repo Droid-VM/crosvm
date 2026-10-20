@@ -97,6 +97,8 @@ use crate::crosvm::config::parse_vhost_user_fs_option;
 #[cfg(feature = "android_display")]
 use crate::crosvm::config::AndroidDisplayServiceConfig;
 use crate::crosvm::config::BatteryConfig;
+#[cfg(all(unix, feature = "media"))]
+use crate::crosvm::config::MediaDeviceConfig;
 use crate::crosvm::config::PreAllocConfig;
 use crate::crosvm::config::CpuOptions;
 use crate::crosvm::config::DtboOption;
@@ -590,6 +592,8 @@ pub enum CrossPlatformDevicesCommands {
     Block(device::BlockOptions),
     #[cfg(feature = "gpu")]
     Gpu(device::GpuOptions),
+    #[cfg(all(unix, feature = "media"))]
+    Media(device::MediaOptions),
     #[cfg(feature = "net")]
     Net(device::NetOptions),
     #[cfg(feature = "audio")]
@@ -2048,18 +2052,26 @@ pub struct RunCommand {
     ///       (default: "0 <current egid> 1")
     pub pmem_ext2: Vec<PmemExt2Option>,
 
-    #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB")]
+    #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB,venus-host-mb=MB,media-host-mb=MB,media-guest-mb=MB,test-pool-mb=MB,test-pool-prealloc-mb=MB,test-pool-step-mb=MB")]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
-    /// host-owned pre-allocated GPU pool sizes (MB). Boot-blessed regions the in-process renderer
-    /// sub-allocates host-visible blobs from (no runtime per-blob SHARE). crosvm exports these to
-    /// the renderer as NCTX_GFX_POOL_MB env, so the user no longer hand-exports them. Possible keys:
+    /// pre-allocated pool sizes (MB). Boot-blessed regions laid out above guest RAM and SHARE'd
+    /// rather than lent, so host and guest reach the same pages without a runtime SHARE per
+    /// buffer. crosvm exports these to the consumer as NCTX_* env before anything reads the
+    /// memory layout, so the user no longer hand-exports them. A key that is absent means that
+    /// pool is not created at all. Possible keys:
     ///     gfx-host-mb=<MB>  - gfxstream host-visible pool size (default 0 = gfx pre-alloc disabled)
     ///     gpu-guest-mb=<MB> - guest-alloc pool size, shared by both renderers (0 = off)
     ///     gpu-guest-prealloc-mb=<MB> - boot-SHARE'd floor; defaults to gpu-guest-mb
     ///     gpu-guest-step-mb=<MB> - runtime grow/reclaim granularity (0 = fully pre-shared)
     ///     gpu-guest-max-grants=<N> - per-pool live runtime grant cap (0 = no local cap)
     ///     drm-host-mb=<MB>  - drm2kgsl host arena size (0 = drm2kgsl runtime-share)
+    ///     venus-host-mb=<MB> - venus (vkr) transport pool size (0 = per-blob runtime SHARE)
+    ///     media-host-mb=<MB> - virtio-media host-owned buffer pool (0 = per-buffer memfd + BAR)
+    ///     media-guest-mb=<MB> - virtio-media guest-owned buffer pool (0 = guest allocates from RAM)
+    ///     test-pool-mb=<MB> - growable TEST pool window; nothing but the test driver uses it
+    ///     test-pool-prealloc-mb=<MB> - its boot-SHARE'd floor; defaults to the whole window
+    ///     test-pool-step-mb=<MB> - its grant granularity (0 = fully pre-shared, does not grow)
     pub pre_alloc: Option<PreAllocConfig>,
 
     #[argh(switch)]
@@ -2815,6 +2827,50 @@ pub struct RunCommand {
     /// enable version of the virtual cpu freq device compatible
     /// with the driver in upstream linux
     pub virt_cpufreq_upstream: Option<bool>,
+
+    #[cfg(all(unix, feature = "media"))]
+    #[argh(
+        option,
+        arg_name = "kind=KIND[,card=NAME][,camera_id=ID][,role=ROLE][,allow_sw=BOOL][,uid=N][,gid=N]"
+    )]
+    #[serde(default)]
+    #[merge(strategy = append)]
+    /// add a virtio-media (V4L2) device. May be given more than
+    /// once. On gunyah every such device serves its MMAP buffers
+    /// out of the media_host pool and refuses to start without
+    /// `--pre-alloc media-host-mb`; elsewhere it falls back to a
+    /// PCI shared-memory BAR when there is no pool. The gunyah
+    /// requirement holds even with the guest driver's
+    /// driver_owned_queues=all, which never maps a host buffer:
+    /// the device must still be able to serve one the moment the
+    /// guest asks, and the only place it can put one there is the
+    /// pool. All the devices in a VM share the one pool.
+    /// Possible key values:
+    ///     kind=(simple,loopback,camera,decoder,encoder) - What
+    ///         the device is. simple is the fixed-pattern capture
+    ///         device --simple-media-device makes; loopback is a
+    ///         memory-to-memory device copying every OUTPUT buffer
+    ///         into a CAPTURE buffer, for testing guest-owned and
+    ///         host-owned buffers together. camera is a host
+    ///         camera over the Camera2 NDK and needs uid=;
+    ///         decoder and encoder are a stateful V4L2 decoder
+    ///         and encoder over the host's MediaCodec hardware
+    ///         codecs and need uid= too.
+    ///     card=NAME - V4L2 card name shown to the guest (31
+    ///         bytes at most).
+    ///     camera_id=ID - Host camera to expose (camera).
+    ///     role=(main,aux) - Camera role (camera).
+    ///     allow_sw=(true,false) - Offer the host's software
+    ///         codecs too, not only hardware ones (decoder,
+    ///         encoder; AV1 encoding only with it). Default
+    ///         false.
+    ///     uid=INT - Run the backend in its own process under
+    ///         this host uid, as --virtio-snd does. Any kind
+    ///         may use it; camera, decoder and encoder require
+    ///         it, because the camera and codec services refuse
+    ///         uid 0.
+    ///     gid=INT - Group for that process. Defaults to uid.
+    pub virtio_media: Vec<MediaDeviceConfig>,
 
     #[cfg(feature = "audio")]
     #[argh(
@@ -4001,6 +4057,11 @@ impl TryFrom<RunCommand> for super::config::Config {
         {
             cfg.v4l2_proxy = cmd.v4l2_proxy;
             cfg.simple_media_device = cmd.simple_media_device.unwrap_or_default();
+        }
+
+        #[cfg(all(unix, feature = "media"))]
+        {
+            cfg.virtio_media = cmd.virtio_media;
         }
 
         #[cfg(all(unix, feature = "media", feature = "video-decoder"))]

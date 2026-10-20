@@ -200,6 +200,24 @@ pub enum MemoryRegionPurpose {
     #[default]
     GuestMemoryRegion,
 
+    /// DroidVM: virtio-media HOST-allocated buffer pool. A SHARE-blessed region (treated exactly
+    /// like GpuPool for access/bless/hugepage) the host media device sub-allocates every
+    /// host-owned V4L2 buffer from -- camera frames, decoded frames, encoded bitstreams -- so the
+    /// guest maps them pool-relative with no per-buffer runtime SHARE and, on Gunyah, with no
+    /// 4 GiB PCI shared-memory BAR (the 64-bit MMIO window holds only one, and the GPU has it).
+    /// Distinct from GpuPool so it is sized independently and gets its own `media_host` DT node.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    MediaPool,
+
+    /// DroidVM: virtio-media GUEST-allocated buffer pool. The mirror image of MediaPool: a second
+    /// SHARE-blessed region that the guest virtio-media driver owns and sub-allocates with
+    /// drm_buddy, holding the buffers the guest produces (bitstreams to decode, raw frames to
+    /// encode). The host reaches them through the USERPTR scatter-gather path, which is why the
+    /// region must stay host-accessible. Distinct so it gets its own `media_guest` DT node and is
+    /// never handed to the host-side allocator, which sees only MediaPool.
+    #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+    MediaPoolGuest,
+
     /// PVMFW
     ProtectedFirmwareRegion,
 
@@ -1050,6 +1068,21 @@ impl GuestMemory {
             // pre-shared (step 0), so the range check is a formality with the same answer.
             #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
             MemoryRegionPurpose::VenusPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // virtio-media host pool: SHARE'd like the gfx pools; the media device lives in this
+            // process (or in a vhost-user helper that is handed the same memfd) and hands the
+            // guest pool-relative offsets into buffers it must keep filling.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::MediaPool => {
+                self.check_pool_backed_range(region, guest_addr, 1)
+            }
+            // virtio-media guest pool: SHARE'd like GpuPoolGuest, and for the same reason. The
+            // guest driver allocates its buffers here and sends the host bare guest-physical
+            // scatter-gather lists; without this arm every such list would be refused as a
+            // protected-memory access and the OUTPUT queue could never be read.
+            #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
+            MemoryRegionPurpose::MediaPoolGuest => {
                 self.check_pool_backed_range(region, guest_addr, 1)
             }
             // The one region where this actually gates anything today: everything else has

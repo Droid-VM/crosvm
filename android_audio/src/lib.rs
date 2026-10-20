@@ -545,7 +545,16 @@ struct AudioStream {
     frame_rate: u32,
     next_frame: Instant,
     start_time: Option<Instant>,
-    total_frames: i32,
+    /// Frames handed to the guest since the schedule was last anchored. Nothing but the pacing
+    /// deadline below reads it, and it only ever counts up.
+    ///
+    /// `u64` rather than `i32`, because `i32` ran out: at 48 kHz it holds 2^31 / 48000 = 12.43 h
+    /// of stream, and this fork builds with `overflow-checks = true`, so reaching the end is a
+    /// panic and not a wrap. Measured 2026-09-19 -- a VM whose audio had been idle since 04:16
+    /// panicked at 16:42, 12.43 h in, which killed the snd helper and then crosvm. The multiply
+    /// in the deadline is what now bounds the counter: `total_frames * 1000` stays inside `u64`
+    /// for about 12,000 years at 48 kHz.
+    total_frames: u64,
     buffer_drop: AndroidAudioStreamCommit,
     read_count: i32,
     aaudio_buffer_size: usize,
@@ -707,7 +716,7 @@ impl AudioStream {
                     // More than a period behind. Start counting again from here; the audio that
                     // should have been delivered in the gap is gone either way, and racing to
                     // deliver it now would only put the guest ahead of the endpoint.
-                    self.total_frames = buffer_size as i32;
+                    self.total_frames = buffer_size as u64;
                     now
                 } else {
                     anchor
@@ -737,10 +746,10 @@ impl AsyncPlaybackBufferStream for AudioStream {
         ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError> {
         let buffer_size = self.buffer.len() / self.frame_size;
-        self.total_frames += buffer_size as i32;
+        self.total_frames += buffer_size as u64;
         let start_time = self.pace(ex, buffer_size).await?;
-        self.next_frame = start_time
-            + Duration::from_millis(self.total_frames as u64 * 1000 / self.frame_rate as u64);
+        self.next_frame =
+            start_time + Duration::from_millis(self.total_frames * 1000 / self.frame_rate as u64);
         Ok(
             AsyncPlaybackBuffer::new(self.frame_size, self.buffer.as_mut(), &mut self.buffer_drop)
                 .map_err(Box::new)?,
@@ -768,10 +777,10 @@ impl AsyncCaptureBufferStream for AudioStream {
     ) -> Result<AsyncCaptureBuffer<'a>, BoxError> {
         let buffer_size = self.buffer.len() / self.frame_size;
         self.read_count += 1;
-        self.total_frames += buffer_size as i32;
+        self.total_frames += buffer_size as u64;
         let start_time = self.pace(ex, buffer_size).await?;
-        self.next_frame = start_time
-            + Duration::from_millis(self.total_frames as u64 * 1000 / self.frame_rate as u64);
+        self.next_frame =
+            start_time + Duration::from_millis(self.total_frames * 1000 / self.frame_rate as u64);
 
         // Skip for at least (1.5x aaudio buffer size - buffer_size) to ensure there is always a
         // aaudio buffer available for read.
@@ -1000,5 +1009,215 @@ impl StreamSourceGenerator for AndroidAudioStreamSourceGenerator {
             table_path: self.table_path.clone(),
             device_id: self.device_id,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::mem::ManuallyDrop;
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
+
+    use audio_streams::AsyncStream;
+
+    use super::*;
+
+    const RATE: u32 = 48_000;
+    const FRAME_SIZE: usize = 4;
+    /// 10 ms at [`RATE`], which is the order of period virtio-snd asks for.
+    const PERIOD_FRAMES: usize = 480;
+    /// One period short of the value an `i32` counter died on, so a single period crosses it.
+    const NEAR_THE_I32_CEILING: u64 = i32::MAX as u64 - 1;
+
+    /// An executor whose `delay` is never reached.
+    ///
+    /// Every case below is arranged so that `pace` anchors the schedule and returns without
+    /// waiting; a call here would mean the test set the stream up wrong, not that it must wait.
+    struct NoDelay;
+
+    #[async_trait(?Send)]
+    impl AudioStreamsExecutor for NoDelay {
+        fn async_unix_stream(&self, _f: UnixStream) -> std::io::Result<AsyncStream> {
+            unreachable!("the frame counter does no io");
+        }
+
+        async fn delay(&self, _dur: Duration) -> std::io::Result<()> {
+            unreachable!("none of these periods is due in the future");
+        }
+    }
+
+    /// Runs a future that is not supposed to suspend.
+    fn poll_once<F: Future>(fut: F) -> F::Output {
+        struct Idle;
+        impl Wake for Idle {
+            fn wake(self: Arc<Self>) {}
+        }
+        let waker = Waker::from(Arc::new(Idle));
+        let mut fut = Box::pin(fut);
+        match fut.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("the stream waited, so `pace` did not take the branch meant"),
+        }
+    }
+
+    /// An [`AudioStream`] with no endpoint behind it, already `total_frames` into its schedule.
+    ///
+    /// Built field by field because [`AudioStream::new`] opens an AAudio stream, and the counter
+    /// under test never reaches the device. [`ManuallyDrop`] because dropping one would close the
+    /// null `stream_ptr`, which on the host is [`libaaudio_stub`]'s `unimplemented!()`.
+    fn seeded_stream(
+        direction: AndroidAudioStreamDirection,
+        total_frames: u64,
+    ) -> ManuallyDrop<AudioStream> {
+        let buffer = vec![0u8; PERIOD_FRAMES * FRAME_SIZE].into_boxed_slice();
+        let buffer_ptr = buffer.as_ptr();
+        ManuallyDrop::new(AudioStream {
+            buffer,
+            frame_size: FRAME_SIZE,
+            frame_rate: RATE,
+            next_frame: Instant::now(),
+            start_time: None,
+            total_frames,
+            buffer_drop: AndroidAudioStreamCommit {
+                buffer_ptr,
+                stream: AAudioStreamPtr {
+                    stream_ptr: std::ptr::null_mut(),
+                    open: OpenParams {
+                        num_channels: 2,
+                        format: SampleFormat::S16LE,
+                        frame_rate: RATE,
+                        buffer_size: PERIOD_FRAMES,
+                        direction,
+                        host_key: String::new(),
+                        table_path: PathBuf::new(),
+                        device_id: AAUDIO_DEVICE_UNSPECIFIED,
+                    },
+                    // Far enough out that nothing tries to reopen the endpoint mid-test.
+                    retry_at: Instant::now() + Duration::from_secs(3600),
+                    reported_lost: true,
+                    idle: false,
+                },
+                direction,
+                frame_size: FRAME_SIZE,
+                frame_rate: RATE,
+            },
+            read_count: 0,
+            aaudio_buffer_size: PERIOD_FRAMES * 4,
+        })
+    }
+
+    /// Where the schedule says the period ending at `total_frames` is due, relative to the anchor.
+    fn deadline_after(total_frames: u64) -> Duration {
+        Duration::from_millis(total_frames * 1000 / RATE as u64)
+    }
+
+    /// The playback counter crosses 2^31 frames without panicking.
+    ///
+    /// That is 12.43 h of stream at 48 kHz, and with `overflow-checks = true` an `i32`
+    /// `total_frames` panics on the period that crosses it -- measured on a real VM, 2026-09-19.
+    #[test]
+    fn a_playback_stream_survives_the_twelve_hour_mark() {
+        let mut stream = seeded_stream(AndroidAudioStreamDirection::Output, NEAR_THE_I32_CEILING);
+        let period = AsyncPlaybackBufferStream::next_playback_buffer(&mut *stream, &NoDelay);
+        let before = Instant::now();
+        poll_once(period).expect("a playback period");
+        let after = Instant::now();
+
+        let expected = NEAR_THE_I32_CEILING + PERIOD_FRAMES as u64;
+        assert_eq!(stream.total_frames, expected);
+        assert!(stream.total_frames > i32::MAX as u64);
+        // The deadline is still derived from the whole counter: 12.43 h past the anchor, which
+        // `pace` set to the instant of this call. A counter that wrapped would land near `before`.
+        let due = deadline_after(expected);
+        assert!(stream.next_frame >= before + due && stream.next_frame <= after + due);
+    }
+
+    /// The same counter, reached through the capture path.
+    ///
+    /// `read_count` is still inside the priming window, so this returns silence and the AAudio
+    /// read is never attempted -- the frame counter is advanced either way.
+    #[test]
+    fn a_capture_stream_survives_the_twelve_hour_mark() {
+        let mut stream = seeded_stream(AndroidAudioStreamDirection::Input, NEAR_THE_I32_CEILING);
+        let period = AsyncCaptureBufferStream::next_capture_buffer(&mut *stream, &NoDelay);
+        let before = Instant::now();
+        poll_once(period).expect("a capture period");
+        let after = Instant::now();
+
+        let expected = NEAR_THE_I32_CEILING + PERIOD_FRAMES as u64;
+        assert_eq!(stream.total_frames, expected);
+        assert!(stream.total_frames > i32::MAX as u64);
+        let due = deadline_after(expected);
+        assert!(stream.next_frame >= before + due && stream.next_frame <= after + due);
+    }
+
+    /// Pacing is unchanged by the wider counter: a period more than a period late still abandons
+    /// the backlog and starts counting again from this one.
+    #[test]
+    fn a_late_period_still_re_anchors_the_schedule() {
+        let mut stream = seeded_stream(AndroidAudioStreamDirection::Output, NEAR_THE_I32_CEILING);
+        let late = Instant::now() - Duration::from_millis(20);
+        stream.start_time = Some(late);
+        stream.next_frame = late;
+        let period = AsyncPlaybackBufferStream::next_playback_buffer(&mut *stream, &NoDelay);
+        let before = Instant::now();
+        poll_once(period).expect("a playback period");
+        let after = Instant::now();
+
+        // Reset to this one period, not the 2^31 frames that were owed.
+        assert_eq!(stream.total_frames, PERIOD_FRAMES as u64);
+        let due = deadline_after(PERIOD_FRAMES as u64);
+        assert!(stream.next_frame >= before + due && stream.next_frame <= after + due);
+    }
+    // The seven AAudio entry points this fork added and that `libaaudio_stub` never grew. The
+    // host test binary does not link without them: both paths under test reach
+    // `open_aaudio_stream`, through `try_reconnect` on the capture side and through the commit
+    // vtable on the playback side, even though no test can ever call it -- these streams have no
+    // endpoint. They belong beside the other fourteen in `libaaudio_stub.rs`; they are here
+    // because this change is confined to one file.
+    #[no_mangle]
+    extern "C" fn AAudioStreamBuilder_setUsage(_builder: *mut AAudioStreamBuilder, _usage: i32) {
+        unimplemented!();
+    }
+
+    #[no_mangle]
+    extern "C" fn AAudioStreamBuilder_setContentType(
+        _builder: *mut AAudioStreamBuilder,
+        _content_type: i32,
+    ) {
+        unimplemented!();
+    }
+
+    #[no_mangle]
+    extern "C" fn AAudioStreamBuilder_setInputPreset(
+        _builder: *mut AAudioStreamBuilder,
+        _input_preset: i32,
+    ) {
+        unimplemented!();
+    }
+
+    #[no_mangle]
+    extern "C" fn AAudioStream_getDeviceId(_stream: *mut AAudioStream) -> i32 {
+        unimplemented!();
+    }
+
+    #[no_mangle]
+    extern "C" fn AAudioStream_getFormat(_stream: *mut AAudioStream) -> AaudioFormatT {
+        unimplemented!();
+    }
+
+    #[no_mangle]
+    extern "C" fn AAudioStream_getSampleRate(_stream: *mut AAudioStream) -> i32 {
+        unimplemented!();
+    }
+
+    #[no_mangle]
+    extern "C" fn AAudioStream_getChannelCount(_stream: *mut AAudioStream) -> i32 {
+        unimplemented!();
     }
 }

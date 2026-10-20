@@ -9,13 +9,25 @@ use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
+#[cfg(feature = "media")]
+use std::net::Shutdown;
 use std::ops::RangeInclusive;
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
+#[cfg(feature = "media")]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str;
+#[cfg(feature = "media")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "media")]
+use std::sync::atomic::Ordering;
+#[cfg(feature = "media")]
+use std::sync::mpsc;
 use std::sync::Arc;
+#[cfg(feature = "media")]
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -37,6 +49,10 @@ use devices::virtio::block::DiskOption;
 use devices::virtio::device_constants::video::VideoBackendType;
 #[cfg(any(feature = "video-decoder", feature = "video-encoder"))]
 use devices::virtio::device_constants::video::VideoDeviceType;
+#[cfg(feature = "media")]
+use devices::virtio::media::MediaDeviceSupport;
+#[cfg(feature = "media")]
+use devices::virtio::media::MediaPool;
 use devices::virtio::ipc_memory_mapper::create_ipc_mapper;
 use devices::virtio::ipc_memory_mapper::CreateIpcMapperRet;
 use devices::virtio::memory_mapper::BasicMemoryMapper;
@@ -91,7 +107,14 @@ use resources::SystemAllocator;
 use sync::Mutex;
 use vm_control::api::VmMemoryClient;
 use vm_memory::GuestAddress;
+#[cfg(feature = "media")]
+use vm_memory::GuestMemory;
+#[cfg(feature = "media")]
 
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceConfig;
+#[cfg(feature = "media")]
+use crate::crosvm::config::MediaDeviceKind;
 use crate::crosvm::config::PmemOption;
 use crate::crosvm::config::VhostUserFrontendOption;
 use crate::crosvm::config::VhostUserFsOption;
@@ -552,12 +575,14 @@ pub fn create_virtio_snd_device(
     snd_params: SndParameters,
     snd_device_tube: Tube,
     worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
 ) -> DeviceResult {
     if snd_params.uid.is_some() {
         return create_unprivileged_virtio_snd_device(
             protection_type,
             snd_params,
             worker_process_pids,
+            helper_pid_labels,
         );
     }
     let backend = snd_params.backend;
@@ -611,11 +636,15 @@ pub fn create_virtio_snd_device(
 ///
 /// The guest cannot tell this apart from the in-process device: vhost-user moves the virtqueue
 /// handling to the other side of a socket, but the device the guest enumerates is the same one.
-/// See `snd_helper` for why the backend cannot simply stay here.
+/// See `device_helper` for why the backend cannot simply stay here.
+///
+/// The child's pid is labelled the way the media helper's is, so a snd helper that dies is a
+/// logged crash rather than a stray child waved through (`logs/vpu_wp/M3.md` §9 item 3).
 fn create_unprivileged_virtio_snd_device(
     protection_type: ProtectionType,
     mut snd_params: SndParameters,
     worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
 ) -> DeviceResult {
     // The backend process builds its own feature set out of nothing but these parameters, and the
     // frontend below can only mask against what the backend offers -- so the one thing the backend
@@ -623,10 +652,38 @@ fn create_unprivileged_virtio_snd_device(
     // carried across. Same rule `base_features` applies to every in-process device.
     snd_params.access_platform = protection_type != ProtectionType::Unprotected;
 
-    let (vmm_end, pid) = crate::crosvm::sys::linux::snd_helper::launch(snd_params)
-        .context("failed to launch the unprivileged snd backend")?;
-    // So that the child exiting is not reported as a device crashing.
+    let uid = snd_params
+        .uid
+        .ok_or_else(|| anyhow!("create_unprivileged_virtio_snd_device called without a uid"))?;
+    let gid = snd_params.gid.unwrap_or(uid);
+    let supp_gids = std::mem::take(&mut snd_params.supp_gids);
+    // Whatever the child does, it must not try to spawn a backend of its own.
+    snd_params.uid = None;
+    snd_params.gid = None;
+    let config =
+        serde_json::to_string(&snd_params).context("failed to serialise snd parameters")?;
+
+    let (vmm_end, pid) =
+        crate::crosvm::sys::linux::device_helper::launch("snd", config, uid, gid, supp_gids, None)
+            .context("failed to launch the unprivileged snd backend")?;
+    // So that the child exiting cleanly is not reported as a device crashing, and anything else
+    // is, under a name.
     worker_process_pids.insert(pid);
+    helper_pid_labels.insert(pid as u32, "snd helper".to_string());
+    // This child exec'd /proc/self/exe too, so `ps` calls it `exe`; the same line the media
+    // helper gets (D14).
+    info!(
+        "launched snd helper: pid {}, uid {}, gid {}, backend {}, card_index {}, log level {}",
+        pid,
+        uid,
+        gid,
+        // The `backend=` spelling the command line uses, not `Debug`'s `Sys(AAUDIO)`.
+        String::from(snd_params.backend),
+        snd_params.card_index,
+        // What the helper was actually started at. A `debug!` in a backend only reaches the log
+        // when this says so, and until D57 it always said `info` (VPU_DESIGN.md §6.2).
+        crate::crosvm::sys::linux::device_helper::vmm_log_filter(),
+    );
 
     let connection = vmm_end
         .try_into()
@@ -1250,14 +1307,362 @@ pub fn register_video_device(
     Ok(())
 }
 
+/// Create the `--virtio-media` device `config` describes, serving its `MMAP` buffers out of
+/// `pool` when the VM has a `media_host` pool and out of a PCI shared-memory BAR otherwise
+/// (`VPU_DESIGN.md` §3.2, §3.5).
+///
+/// With `uid=` the device runs in a helper process under that uid instead, the way `--virtio-snd`
+/// does (`VPU_DESIGN.md` §6); `mem` is then what the host-accessible windows are computed from,
+/// and the helper's pid is recorded so its exit is judged and logged as one of ours.
+///
+/// Which kinds exist and where is [`MediaDeviceKind::support`]'s table, and it is consulted
+/// before `uid=` decides where the device is built: a kind nothing implements is refused here,
+/// by name, so a command line written for a later milestone fails to start rather than starting
+/// a helper that refuses it on the far side of a socket (B4 §7.1, defect D15). `kind=camera`
+/// exists in the helper alone -- the camera service refuses uid 0 (design §7.1) -- and so do
+/// the two codec kinds (design §7.4), so without `uid=` they are refused here too.
 #[cfg(feature = "media")]
-pub fn create_simple_media_device(protection_type: ProtectionType) -> DeviceResult {
+pub fn create_virtio_media_device(
+    protection_type: ProtectionType,
+    config: &MediaDeviceConfig,
+    pool: Option<MediaPool>,
+    mem: &GuestMemory,
+    worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
+) -> DeviceResult {
+    use devices::virtio::media::create_virtio_media_loopback_device;
     use devices::virtio::media::create_virtio_media_simple_capture_device;
 
+    // The kind before the uid. A kind nothing implements must be refused before anything is
+    // launched, or `uid=` sends it to a helper that refuses it by name on its own stderr while
+    // the error the VMM reports is `failed to get features: ... Connection reset by peer` (D15).
+    if config.kind.support() == MediaDeviceSupport::Unimplemented {
+        bail!("{}", config.kind.unimplemented_message());
+    }
+
+    if config.uid.is_some() {
+        return create_unprivileged_virtio_media_device(
+            protection_type,
+            config,
+            pool,
+            mem,
+            worker_process_pids,
+            helper_pid_labels,
+        );
+    }
+
     let features = virtio::base_features(protection_type);
-    let dev = create_virtio_media_simple_capture_device(features);
+    let dev = match config.kind {
+        MediaDeviceKind::Simple => create_virtio_media_simple_capture_device(features, pool),
+        MediaDeviceKind::Loopback => create_virtio_media_loopback_device(
+            features,
+            config.card.as_deref().unwrap_or("droidvm loopback"),
+            pool,
+        ),
+        // `HelperOnly`, and this call has no uid.
+        MediaDeviceKind::Camera => {
+            bail!(
+                "--virtio-media kind=camera needs uid=<app uid>: the camera device runs in a \
+                 helper process under the app's uid, because cameraserver resolves the caller \
+                 from the real uid and refuses root (VPU_DESIGN.md §7.1)"
+            )
+        }
+        MediaDeviceKind::Decoder => {
+            bail!(
+                "--virtio-media kind=decoder needs uid=<app uid>: the decoder device runs in a \
+                 helper process under the app's uid, because the codec services resolve the \
+                 caller from the real uid and every codec device keeps to the one process model \
+                 (VPU_DESIGN.md §7.4)"
+            )
+        }
+        MediaDeviceKind::Encoder => {
+            bail!(
+                "--virtio-media kind=encoder needs uid=<app uid>: the encoder device runs in a \
+                 helper process under the app's uid, because the codec services resolve the \
+                 caller from the real uid and every codec device keeps to the one process model \
+                 (VPU_DESIGN.md §7.4)"
+            )
+        }
+    };
 
     Ok(VirtioDeviceStub { dev, jail: None })
+}
+
+/// Builds a virtio-media device whose backend runs as `config.uid` in a child process
+/// (`crosvm device media`, `VPU_DESIGN.md` §6).
+///
+/// The guest cannot tell this apart from the in-process device: vhost-user moves the virtqueue
+/// handling to the other side of a socket, but the device the guest enumerates is the same one.
+/// The helper is pool-mode only -- the frontend forwards a shared-memory BAR to the GPU alone, so
+/// there is no `Bar` shape out of process -- which is why a VM without a `media_host` pool is
+/// refused here rather than given a device with no usable buffers (design §6.2, §3.3).
+///
+/// The helper's `GuestMemory` has no purposes and is never marked protected, so it is told, from
+/// this VMM's memory, which guest-physical windows the host may touch; everything it maps for a
+/// guest scatter-gather list is checked against them first (`HostAccessPolicy::Windows`).
+///
+/// The helper maps the pool but never allocates from it: the offset space stays with the VMM's
+/// one allocator (a private allocator per helper is D49's aliasing; a static slice per helper
+/// was F12's fix and starved a 4K decode), and the helper reserves and releases offsets over a
+/// `Tube` whose child end travels as `--pool-fd`. The VMM's end goes to a `media pool <card>`
+/// thread holding that helper's lease ([`MediaPool::spawn_server`]): when the helper exits or
+/// dies, the tube's EOF ends the thread and the lease's drop sweeps every reservation the
+/// helper still held back into the pool.
+#[cfg(feature = "media")]
+fn create_unprivileged_virtio_media_device(
+    protection_type: ProtectionType,
+    config: &MediaDeviceConfig,
+    pool: Option<MediaPool>,
+    mem: &GuestMemory,
+    worker_process_pids: &mut BTreeSet<Pid>,
+    helper_pid_labels: &mut BTreeMap<u32, String>,
+) -> DeviceResult {
+    use devices::virtio::media::guest_buf::host_accessible_windows;
+    use devices::virtio::vhost::user::MediaBackendParams;
+
+    let uid = config
+        .uid
+        .ok_or_else(|| anyhow!("create_unprivileged_virtio_media_device called without a uid"))?;
+    let gid = config.gid.unwrap_or(uid);
+    let pool = pool.ok_or_else(|| {
+        anyhow!(
+            "--virtio-media kind={},uid={} runs the device in a helper process, which serves \
+             MMAP buffers from the media_host pool only, and this VM has no such pool: add \
+             --pre-alloc media-host-mb=<MiB> (VPU_DESIGN.md §6.2)",
+            config.kind.as_str(),
+            uid
+        )
+    })?;
+    let (pool_gpa, _) = pool.guest_range();
+
+    // The helper builds its own feature set out of nothing but these parameters, and the frontend
+    // below can only mask against what the backend offers -- so the one thing the helper cannot
+    // work out for itself, that this VM's memory is not the host's to address, is carried across.
+    // Same rule `base_features` applies to every in-process device, and the same one the snd
+    // helper is told.
+    let params = MediaBackendParams {
+        kind: config.kind,
+        card: config.card.clone(),
+        camera_id: config.camera_id.clone(),
+        role: config.role.clone(),
+        allow_sw: config.allow_sw,
+        pool_gpa,
+        access_windows: host_accessible_windows(mem, protection_type.isolates_memory())
+            .into_iter()
+            .map(|window| (window.start, window.end - window.start + 1))
+            .collect(),
+        access_platform: protection_type != ProtectionType::Unprotected,
+    };
+    let config_json =
+        serde_json::to_string(&params).context("failed to serialise media parameters")?;
+
+    // The helper's line to the VMM's pool allocator. The child end travels by number as
+    // `--pool-fd` (CLOEXEC cleared in `launch`, exactly like the vhost-user socket) and is
+    // dropped here once the child holds it, so the child dying leaves no copy behind and the
+    // server thread's recv sees a clean EOF.
+    let (pool_server_end, pool_helper_end) =
+        base::Tube::pair().context("failed to create the media pool tube pair")?;
+    let pool_helper_fd = pool_helper_end.as_raw_descriptor();
+
+    // No supplementary groups: nothing a media device needs is granted by group membership, and
+    // crosvm's own groups are root's.
+    let (vmm_end, pid) = crate::crosvm::sys::linux::device_helper::launch(
+        "media",
+        config_json,
+        uid,
+        gid,
+        Vec::new(),
+        Some(pool_helper_fd),
+    )
+    .context("failed to launch the unprivileged media backend")?;
+    drop(pool_helper_end);
+    // The child exists from here on, so it is recorded and labelled BEFORE anything below can
+    // fail out of this function (R8-10): a clean exit is then never reported as a device
+    // crashing, anything else is reported under a name, and a failed server-thread spawn
+    // cannot leave an unlabelled orphan no reaper knows.
+    worker_process_pids.insert(pid);
+    helper_pid_labels.insert(pid as u32, "media helper".to_string());
+    // The card name the pool's log lines and server thread start under: `card=` when given,
+    // else the kind's name. The helper's Hello then replaces it with the default card string
+    // the device actually serves (`droidvm decoder`, `camera <id>`, ...), so the VMM's pool
+    // lines end up naming what the guest's `v4l2-ctl --info` shows; this launch's log line
+    // below keeps kind + card for the mapping between the two spellings.
+    let pool_card = config
+        .card
+        .clone()
+        .unwrap_or_else(|| config.kind.as_str().to_string());
+    pool.spawn_server(&pool_card, pool_server_end)
+        .context("failed to start the media pool server thread")?;
+    // The child exec'd /proc/self/exe, so its `comm` is `exe` and no `ps` will ever show what it
+    // is: this line is the only place a running helper is named (B4 §5.1, defect D14). Find it
+    // later by cmdline, not by name -- `deploy/vpu/README.md` has the one-liner.
+    info!(
+        "launched media helper: pid {}, uid {}, gid {}, kind {}, card {}, pool_gpa {:#x}, pool \
+         served by the VMM over fd {}, {} access window(s), log level {}",
+        pid,
+        uid,
+        gid,
+        config.kind.as_str(),
+        config.card.as_deref().unwrap_or("<default>"),
+        pool_gpa,
+        pool_helper_fd,
+        params.access_windows.len(),
+        // What the helper was actually started at. A `debug!` in a backend only reaches the log
+        // when this says so, and until D57 it always said `info` (VPU_DESIGN.md §6.2).
+        crate::crosvm::sys::linux::device_helper::vmm_log_filter(),
+    );
+
+    // `VhostUserFrontend::new` below is the vhost-user handshake: `set_owner`, `get_features`,
+    // `get_protocol_features`, each a blocking read on this socket with no timeout of its own, and
+    // the helper answers only once it has built its device -- for `kind=camera`, after a round of
+    // binder work (`review-m4` R4). A helper that never answers would hold the VM in device
+    // creation for good, so the wait is bounded; a helper that has already given up is named,
+    // because the child reaper that would otherwise report it is not running yet.
+    let watchdog = HandshakeWatchdog::arm(&vmm_end, pid)?;
+
+    let connection = vmm_end
+        .try_into()
+        .context("failed to create a vhost-user connection to the media backend")?;
+
+    let result = VhostUserFrontend::new(
+        virtio::DeviceType::Media,
+        virtio::base_features(protection_type),
+        connection,
+        None,
+        None,
+    );
+    if watchdog.finish() {
+        // The socket has been shut down; this connection is finished whatever `new` returned.
+        bail!("{}", media_handshake_failure(pid, true));
+    }
+    let dev = result.with_context(|| media_handshake_failure(pid, false))?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        // No sandbox here: virtqueue handling happens in the backend process.
+        jail: None,
+    })
+}
+
+/// How long the VMM waits for a media helper to answer the vhost-user handshake.
+#[cfg(feature = "media")]
+const MEDIA_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounds one vhost-user handshake with a helper process.
+///
+/// **Why a watchdog and not `SO_RCVTIMEO`.** The socket does support a receive timeout, but
+/// `vmm_vhost` maps the `EAGAIN` it raises to `Error::SocketRetry`
+/// (`third_party/vmm_vhost/src/lib.rs:204-206`), which `Connection::recv_into_bufs_all` retries in
+/// a loop (`third_party/vmm_vhost/src/connection.rs:135-138`): a read timeout would spin, not
+/// fail. What does end a blocked `recvmsg` is a shutdown of the socket -- it then returns 0 bytes,
+/// which `recv_into_bufs` turns into `Error::Disconnect` -- so the watchdog holds a dup of the
+/// VMM's end and shuts it down for reading when it gives up. The dup is a second handle on the
+/// same socket, so the shutdown reaches the socket the frontend is reading; closing the dup (when
+/// the thread ends) shuts nothing down.
+#[cfg(feature = "media")]
+struct HandshakeWatchdog {
+    /// Set by whichever of the two finishes first. The loser leaves the socket alone, so a
+    /// handshake that completes in the same instant the watchdog expires is not cut off after the
+    /// fact -- and the winner is what [`HandshakeWatchdog::finish`] reports.
+    over: Arc<AtomicBool>,
+    /// Dropping it wakes the thread at once, so a handshake that answered does not wait out the
+    /// timeout.
+    done: mpsc::Sender<()>,
+    thread: thread::JoinHandle<()>,
+}
+
+#[cfg(feature = "media")]
+impl HandshakeWatchdog {
+    fn arm(vmm_end: &UnixStream, pid: Pid) -> Result<Self> {
+        let socket = vmm_end
+            .try_clone()
+            .context("failed to duplicate the media helper's socket")?;
+        let over = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&over);
+        let (done, wait) = mpsc::channel::<()>();
+        let thread = thread::Builder::new()
+            .name("media_handshake".to_string())
+            .spawn(move || {
+                if !matches!(
+                    wait.recv_timeout(MEDIA_HANDSHAKE_TIMEOUT),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    return;
+                }
+                if flag
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    warn!(
+                        "the media helper (pid {}) has not answered the vhost-user handshake in \
+                         {} s; giving up on it",
+                        pid,
+                        MEDIA_HANDSHAKE_TIMEOUT.as_secs()
+                    );
+                    let _ = socket.shutdown(Shutdown::Read);
+                }
+            })
+            .context("failed to start the media helper's handshake watchdog")?;
+        Ok(Self { over, done, thread })
+    }
+
+    /// Claim the outcome and join the thread. `true` means the watchdog got there first, i.e. the
+    /// socket was shut down and the handshake is over whatever it returned.
+    fn finish(self) -> bool {
+        let timed_out = self
+            .over
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err();
+        drop(self.done);
+        let _ = self.thread.join();
+        timed_out
+    }
+}
+
+/// The error for a media helper whose handshake did not happen, with `waitpid(pid, WNOHANG)`
+/// asked what became of the helper itself.
+///
+/// A helper that refused its parameters -- an unknown `camera_id`, a uid that can see no camera,
+/// no NDK, a kind it does not implement -- has already exited by the time the VMM's read fails,
+/// and the VMM's own error is then `Connection reset by peer` with nothing to say who reset it
+/// (B4 §7.1, defect D15). Its exit status is that missing sentence, and nothing else will ever
+/// report it: the child reaper does not run until the VM is built.
+#[cfg(feature = "media")]
+fn media_handshake_failure(pid: Pid, timed_out: bool) -> String {
+    if let Some(how) = media_helper_end(pid) {
+        return format!(
+            "the media helper (pid {pid}) {how} before the handshake -- read its stderr \
+             (the VM log)"
+        );
+    }
+    if timed_out {
+        return format!(
+            "the media helper (pid {pid}) did not answer the vhost-user handshake within {} s",
+            MEDIA_HANDSHAKE_TIMEOUT.as_secs()
+        );
+    }
+    format!(
+        "failed to set up the vhost-user frontend for media: the helper (pid {pid}) is still \
+         running -- read its stderr (the VM log)"
+    )
+}
+
+/// How a helper ended, or `None` if it is still running.
+#[cfg(feature = "media")]
+fn media_helper_end(pid: Pid) -> Option<String> {
+    match base::linux::wait_for_pid(pid, libc::WNOHANG) {
+        // Still running: slow, or wedged, but not the one that gave up.
+        Ok((None, _)) => None,
+        Ok((Some(_), status)) => Some(match (status.code(), status.signal()) {
+            (Some(code), _) => format!("exited with status {code}"),
+            (_, Some(signal)) => format!("was killed by signal {signal}"),
+            _ => format!("ended ({status})"),
+        }),
+        Err(e) => {
+            warn!("cannot ask what the media helper (pid {}) did: {}", pid, e);
+            None
+        }
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1294,7 +1699,9 @@ pub fn create_virtio_media_adapter(
     };
 
     let features = virtio::base_features(protection_type);
-    let dev = create_virtio_media_decoder_adapter_device(features, tube, backend)?;
+    // The decoder adapter keeps the upstream shared-memory BAR shape; its backends are not
+    // built for Android, where the pool matters.
+    let dev = create_virtio_media_decoder_adapter_device(features, tube, backend, None)?;
 
     Ok(VirtioDeviceStub { dev, jail })
 }
