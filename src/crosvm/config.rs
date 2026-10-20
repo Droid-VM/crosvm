@@ -350,7 +350,12 @@ pub struct KmsDisplayConfig {
 #[cfg(feature = "kms_display")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum KmsTakeoverMode { Display }
+pub enum KmsTakeoverMode {
+    /// crosvm stops Android and starts its own restoration sentinel (adb debugging).
+    Display,
+    /// The launcher has stopped Android and owns the restoration sentinel.
+    External,
+}
 
 #[cfg(feature = "kms_display")]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

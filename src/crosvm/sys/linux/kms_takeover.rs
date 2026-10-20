@@ -10,6 +10,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,78 @@ const COMPOSER: &str = "vendor.qti.hardware.display.composer";
 const SF: &str = "surfaceflinger";
 const SUSPEND: &str = "system_suspend";
 const WAKE: &str = "crosvm_kms";
+const DISPLAY_LOCKS: [&str; 2] = [
+    "/data/local/tmp/crosvm-kms.lock",
+    "/data/data/cn.classfun.droidvm/run/android-display.lock",
+];
+
+// Opening an existing file and briefly probing flock never arms restoration or
+// changes Android. An unlocked file (even one left by an old sentinel) is not an owner.
+fn display_lock_held(path: &Path) -> Result<bool> {
+    let lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("open display lock {}", path.display())),
+    };
+    ensure!(
+        lock.metadata()?.is_file(),
+        "invalid display lock {}",
+        path.display()
+    );
+    // SAFETY: lock owns a live fd. Closing it releases a successful probe immediately.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        return Ok(true);
+    }
+    Err(error).with_context(|| format!("probe display lock {}", path.display()))
+}
+
+/// The launcher's sentinel alone owns Android restoration in external mode.
+pub(crate) fn preflight_external() -> Result<()> {
+    for name in [SF, COMPOSER] {
+        ensure!(
+            property(&format!("init.svc.{name}"))? == "stopped",
+            "KMS external takeover requires Android service {name} to be stopped"
+        );
+    }
+    for path in DISPLAY_LOCKS {
+        if display_lock_held(Path::new(path))? {
+            return Ok(());
+        }
+    }
+    bail!("KMS external takeover requires a restoration sentinel holding a display lock");
+}
+
+fn acquire_display_lock(path: &Path) -> Result<File> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .with_context(|| format!("open display lock {}", path.display()))?;
+    ensure!(
+        lock.metadata()?.is_file(),
+        "invalid display lock {}",
+        path.display()
+    );
+    // SAFETY: lock owns a live fd; retain both files until restoration has completed.
+    ensure!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
+        "another KMS session owns display lock {}: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    Ok(lock)
+}
 
 // Verified against warsaw OS4.0.0.7's actual hangdetect.ko, not the generic MTK ABI.
 // HANG_KICK takes a scalar timeout in seconds, despite its _IOR encoding.
@@ -479,18 +552,11 @@ pub(crate) fn sentinel_main() -> Result<()> {
     // Detach from the launching terminal/process group; the sentinel must survive parent death.
     // SAFETY: setsid takes no pointers and affects only this fresh exec'd process.
     ensure!(unsafe { libc::setsid() } >= 0, "sentinel setsid failed");
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open("/data/local/tmp/crosvm-kms.lock")?;
-    // SAFETY: lock is a live file descriptor. Never let two sentinels restore over each other.
-    ensure!(
-        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
-        "another KMS session owns the display"
-    );
+    // Match the daemon sentinel's lock order to exclude production and adb sessions.
+    let _locks = DISPLAY_LOCKS
+        .iter()
+        .map(|path| acquire_display_lock(Path::new(path)))
+        .collect::<Result<Vec<_>>>()?;
     let mut input = BufReader::new(std::io::stdin());
     let mut line = String::new();
     input.read_line(&mut line)?;
