@@ -148,6 +148,7 @@ use devices::PvPanicPciDevice;
 #[cfg(feature = "pci-hotplug")]
 use devices::ResourceCarrier;
 use devices::StubPciDevice;
+use devices::VirtioMmioDevice;
 use devices::VirtioPciDevice;
 #[cfg(feature = "usb")]
 use devices::XhciController;
@@ -1487,6 +1488,25 @@ fn create_devices(
         .context("failed to create virtio pci dev")?;
 
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, stub.jail));
+    }
+
+    // Block devices on the virtio-mmio transport. No PCI plumbing: the aarch64 VM builder puts
+    // them on the MMIO bus and wires their queue-notify ioevents and level IRQ. They run in the
+    // VMM process (a jailed proxy is PCI-only here).
+    for disk in &cfg.virtio_mmio_disks {
+        let (disk_host_tube, disk_device_tube) = Tube::pair().context("failed to create tube")?;
+        add_control_tube(DeviceControlTube::Disk(disk_host_tube).into());
+        let stub = DiskConfig::new(disk, Some(disk_device_tube))
+            .create_virtio_device_and_jail(cfg.protection_type, cfg.jail_config.as_ref())?;
+        if stub.jail.is_some() {
+            warn!(
+                "virtio-mmio block {} runs in the VMM process, outside its jail",
+                disk.path.display()
+            );
+        }
+        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+            .context("failed to create virtio-mmio device")?;
+        devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
     #[cfg(feature = "usb")]

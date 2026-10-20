@@ -490,6 +490,19 @@ fn create_serial_nodes(fdt: &mut Fdt, serial_devices: &[SerialDeviceInfo]) -> Re
 /// emulates a level line over that edge via its `irq_asserted` latch. A LEVEL
 /// declaration here would leave the GIC line asserted after EOI (crosvm never
 /// deasserts an edge irqfd) and storm the guest with "irq N: nobody cared".
+/// A virtio-mmio transport (--virtio-mmio-block): the generic "virtio,mmio" binding, a level SPI
+/// like a virtio-pci INTx, and coherent DMA (guest RAM is shared, there is no IOMMU or pool).
+fn create_virtio_mmio_node(fdt: &mut Fdt, base: u64, size: u64, irq: u32) -> Result<()> {
+    let reg = [base, size];
+    let interrupts = [GIC_FDT_IRQ_TYPE_SPI, irq, IRQ_TYPE_LEVEL_HIGH];
+    let node = fdt.root_mut().subnode_mut(&format!("virtio_mmio@{:x}", base))?;
+    node.set_prop("compatible", "virtio,mmio")?;
+    node.set_prop("reg", &reg)?;
+    node.set_prop("interrupts", &interrupts)?;
+    node.set_prop("dma-coherent", ())?;
+    Ok(())
+}
+
 fn create_sbsa_uart_node(fdt: &mut Fdt, base: u64, irq: u32) -> Result<()> {
     let reg = [base, 0x1000u64];
     let interrupts = [GIC_FDT_IRQ_TYPE_SPI, irq, IRQ_TYPE_EDGE_RISING];
@@ -1010,6 +1023,7 @@ pub fn create_fdt(
     smbios: &SmbiosOptions,
     pflash_cfg: Option<PflashDtConfig>,
     sbsa_uart_cfg: Option<(u64, u32, bool)>,
+    virtio_mmio: &[(u64, u64, u32)],
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -1174,6 +1188,9 @@ pub fn create_fdt(
     create_serial_nodes(&mut fdt, serial_devices)?;
     if let Some((base, irq, _is_console)) = sbsa_uart_cfg {
         create_sbsa_uart_node(&mut fdt, base, irq)?;
+    }
+    for &(base, size, irq) in virtio_mmio {
+        create_virtio_mmio_node(&mut fdt, base, size, irq)?;
     }
     create_psci_node(&mut fdt, &psci_version)?;
     create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges, dma_pool_phandle)?;

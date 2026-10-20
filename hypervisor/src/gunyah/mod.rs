@@ -1901,7 +1901,10 @@ impl Vm for GunyahVm {
 
         let mut flags = 0;
         if do_datamatch {
-            flags |= 1 << GH_IOEVENTFD_DATAMATCH;
+            // GH_IOEVENTFD_DATAMATCH is the mask (1 << 0), as in the UAPI's
+            // GH_IOEVENTFD_FLAGS_DATAMATCH, not a bit number: shifting it sets a reserved flag
+            // and the kernel refuses the ioeventfd with EINVAL.
+            flags |= GH_IOEVENTFD_DATAMATCH;
         }
 
         let maddr = if let IoEventAddress::Mmio(maddr) = addr {
