@@ -1246,6 +1246,8 @@ pub struct Config {
     pub virt_cpufreq: bool,
     pub virt_cpufreq_v2: bool,
     pub virtio_input: Vec<InputDeviceOption>,
+    /// Block devices on the virtio-mmio transport (`--virtio-mmio-block`).
+    pub virtio_mmio_disks: Vec<DiskOption>,
     #[cfg(feature = "audio")]
     #[serde(skip)]
     pub virtio_snds: Vec<SndParameters>,
@@ -1490,6 +1492,7 @@ impl Default for Config {
             virt_cpufreq_v2: false,
             virtio_input: Vec::new(),
             #[cfg(feature = "audio")]
+            virtio_mmio_disks: Vec::new(),
             virtio_snds: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             #[cfg(feature = "media")]

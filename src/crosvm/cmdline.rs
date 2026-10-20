@@ -2829,6 +2829,14 @@ pub struct RunCommand {
     /// with the driver in upstream linux
     pub virt_cpufreq_upstream: Option<bool>,
 
+    #[argh(option, arg_name = "PATH[,key=value[,key=value[,...]]]")]
+    #[serde(default)]
+    #[merge(strategy = append)]
+    /// a block device on the virtio-mmio transport instead of virtio-pci, for a guest that has a
+    /// virtio-mmio driver but no PCI host driver (aarch64 only). Same keys as --block; each device
+    /// gets one page of MMIO and one SPI, and a "virtio,mmio" device tree node.
+    virtio_mmio_block: Vec<DiskOptionWithId>,
+
     #[cfg(feature = "audio")]
     #[argh(
         option,
@@ -3250,6 +3258,11 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.disks = disks.into_iter().map(|d| d.disk_option).collect();
 
         cfg.scsis = cmd.scsi_block;
+        cfg.virtio_mmio_disks = cmd
+            .virtio_mmio_block
+            .into_iter()
+            .map(|d| d.disk_option)
+            .collect();
 
         cfg.pmems = cmd.pmem;
         cfg.pre_alloc = cmd.pre_alloc;

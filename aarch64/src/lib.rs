@@ -35,6 +35,7 @@ use devices::serial_device::SerialParameters;
 use devices::vmwdt::VMWDT_DEFAULT_CLOCK_HZ;
 use devices::vmwdt::VMWDT_DEFAULT_TIMEOUT_SEC;
 use devices::Bus;
+use devices::BusDevice;
 use devices::BusDeviceObj;
 use devices::BusError;
 use devices::BusType;
@@ -65,6 +66,7 @@ use hypervisor::DeviceKind;
 use hypervisor::Hypervisor;
 use hypervisor::HypervisorCap;
 use hypervisor::HypervisorKind;
+use hypervisor::IoEventAddress;
 use hypervisor::MemCacheType;
 use hypervisor::ProtectionType;
 use hypervisor::VcpuAArch64;
@@ -206,6 +208,12 @@ const AARCH64_GPIO_ADDR: u64 = 0x4000;
 // must not squat on it, so it lives at page 0x6000.
 const AARCH64_SBSA_UART_BASE: u64 = 0x6000;
 const AARCH64_SBSA_UART_SIZE: u64 = 0x1000;
+
+// virtio-mmio devices (--virtio-mmio-block): one 4 KiB page each from a free spot of the low
+// MMIO area, below the GIC and inside what Gunyah traps to the VMM.
+const AARCH64_VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
+const AARCH64_VIRTIO_MMIO_STRIDE: u64 = 0x1000;
+const AARCH64_VIRTIO_MMIO_MAX: usize = 16;
 // DroidVM PmReset: ACPI reduced-hardware power controller backing the FADT's
 // SLEEP_CONTROL_REG (0x5000) / SLEEP_STATUS_REG (0x5004) / RESET_REG (0x5008).
 // Windows-on-ARM has no PSCI, so power-off/reboot come through these registers.
@@ -478,6 +486,8 @@ pub enum Error {
     ReadReg(base::Error),
     #[error("error reading CPU registers: {0}")]
     ReadRegs(base::Error),
+    #[error("failed to register an ioevent: {0}")]
+    RegisterIoevent(base::Error),
     #[error("failed to register irq fd: {0}")]
     RegisterIrqfd(base::Error),
     #[error("error registering PCI bus: {0}")]
@@ -486,6 +496,8 @@ pub enum Error {
     RegisterPflash(BusError),
     #[error("error registering virtual cpufreq device: {0}")]
     RegisterVirtCpufreq(BusError),
+    #[error("error registering virtio-mmio device: {0}")]
+    RegisterVirtioMmio(BusError),
     #[error("error registering virtual socket device: {0}")]
     RegisterVsock(arch::DeviceRegistrationError),
     #[error("failed to set device attr: {0}")]
@@ -504,6 +516,8 @@ pub enum Error {
     Unsupported,
     #[error("failed to initialize VCPU: {0}")]
     VcpuInit(base::Error),
+    #[error("too many virtio-mmio devices: {0} (at most {AARCH64_VIRTIO_MMIO_MAX})")]
+    VirtioMmioTooMany(usize),
     #[error("error writing guest memory: {0}")]
     WriteGuestMemory(GuestMemoryError),
     #[error("error writing CPU register: {0}")]
@@ -1436,9 +1450,12 @@ impl arch::LinuxArch for AArch64 {
 
         let pci_root = Arc::new(Mutex::new(pci));
         let pci_bus = Arc::new(Mutex::new(PciConfigMmio::new(pci_root.clone(), 12)));
-        let (platform_devices, _others): (Vec<_>, Vec<_>) = others
+        let (platform_devices, others): (Vec<_>, Vec<_>) = others
             .into_iter()
             .partition(|(dev, _)| dev.as_platform_device().is_some());
+        let (virtio_mmio_devices, _others): (Vec<_>, Vec<_>) = others
+            .into_iter()
+            .partition(|(dev, _)| dev.as_virtio_mmio_device().is_some());
 
         let platform_devices = platform_devices
             .into_iter()
@@ -1457,6 +1474,51 @@ impl arch::LinuxArch for AArch64 {
             )
             .map_err(Error::CreatePlatformBus)?;
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
+
+        // virtio-mmio devices: a page each from AARCH64_VIRTIO_MMIO_BASE, a level SPI each (the
+        // virtio-pci INTx shape), and their queue-notify ioevents registered with the hypervisor.
+        // They live in this process; a jail would need a proxy that only PCI devices get here.
+        if virtio_mmio_devices.len() > AARCH64_VIRTIO_MMIO_MAX {
+            return Err(Error::VirtioMmioTooMany(virtio_mmio_devices.len()));
+        }
+        let mut virtio_mmio_fdt = Vec::new();
+        for (index, (dev, _jail)) in virtio_mmio_devices.into_iter().enumerate() {
+            let mut dev = dev.into_virtio_mmio_device().unwrap();
+            let base = AARCH64_VIRTIO_MMIO_BASE + index as u64 * AARCH64_VIRTIO_MMIO_STRIDE;
+            dev.set_mmio_base(base);
+            let irq = system_allocator.allocate_irq().ok_or(Error::AllocateIrq)?;
+            let irq_evt = devices::IrqLevelEvent::new().map_err(Error::CreateEvent)?;
+            dev.assign_irq(&irq_evt, irq);
+            for (event, addr, datamatch) in dev.ioevents() {
+                vm.register_ioevent(event, IoEventAddress::Mmio(addr), datamatch)
+                    .map_err(Error::RegisterIoevent)?;
+            }
+            irq_chip
+                .register_level_irq_event(
+                    irq,
+                    &irq_evt,
+                    IrqEventSource {
+                        device_id: dev.device_id(),
+                        queue_id: 0,
+                        device_name: dev.debug_label(),
+                    },
+                )
+                .map_err(Error::RegisterIrqfd)?;
+            base::info!(
+                "virtio-mmio: {} at {:#x} irq {}",
+                dev.debug_label(),
+                base,
+                irq
+            );
+            mmio_bus
+                .insert(
+                    Arc::new(Mutex::new(*dev)),
+                    base,
+                    devices::virtio::VIRTIO_MMIO_REGION_SZ,
+                )
+                .map_err(Error::RegisterVirtioMmio)?;
+            virtio_mmio_fdt.push((base, devices::virtio::VIRTIO_MMIO_REGION_SZ, irq));
+        }
 
         let (vmwdt_host_tube, vmwdt_control_tube) = Tube::pair().map_err(Error::CreateTube)?;
         let pm = Self::add_arch_devs(
@@ -1943,6 +2005,7 @@ impl arch::LinuxArch for AArch64 {
             &components.smbios,
             pflash_cfg,
             sbsa_uart_cfg,
+            &virtio_mmio_fdt,
         )
         .map_err(Error::CreateFdt)?;
 
