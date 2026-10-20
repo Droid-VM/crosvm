@@ -2353,11 +2353,20 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
     #[cfg(all(feature = "kms_display", target_os = "android"))]
-    let _kms_takeover = cfg.kms_display.as_ref().map(|_| kms_takeover::Takeover::begin()).transpose()?;
+    let _kms_takeover = match cfg.kms_display.as_ref().map(|k| &k.takeover) {
+        Some(crate::crosvm::config::KmsTakeoverMode::Display) => {
+            Some(kms_takeover::Takeover::begin()?)
+        }
+        Some(crate::crosvm::config::KmsTakeoverMode::External) => {
+            kms_takeover::preflight_external()?;
+            None
+        }
+        None => None,
+    };
     #[cfg(all(feature = "kms_display", target_os = "android"))]
     if let Some(kms) = &cfg.kms_display {
         // Check master, native mode and all required properties before allocating guest RAM.
-        // The worker subsequently opens its own card; Android remains stopped under the guard.
+        // The worker subsequently opens its own card; the selected sentinel owns restoration.
         drop(gpu_display::GpuDisplay::open_kms(
             &kms.card, kms.planes == crate::crosvm::config::KmsPlanes::Split,
         ).context("KMS preflight")?);

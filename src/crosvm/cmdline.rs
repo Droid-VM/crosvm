@@ -1680,7 +1680,7 @@ pub struct RunCommand {
     #[argh(option, from_str_fn(kms_display_from_str))]
     #[serde(default)]
     #[merge(strategy = overwrite_option)]
-    /// direct SDE command-mode scanout: card=PATH,screen=gpu-0,takeover=display[,planes=split|single]
+    /// direct SDE command-mode scanout: card=PATH,screen=gpu-0,takeover=display|external[,planes=split|single]
     pub kms_display: Option<crate::crosvm::config::KmsDisplayConfig>,
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
