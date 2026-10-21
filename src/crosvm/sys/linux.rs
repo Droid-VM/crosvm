@@ -103,6 +103,7 @@ use devices::virtio::vhost::user::VhostUserConnectionTrait;
 use devices::virtio::vhost::user::VhostUserListener;
 #[cfg(feature = "balloon")]
 use devices::virtio::BalloonFeatures;
+use devices::virtio::DeviceType;
 #[cfg(feature = "pci-hotplug")]
 use devices::virtio::NetParameters;
 #[cfg(feature = "pci-hotplug")]
@@ -1443,7 +1444,14 @@ fn create_devices(
         simplefb_vnc_input_out,
     )?;
 
+    // --virtio-mmio-input: the input devices wait for the virtio-mmio block devices, so that the
+    // disks keep the first MMIO pages whatever input a VM has.
+    let mut mmio_inputs = Vec::new();
     for stub in stubs {
+        if cfg.virtio_mmio_input && stub.dev.device_type() == DeviceType::Input {
+            mmio_inputs.push(stub);
+            continue;
+        }
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
         add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
 
@@ -1506,6 +1514,15 @@ fn create_devices(
         }
         let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio device")?;
+        devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
+    }
+
+    for stub in mmio_inputs {
+        if stub.jail.is_some() {
+            warn!("virtio-mmio input runs in the VMM process, outside its jail");
+        }
+        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+            .context("failed to create virtio-mmio input device")?;
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
