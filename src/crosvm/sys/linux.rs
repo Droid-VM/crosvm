@@ -1535,6 +1535,14 @@ fn create_devices(
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
+    // --droidvm-gpu: the last virtio-mmio device, after the inputs.
+    if cfg.droidvm_gpu {
+        let gpu = virtio::DroidVmGpu::new(virtio::base_features(cfg.protection_type));
+        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), Box::new(gpu))
+            .context("failed to create droidvm-gpu device")?;
+        devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
+    }
+
     #[cfg(feature = "usb")]
     if cfg.usb {
         // Create xhci controller.

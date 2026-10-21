@@ -476,6 +476,10 @@ impl VirtioPciDevice {
                 PciClassCode::BaseSystemPeripheral,
                 &PciBaseSystemPeripheralSubclass::Other as &dyn PciSubclass,
             ),
+            DeviceType::DroidVmGpu => (
+                PciClassCode::DisplayController,
+                &PciDisplaySubclass::Other as &dyn PciSubclass,
+            ),
         };
 
         let num_interrupts = device.num_interrupts();
