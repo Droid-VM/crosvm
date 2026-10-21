@@ -17,6 +17,9 @@ pub const VIRTIO_ID_PVCLOCK: u32 = 61;
 // DroidVM: host->guest transport for Gunyah runtime memparcel accept (VmAccept::Sync).
 // Nonstandard; must match the guest module (droidvm-guest-additions/virtio_gunyah_accept).
 pub const VIRTIO_ID_GUNYAH_ACCEPT: u32 = 60;
+// DroidVM: paravirtual Adreno for an XNU guest, run against the host's KGSL (devices/src/virtio/droidvm_gpu.rs).
+// Nonstandard; must match UniXNU-droidvm package/DroidVMGpuWire.h.
+pub const VIRTIO_ID_DROIDVM_GPU: u32 = 59;
 // TODO: Remove this once the ID is included in the Linux headers.
 pub const VIRTIO_ID_MEDIA: u32 = 48;
 
