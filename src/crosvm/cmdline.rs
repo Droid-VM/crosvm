@@ -2837,6 +2837,13 @@ pub struct RunCommand {
     /// gets one page of MMIO and one SPI, and a "virtio,mmio" device tree node.
     virtio_mmio_block: Vec<DiskOptionWithId>,
 
+    #[argh(switch)]
+    #[serde(skip)] // TODO(b/255223604)
+    #[merge(strategy = overwrite_option)]
+    /// put the --input devices on the virtio-mmio transport instead of virtio-pci (aarch64 only),
+    /// after the --virtio-mmio-block devices and in their command line order
+    virtio_mmio_input: Option<bool>,
+
     #[cfg(feature = "audio")]
     #[argh(
         option,
@@ -3263,6 +3270,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             .into_iter()
             .map(|d| d.disk_option)
             .collect();
+        cfg.virtio_mmio_input = cmd.virtio_mmio_input.unwrap_or_default();
 
         cfg.pmems = cmd.pmem;
         cfg.pre_alloc = cmd.pre_alloc;
