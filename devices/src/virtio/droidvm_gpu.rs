@@ -14,9 +14,19 @@
 //!   timestamps), so the guest's in-order fence timeline is KGSL's; RETIRED and WAIT read it.
 //!
 //! One request at a time, handled synchronously by the worker; the guest polls the used ring.
+//!
+//! The guest is not trusted with the host's GPU or memory: whatever it sends, the worst it may do is lose its own GPU.
+//! - IMPORT takes only memory host and guest share (the guest's RAM and the framebuffer of a pseudo-unprotected VM).
+//!   The rest is lent to the VM, and a GPU access to memory the host has given away faults in the hypervisor or the
+//!   firmware, below anything Linux can recover. Live imports are capped in count and in bytes.
+//! - BIND stays inside the object it names and inside the VBO, page-aligned.
+//! - The KGSL context is created without fault tolerance (KGSL invalidates it on a fault instead of replaying the guest's
+//!   work) and in the lowest priority band, so the host's own GPU work goes first; a KGSL that refuses either keeps what it
+//!   accepts. When KGSL reports a GPU reset caused by this context, the device releases everything it holds and refuses
+//!   all further work.
+//! - Waits are bounded, so the worker always gets back to its kill event and the VM can stop.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
@@ -37,6 +47,7 @@ use vm_memory::udmabuf::UdmabufDriver;
 use vm_memory::udmabuf::UdmabufDriverTrait;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
+use vm_memory::MemoryRegionPurpose;
 use zerocopy::FromBytes;
 use zerocopy::Immutable;
 use zerocopy::IntoBytes;
@@ -55,6 +66,18 @@ const WIRE_VERSION: u32 = 1;
 const MAX_RANGES: u32 = 1024;
 const MAX_IBS: u32 = 16;
 const WAIT_MAX_MS: u32 = 4;
+/// Live imports at most: each costs the host kernel page arrays, a scatter list and GPU page tables.
+const MAX_OBJECTS: usize = 4096;
+/// Live imported bytes at most, in units of the shared memory: the same pages may be imported more than once (one
+/// IOSurface for two clients), but not without bound.
+const MAX_IMPORTED_SHARES: u64 = 2;
+/// An ioctl interrupted this many times in a row gives up, so the worker always returns to its kill event.
+const EINTR_RETRIES: u32 = 8;
+/// Every this many submissions the GPU reset status is read even when nothing failed.
+const RESET_CHECK_INTERVAL: u64 = 64;
+/// Refused requests logged at most (a guest can repeat one forever).
+const REFUSALS_LOGGED: u64 = 16;
+const PAGE: u64 = 4096;
 
 const OP_INFO: u32 = 1;
 const OP_IMPORT: u32 = 2;
@@ -164,6 +187,7 @@ mod kgsl {
     const RW: u64 = 3;
 
     pub const PROP_DEVICE_INFO: u32 = 0x1;
+    pub const PROP_GPU_RESET_STAT: u32 = 0x9;
     pub const PROP_UCHE_GMEM_VADDR: u32 = 0x13;
     pub const PROP_HIGHEST_BANK_BIT: u32 = 0x17;
     pub const PROP_UBWC_MODE: u32 = 0x1b;
@@ -174,6 +198,12 @@ mod kgsl {
     pub const CONTEXT_SUBMIT_IB_LIST: u64 = 0x4;
     pub const CONTEXT_PREAMBLE: u32 = 0x10;
     pub const CONTEXT_USER_GENERATED_TS: u32 = 0x80;
+    pub const CONTEXT_NO_FAULT_TOLERANCE: u32 = 0x200;
+    pub const CONTEXT_PRIORITY_SHIFT: u32 = 12;
+    /// The highest priority number is the lowest priority: KGSL places it in its last ringbuffer.
+    pub const CONTEXT_PRIORITY_LOWEST: u32 = 0xf << CONTEXT_PRIORITY_SHIFT;
+    pub const CTX_STAT_NO_ERROR: u32 = 0;
+    pub const CTX_STAT_INNOCENT_CONTEXT_RESET_EXT: u32 = 2;
     pub const CMDLIST_IB: u32 = 0x1;
     pub const MEMFLAGS_GPUREADONLY: u64 = 1 << 24;
     pub const CACHEMODE_SHIFT: u64 = 26;
@@ -330,12 +360,23 @@ struct Kgsl {
     context: u32,
     vbo: u32,
     info: Info,
-    objects: BTreeSet<u32>,
+    /// Live imports and their sizes.
+    objects: BTreeMap<u32, u64>,
+    /// Their total, and its cap.
+    imported: u64,
+    import_limit: u64,
+    /// The guest-physical spans IMPORT may take (start, end): the memory host and guest share.
+    shared: Vec<(u64, u64)>,
     udmabuf: UdmabufDriver,
+    submits: u64,
+    refusals: u64,
+    /// The GPU was reset because of this context: everything is released and every request refused.
+    failed: bool,
 }
 
 impl Kgsl {
     fn ioctl<T>(&self, request: u64, arg: &mut T) -> io::Result<()> {
+        let mut interrupted = 0;
         loop {
             // SAFETY: `arg` is a live, correctly laid out argument of `request` (the kgsl uapi layouts above).
             let ret = unsafe {
@@ -345,10 +386,20 @@ impl Kgsl {
                 return Ok(());
             }
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINTR) {
+            interrupted += 1;
+            if error.raw_os_error() != Some(libc::EINTR) || interrupted > EINTR_RETRIES {
                 return Err(error);
             }
         }
+    }
+
+    /// Logs a refused request, the first few times only.
+    fn refuse(&mut self, status: i32, what: std::fmt::Arguments) -> i32 {
+        self.refusals += 1;
+        if self.refusals <= REFUSALS_LOGGED {
+            warn!("droidvm-gpu: refused {} ({})", what, -status);
+        }
+        status
     }
 
     fn property<T>(&self, type_: u32, value: &mut T) -> io::Result<()> {
@@ -360,20 +411,41 @@ impl Kgsl {
         self.ioctl(kgsl::GETPROPERTY, &mut request)
     }
 
-    fn open() -> anyhow::Result<Kgsl> {
+    fn open(mem: &GuestMemory) -> anyhow::Result<Kgsl> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/kgsl-3d0")
             .context("open /dev/kgsl-3d0")?;
         let udmabuf = UdmabufDriver::new().map_err(|e| anyhow!("open /dev/udmabuf: {}", e))?;
+        let shared: Vec<(u64, u64)> = mem
+            .regions()
+            .filter(|region| {
+                matches!(
+                    region.options.purpose,
+                    MemoryRegionPurpose::SharedGuestRam | MemoryRegionPurpose::SharedFramebuffer
+                )
+            })
+            .map(|region| (region.guest_addr.offset(), region.guest_addr.offset() + region.size as u64))
+            .collect();
+        if shared.is_empty() {
+            // Without a shared region every guest page is lent to the VM: nothing may go to the host's GPU.
+            return Err(anyhow!("no guest memory is shared with the host (not a pseudo-unprotected VM?)"));
+        }
+        let shared_bytes: u64 = shared.iter().map(|(start, end)| end - start).sum();
         let mut kgsl = Kgsl {
             file,
             context: 0,
             vbo: 0,
             info: Info::default(),
-            objects: BTreeSet::new(),
+            objects: BTreeMap::new(),
+            imported: 0,
+            import_limit: shared_bytes.saturating_mul(MAX_IMPORTED_SHARES),
+            shared,
             udmabuf,
+            submits: 0,
+            refusals: 0,
+            failed: false,
         };
         let mut device = kgsl::DevInfo::default();
         kgsl.property(kgsl::PROP_DEVICE_INFO, &mut device)
@@ -390,16 +462,37 @@ impl Kgsl {
         }
         let (vbo, va_start, va_size) = kgsl.reserve_vbo()?;
         kgsl.vbo = vbo;
-        let mut create = kgsl::DrawCtxtCreate {
-            flags: kgsl::CONTEXT_SAVE_GMEM
-                | kgsl::CONTEXT_NO_GMEM_ALLOC
-                | kgsl::CONTEXT_PREAMBLE
-                | kgsl::CONTEXT_USER_GENERATED_TS,
-            drawctxt_id: 0,
-        };
-        kgsl.ioctl(kgsl::DRAWCTXT_CREATE, &mut create)
-            .context("DRAWCTXT_CREATE")?;
-        kgsl.context = create.drawctxt_id;
+        // drm2kgsl's flags (Turnip's own, proven on this device), with the containment added in front. A KGSL may refuse a
+        // priority band with EINVAL (drm2kgsl saw that), so each protection is dropped only when the one before is refused.
+        let base = kgsl::CONTEXT_SAVE_GMEM
+            | kgsl::CONTEXT_NO_GMEM_ALLOC
+            | kgsl::CONTEXT_PREAMBLE
+            | kgsl::CONTEXT_USER_GENERATED_TS;
+        let attempts = [
+            (
+                base | kgsl::CONTEXT_NO_FAULT_TOLERANCE | kgsl::CONTEXT_PRIORITY_LOWEST,
+                "no fault tolerance, lowest priority",
+            ),
+            (base | kgsl::CONTEXT_NO_FAULT_TOLERANCE, "no fault tolerance"),
+            (base, "KGSL's defaults only"),
+        ];
+        let mut protection = None;
+        for (flags, what) in attempts {
+            let mut create = kgsl::DrawCtxtCreate {
+                flags,
+                drawctxt_id: 0,
+            };
+            match kgsl.ioctl(kgsl::DRAWCTXT_CREATE, &mut create) {
+                Ok(()) => {
+                    kgsl.context = create.drawctxt_id;
+                    protection = Some(what);
+                    break;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EINVAL) => continue,
+                Err(e) => return Err(e).context("DRAWCTXT_CREATE"),
+            }
+        }
+        let protection = protection.ok_or_else(|| anyhow!("DRAWCTXT_CREATE refused every flag set"))?;
         kgsl.info = Info {
             version: WIRE_VERSION,
             // freedreno's table keys most chips with the fuse byte cleared; the guest's Turnip
@@ -416,7 +509,8 @@ impl Kgsl {
             faults: 0,
         };
         info!(
-            "droidvm-gpu: KGSL chip {:#x} gmem {:#x}@{:#x} hbb {} ubwc {} VBO {} {:#x}+{:#x} context {}",
+            "droidvm-gpu: KGSL chip {:#x} gmem {:#x}@{:#x} hbb {} ubwc {} VBO {} {:#x}+{:#x} context {} ({}); \
+             imports from {} shared span(s), at most {} objects and {:#x} bytes",
             device.chip_id,
             device.gmem_sizebytes,
             gmem_base,
@@ -425,9 +519,68 @@ impl Kgsl {
             vbo,
             va_start,
             va_size,
-            kgsl.context
+            kgsl.context,
+            protection,
+            kgsl.shared.len(),
+            MAX_OBJECTS,
+            kgsl.import_limit
         );
         Ok(kgsl)
+    }
+
+    /// Whether KGSL reset the GPU because of this context since the last query (KGSL_PROP_GPU_RESET_STAT, Turnip's
+    /// lost-device check). A reset another context caused is no reason to stop; a status it cannot read is.
+    fn guilty(&self) -> bool {
+        let mut status = self.context;
+        match self.property(kgsl::PROP_GPU_RESET_STAT, &mut status) {
+            Ok(()) => status != kgsl::CTX_STAT_NO_ERROR && status != kgsl::CTX_STAT_INNOCENT_CONTEXT_RESET_EXT,
+            Err(_) => true,
+        }
+    }
+
+    /// After a failed submission or wait, and now and then: on a reset this context caused, release everything the host
+    /// GPU holds of the guest and refuse all further work. The guest has lost its GPU; the host keeps its own.
+    fn check_reset(&mut self, after: &str) {
+        if self.failed || !self.guilty() {
+            return;
+        }
+        error!(
+            "droidvm-gpu: the GPU was reset because of the guest's context (after {}); releasing its {} objects \
+             ({:#x} bytes) and refusing all further requests",
+            after,
+            self.objects.len(),
+            self.imported
+        );
+        self.failed = true;
+        self.release_all();
+    }
+
+    /// Frees every import, the VBO and the context: nothing of the guest stays mapped in the host's GPU.
+    fn release_all(&mut self) {
+        for (id, _) in std::mem::take(&mut self.objects) {
+            self.free_object(id);
+        }
+        self.imported = 0;
+        if self.vbo != 0 {
+            self.free_object(self.vbo);
+            self.vbo = 0;
+        }
+        if self.context != 0 {
+            let mut id = self.context;
+            let _ = self.ioctl(kgsl::DRAWCTXT_DESTROY, &mut id);
+            self.context = 0;
+        }
+    }
+
+    fn free(&mut self, id: u32) -> bool {
+        match self.objects.remove(&id) {
+            Some(bytes) => {
+                self.imported -= bytes;
+                self.free_object(id);
+                true
+            }
+            None => false,
+        }
     }
 
     fn reserve_vbo(&self) -> anyhow::Result<(u32, u64, u64)> {
@@ -467,11 +620,25 @@ impl Kgsl {
         let mut total = 0u64;
         let mut iovecs = Vec::with_capacity(ranges.len());
         for range in ranges {
-            if range.address % 4096 != 0 || range.bytes == 0 || range.bytes % 4096 != 0 {
+            if range.address % PAGE != 0 || range.bytes == 0 || range.bytes % PAGE != 0 {
                 return Err(-libc::EINVAL);
+            }
+            let end = range.address.checked_add(range.bytes).ok_or(-libc::EINVAL)?;
+            if !self.shared.iter().any(|&(start, stop)| start <= range.address && end <= stop) {
+                return Err(self.refuse(
+                    -libc::EPERM,
+                    format_args!("IMPORT of {:#x}+{:#x}: not memory the host shares", range.address, range.bytes),
+                ));
             }
             total = total.checked_add(range.bytes).ok_or(-libc::EINVAL)?;
             iovecs.push((GuestAddress(range.address), range.bytes as usize));
+        }
+        if self.objects.len() >= MAX_OBJECTS || self.imported.saturating_add(total) > self.import_limit {
+            let (objects, imported) = (self.objects.len(), self.imported);
+            return Err(self.refuse(
+                -libc::ENOSPC,
+                format_args!("IMPORT of {:#x} bytes: {} objects, {:#x} bytes imported already", total, objects, imported),
+            ));
         }
         let dmabuf = self.udmabuf.create_udmabuf(mem, &iovecs).map_err(|e| {
             warn!("droidvm-gpu: udmabuf over {} ranges: {}", ranges.len(), e);
@@ -492,7 +659,8 @@ impl Kgsl {
             warn!("droidvm-gpu: GPUOBJ_IMPORT of {:#x} bytes: {}", total, e);
             -e.raw_os_error().unwrap_or(libc::EIO)
         })?;
-        self.objects.insert(import.id);
+        self.objects.insert(import.id, total);
+        self.imported += total;
         let mut info = kgsl::GpuObjInfo {
             id: import.id,
             ..Default::default()
@@ -506,15 +674,29 @@ impl Kgsl {
         })
     }
 
-    fn bind(&self, bind: &Bind) -> i32 {
+    fn bind(&mut self, bind: &Bind) -> i32 {
         let va_end = self.info.va_start + self.info.va_size;
-        if !self.objects.contains(&bind.object)
-            || (bind.op != 1 && bind.op != 2)
+        let object_bytes = match self.objects.get(&bind.object) {
+            Some(&bytes) => bytes,
+            None => return -libc::EINVAL,
+        };
+        // A bind (op 1) maps [offset, offset + bytes) of the object, which must lie inside it; KGSL works in pages.
+        let inside_object = bind.op == 2 || bind.offset.checked_add(bind.bytes).map_or(false, |end| end <= object_bytes);
+        if (bind.op != 1 && bind.op != 2)
             || bind.bytes == 0
             || bind.iova < self.info.va_start
             || bind.iova.checked_add(bind.bytes).map_or(true, |end| end > va_end)
         {
             return -libc::EINVAL;
+        }
+        if !inside_object || bind.offset % PAGE != 0 || bind.iova % PAGE != 0 || bind.bytes % PAGE != 0 {
+            return self.refuse(
+                -libc::EINVAL,
+                format_args!(
+                    "BIND of object {} ({:#x} bytes) +{:#x} at {:#x} ({:#x})",
+                    bind.object, object_bytes, bind.offset, bind.iova, bind.bytes
+                ),
+            );
         }
         // KGSL refuses an unbind with a child offset: the child's id and the VBO range name what goes.
         let mut range = kgsl::BindRange {
@@ -563,11 +745,19 @@ impl Kgsl {
             timestamp,
             ..Default::default()
         };
-        match self.ioctl(kgsl::GPU_COMMAND, &mut command) {
-            Ok(()) => 0,
+        let result = self.ioctl(kgsl::GPU_COMMAND, &mut command);
+        self.submits += 1;
+        match result {
+            Ok(()) => {
+                if self.submits % RESET_CHECK_INTERVAL == 0 {
+                    self.check_reset("a submission");
+                }
+                0
+            }
             Err(e) => {
                 self.info.faults += 1;
                 warn!("droidvm-gpu: GPU_COMMAND ts {}: {}", timestamp, e);
+                self.check_reset("a failed submission");
                 -e.raw_os_error().unwrap_or(libc::EIO)
             }
         }
@@ -584,31 +774,28 @@ impl Kgsl {
         Ok(read.timestamp)
     }
 
-    fn wait(&self, timestamp: u32, timeout_ms: u32) -> i32 {
+    fn wait(&mut self, timestamp: u32, timeout_ms: u32) -> i32 {
+        // At least 1 ms: a zero timeout may mean "forever" to KGSL, and the worker has to get back to its kill event.
         let mut wait = kgsl::WaitTimestamp {
             context_id: self.context,
             timestamp,
-            timeout: timeout_ms.min(WAIT_MAX_MS),
+            timeout: timeout_ms.clamp(1, WAIT_MAX_MS),
         };
         match self.ioctl(kgsl::WAITTIMESTAMP_CTXTID, &mut wait) {
             Ok(()) => 0,
-            Err(e) => -e.raw_os_error().unwrap_or(libc::EIO),
+            Err(e) => {
+                if e.raw_os_error() != Some(libc::ETIMEDOUT) {
+                    self.check_reset("a failed wait");
+                }
+                -e.raw_os_error().unwrap_or(libc::EIO)
+            }
         }
     }
 }
 
 impl Drop for Kgsl {
     fn drop(&mut self) {
-        for &id in &self.objects {
-            self.free_object(id);
-        }
-        if self.vbo != 0 {
-            self.free_object(self.vbo);
-        }
-        if self.context != 0 {
-            let mut id = self.context;
-            let _ = self.ioctl(kgsl::DRAWCTXT_DESTROY, &mut id);
-        }
+        self.release_all();
     }
 }
 
@@ -660,6 +847,10 @@ impl Worker {
                 payload,
             )
         };
+        // After a reset the guest's context caused, nothing more goes to the GPU; INFO still says how many faults.
+        if self.kgsl.failed && request.op != OP_INFO && request.op != OP_TICKS {
+            return fail(-libc::ENODEV);
+        }
         match request.op {
             OP_INFO => ok(self.kgsl.info.as_bytes().to_vec()),
             OP_IMPORT => {
@@ -683,10 +874,7 @@ impl Worker {
                 }
             }
             OP_FREE => match reader.read_obj::<Free>() {
-                Ok(free) if self.kgsl.objects.remove(&free.object) => {
-                    self.kgsl.free_object(free.object);
-                    ok(Vec::new())
-                }
+                Ok(free) if self.kgsl.free(free.object) => ok(Vec::new()),
                 _ => fail(-libc::EINVAL),
             },
             OP_BIND => match reader.read_obj::<Bind>() {
@@ -820,7 +1008,7 @@ impl VirtioDevice for DroidVmGpu {
             return Err(anyhow!("expected 1 queue, got {}", queues.len()));
         }
         let queue = queues.remove(&0).unwrap();
-        let kgsl = Kgsl::open()?;
+        let kgsl = Kgsl::open(&mem)?;
         self.worker_thread = Some(WorkerThread::start("v_droidvm_gpu", move |kill_evt| {
             let mut worker = Worker { queue, mem, kgsl };
             if let Err(e) = worker.run(kill_evt) {
