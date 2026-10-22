@@ -1252,6 +1252,8 @@ pub struct Config {
     pub virtio_mmio_disks: Vec<DiskOption>,
     /// The virtio input devices go on the virtio-mmio transport (`--virtio-mmio-input`).
     pub virtio_mmio_input: bool,
+    /// The virtio net devices (`--net`) go on the virtio-mmio transport (`--virtio-mmio-net`).
+    pub virtio_mmio_net: bool,
     #[cfg(feature = "audio")]
     #[serde(skip)]
     pub virtio_snds: Vec<SndParameters>,
@@ -1499,6 +1501,7 @@ impl Default for Config {
             #[cfg(feature = "audio")]
             virtio_mmio_disks: Vec::new(),
             virtio_mmio_input: false,
+            virtio_mmio_net: false,
             virtio_snds: Vec::new(),
             #[cfg(any(target_os = "android", target_os = "linux"))]
             #[cfg(feature = "media")]

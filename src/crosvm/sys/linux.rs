@@ -1456,9 +1456,14 @@ fn create_devices(
     // --virtio-mmio-input: the input devices wait for the virtio-mmio block devices, so that the
     // disks keep the first MMIO pages whatever input a VM has.
     let mut mmio_inputs = Vec::new();
+    let mut mmio_nets = Vec::new();
     for stub in stubs {
         if cfg.virtio_mmio_input && stub.dev.device_type() == DeviceType::Input {
             mmio_inputs.push(stub);
+            continue;
+        }
+        if cfg.virtio_mmio_net && stub.dev.device_type() == DeviceType::Net {
+            mmio_nets.push(stub);
             continue;
         }
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -1540,6 +1545,17 @@ fn create_devices(
         let gpu = virtio::DroidVmGpu::new(virtio::base_features(cfg.protection_type));
         let dev = VirtioMmioDevice::new(vm.get_memory().clone(), Box::new(gpu))
             .context("failed to create droidvm-gpu device")?;
+        devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
+    }
+
+    // --virtio-mmio-net: the --net devices diverted onto the MMIO transport, after --droidvm-gpu.
+    // The device object is the same one --net builds for virtio-pci; only the transport wrapper differs.
+    for stub in mmio_nets {
+        if stub.jail.is_some() {
+            warn!("virtio-mmio net runs in the VMM process, outside its jail");
+        }
+        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+            .context("failed to create virtio-mmio net device")?;
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
