@@ -2838,6 +2838,13 @@ pub struct RunCommand {
     /// after the --virtio-mmio-block devices and in their command line order
     virtio_mmio_input: Option<bool>,
 
+    #[argh(switch)]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// put the --net devices on the virtio-mmio transport instead of virtio-pci (aarch64 only), after
+    /// the --droidvm-gpu device, for a guest that has a virtio-mmio driver but no PCI host driver
+    virtio_mmio_net: Option<bool>,
+
     #[cfg(feature = "audio")]
     #[argh(
         option,
@@ -3265,6 +3272,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             .map(|d| d.disk_option)
             .collect();
         cfg.virtio_mmio_input = cmd.virtio_mmio_input.unwrap_or_default();
+        cfg.virtio_mmio_net = cmd.virtio_mmio_net.unwrap_or_default();
         cfg.droidvm_gpu = cmd.droidvm_gpu.unwrap_or_default();
 
         cfg.pmems = cmd.pmem;
