@@ -65,7 +65,7 @@ use super::VirtioDevice;
 const QUEUE_SIZE: u16 = 16;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
 
-const WIRE_VERSION: u32 = 2;
+const WIRE_VERSION: u32 = 3;
 const MAX_RANGES: u32 = 1024;
 const MAX_IBS: u32 = 16;
 const WAIT_MAX_MS: u32 = 4;
@@ -92,8 +92,9 @@ const OP_WAIT: u32 = 7;
 const OP_TICKS: u32 = 8;
 const OP_CLIENT: u32 = 9;
 
-/// Guest clients (NativeAdrenoPublish's slots) with a KGSL context of their own.
-const MAX_CLIENTS: u16 = 16;
+/// Guest clients (NativeAdrenoPublish's slots) with a KGSL context of their own: the guest's 32 slots, each a 1 GiB window of
+/// the VBO (the wallpaper's poster extensions, widgets, Settings and WebKit's processes took the ten there were before).
+const MAX_CLIENTS: u16 = 32;
 
 const IMPORT_READ_ONLY: u32 = 1;
 const IMPORT_COHERENT: u32 = 2;
