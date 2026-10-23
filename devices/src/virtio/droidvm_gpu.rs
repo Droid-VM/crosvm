@@ -323,6 +323,23 @@ mod kgsl {
         pub flags: u32,
         pub id: u32,
     }
+    /// `kgsl_command_syncpoint` of type `KGSL_CMD_SYNCPOINT_TYPE_TIMESTAMP`: the command waits until `context_id` retires
+    /// `timestamp`, or its events are cancelled (the context invalidated or destroyed).
+    pub const SYNCPOINT_TYPE_TIMESTAMP: u32 = 0;
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    pub struct CommandSyncpoint {
+        pub priv_: u64,
+        pub size: u64,
+        pub type_: u32,
+        pub pad: u32,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    pub struct SyncpointTimestamp {
+        pub context_id: u32,
+        pub timestamp: u32,
+    }
     #[repr(C)]
     #[derive(Default)]
     pub struct GpuCommand {
@@ -814,6 +831,31 @@ impl Kgsl {
             Ok(context) => context,
             Err(status) => return status,
         };
+        // Every earlier submission, whichever client's context ran it, comes first. With one context the GPU ran the guest's
+        // commands in submission order, and its processes rely on that between them: an app's drawing into a surface before the
+        // render server samples it, the render server's reads before the app draws the surface's next contents. Apart, contexts
+        // run in any order (the render server showed one layer's contents in another's place), so each command waits for the other
+        // clients' latest one on the GPU. A lost context's events are cancelled, which ends the wait.
+        let waits: Vec<kgsl::SyncpointTimestamp> = self
+            .clients
+            .iter()
+            .filter(|(other, entry)| **other != client && !entry.lost)
+            .filter_map(|(_, entry)| {
+                entry.pending.back().map(|&timestamp| kgsl::SyncpointTimestamp {
+                    context_id: entry.context,
+                    timestamp,
+                })
+            })
+            .collect();
+        let syncs: Vec<kgsl::CommandSyncpoint> = waits
+            .iter()
+            .map(|wait| kgsl::CommandSyncpoint {
+                priv_: wait as *const kgsl::SyncpointTimestamp as u64,
+                size: std::mem::size_of::<kgsl::SyncpointTimestamp>() as u64,
+                type_: kgsl::SYNCPOINT_TYPE_TIMESTAMP,
+                pad: 0,
+            })
+            .collect();
         let commands: Vec<kgsl::CommandObject> = ibs
             .iter()
             .map(|ib| kgsl::CommandObject {
@@ -829,6 +871,9 @@ impl Kgsl {
             cmdlist: commands.as_ptr() as u64,
             cmdsize: std::mem::size_of::<kgsl::CommandObject>() as u32,
             numcmds: commands.len() as u32,
+            synclist: if syncs.is_empty() { 0 } else { syncs.as_ptr() as u64 },
+            syncsize: std::mem::size_of::<kgsl::CommandSyncpoint>() as u32,
+            numsyncs: syncs.len() as u32,
             context_id: context,
             timestamp,
             ..Default::default()
