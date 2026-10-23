@@ -10,8 +10,10 @@
 //!   guest physical ranges into a udmabuf and KGSL imports it as one object;
 //! - BIND places a range of an object at a guest-chosen GPU address inside the one VBO reserved at
 //!   activation, which INFO reports as the guest's VA range;
-//! - SUBMIT queues IBs on the device's single KGSL context with the guest's timestamp (user-generated
-//!   timestamps), so the guest's in-order fence timeline is KGSL's; RETIRED and WAIT read it.
+//! - SUBMIT queues IBs with the guest's timestamp (user-generated timestamps) on the KGSL context of the guest client
+//!   that sent them (NativeAdrenoPublish's slot: the render server, the widgets, WebKit, ...). The guest numbers its
+//!   submissions in one sequence across its clients, so each context's timestamps rise; RETIRED is the guest's
+//!   timeline across them (everything below the oldest submission still running anywhere), and WAIT waits for that one.
 //!
 //! One request at a time, handled synchronously by the worker; the guest polls the used ring.
 //!
@@ -20,13 +22,14 @@
 //!   The rest is lent to the VM, and a GPU access to memory the host has given away faults in the hypervisor or the
 //!   firmware, below anything Linux can recover. Live imports are capped in count and in bytes.
 //! - BIND stays inside the object it names and inside the VBO, page-aligned.
-//! - The KGSL context is created without fault tolerance (KGSL invalidates it on a fault instead of replaying the guest's
-//!   work) and in the lowest priority band, so the host's own GPU work goes first; a KGSL that refuses either keeps what it
-//!   accepts. When KGSL reports a GPU reset caused by this context, the device releases everything it holds and refuses
-//!   all further work.
+//! - The KGSL contexts are created without fault tolerance (KGSL invalidates one on a fault instead of replaying the
+//!   guest's work) and in the lowest priority band, so the host's own GPU work goes first; a KGSL that refuses either
+//!   keeps what it accepts. A context KGSL invalidates, or that caused a GPU reset, is destroyed and its client's work
+//!   refused (EDEADLK): that client has lost its GPU, the others keep theirs. CLIENT starts a slot's next user afresh.
 //! - Waits are bounded, so the worker always gets back to its kill event and the VM can stop.
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
@@ -62,7 +65,7 @@ use super::VirtioDevice;
 const QUEUE_SIZE: u16 = 16;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
 
-const WIRE_VERSION: u32 = 1;
+const WIRE_VERSION: u32 = 2;
 const MAX_RANGES: u32 = 1024;
 const MAX_IBS: u32 = 16;
 const WAIT_MAX_MS: u32 = 4;
@@ -87,6 +90,10 @@ const OP_SUBMIT: u32 = 5;
 const OP_RETIRED: u32 = 6;
 const OP_WAIT: u32 = 7;
 const OP_TICKS: u32 = 8;
+const OP_CLIENT: u32 = 9;
+
+/// Guest clients (NativeAdrenoPublish's slots) with a KGSL context of their own.
+const MAX_CLIENTS: u16 = 16;
 
 const IMPORT_READ_ONLY: u32 = 1;
 const IMPORT_COHERENT: u32 = 2;
@@ -163,7 +170,14 @@ struct Ib {
 #[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
 struct Submit {
     timestamp: u32,
-    count: u32,
+    count: u16,
+    client: u16,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct ClientReset {
+    client: u32,
+    reserved: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -355,9 +369,22 @@ mod kgsl {
 /// Sizes tried for the VBO that holds every guest GPU address, largest first.
 const VBO_SIZES: &[u64] = &[1 << 40, 1 << 38, 1 << 37, 1 << 36, 1 << 34, 1 << 32];
 
+/// One guest client's KGSL context and its submissions not yet retired, oldest first.
+#[derive(Default)]
+struct Client {
+    context: u32,
+    pending: VecDeque<u32>,
+    /// KGSL invalidated the context, or it caused a GPU reset: the client's work is refused until CLIENT.
+    lost: bool,
+}
+
 struct Kgsl {
     file: File,
-    context: u32,
+    /// The flags every client's context is created with (the first set KGSL accepted at activation).
+    context_flags: u32,
+    clients: BTreeMap<u16, Client>,
+    /// The latest timestamp the guest submitted: the timeline once nothing is pending.
+    last_submitted: u32,
     vbo: u32,
     info: Info,
     /// Live imports and their sizes.
@@ -370,8 +397,6 @@ struct Kgsl {
     udmabuf: UdmabufDriver,
     submits: u64,
     refusals: u64,
-    /// The GPU was reset because of this context: everything is released and every request refused.
-    failed: bool,
 }
 
 impl Kgsl {
@@ -435,7 +460,9 @@ impl Kgsl {
         let shared_bytes: u64 = shared.iter().map(|(start, end)| end - start).sum();
         let mut kgsl = Kgsl {
             file,
-            context: 0,
+            context_flags: 0,
+            clients: BTreeMap::new(),
+            last_submitted: 0,
             vbo: 0,
             info: Info::default(),
             objects: BTreeMap::new(),
@@ -445,7 +472,6 @@ impl Kgsl {
             udmabuf,
             submits: 0,
             refusals: 0,
-            failed: false,
         };
         let mut device = kgsl::DevInfo::default();
         kgsl.property(kgsl::PROP_DEVICE_INFO, &mut device)
@@ -484,7 +510,15 @@ impl Kgsl {
             };
             match kgsl.ioctl(kgsl::DRAWCTXT_CREATE, &mut create) {
                 Ok(()) => {
-                    kgsl.context = create.drawctxt_id;
+                    // The render server's (client 0); the others are created with the same flags when they first submit.
+                    kgsl.context_flags = flags;
+                    kgsl.clients.insert(
+                        0,
+                        Client {
+                            context: create.drawctxt_id,
+                            ..Default::default()
+                        },
+                    );
                     protection = Some(what);
                     break;
                 }
@@ -509,7 +543,7 @@ impl Kgsl {
             faults: 0,
         };
         info!(
-            "droidvm-gpu: KGSL chip {:#x} gmem {:#x}@{:#x} hbb {} ubwc {} VBO {} {:#x}+{:#x} context {} ({}); \
+            "droidvm-gpu: KGSL chip {:#x} gmem {:#x}@{:#x} hbb {} ubwc {} VBO {} {:#x}+{:#x} client contexts ({}); \
              imports from {} shared span(s), at most {} objects and {:#x} bytes",
             device.chip_id,
             device.gmem_sizebytes,
@@ -519,7 +553,6 @@ impl Kgsl {
             vbo,
             va_start,
             va_size,
-            kgsl.context,
             protection,
             kgsl.shared.len(),
             MAX_OBJECTS,
@@ -528,34 +561,86 @@ impl Kgsl {
         Ok(kgsl)
     }
 
-    /// Whether KGSL reset the GPU because of this context since the last query (KGSL_PROP_GPU_RESET_STAT, Turnip's
-    /// lost-device check). A reset another context caused is no reason to stop; a status it cannot read is.
-    fn guilty(&self) -> bool {
-        let mut status = self.context;
+    /// Whether KGSL reset the GPU because of `context` since the last query (KGSL_PROP_GPU_RESET_STAT, Turnip's lost-device
+    /// check). A reset another context caused is no reason to stop; a status it cannot read is.
+    fn guilty(&self, context: u32) -> bool {
+        let mut status = context;
         match self.property(kgsl::PROP_GPU_RESET_STAT, &mut status) {
             Ok(()) => status != kgsl::CTX_STAT_NO_ERROR && status != kgsl::CTX_STAT_INNOCENT_CONTEXT_RESET_EXT,
             Err(_) => true,
         }
     }
 
-    /// After a failed submission or wait, and now and then: on a reset this context caused, release everything the host
-    /// GPU holds of the guest and refuse all further work. The guest has lost its GPU; the host keeps its own.
-    fn check_reset(&mut self, after: &str) {
-        if self.failed || !self.guilty() {
-            return;
+    /// The client's context, created on its first submission; EDEADLK for a client that lost its GPU.
+    fn context_for(&mut self, client: u16) -> Result<u32, i32> {
+        if let Some(entry) = self.clients.get(&client) {
+            return if entry.lost { Err(-libc::EDEADLK) } else { Ok(entry.context) };
         }
-        error!(
-            "droidvm-gpu: the GPU was reset because of the guest's context (after {}); releasing its {} objects \
-             ({:#x} bytes) and refusing all further requests",
-            after,
-            self.objects.len(),
-            self.imported
+        let mut create = kgsl::DrawCtxtCreate {
+            flags: self.context_flags,
+            drawctxt_id: 0,
+        };
+        if let Err(e) = self.ioctl(kgsl::DRAWCTXT_CREATE, &mut create) {
+            return Err(self.refuse(
+                -e.raw_os_error().unwrap_or(libc::EIO),
+                format_args!("a context for client {}: {}", client, e),
+            ));
+        }
+        info!("droidvm-gpu: client {} has KGSL context {}", client, create.drawctxt_id);
+        self.clients.insert(
+            client,
+            Client {
+                context: create.drawctxt_id,
+                ..Default::default()
+            },
         );
-        self.failed = true;
-        self.release_all();
+        Ok(create.drawctxt_id)
     }
 
-    /// Frees every import, the VBO and the context: nothing of the guest stays mapped in the host's GPU.
+    fn destroy_context(&self, context: u32) {
+        if context != 0 {
+            let mut id = context;
+            let _ = self.ioctl(kgsl::DRAWCTXT_DESTROY, &mut id);
+        }
+    }
+
+    /// The client lost its GPU: its context is destroyed and its submissions count as done, so the guest's timeline moves
+    /// on for the others; everything it sends is refused until CLIENT gives its slot to the next user.
+    fn lose(&mut self, client: u16, why: &str) {
+        let context = match self.clients.get_mut(&client) {
+            Some(entry) if !entry.lost => {
+                entry.lost = true;
+                entry.pending.clear();
+                std::mem::take(&mut entry.context)
+            }
+            _ => return,
+        };
+        self.info.faults += 1;
+        error!("droidvm-gpu: client {} lost its GPU context {} ({}); the other clients keep theirs", client, context, why);
+        self.destroy_context(context);
+    }
+
+    /// After a failed submission or wait, and now and then: a context that caused a GPU reset is lost.
+    fn check_resets(&mut self, after: &str) {
+        let guilty: Vec<u16> = self
+            .clients
+            .iter()
+            .filter(|(_, entry)| !entry.lost && self.guilty(entry.context))
+            .map(|(&client, _)| client)
+            .collect();
+        for client in guilty {
+            self.lose(client, &format!("it caused a GPU reset, seen after {}", after));
+        }
+    }
+
+    /// CLIENT: the slot's previous user is gone (it waited for its work before closing); the next one starts afresh.
+    fn reset_client(&mut self, client: u16) {
+        if let Some(entry) = self.clients.remove(&client) {
+            self.destroy_context(entry.context);
+        }
+    }
+
+    /// Frees every import, the VBO and the contexts: nothing of the guest stays mapped in the host's GPU.
     fn release_all(&mut self) {
         for (id, _) in std::mem::take(&mut self.objects) {
             self.free_object(id);
@@ -565,10 +650,8 @@ impl Kgsl {
             self.free_object(self.vbo);
             self.vbo = 0;
         }
-        if self.context != 0 {
-            let mut id = self.context;
-            let _ = self.ioctl(kgsl::DRAWCTXT_DESTROY, &mut id);
-            self.context = 0;
+        for (_, entry) in std::mem::take(&mut self.clients) {
+            self.destroy_context(entry.context);
         }
     }
 
@@ -725,7 +808,11 @@ impl Kgsl {
         }
     }
 
-    fn submit(&mut self, timestamp: u32, ibs: &[Ib]) -> i32 {
+    fn submit(&mut self, client: u16, timestamp: u32, ibs: &[Ib]) -> i32 {
+        let context = match self.context_for(client) {
+            Ok(context) => context,
+            Err(status) => return status,
+        };
         let commands: Vec<kgsl::CommandObject> = ibs
             .iter()
             .map(|ib| kgsl::CommandObject {
@@ -741,7 +828,7 @@ impl Kgsl {
             cmdlist: commands.as_ptr() as u64,
             cmdsize: std::mem::size_of::<kgsl::CommandObject>() as u32,
             numcmds: commands.len() as u32,
-            context_id: self.context,
+            context_id: context,
             timestamp,
             ..Default::default()
         };
@@ -749,43 +836,99 @@ impl Kgsl {
         self.submits += 1;
         match result {
             Ok(()) => {
+                if let Some(entry) = self.clients.get_mut(&client) {
+                    entry.pending.push_back(timestamp);
+                }
+                self.last_submitted = timestamp;
                 if self.submits % RESET_CHECK_INTERVAL == 0 {
-                    self.check_reset("a submission");
+                    self.check_resets("a submission");
                 }
                 0
             }
             Err(e) => {
-                self.info.faults += 1;
-                warn!("droidvm-gpu: GPU_COMMAND ts {}: {}", timestamp, e);
-                self.check_reset("a failed submission");
+                warn!("droidvm-gpu: GPU_COMMAND client {} ts {}: {}", client, timestamp, e);
+                // EDEADLK and EPROTO: KGSL invalidated the context (a fault in this client's commands).
+                if matches!(e.raw_os_error(), Some(libc::EDEADLK) | Some(libc::EPROTO)) || self.guilty(context) {
+                    self.lose(client, &format!("GPU_COMMAND: {}", e));
+                    return -libc::EDEADLK;
+                }
+                self.check_resets("a failed submission");
                 -e.raw_os_error().unwrap_or(libc::EIO)
             }
         }
     }
 
-    fn retired(&self) -> Result<u32, i32> {
-        let mut read = kgsl::ReadTimestamp {
-            context_id: self.context,
-            type_: kgsl::TIMESTAMP_RETIRED,
-            timestamp: 0,
-        };
-        self.ioctl(kgsl::READTIMESTAMP_CTXTID, &mut read)
-            .map_err(|e| -e.raw_os_error().unwrap_or(libc::EIO))?;
-        Ok(read.timestamp)
+    /// The guest's timeline: everything below the oldest submission still running in any context has retired.
+    fn retired(&mut self) -> Result<u32, i32> {
+        let mut failed = Vec::new();
+        for (&client, entry) in self.clients.iter_mut() {
+            if entry.lost || entry.pending.is_empty() {
+                continue;
+            }
+            let mut read = kgsl::ReadTimestamp {
+                context_id: entry.context,
+                type_: kgsl::TIMESTAMP_RETIRED,
+                timestamp: 0,
+            };
+            // SAFETY: as in ioctl(); `read` is the READTIMESTAMP_CTXTID argument.
+            let ret = unsafe {
+                libc::ioctl(self.file.as_raw_descriptor(), kgsl::READTIMESTAMP_CTXTID as _, &mut read as *mut _ as *mut libc::c_void)
+            };
+            if ret != 0 {
+                failed.push(client);
+                continue;
+            }
+            while entry.pending.front().is_some_and(|&ts| ts <= read.timestamp) {
+                entry.pending.pop_front();
+            }
+        }
+        for client in failed {
+            self.lose(client, "its retired timestamp could not be read");
+        }
+        Ok(self
+            .clients
+            .values()
+            .filter_map(|entry| entry.pending.front().copied())
+            .min()
+            .map_or(self.last_submitted, |oldest| oldest - 1))
     }
 
+    /// Waits (bounded) for the submission the guest's timeline waits on: the oldest still running, if it is at or below
+    /// `timestamp`.
     fn wait(&mut self, timestamp: u32, timeout_ms: u32) -> i32 {
+        match self.retired() {
+            Ok(retired) if retired >= timestamp => return 0,
+            Ok(_) => {}
+            Err(status) => return status,
+        }
+        let Some((client, context, target)) = self
+            .clients
+            .iter()
+            .filter_map(|(&client, entry)| entry.pending.front().map(|&oldest| (oldest, client, entry)))
+            .min_by_key(|(oldest, _, _)| *oldest)
+            .map(|(_, client, entry)| {
+                let target = entry.pending.iter().copied().take_while(|&ts| ts <= timestamp).last();
+                (client, entry.context, target.unwrap_or(*entry.pending.front().unwrap()))
+            })
+        else {
+            return 0;
+        };
         // At least 1 ms: a zero timeout may mean "forever" to KGSL, and the worker has to get back to its kill event.
         let mut wait = kgsl::WaitTimestamp {
-            context_id: self.context,
-            timestamp,
+            context_id: context,
+            timestamp: target,
             timeout: timeout_ms.clamp(1, WAIT_MAX_MS),
         };
         match self.ioctl(kgsl::WAITTIMESTAMP_CTXTID, &mut wait) {
             Ok(()) => 0,
             Err(e) => {
-                if e.raw_os_error() != Some(libc::ETIMEDOUT) {
-                    self.check_reset("a failed wait");
+                if e.raw_os_error() == Some(libc::ETIMEDOUT) {
+                    return -libc::ETIMEDOUT;
+                }
+                if matches!(e.raw_os_error(), Some(libc::EDEADLK) | Some(libc::EPROTO)) || self.guilty(context) {
+                    // Its work counts as done now: the timeline moves on, and the caller reads it again.
+                    self.lose(client, &format!("WAITTIMESTAMP: {}", e));
+                    return 0;
                 }
                 -e.raw_os_error().unwrap_or(libc::EIO)
             }
@@ -847,10 +990,6 @@ impl Worker {
                 payload,
             )
         };
-        // After a reset the guest's context caused, nothing more goes to the GPU; INFO still says how many faults.
-        if self.kgsl.failed && request.op != OP_INFO && request.op != OP_TICKS {
-            return fail(-libc::ENODEV);
-        }
         match request.op {
             OP_INFO => ok(self.kgsl.info.as_bytes().to_vec()),
             OP_IMPORT => {
@@ -889,7 +1028,7 @@ impl Worker {
                     Ok(header) => header,
                     Err(_) => return fail(-libc::EINVAL),
                 };
-                if header.timestamp == 0 || header.count == 0 || header.count > MAX_IBS {
+                if header.timestamp == 0 || header.count == 0 || u32::from(header.count) > MAX_IBS || header.client >= MAX_CLIENTS {
                     return fail(-libc::EINVAL);
                 }
                 let mut ibs = Vec::with_capacity(header.count as usize);
@@ -899,7 +1038,7 @@ impl Worker {
                         _ => return fail(-libc::EINVAL),
                     }
                 }
-                match self.kgsl.submit(header.timestamp, &ibs) {
+                match self.kgsl.submit(header.client, header.timestamp, &ibs) {
                     0 => ok(Vec::new()),
                     status => fail(status),
                 }
@@ -921,6 +1060,13 @@ impl Worker {
                 Err(_) => fail(-libc::EINVAL),
             },
             OP_TICKS => ok(Ticks { ticks: host_ticks() }.as_bytes().to_vec()),
+            OP_CLIENT => match reader.read_obj::<ClientReset>() {
+                Ok(reset) if reset.client < u32::from(MAX_CLIENTS) => {
+                    self.kgsl.reset_client(reset.client as u16);
+                    ok(Vec::new())
+                }
+                _ => fail(-libc::EINVAL),
+            },
             _ => fail(-libc::ENOSYS),
         }
     }
