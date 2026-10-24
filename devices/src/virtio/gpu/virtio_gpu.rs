@@ -2066,13 +2066,10 @@ impl VirtioGpu {
                 }
             }
 
-            // HOST3D_GUEST means both storages: the renderer's context produces the host object
-            // AND the guest supplies the pages. virglrenderer enforces the second half -- it
-            // rejects the blob if the iovecs do not cover its size -- so a guest-allocated blob
-            // on that path needs the iovecs as well as the dma-buf, not one or the other. The
-            // udmabuf above is what the GPU ends up bound to; these are what makes the resource
-            // legal to create in the first place.
-            if resource_create_blob.blob_mem == VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST {
+            // Both GUEST scanout blobs and HOST3D_GUEST renderer objects supply guest pages.
+            // virglrenderer requires the iovecs to cover their size even when udmabuf already
+            // wraps those same pages for display/KGSL import.
+            if resource_create_blob.blob_mem != VIRTIO_GPU_BLOB_MEM_HOST3D {
                 let iovs = match sglist_to_rutabaga_iovecs(&vecs[..], mem) {
                     Ok(iovs) => iovs,
                     Err(_) => {
@@ -2153,6 +2150,12 @@ impl VirtioGpu {
                 // A 2 GiB pool keeps the offset within u32.
                 pool_offset: Some(pool_offset as u32),
             });
+        }
+
+        // virtio-mmio currently has no shared-memory aperture. Reject unsupported host-visible
+        // mappings before exporting/mapping the resource; pool mappings above need no mapper.
+        if self.mapper.lock().is_none() {
+            return Err(ErrUnspec);
         }
 
         let resource = self
@@ -2271,7 +2274,7 @@ impl VirtioGpu {
             .mapper
             .lock()
             .as_mut()
-            .expect("No backend request connection found")
+            .ok_or(ErrUnspec)?
             .add_mapping_blob(source.unwrap(), offset, prot, cache, VmAccept::Sync)
         {
             Ok(_) => (),
@@ -2331,7 +2334,7 @@ impl VirtioGpu {
         self.mapper
             .lock()
             .as_mut()
-            .expect("No backend request connection found")
+            .ok_or(ErrUnspec)?
             .remove_mapping(shmem_offset)
             .map_err(|_| ErrUnspec)?;
         resource.shmem_offset = None;

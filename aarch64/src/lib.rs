@@ -1510,6 +1510,9 @@ impl arch::LinuxArch for AArch64 {
                 base,
                 irq
             );
+            // These devices stay in the VMM after PCI/platform sandbox setup. Forward the
+            // same lifecycle callback as the other buses: GPU starts its renderer worker here.
+            dev.on_sandboxed();
             mmio_bus
                 .insert(
                     Arc::new(Mutex::new(*dev)),

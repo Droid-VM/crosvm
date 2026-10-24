@@ -1448,6 +1448,7 @@ fn create_devices(
     // disks keep the first MMIO pages whatever input a VM has.
     let mut mmio_inputs = Vec::new();
     let mut mmio_nets = Vec::new();
+    let mut mmio_gpus = Vec::new();
     for stub in stubs {
         if cfg.virtio_mmio_input && stub.dev.device_type() == DeviceType::Input {
             mmio_inputs.push(stub);
@@ -1455,6 +1456,10 @@ fn create_devices(
         }
         if cfg.virtio_mmio_net && stub.dev.device_type() == DeviceType::Net {
             mmio_nets.push(stub);
+            continue;
+        }
+        if cfg.virtio_mmio_gpu && stub.dev.device_type() == DeviceType::Gpu {
+            mmio_gpus.push(stub);
             continue;
         }
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -1531,7 +1536,7 @@ fn create_devices(
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
-    // --droidvm-gpu: the last virtio-mmio device, after the inputs.
+    // --droidvm-gpu: after the inputs, before net and the standard virtio GPU.
     if cfg.droidvm_gpu {
         let gpu = virtio::DroidVmGpu::new(virtio::base_features(cfg.protection_type));
         let dev = VirtioMmioDevice::new(vm.get_memory().clone(), Box::new(gpu))
@@ -1547,6 +1552,18 @@ fn create_devices(
         }
         let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio net device")?;
+        devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
+    }
+
+    // Append the GPU so enabling it does not renumber an existing guest's disks, inputs or net.
+    // The shared-memory BAR plumbing above belongs to PCI. Guest-backed blobs and the
+    // drm2kgsl_host pool work without it; non-pool MAP_BLOB returns a protocol error.
+    for stub in mmio_gpus {
+        if stub.jail.is_some() {
+            warn!("virtio-mmio GPU runs in the VMM process, outside its jail");
+        }
+        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+            .context("failed to create virtio-mmio GPU device")?;
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 

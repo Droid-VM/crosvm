@@ -92,6 +92,11 @@ const OP_WAIT: u32 = 7;
 const OP_TICKS: u32 = 8;
 const OP_CLIENT: u32 = 9;
 
+const INFO_EXTENSION_MAGIC: u32 = 0x5850_4744;
+const INFO_EXTENSION_KIND_CAPABILITIES: u32 = 1;
+const INFO_EXTENSION_VERSION: u32 = 1;
+const INFO_CAPABILITY_RETIRED_LOST_MASK: u32 = 1 << 0;
+
 /// Guest clients (NativeAdrenoPublish's slots) with a KGSL context of their own: the guest's 32 slots, each a 1 GiB window of
 /// the VBO (the wallpaper's poster extensions, widgets, Settings and WebKit's processes took the ten there were before).
 const MAX_CLIENTS: u16 = 32;
@@ -126,6 +131,22 @@ struct Info {
     highest_bank_bit: u32,
     ubwc_mode: u32,
     faults: u64,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct InfoExtensionQuery {
+    magic: u32,
+    kind: u32,
+    version: u32,
+    reserved: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+struct InfoCapabilities {
+    magic: u32,
+    version: u32,
+    capabilities: u32,
+    max_clients: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -394,6 +415,38 @@ struct Client {
     pending: VecDeque<u32>,
     /// KGSL invalidated the context, or it caused a GPU reset: the client's work is refused until CLIENT.
     lost: bool,
+}
+
+fn lost_client_mask(clients: &BTreeMap<u16, Client>) -> u32 {
+    clients.iter().fold(0, |mask, (&client, entry)| {
+        if entry.lost && client < MAX_CLIENTS {
+            mask | (1u32 << u32::from(client))
+        } else {
+            mask
+        }
+    })
+}
+
+/// Returns the extension reply only for a complete, exact capabilities query.
+fn info_extension_reply(
+    request_bytes: u32,
+    query: Option<InfoExtensionQuery>,
+) -> Option<InfoCapabilities> {
+    let query = query?;
+    if request_bytes != std::mem::size_of::<InfoExtensionQuery>() as u32
+        || query.magic != INFO_EXTENSION_MAGIC
+        || query.kind != INFO_EXTENSION_KIND_CAPABILITIES
+        || query.version != INFO_EXTENSION_VERSION
+        || query.reserved != 0
+    {
+        return None;
+    }
+    Some(InfoCapabilities {
+        magic: INFO_EXTENSION_MAGIC,
+        version: INFO_EXTENSION_VERSION,
+        capabilities: INFO_CAPABILITY_RETIRED_LOST_MASK,
+        max_clients: u32::from(MAX_CLIENTS),
+    })
 }
 
 struct Kgsl {
@@ -1037,7 +1090,22 @@ impl Worker {
             )
         };
         match request.op {
-            OP_INFO => ok(self.kgsl.info.as_bytes().to_vec()),
+            OP_INFO => {
+                let extension = if request.bytes == std::mem::size_of::<InfoExtensionQuery>() as u32
+                {
+                    let query = match reader.read_obj::<InfoExtensionQuery>() {
+                        Ok(query) => query,
+                        Err(_) => return fail(-libc::EINVAL),
+                    };
+                    info_extension_reply(request.bytes, Some(query))
+                } else {
+                    info_extension_reply(request.bytes, None)
+                };
+                match extension {
+                    Some(reply) => ok(reply.as_bytes().to_vec()),
+                    None => ok(self.kgsl.info.as_bytes().to_vec()),
+                }
+            }
             OP_IMPORT => {
                 let header: Import = match reader.read_obj() {
                     Ok(header) => header,
@@ -1092,7 +1160,7 @@ impl Worker {
             OP_RETIRED => match self.kgsl.retired() {
                 Ok(timestamp) => ok(Timestamp {
                     timestamp,
-                    timeout_ms: 0,
+                    timeout_ms: lost_client_mask(&self.kgsl.clients),
                 }
                 .as_bytes()
                 .to_vec()),
@@ -1217,5 +1285,96 @@ impl VirtioDevice for DroidVmGpu {
             let _worker = worker_thread.stop();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_info_query() -> InfoExtensionQuery {
+        InfoExtensionQuery {
+            magic: INFO_EXTENSION_MAGIC,
+            kind: INFO_EXTENSION_KIND_CAPABILITIES,
+            version: INFO_EXTENSION_VERSION,
+            reserved: 0,
+        }
+    }
+
+    #[test]
+    fn info_extension_requires_an_exact_query() {
+        let query_bytes = std::mem::size_of::<InfoExtensionQuery>() as u32;
+        assert!(info_extension_reply(0, None).is_none());
+
+        let reply = info_extension_reply(query_bytes, Some(valid_info_query())).unwrap();
+        assert_eq!(reply.magic, INFO_EXTENSION_MAGIC);
+        assert_eq!(reply.version, INFO_EXTENSION_VERSION);
+        assert_eq!(reply.capabilities, INFO_CAPABILITY_RETIRED_LOST_MASK);
+        assert_eq!(reply.max_clients, 32);
+
+        let mut query = valid_info_query();
+        query.magic ^= 1;
+        assert!(info_extension_reply(query_bytes, Some(query)).is_none());
+
+        let mut query = valid_info_query();
+        query.kind += 1;
+        assert!(info_extension_reply(query_bytes, Some(query)).is_none());
+
+        let mut query = valid_info_query();
+        query.version += 1;
+        assert!(info_extension_reply(query_bytes, Some(query)).is_none());
+
+        let mut query = valid_info_query();
+        query.reserved = 1;
+        assert!(info_extension_reply(query_bytes, Some(query)).is_none());
+
+        assert!(info_extension_reply(query_bytes - 1, Some(valid_info_query())).is_none());
+        assert!(info_extension_reply(query_bytes + 1, Some(valid_info_query())).is_none());
+    }
+
+    #[test]
+    fn lost_client_mask_reports_only_lost_clients_in_range() {
+        let mut clients = BTreeMap::new();
+        assert_eq!(lost_client_mask(&clients), 0);
+
+        clients.insert(
+            0,
+            Client {
+                lost: true,
+                ..Default::default()
+            },
+        );
+        clients.insert(
+            5,
+            Client {
+                context: 42,
+                ..Default::default()
+            },
+        );
+        clients.insert(
+            31,
+            Client {
+                lost: true,
+                ..Default::default()
+            },
+        );
+        clients.insert(
+            32,
+            Client {
+                lost: true,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(lost_client_mask(&clients), 0x8000_0001);
+    }
+
+    #[test]
+    fn legacy_info_and_timestamp_layouts_are_unchanged() {
+        assert_eq!(WIRE_VERSION, 3);
+        assert_eq!(std::mem::size_of::<Info>(), 64);
+        assert_eq!(std::mem::size_of::<Timestamp>(), 8);
+        assert_eq!(std::mem::size_of::<InfoExtensionQuery>(), 16);
+        assert_eq!(std::mem::size_of::<InfoCapabilities>(), 16);
     }
 }

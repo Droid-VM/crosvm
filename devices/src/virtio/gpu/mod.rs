@@ -464,18 +464,15 @@ struct PendingFlipFence {
     ring: VirtioGpuRing,
     fence_id: u64,
     fence: SafeDescriptor,
-    /// Safety valve: a display that never signals (surface torn down mid-flip, HWC stall) must
-    /// not freeze the guest compositor.  Past this instant the fence is completed regardless.
+    /// Diagnostic deadline. Expiry never releases the guest source while the blit may read it.
     deadline: std::time::Instant,
     /// Whether the fd has been added to the worker's WaitContext yet.
     registered: bool,
 }
 
-/// How long a flip completion fence may stay unsignaled before it is force-completed.  Three
-/// 120Hz vsyncs -- generous for a healthy display, small enough that a torn-down surface only
-/// hiccups the guest instead of stalling it (the guest side waits with its own multi-second
-/// timeout, which would otherwise be the visible failure).
-const FLIP_FENCE_TIMEOUT: Duration = Duration::from_millis(25);
+/// Poll periodically even if WaitContext registration fails. A delayed fence must not tell
+/// the guest that it can recycle pages which the host GPU is still reading.
+const FLIP_FENCE_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct Frontend {
     fence_state: Arc<Mutex<FenceState>>,
@@ -497,9 +494,9 @@ impl Frontend {
     fn register_flip_fences(&mut self, wait_ctx: &WaitContext<WorkerToken>) {
         for pending in self.pending_flip_fences.iter_mut() {
             if !pending.registered {
-                // Registration failure is not fatal: the deadline path still completes it.
+                // Registration failure is not fatal: the deadline path polls the fd again.
                 if let Err(e) = wait_ctx.add(&pending.fence, WorkerToken::FlipFence) {
-                    base::warn!("failed to poll flip fence, falling back to timeout: {}", e);
+                    base::warn!("failed to register flip fence, falling back to polling: {}", e);
                 }
                 pending.registered = true;
             }
@@ -507,12 +504,12 @@ impl Frontend {
     }
 
     /// The nearest deadline among pending flip fences, if any -- the worker bounds its wait by
-    /// this so an unsignaled fence cannot stall the guest past `FLIP_FENCE_TIMEOUT`.
+    /// this so registration failures still get polled and stalled flips get diagnosed.
     fn next_flip_fence_deadline(&self) -> Option<std::time::Instant> {
         self.pending_flip_fences.iter().map(|f| f.deadline).min()
     }
 
-    /// Completes every pending flip fence that has signaled or passed its deadline.  Returns
+    /// Completes every pending flip fence that has signaled. Returns
     /// whether any completion was delivered (the caller then signals the ctrl queue).
     fn complete_flip_fences(
         &mut self,
@@ -531,17 +528,21 @@ impl Frontend {
                 revents: 0,
             };
             // SAFETY: pfd points at a valid pollfd for the duration of the call.
-            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } > 0;
+            let signaled = unsafe { libc::poll(&mut pfd, 1, 0) } > 0
+                && pfd.revents & (libc::POLLIN | libc::POLLERR) != 0;
             if !signaled && now < pending.deadline {
                 i += 1;
                 continue;
             }
             if !signaled {
                 base::warn!(
-                    "flip fence {} timed out after {:?}; completing anyway",
+                    "flip fence {} still pending after {:?}; retaining guest source",
                     pending.fence_id,
                     FLIP_FENCE_TIMEOUT
                 );
+                self.pending_flip_fences[i].deadline = now + FLIP_FENCE_TIMEOUT;
+                i += 1;
+                continue;
             }
             let pending = self.pending_flip_fences.remove(i);
             if pending.registered {
