@@ -139,6 +139,60 @@ pub fn new_rotary_config(idx: u32) -> VirtioInputConfig {
     )
 }
 
+/// Units per g of the motion sensors' acceleration axes, and their bound (16 g).
+pub const MOTION_ACCEL_PER_G: i32 = 256;
+pub const MOTION_ACCEL_MAX: i32 = 16 * MOTION_ACCEL_PER_G;
+/// Units per degree per second of the motion sensors' angular velocity axes, and their bound
+/// (about 2048 degrees per second).
+pub const MOTION_GYRO_PER_DEG_S: i32 = 16;
+pub const MOTION_GYRO_MAX: i32 = 32767;
+
+/// Instantiates a VirtioInputConfig object with the default configuration for motion sensors, as
+/// evdev describes them: one device marked INPUT_PROP_ACCELEROMETER with the acceleration on
+/// ABS_X/Y/Z, the angular velocity on ABS_RX/RY/RZ and MSC_TIMESTAMP, in the frame of the device's
+/// screen (X right, Y up, Z out of it). The acceleration is the gravity vector, as Linux desktops
+/// read it (iio-sensor-proxy: Y negative is "normal", X positive "left-up", 1 g about 256): upright
+/// and at rest, Y reads -1 g. The angular velocity is counter-clockwise positive about each axis.
+/// The same as devices/tests/data/input/example_custom_motion_sensor_config.json.
+pub fn new_motion_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Motion Sensors {idx}"));
+    VirtioInputConfig::new(
+        virtio_input_device_ids::new(0, 0, 0, 0),
+        name,
+        format!("virtio-motion-sensors-{idx}"),
+        virtio_input_bitmap::from_bits(&[INPUT_PROP_ACCELEROMETER]),
+        default_motion_events(),
+        default_motion_absinfo(),
+    )
+}
+
+fn default_motion_events() -> BTreeMap<u16, virtio_input_bitmap> {
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(
+        EV_ABS,
+        virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ]),
+    );
+    supported_events.insert(EV_MSC, virtio_input_bitmap::from_bits(&[MSC_TIMESTAMP]));
+    supported_events
+}
+
+fn default_motion_absinfo() -> BTreeMap<u16, virtio_input_absinfo> {
+    let accel = virtio_input_absinfo::new(-MOTION_ACCEL_MAX as u32, MOTION_ACCEL_MAX as u32, 0, 0)
+        .with_res(MOTION_ACCEL_PER_G as u32);
+    let gyro = virtio_input_absinfo::new(-(MOTION_GYRO_MAX + 1) as u32, MOTION_GYRO_MAX as u32, 0, 0)
+        .with_res(MOTION_GYRO_PER_DEG_S as u32);
+    let mut absinfo: BTreeMap<u16, virtio_input_absinfo> = BTreeMap::new();
+    for axis in [ABS_X, ABS_Y, ABS_Z] {
+        absinfo.insert(axis, accel);
+    }
+    for axis in [ABS_RX, ABS_RY, ABS_RZ] {
+        absinfo.insert(axis, gyro);
+    }
+    absinfo
+}
+
 /// Instantiates a VirtioInputConfig object with the default configuration for a touchscreen (no
 /// multitouch support).
 pub fn new_single_touch_config(

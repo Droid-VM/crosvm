@@ -900,6 +900,40 @@ pub fn create_rotary_device<T: IntoUnixStream>(
     })
 }
 
+/// Motion sensors (an accelerometer and a gyroscope), fed by the host's sensors when
+/// `host_sensors` is set and by whatever writes to `socket` (which overrides them while it writes).
+/// The device reads one end of a socket pair; spawn_motion_feeder writes the other.
+pub fn create_motion_device(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    socket: Option<&Path>,
+    host_sensors: bool,
+    name: Option<&str>,
+    idx: u32,
+) -> DeviceResult {
+    let external = socket
+        .map(|path| path.into_unix_stream())
+        .transpose()
+        .context("failed configuring virtio motion sensors")?;
+    let (device_end, feeder_end) =
+        UnixStream::pair().context("failed to create the motion sensors' feed")?;
+    virtio::input::spawn_motion_feeder(external, feeder_end, host_sensors)
+        .context("failed to start feeding the motion sensors")?;
+
+    let dev = virtio::input::new_motion(
+        idx,
+        device_end,
+        virtio::base_features(protection_type),
+        name,
+    )
+    .context("failed to set up input device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
 pub fn create_vinput_device(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,

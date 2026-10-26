@@ -640,6 +640,19 @@ pub enum InputDeviceOption {
         path: PathBuf,
         config_path: PathBuf,
     },
+    // Motion sensors: an accelerometer and a gyroscope in one device, as evdev describes them
+    // (INPUT_PROP_ACCELEROMETER, ABS_X/Y/Z and ABS_RX/RY/RZ, MSC_TIMESTAMP). With `host-sensors`
+    // crosvm feeds it from the host's own sensors (Android's, through the NDK), in the host
+    // device's natural frame, so the guest has them whether or not anything is showing it. Frames
+    // written to `path` override them while they keep coming, for a presenter that turns the
+    // guest's picture or wants the guest to see other values. Either source may be left out.
+    #[serde(rename_all = "kebab-case")]
+    Motion {
+        path: Option<PathBuf>,
+        #[serde(default)]
+        host_sensors: bool,
+        name: Option<String>,
+    },
 }
 
 fn parse_hex_or_decimal(maybe_hex_string: &str) -> Result<u64, String> {

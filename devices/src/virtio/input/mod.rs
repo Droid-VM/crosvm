@@ -6,6 +6,7 @@
 mod defaults;
 mod evdev;
 mod event_source;
+mod motion;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -867,6 +868,28 @@ where
         virtio_features,
     })
 }
+
+/// Creates a new virtio device for motion sensors (an accelerometer and a gyroscope). `source`
+/// carries their events; spawn_motion_feeder() can feed it from the host's sensors and an outside
+/// writer.
+pub fn new_motion<T>(
+    idx: u32,
+    source: T,
+    virtio_features: u64,
+    name: Option<&str>,
+) -> Result<Input<SocketEventSource<T>>>
+where
+    T: Read + Write + AsRawDescriptor + Send + 'static,
+{
+    Ok(Input {
+        worker_thread: None,
+        config: defaults::new_motion_config(idx, name),
+        source: Some(SocketEventSource::new(source)),
+        virtio_features,
+    })
+}
+
+pub use motion::spawn_motion_feeder;
 
 /// Creates a new virtio device for rotary.
 pub fn new_rotary<T>(

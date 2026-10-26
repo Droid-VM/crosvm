@@ -1629,6 +1629,7 @@ pub struct RunCommand {
     ///     absolute-mouse[path=PATH,width=W,height=H,name=N]
     ///     evdev[path=PATH]
     ///     keyboard[path=PATH,name=N]
+    ///     motion[path=PATH,host-sensors=BOOL,name=N]
     ///     mouse[path=PATH]
     ///     multi-touch[path=PATH,width=W,height=H,name=N]
     ///     rotary[path=PATH]

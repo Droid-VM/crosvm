@@ -207,7 +207,17 @@ which configures a device equivalent to the default keyboard (`crosvm run --inpu
 [`/devices/tests/data/input/example_custom_motion_sensor_config.json`](https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/tests/data/input/example_custom_motion_sensor_config.json)
 configures motion sensors as evdev describes them (`INPUT_PROP_ACCELEROMETER`; acceleration on
 ABS_X/Y/Z, angular velocity on ABS_RX/RY/RZ, `MSC_TIMESTAMP`), which a Linux guest's udev tags
-`ID_INPUT_ACCELEROMETER`.
+`ID_INPUT_ACCELEROMETER`. The acceleration is the gravity vector in the screen's frame, as Linux
+desktops read it through iio-sensor-proxy: X right, Y up, Z out of the screen, and upright at rest Y
+reads -1 g.
+
+`motion[path=PATH,host-sensors=BOOL,name=N]` is that device built in. With `host-sensors=true`
+crosvm feeds it from the host's own accelerometer and gyroscope (on Android, through the NDK's
+sensor manager), in the host device's natural frame. Frames of `virtio_input_event`s, each ending in
+`SYN_REPORT`, written to the socket at `path` override the host's sensors for as long as they keep
+coming (a second after the last one, or at once when the writer closes, the host's sensors take
+over again): a presenter that shows the guest turned, or wants it to see other values, sends its
+own.
 
 An axis's "min" and "max" may be negative. Its optional "res" is the evdev resolution the guest
 reads: units per millimetre for a touch axis, per g for acceleration, per degree per second for
