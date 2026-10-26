@@ -204,6 +204,14 @@ It configures a device equivalent to the default multitouch screen device
 (`crosvm run --input=multi-touch,...`). Another example can be found in
 [`/devices/tests/data/input/example_custom_keyboard_config.json`](https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/tests/data/input/example_custom_keyboard_config.json),
 which configures a device equivalent to the default keyboard (`crosvm run --input=keyboard,...`).
+[`/devices/tests/data/input/example_custom_motion_sensor_config.json`](https://chromium.googlesource.com/crosvm/crosvm/+/refs/heads/main/devices/tests/data/input/example_custom_motion_sensor_config.json)
+configures motion sensors as evdev describes them (`INPUT_PROP_ACCELEROMETER`; acceleration on
+ABS_X/Y/Z, angular velocity on ABS_RX/RY/RZ, `MSC_TIMESTAMP`), which a Linux guest's udev tags
+`ID_INPUT_ACCELEROMETER`.
+
+An axis's "min" and "max" may be negative. Its optional "res" is the evdev resolution the guest
+reads: units per millimetre for a touch axis, per g for acceleration, per degree per second for
+angular velocity (0, unknown, when absent).
 
 Here is a portion of the example config file:
 

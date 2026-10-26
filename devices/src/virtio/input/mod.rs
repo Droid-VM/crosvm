@@ -156,6 +156,10 @@ pub struct virtio_input_absinfo {
     max: Le32,
     fuzz: Le32,
     flat: Le32,
+    // Units per millimetre, per g or per degree per second, as evdev's resolution (virtio spec
+    // 5.8.4); 0 when unknown.
+    #[serde(default)]
+    res: Le32,
 }
 
 impl virtio_input_absinfo {
@@ -165,7 +169,13 @@ impl virtio_input_absinfo {
             max: Le32::from(max),
             fuzz: Le32::from(fuzz),
             flat: Le32::from(flat),
+            res: Le32::from(0),
         }
+    }
+
+    fn with_res(mut self, res: u32) -> virtio_input_absinfo {
+        self.res = Le32::from(res);
+        self
     }
 }
 
@@ -925,12 +935,30 @@ struct InputConfigFileAbsInfo {
     #[allow(dead_code)]
     axis: String,
     axis_code: u16,
-    min: u32,
-    max: u32,
+    // Signed, as evdev's: -2048 for an accelerometer's lower bound. The guest reads the config
+    // space as __le32 and takes it as signed, so the two's-complement form (4294965248) that a
+    // u32 field forced on earlier files still means the same.
+    min: i64,
+    max: i64,
     #[serde(default)]
     fuzz: u32,
     #[serde(default)]
     flat: u32,
+    // Units per millimetre (touch), per g (accelerometer) or per degree per second (gyroscope).
+    #[serde(default)]
+    res: u32,
+}
+
+// An axis bound as the config space holds it: a signed 32-bit value in two's complement.
+fn axis_bound(value: i64, config_path: &PathBuf) -> Result<u32> {
+    if value < i32::MIN as i64 || value > u32::MAX as i64 {
+        return Err(InputError::ParseEventConfigError(format!(
+            "The axis bound {} in {} does not fit in 32 bits",
+            value,
+            config_path.display()
+        )));
+    }
+    Ok(value as u32)
 }
 
 struct CustomInputConfig {
@@ -995,12 +1023,14 @@ fn parse_input_config_file(config_path: &PathBuf, device_idx: u32) -> Result<Cus
         .axis_info
         .iter()
         .map(|a| {
-            (
+            let min = axis_bound(a.min, config_path)?;
+            let max = axis_bound(a.max, config_path)?;
+            Ok((
                 a.axis_code,
-                virtio_input_absinfo::new(a.min, a.max, a.fuzz, a.flat),
-            )
+                virtio_input_absinfo::new(min, max, a.fuzz, a.flat).with_res(a.res),
+            ))
         })
-        .collect();
+        .collect::<Result<_>>()?;
 
     let name = config_file
         .name
@@ -1289,6 +1319,32 @@ mod tests {
     }
 
     // Test the example custom touchscreen config file
+    // A motion sensor config: negative axis bounds and resolutions reach the config space as the
+    // guest reads them (two's complement, units per g and per degree per second).
+    #[test]
+    fn example_custom_motion_sensor_config_file_signed_axes_and_resolution() {
+        use linux_input_sys::constants::ABS_RZ;
+        use linux_input_sys::constants::ABS_X;
+        use linux_input_sys::constants::INPUT_PROP_ACCELEROMETER;
+
+        let temp_file = TempDir::new().unwrap();
+        let path = temp_file.path().join("test.json");
+        let test_json =
+            include_str!("../../../tests/data/input/example_custom_motion_sensor_config.json");
+        fs::write(&path, test_json).expect("Unable to write test file");
+
+        let config = parse_input_config_file(&path, 0).expect("Failed to parse JSON file");
+        assert_eq!(
+            config.axis_info.get(&ABS_X),
+            Some(&virtio_input_absinfo::new((-4096i32) as u32, 4096, 0, 0).with_res(256))
+        );
+        assert_eq!(
+            config.axis_info.get(&ABS_RZ),
+            Some(&virtio_input_absinfo::new((-32768i32) as u32, 32767, 0, 0).with_res(16))
+        );
+        assert_eq!(config.properties, virtio_input_bitmap::from_bits(&[INPUT_PROP_ACCELEROMETER]));
+    }
+
     // (tests/data/input/example_custom_multitouchscreen_config.json) provides the same
     // configuration as the default multi touch screen.
     #[test]

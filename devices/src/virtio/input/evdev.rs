@@ -96,6 +96,7 @@ impl From<evdev_abs_info> for virtio_input_absinfo {
             max: Le32::from(other.maximum),
             fuzz: Le32::from(other.fuzz),
             flat: Le32::from(other.flat),
+            res: Le32::from(other.resolution),
         }
     }
 }
