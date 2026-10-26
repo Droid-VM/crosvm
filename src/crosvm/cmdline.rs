@@ -1351,13 +1351,6 @@ pub struct RunCommand {
     /// capture keyboard input from the display window
     pub display_window_mouse: Option<bool>,
 
-    #[argh(switch)]
-    #[serde(skip)] // TODO(b/255223604)
-    #[merge(strategy = overwrite_option)]
-    /// add the droidvm-gpu virtio-mmio device (aarch64 only): UniXNU's paravirtual Adreno, whose
-    /// requests run on the host's /dev/kgsl-3d0; it follows the virtio-mmio input devices
-    droidvm_gpu: Option<bool>,
-
     #[cfg(feature = "config-file")]
     #[argh(option, arg_name = "CONFIG_FILE")]
     #[serde(skip)]
@@ -2849,7 +2842,7 @@ pub struct RunCommand {
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
     /// put the --net devices on the virtio-mmio transport instead of virtio-pci (aarch64 only), after
-    /// the --droidvm-gpu device, for a guest that has a virtio-mmio driver but no PCI host driver
+    /// the virtio-mmio input devices, for a guest that has a virtio-mmio driver but no PCI host driver
     virtio_mmio_net: Option<bool>,
 
     #[cfg(feature = "audio")]
@@ -3281,7 +3274,6 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.virtio_mmio_input = cmd.virtio_mmio_input.unwrap_or_default();
         cfg.virtio_mmio_net = cmd.virtio_mmio_net.unwrap_or_default();
         cfg.virtio_mmio_gpu = cmd.virtio_mmio_gpu.unwrap_or_default();
-        cfg.droidvm_gpu = cmd.droidvm_gpu.unwrap_or_default();
 
         cfg.pmems = cmd.pmem;
         cfg.pre_alloc = cmd.pre_alloc;

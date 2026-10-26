@@ -1536,15 +1536,7 @@ fn create_devices(
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
-    // --droidvm-gpu: after the inputs, before net and the standard virtio GPU.
-    if cfg.droidvm_gpu {
-        let gpu = virtio::DroidVmGpu::new(virtio::base_features(cfg.protection_type));
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), Box::new(gpu))
-            .context("failed to create droidvm-gpu device")?;
-        devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
-    }
-
-    // --virtio-mmio-net: the --net devices diverted onto the MMIO transport, after --droidvm-gpu.
+    // --virtio-mmio-net: the --net devices diverted onto the MMIO transport, after the inputs.
     // The device object is the same one --net builds for virtio-pci; only the transport wrapper differs.
     for stub in mmio_nets {
         if stub.jail.is_some() {

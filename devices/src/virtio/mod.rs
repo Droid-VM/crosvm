@@ -9,7 +9,6 @@ mod async_utils;
 mod balloon;
 mod descriptor_chain;
 mod descriptor_utils;
-mod droidvm_gpu;
 pub mod device_constants;
 pub mod input;
 mod gunyah_accept;
@@ -91,7 +90,6 @@ pub use self::queue::split_descriptor_chain::SplitDescriptorChain;
 pub use self::queue::PeekedDescriptorChain;
 pub use self::queue::Queue;
 pub use self::queue::QueueConfig;
-pub use self::droidvm_gpu::DroidVmGpu;
 pub use self::gunyah_accept::GunyahAccept;
 pub use self::rng::Rng;
 pub use self::scsi::Controller as ScsiController;
@@ -192,7 +190,6 @@ pub enum DeviceType {
     Pvclock = virtio_ids::VIRTIO_ID_PVCLOCK,
     Media = virtio_ids::VIRTIO_ID_MEDIA,
     GunyahAccept = virtio_ids::VIRTIO_ID_GUNYAH_ACCEPT,
-    DroidVmGpu = virtio_ids::VIRTIO_ID_DROIDVM_GPU,
 }
 
 impl DeviceType {
@@ -225,7 +222,6 @@ impl DeviceType {
             DeviceType::Pvclock => 1,       // request queue
             DeviceType::Media => 2,         // commandq, eventq
             DeviceType::GunyahAccept => 3,  // requestq, completionq, poolq
-            DeviceType::DroidVmGpu => 1,    // request queue
         }
     }
 }
@@ -257,7 +253,6 @@ impl std::fmt::Display for DeviceType {
             DeviceType::Scmi => write!(f, "scmi"),
             DeviceType::Media => write!(f, "media"),
             DeviceType::GunyahAccept => write!(f, "gunyah-accept"),
-            DeviceType::DroidVmGpu => write!(f, "droidvm-gpu"),
         }
     }
 }

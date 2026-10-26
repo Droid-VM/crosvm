@@ -1048,8 +1048,6 @@ pub struct Config {
     pub display_input_width: Option<u32>,
     pub display_window_keyboard: bool,
     pub display_window_mouse: bool,
-    /// UniXNU's paravirtual Adreno on the host's KGSL, a virtio-mmio device (`--droidvm-gpu`).
-    pub droidvm_gpu: bool,
     pub dump_device_tree_blob: Option<PathBuf>,
     pub dynamic_power_coefficient: BTreeMap<usize, u32>,
     pub enable_fw_cfg: bool,
@@ -1298,7 +1296,6 @@ impl Default for Config {
             display_input_width: None,
             display_window_keyboard: false,
             display_window_mouse: false,
-            droidvm_gpu: false,
             dump_device_tree_blob: None,
             dynamic_power_coefficient: BTreeMap::new(),
             enable_fw_cfg: false,
