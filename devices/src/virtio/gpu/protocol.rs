@@ -578,6 +578,9 @@ pub const VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM: u32 = 67;
 pub const VIRTIO_GPU_FORMAT_X8B8G8R8_UNORM: u32 = 68;
 pub const VIRTIO_GPU_FORMAT_A8B8G8R8_UNORM: u32 = 121;
 pub const VIRTIO_GPU_FORMAT_R8G8B8X8_UNORM: u32 = 134;
+/// DroidVM's own: half-float RGBA scanouts (a macOS guest's WindowServer composes into 'RGhA', its fourcc the
+/// value), which the display's GPU blit converts to its 8-bit target.
+pub const VIRTIO_GPU_FORMAT_R16G16B16A16_FLOAT_DROIDVM: u32 = 0x52476841;
 
 /// A virtio gpu command and associated metadata specific to each command.
 #[derive(Copy, Clone)]

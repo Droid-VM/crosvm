@@ -4294,7 +4294,16 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         #[cfg(feature = "android_display")]
         let android_service = cfg
             .android_display_service_for(DisplayScreen::Simplefb)
-            .map(|s| (s.name.clone(), s.transport_cap));
+            .map(|s| (s.name.clone(), s.transport_cap))
+            // A simplefb screen nobody shows is the boot picture of the GPU screen: the firmware,
+            // the bootloader and an early kernel console draw into it before any guest driver sets
+            // a scanout. Its frames go to the GPU screen's window ("#boot": the display service
+            // shared in-process, CPU path, dropped while the GPU scanout presents), so the window
+            // shows something from the first firmware frame on.
+            .or_else(|| {
+                cfg.android_display_service_for(DisplayScreen::Gpu0)
+                    .map(|s| (format!("{}#boot", s.name), s.transport_cap))
+            });
         #[cfg(not(feature = "android_display"))]
         let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
 
