@@ -53,7 +53,8 @@ const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
 
 const WIRE_VERSION: u32 = 1;
 const MAX_RANGES: u32 = 1024;
-const MAX_IBS: u32 = 16;
+// IBs per OP_SUBMIT: a guest built with 16 (the first macOS kext) still fits; macOS sends up to 64 (build-droidvm-gpu.py).
+const MAX_IBS: u32 = 64;
 const WAIT_MAX_MS: u32 = 4;
 
 const OP_INFO: u32 = 1;
