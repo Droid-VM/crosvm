@@ -79,6 +79,8 @@ pub const DRM_FORMAT_XRGB8888: u32 = drm_fourcc(b'X', b'R', b'2', b'4');
 pub const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
 pub const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
 pub const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+/// Half-float R, G, B, A (16 bits each, red first in memory): a macOS guest's 'RGhA' framebuffer.
+pub const DRM_FORMAT_ABGR16161616F: u32 = drm_fourcc(b'A', b'B', b'4', b'H');
 pub const DRM_FORMAT_RGB888: u32 = drm_fourcc(b'R', b'G', b'2', b'4');
 pub const DRM_FORMAT_RGB565: u32 = drm_fourcc(b'R', b'G', b'1', b'6');
 

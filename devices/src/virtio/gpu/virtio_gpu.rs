@@ -104,7 +104,12 @@ const POOL_SCANOUT_DMABUF_MIN_SIZE: u64 = 512 * 1024;
 fn is_single_plane_8888_rgb(format: u32) -> bool {
     matches!(
         format,
-        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888
+        DRM_FORMAT_XRGB8888
+            | DRM_FORMAT_ARGB8888
+            | DRM_FORMAT_XBGR8888
+            | DRM_FORMAT_ABGR8888
+            // Also single-plane RGB, 8 bytes a pixel; the display's blit converts it.
+            | DRM_FORMAT_ABGR16161616F
     )
 }
 

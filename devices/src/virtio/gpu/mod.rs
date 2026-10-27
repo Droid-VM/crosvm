@@ -1064,6 +1064,7 @@ impl Frontend {
                     VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM => DrmFormat::new(b'X', b'R', b'2', b'4'),
                     VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM => DrmFormat::new(b'A', b'R', b'2', b'4'),
                     VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM => DrmFormat::new(b'A', b'B', b'2', b'4'),
+                    VIRTIO_GPU_FORMAT_R16G16B16A16_FLOAT_DROIDVM => DrmFormat::new(b'A', b'B', b'4', b'H'),
                     _ => {
                         error!("unrecognized virtio-gpu format {}", virtio_gpu_format);
                         return Err(GpuResponse::ErrUnspec);
