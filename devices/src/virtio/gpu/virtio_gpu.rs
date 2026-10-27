@@ -211,11 +211,19 @@ fn to_safe_descriptor(r: RutabagaDescriptor) -> SafeDescriptor {
     unsafe { SafeDescriptor::from_raw_descriptor(r.into_raw_descriptor()) }
 }
 
+/// How many presents a resource stays on the CPU copy after its import failed before the import is
+/// tried again. A refusal is not always the resource's own: before the display's window exists
+/// (the console not yet attached at boot) every import fails, and the compositor's framebuffers
+/// that failed then stayed on the CPU copy for the rest of the boot (two frames in three on a
+/// guest that cycles three). One retry per this many presents costs next to nothing.
+const DISPLAY_IMPORT_RETRY_PRESENTS: u32 = 120;
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DisplayImportState {
     Unknown,
     Imported { import_id: u32, surface_id: u32 },
-    CpuFallback,
+    /// Presented by CPU copy; `retry_in` presents later the import is tried again.
+    CpuFallback { retry_in: u32 },
 }
 
 struct VirtioGpuResource {
@@ -662,7 +670,9 @@ impl VirtioGpuScanout {
                         strace!("flush.flip_to.fail");
                         resource.transition_display_import(
                             &mut display.borrow_mut(),
-                            DisplayImportState::CpuFallback,
+                            DisplayImportState::CpuFallback {
+                                retry_in: DISPLAY_IMPORT_RETRY_PRESENTS,
+                            },
                         );
                     }
                 }
@@ -993,21 +1003,31 @@ impl VirtioGpuScanout {
                     DisplayImportState::Unknown,
                 );
             }
-            DisplayImportState::CpuFallback => return None,
-            DisplayImportState::Unknown => {}
+            DisplayImportState::CpuFallback { retry_in } if retry_in > 0 => {
+                resource.display_import_state = DisplayImportState::CpuFallback {
+                    retry_in: retry_in - 1,
+                };
+                return None;
+            }
+            DisplayImportState::CpuFallback { .. } | DisplayImportState::Unknown => {}
         }
 
+        let fallback = DisplayImportState::CpuFallback {
+            retry_in: DISPLAY_IMPORT_RETRY_PRESENTS,
+        };
         if !display.borrow_mut().is_dmabuf_import_supported() {
             note_no_import("display backend has no dmabuf import");
-            resource.display_import_state = DisplayImportState::CpuFallback;
+            resource.display_import_state = fallback;
             return None;
         }
 
-        // A resource that failed once will fail the same way every present. Cache the verdict
-        // instead of paying an export + query + refused import per frame on top of the copy.
+        // A resource that failed usually fails the same way on the next present. Cache the verdict
+        // instead of paying an export + query + refused import per frame on top of the copy, but
+        // only for DISPLAY_IMPORT_RETRY_PRESENTS presents: the refusal may have been the display's
+        // (no window yet), not the resource's.
         let imported = Self::try_import_resource_to_display(display, surface_id, resource, rutabaga);
         if imported.is_none() {
-            resource.display_import_state = DisplayImportState::CpuFallback;
+            resource.display_import_state = fallback;
         }
         imported
     }
