@@ -1343,6 +1343,9 @@ pub struct Config {
     pub virtio_mmio_input: bool,
     /// The virtio net devices (`--net`) go on the virtio-mmio transport (`--virtio-mmio-net`).
     pub virtio_mmio_net: bool,
+    /// The virtio sound devices (`--virtio-snd`) go on the virtio-mmio transport, after the GPU
+    /// (`--virtio-mmio-snd`).
+    pub virtio_mmio_snd: bool,
     #[cfg(feature = "audio")]
     #[serde(skip)]
     pub virtio_snds: Vec<SndParameters>,
@@ -1588,6 +1591,7 @@ impl Default for Config {
             virtio_mmio_gpu: false,
             virtio_mmio_input: false,
             virtio_mmio_net: false,
+            virtio_mmio_snd: false,
             #[cfg(feature = "media")]
             virtio_media: Vec::new(),
             #[cfg(feature = "audio")]
