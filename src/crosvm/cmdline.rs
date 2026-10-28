@@ -2898,6 +2898,15 @@ pub struct RunCommand {
     #[argh(switch)]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
+    /// put the --virtio-media devices on the virtio-mmio transport instead of virtio-pci (aarch64
+    /// only), after the virtio-mmio sound cards, for a guest that has a virtio-mmio driver but no
+    /// PCI host driver. A device with a uid keeps its helper process and takes its MMAP buffers
+    /// from the media_host pool (--pre-alloc media-host-mb), as on PCI.
+    virtio_mmio_media: Option<bool>,
+
+    #[argh(switch)]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
     /// put the --net devices on the virtio-mmio transport instead of virtio-pci (aarch64 only), after
     /// the virtio-mmio input devices, for a guest that has a virtio-mmio driver but no PCI host driver
     virtio_mmio_net: Option<bool>,
@@ -3340,6 +3349,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.virtio_mmio_net = cmd.virtio_mmio_net.unwrap_or_default();
         cfg.virtio_mmio_gpu = cmd.virtio_mmio_gpu.unwrap_or_default();
         cfg.virtio_mmio_snd = cmd.virtio_mmio_snd.unwrap_or_default();
+        cfg.virtio_mmio_media = cmd.virtio_mmio_media.unwrap_or_default();
 
         cfg.pmems = cmd.pmem;
         cfg.pre_alloc = cmd.pre_alloc;
