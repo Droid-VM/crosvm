@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::sync::atomic::fence;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::bail;
@@ -16,6 +18,8 @@ use base::EventType;
 use base::ReadNotifier;
 use base::WaitContext;
 use sync::Mutex;
+use vm_memory::GuestAddress;
+use vm_memory::GuestMemory;
 use vmm_vhost::BackendClient;
 use vmm_vhost::Error as VhostError;
 
@@ -23,11 +27,41 @@ use crate::virtio::vhost_user_frontend::handler::BackendReqHandler;
 use crate::virtio::Interrupt;
 use crate::virtio::VIRTIO_MSI_NO_VECTOR;
 
+/// VIRTQ_AVAIL_F_NO_INTERRUPT: the driver set this in a queue's avail-ring flags to ask the device
+/// not to raise an interrupt for that queue's completions (it polls instead).
+const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 0x1;
+
 pub struct Worker {
     pub kill_evt: Event,
     pub non_msix_evt: Event,
     pub backend_req_handler: Option<BackendReqHandler>,
     pub backend_client: Arc<Mutex<BackendClient>>,
+    /// Guest memory and each active queue's avail-ring address, so the shared non-MSI-X interrupt
+    /// can honour VIRTQ_AVAIL_F_NO_INTERRUPT. Empty / `event_idx` true means always signal.
+    pub mem: GuestMemory,
+    pub avail_rings: Vec<GuestAddress>,
+    pub event_idx: bool,
+}
+
+impl Worker {
+    /// Whether the shared non-MSI-X interrupt should be asserted now. On virtio-mmio the backend
+    /// kicks one event for all queues and does not look at the suppression flags, so we check them
+    /// here as an in-process device would: signal unless every active queue has asked for no
+    /// interrupt. With EVENT_IDX the decision needs the used index the backend owns, so signal.
+    fn should_signal(&self) -> bool {
+        if self.event_idx || self.avail_rings.is_empty() {
+            return true;
+        }
+        fence(Ordering::SeqCst);
+        for &avail_ring in &self.avail_rings {
+            match self.mem.read_obj_from_addr_volatile::<u16>(avail_ring) {
+                Ok(flags) if flags & VIRTQ_AVAIL_F_NO_INTERRUPT != 0 => {}
+                // A queue that wants interrupts, or a read we could not make: signal to be safe.
+                _ => return true,
+            }
+        }
+        false
+    }
 }
 
 impl Worker {
@@ -96,8 +130,11 @@ impl Worker {
                         let _ = self.non_msix_evt.wait();
 
                         // The parameter vector of signal_used_queue is used only when msix is
-                        // enabled.
-                        interrupt.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+                        // enabled. Suppress the line when every queue set VIRTQ_AVAIL_F_NO_INTERRUPT
+                        // (a polling driver), so an unhandled level IRQ does not storm the guest.
+                        if self.should_signal() {
+                            interrupt.signal_used_queue(VIRTIO_MSI_NO_VECTOR);
+                        }
                     }
                     Token::ReqHandlerRead => {
                         let Some(backend_req_handler) = self.backend_req_handler.as_mut() else {

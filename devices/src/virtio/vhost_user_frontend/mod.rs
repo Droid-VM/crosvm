@@ -26,6 +26,8 @@ use base::RawDescriptor;
 use base::WorkerThread;
 use snapshot::AnySnapshot;
 use sync::Mutex;
+use virtio_sys::virtio_ring::VIRTIO_RING_F_EVENT_IDX;
+use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vmm_vhost::message::VhostUserConfigFlags;
 use vmm_vhost::message::VhostUserMigrationPhase;
@@ -348,7 +350,14 @@ impl VhostUserFrontend {
 
     /// Helper to start up the worker thread that will be used with handling interrupts and requests
     /// from the device process.
-    fn start_worker(&mut self, interrupt: Interrupt, non_msix_evt: Event) {
+    fn start_worker(
+        &mut self,
+        interrupt: Interrupt,
+        non_msix_evt: Event,
+        mem: GuestMemory,
+        avail_rings: Vec<GuestAddress>,
+        event_idx: bool,
+    ) {
         assert!(
             self.worker_thread.is_none(),
             "BUG: attempted to start worker twice"
@@ -370,6 +379,9 @@ impl VhostUserFrontend {
                 non_msix_evt,
                 backend_req_handler,
                 backend_client,
+                mem,
+                avail_rings,
+                event_idx,
             };
             // A vhost-user backend going away must not take the VM with it. Upstream
             // unwrapped here, so a sound helper that exits -- which it does on any guest-side
@@ -479,25 +491,37 @@ impl VirtioDevice for VhostUserFrontend {
     ) -> anyhow::Result<()> {
         self.set_mem_table(&mem)?;
 
-        let msix_config_opt = interrupt
-            .get_msix_config()
-            .as_ref()
-            .ok_or(Error::MsixConfigUnavailable)?;
-        let msix_config = msix_config_opt.lock();
+        // On virtio-pci the per-queue interrupt is an MSI-X vector; on virtio-mmio there is no MSI-X
+        // config and every queue shares the one device interrupt, delivered through `non_msix_evt`
+        // and the worker's VIRTIO_MSI_NO_VECTOR path. Fall back to that when MSI-X is absent rather
+        // than refusing to activate, so a vhost-user device works on the MMIO transport too.
+        let msix_config_opt = interrupt.get_msix_config();
+        let msix_config = msix_config_opt.as_ref().map(|config| config.lock());
 
         let non_msix_evt = Event::new().map_err(Error::CreateEvent)?;
         for (&queue_index, queue) in queues.iter() {
             let irqfd = msix_config
-                .get_irqfd(queue.vector() as usize)
+                .as_ref()
+                .and_then(|config| config.get_irqfd(queue.vector() as usize))
                 .unwrap_or(&non_msix_evt);
             self.activate_vring(&mem, queue_index, queue, irqfd)?;
         }
+
+        // For the shared non-MSI-X interrupt (virtio-mmio), the worker must honour the driver's
+        // VIRTQ_AVAIL_F_NO_INTERRUPT the way an in-process device does, or a polling driver that
+        // asked for no interrupts still gets the line asserted on every completion -- an unhandled
+        // level IRQ that storms the guest. Capture each queue's avail-ring address so the worker
+        // can read the flag at signal time. With EVENT_IDX the suppression is a used_event compare
+        // the frontend cannot do (the backend owns the used ring), so leave that case signalling.
+        let avail_rings: Vec<GuestAddress> =
+            queues.values().map(|queue| queue.avail_ring()).collect();
+        let event_idx = self.acked_features & (1 << VIRTIO_RING_F_EVENT_IDX) != 0;
 
         self.sent_queues = Some(queues);
 
         drop(msix_config);
 
-        self.start_worker(interrupt, non_msix_evt);
+        self.start_worker(interrupt, non_msix_evt, mem, avail_rings, event_idx);
         Ok(())
     }
 
