@@ -68,8 +68,16 @@ pub fn add_goldfish_battery(
             as Box<dyn power_monitor::CreatePowerClientFn>),
     );
 
+    // Without ChromeOS powerd, read the host's /sys/class/power_supply (an Android phone, or a
+    // plain Linux host). Generic: the standard power_supply class, nothing guest-specific. crosvm
+    // runs the battery device in the VMM process when sandboxing is off, so it can read /sys.
     #[cfg(not(feature = "power-monitor-powerd"))]
-    let (create_monitor, create_client) = (None, None);
+    let (create_monitor, create_client) = (
+        Some(Box::new(power_monitor::sysfs::SysfsMonitor::connect)
+            as Box<dyn power_monitor::CreatePowerMonitorFn>),
+        Some(Box::new(power_monitor::sysfs::SysfsClient::connect)
+            as Box<dyn power_monitor::CreatePowerClientFn>),
+    );
 
     let irq_evt = devices::IrqLevelEvent::new().map_err(DeviceRegistrationError::EventCreate)?;
 

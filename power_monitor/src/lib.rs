@@ -71,6 +71,9 @@ impl<T> CreatePowerClientFn for T where
 #[cfg(feature = "powerd")]
 pub mod powerd;
 
+#[cfg(any(target_os = "android", target_os = "linux"))]
+pub mod sysfs;
+
 #[cfg(feature = "powerd")]
 mod protos {
     // ANDROID: b/259142784 - we remove protos subdir b/c cargo2android
