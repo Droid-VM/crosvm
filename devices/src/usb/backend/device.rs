@@ -37,6 +37,8 @@ use crate::usb::backend::transfer::BackendTransfer;
 use crate::usb::backend::transfer::BackendTransferHandle;
 use crate::usb::backend::transfer::BackendTransferType;
 use crate::usb::backend::transfer::ControlTransferState;
+use crate::usb::backend::uvc_backend::transfer::UvcTransfer;
+use crate::usb::backend::uvc_backend::uvc_device::UvcDevice;
 use crate::usb::backend::utils::multi_dispatch;
 use crate::usb::backend::utils::update_transfer_state;
 use crate::usb::xhci::scatter_gather_buffer::ScatterGatherBuffer;
@@ -58,11 +60,13 @@ pub enum BackendDeviceType {
     HostDevice(HostDevice),
     // Virtual security key implementation
     FidoDevice(FidoPassthroughDevice),
+    // Virtual UVC camera streaming a host camera (see uvc_backend)
+    UvcDevice(UvcDevice),
 }
 
 impl AsRawDescriptor for BackendDeviceType {
     fn as_raw_descriptor(&self) -> RawDescriptor {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, as_raw_descriptor)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, as_raw_descriptor)
     }
 }
 
@@ -74,7 +78,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             submit_backend_transfer,
             transfer
         )
@@ -84,7 +88,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             detach_event_handler,
             event_loop
         )
@@ -94,7 +98,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             request_transfer_buffer,
             size
         )
@@ -109,7 +113,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             build_bulk_transfer,
             ep_addr,
             transfer_buffer,
@@ -125,7 +129,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             build_interrupt_transfer,
             ep_addr,
             transfer_buffer
@@ -141,7 +145,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             build_isochronous_transfer,
             ep_addr,
             transfer_buffer,
@@ -153,20 +157,20 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             get_control_transfer_state
         )
     }
 
     fn get_device_state(&mut self) -> Arc<RwLock<DeviceState>> {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, get_device_state)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, get_device_state)
     }
 
     fn get_active_config_descriptor(&mut self) -> Result<ConfigDescriptorTree> {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             get_active_config_descriptor
         )
     }
@@ -175,7 +179,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             get_config_descriptor,
             config
         )
@@ -185,7 +189,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             get_config_descriptor_by_index,
             config_index
         )
@@ -195,7 +199,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             get_device_descriptor_tree
         )
     }
@@ -204,7 +208,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             get_active_configuration
         )
     }
@@ -213,7 +217,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             set_active_configuration,
             config
         )
@@ -223,7 +227,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             clear_feature,
             value,
             index
@@ -234,7 +238,7 @@ impl BackendDevice for BackendDeviceType {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             create_endpoints,
             config_descriptor
         )
@@ -243,34 +247,34 @@ impl BackendDevice for BackendDeviceType {
 
 impl XhciBackendDevice for BackendDeviceType {
     fn get_backend_type(&self) -> BackendType {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, get_backend_type)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, get_backend_type)
     }
 
     fn get_vid(&self) -> u16 {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, get_vid)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, get_vid)
     }
 
     fn get_pid(&self) -> u16 {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, get_pid)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, get_pid)
     }
 
     fn set_address(&mut self, address: UsbDeviceAddress) {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, set_address, address)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, set_address, address)
     }
 
     fn reset(&mut self) -> Result<()> {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, reset)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, reset)
     }
 
     fn get_speed(&self) -> Option<DeviceSpeed> {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, get_speed)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, get_speed)
     }
 
     fn alloc_streams(&self, ep: u8, num_streams: u16) -> Result<()> {
         multi_dispatch!(
             self,
             BackendDeviceType,
-            HostDevice FidoDevice,
+            HostDevice FidoDevice UvcDevice,
             alloc_streams,
             ep,
             num_streams
@@ -278,11 +282,11 @@ impl XhciBackendDevice for BackendDeviceType {
     }
 
     fn free_streams(&self, ep: u8) -> Result<()> {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, free_streams, ep)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, free_streams, ep)
     }
 
     fn stop(&mut self) {
-        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice, stop)
+        multi_dispatch!(self, BackendDeviceType, HostDevice FidoDevice UvcDevice, stop)
     }
 }
 
@@ -436,6 +440,26 @@ impl BackendDeviceType {
                                 }
                             }
                         }
+                        BackendDeviceType::UvcDevice(uvc_device) => {
+                            match uvc_device
+                                .get_config_descriptor_by_index(control_request_setup.value as u8)
+                            {
+                                Ok(descriptor_tree) => {
+                                    let device_descriptor =
+                                        uvc_device.get_device_descriptor_tree()?;
+                                    let offset = descriptor_tree.offset();
+                                    let data = device_descriptor.raw()
+                                        [offset..offset + descriptor_tree.wTotalLength as usize]
+                                        .to_vec();
+                                    let bytes = buffer.write(&data).map_err(Error::WriteBuffer)?;
+                                    (TransferStatus::Completed, bytes as u32)
+                                }
+                                Err(e) => {
+                                    error!("get uvc descriptor error: {}", e);
+                                    (TransferStatus::Stalled, 0)
+                                }
+                            }
+                        }
                     }
                 } else {
                     return Ok(false);
@@ -495,6 +519,10 @@ impl BackendDeviceType {
                     .map_err(Error::CreateTransfer)?,
             ),
             BackendDeviceType::FidoDevice(_) => BackendTransferType::FidoDevice(FidoTransfer::new(
+                0,
+                TransferBuffer::Vector(control_buffer),
+            )),
+            BackendDeviceType::UvcDevice(_) => BackendTransferType::UvcDevice(UvcTransfer::new(
                 0,
                 TransferBuffer::Vector(control_buffer),
             )),

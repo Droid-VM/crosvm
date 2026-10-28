@@ -10,6 +10,7 @@ use usb_util::UsbRequestSetup;
 use crate::usb::backend::endpoint::ControlEndpointState;
 use crate::usb::backend::error::Result;
 use crate::usb::backend::fido_backend::transfer::FidoTransfer;
+use crate::usb::backend::uvc_backend::transfer::UvcTransfer;
 
 /// BackendTransferHandle is a wrapper structure around a generic transfer handle whose
 /// implementation depends on the backend type that is being used.
@@ -32,6 +33,7 @@ impl BackendTransferHandle {
 pub enum BackendTransferType {
     HostDevice(Transfer),
     FidoDevice(FidoTransfer),
+    UvcDevice(UvcTransfer),
 }
 
 /// The backend transfer trait implemention is the interface of a generic transfer structure that
@@ -60,6 +62,7 @@ impl BackendTransfer for BackendTransferType {
         match self {
             BackendTransferType::HostDevice(transfer) => BackendTransfer::status(transfer),
             BackendTransferType::FidoDevice(transfer) => BackendTransfer::status(transfer),
+            BackendTransferType::UvcDevice(transfer) => BackendTransfer::status(transfer),
         }
     }
 
@@ -67,6 +70,7 @@ impl BackendTransfer for BackendTransferType {
         match self {
             BackendTransferType::HostDevice(transfer) => BackendTransfer::actual_length(transfer),
             BackendTransferType::FidoDevice(transfer) => BackendTransfer::actual_length(transfer),
+            BackendTransferType::UvcDevice(transfer) => BackendTransfer::actual_length(transfer),
         }
     }
 
@@ -74,6 +78,7 @@ impl BackendTransfer for BackendTransferType {
         match self {
             BackendTransferType::HostDevice(transfer) => BackendTransfer::buffer(transfer),
             BackendTransferType::FidoDevice(transfer) => BackendTransfer::buffer(transfer),
+            BackendTransferType::UvcDevice(transfer) => BackendTransfer::buffer(transfer),
         }
     }
 
@@ -81,6 +86,7 @@ impl BackendTransfer for BackendTransferType {
         match self {
             BackendTransferType::HostDevice(transfer) => BackendTransfer::iso_packet(transfer, i),
             BackendTransferType::FidoDevice(transfer) => BackendTransfer::iso_packet(transfer, i),
+            BackendTransferType::UvcDevice(transfer) => BackendTransfer::iso_packet(transfer, i),
         }
     }
 
@@ -90,6 +96,9 @@ impl BackendTransfer for BackendTransferType {
                 BackendTransfer::set_callback(transfer, cb)
             }
             BackendTransferType::FidoDevice(transfer) => {
+                BackendTransfer::set_callback(transfer, cb)
+            }
+            BackendTransferType::UvcDevice(transfer) => {
                 BackendTransfer::set_callback(transfer, cb)
             }
         }

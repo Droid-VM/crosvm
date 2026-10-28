@@ -75,6 +75,9 @@ impl EventHandler for UsbUtilEventHandler {
             BackendDeviceType::FidoDevice(fido_device) => fido_device
                 .read_hidraw_file()
                 .context("FidoDeviceEventHandler failed to read hidraw device"),
+            // The UVC camera has no host descriptor to wait on: its transfers
+            // complete on the xhci job queue.
+            BackendDeviceType::UvcDevice(_) => Ok(()),
         }
     }
 }

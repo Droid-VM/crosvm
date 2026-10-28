@@ -701,6 +701,17 @@ impl DeviceSlot {
         // dropped, any context copied or any host stream allocated; after this loop the only
         // thing left to fail is the host itself.
         let mut to_add = Vec::new();
+        let dropped: Vec<u8> = (1..DCI_INDEX_END)
+            .filter(|dci| input_control_context.drop_context_flag(*dci))
+            .collect();
+        warn!(
+            "xhci: slot {} configure endpoint add={:?} drop={:?}",
+            self.slot_id,
+            (1..DCI_INDEX_END)
+                .filter(|dci| input_control_context.add_context_flag(*dci))
+                .collect::<Vec<_>>(),
+            dropped
+        );
         for device_context_index in 1..DCI_INDEX_END {
             if !input_control_context.add_context_flag(device_context_index) {
                 continue;
@@ -710,6 +721,12 @@ impl DeviceSlot {
                     Ok(endpoint_context) => endpoint_context,
                     Err(e) => return unbacked_input_context(e),
                 };
+            warn!(
+                "xhci: ce dci {} type {} max_packet {}",
+                device_context_index,
+                endpoint_context.get_endpoint_type(),
+                endpoint_context.get_max_packet_size()
+            );
             match self.check_endpoint_context(device_context_index, &endpoint_context) {
                 Ok(stream_contexts) => {
                     to_add.push((device_context_index, endpoint_context, stream_contexts))

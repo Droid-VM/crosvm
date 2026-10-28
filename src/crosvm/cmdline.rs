@@ -2624,6 +2624,14 @@ pub struct RunCommand {
     pub unprotected_vm_with_firmware: Option<PathBuf>,
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[argh(option, arg_name = "ID")]
+    #[serde(default)]
+    #[merge(strategy = append)]
+    /// add an emulated USB (UVC) camera streaming this host camera id; repeat
+    /// once per camera, in the order the guest should see them.
+    pub uvc_camera: Vec<String>,
+
+    #[cfg(any(target_os = "android", target_os = "linux"))]
     #[cfg(all(unix, feature = "media"))]
     #[argh(option, arg_name = "[device]")]
     #[serde(default)]
@@ -4056,6 +4064,23 @@ impl TryFrom<RunCommand> for super::config::Config {
         #[cfg(all(unix, feature = "media"))]
         {
             cfg.v4l2_proxy = cmd.v4l2_proxy;
+            // DroidVM: the cameras this VM asks for. The USB device provider
+            // reads the list when it attaches them, which happens after this
+            // point in the start up, so a set here is seen by every device.
+            devices::usb::backend::device_provider::set_uvc_cameras(cmd.uvc_camera);
+            // DroidVM: expose a hardware codec (VPU) node on request. The app
+            // cannot pass new flags, so the path is read from a one-line file;
+            // an absent or empty file keeps the previous behaviour.
+            if let Ok(path) = std::fs::read_to_string("/data/local/tmp/droidvm-vpu") {
+                let path = path.trim();
+                if !path.is_empty() {
+                    let candidate = std::path::PathBuf::from(path);
+                    if !cfg.v4l2_proxy.iter().any(|p| p == &candidate) {
+                        base::info!("droidvm-vpu: exposing {path} through virtio-media");
+                        cfg.v4l2_proxy.push(candidate);
+                    }
+                }
+            }
             cfg.simple_media_device = cmd.simple_media_device.unwrap_or_default();
         }
 

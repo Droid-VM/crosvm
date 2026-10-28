@@ -10,3 +10,4 @@ pub mod fido_backend;
 pub mod host_backend;
 pub mod transfer;
 pub mod utils;
+pub mod uvc_backend;
