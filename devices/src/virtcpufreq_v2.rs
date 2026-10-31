@@ -78,6 +78,11 @@ pub struct VirtCpufreqV2 {
     /// easier for user to manage pCPU allocations when running multiple instances on a large
     /// server.
     largest_pcpu_idx: usize,
+    /// Whether the host has the pCPU the throttle worker needs (`largest_pcpu_idx` + domain + 1). Without one (the vCPUs
+    /// pinned up to the host's last core, as on a phone) a request only raises the vCPU thread's clamp: nothing throttles, and
+    /// the clamp's maximum stays the whole capacity (a vCPU table topping out below the core's cpuinfo_max_freq, as a phone's
+    /// boost frequency left out of scaling_available_frequencies, would otherwise hold the core at every lower request).
+    throttle_cpu: bool,
     //TODO: Put the shared_domain_members in a struct
     shared_domain_vcpus: Vec<usize>,
     shared_domain_perf: Arc<AtomicU32>,
@@ -170,6 +175,12 @@ impl VirtCpufreqV2 {
             );
         }
 
+        let throttle_cpu = std::path::Path::new(&format!(
+            "/sys/devices/system/cpu/cpu{}",
+            largest_pcpu_idx + vcpu_domain as usize + 1
+        ))
+        .exists();
+
         VirtCpufreqV2 {
             vcpu_freq_table,
             pcpu_fmax,
@@ -188,6 +199,7 @@ impl VirtCpufreqV2 {
             vm_ctrl,
             pcpu_min_cap,
             largest_pcpu_idx,
+            throttle_cpu,
             shared_domain_vcpus,
             shared_domain_perf,
         }
@@ -280,7 +292,7 @@ impl BusDevice for VirtCpufreqV2 {
                     let val = util as f32 * 100.0 / SCHED_CAPACITY_SCALE as f32;
                     let val_formatted = format!("{:4}", val).into_bytes();
 
-                    if self.vcpu_fmax != self.pcpu_fmax {
+                    if self.vcpu_fmax != self.pcpu_fmax && self.throttle_cpu {
                         if let Err(e) = domain_uclamp_max.write(&val_formatted) {
                             warn!("Error setting uclamp_max: {:#}", e);
                         }
@@ -296,7 +308,7 @@ impl BusDevice for VirtCpufreqV2 {
                         | SCHED_FLAG_RESET_ON_FORK;
                     sched_attr.sched_util_min = util;
 
-                    if self.vcpu_fmax != self.pcpu_fmax {
+                    if self.vcpu_fmax != self.pcpu_fmax && self.throttle_cpu {
                         sched_attr.sched_util_max = util;
                     } else {
                         sched_attr.sched_util_max = SCHED_CAPACITY_SCALE;
@@ -308,6 +320,9 @@ impl BusDevice for VirtCpufreqV2 {
                 }
 
                 self.shared_domain_perf.store(util_raw, Ordering::SeqCst);
+                if !self.throttle_cpu {
+                    return;
+                }
                 let timer = self.timer.clone();
                 if self.worker.is_none() {
                     let vcpu_id = info.id;
