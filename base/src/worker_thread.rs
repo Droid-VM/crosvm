@@ -44,6 +44,28 @@ fn install_altstack() {
 #[cfg(not(any(target_os = "android", target_os = "linux")))]
 fn install_altstack() {}
 
+/// DroidVM: a worker takes the process's CPUs, not those of the thread that started it. A
+/// virtio-mmio device starts its workers when the guest writes DRIVER_OK, which a vCPU thread
+/// handles, and a thread inherits its creator's affinity: every block, input and network worker
+/// was pinned to vCPU 0's core, so a guest spinning on vCPU 0 for a read kept the host worker that
+/// would answer it off its only core (4 KB reads 29-40 us at the device, 26 us every time on cores
+/// no vCPU holds). The main thread's set is the process's own (vCPU pinning narrows only the vCPU
+/// threads). Best-effort: a failure leaves the inherited set.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn take_process_cpus() {
+    // SAFETY: a zeroed cpu_set_t is a valid empty set, and both calls only read or write it.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        if libc::sched_getaffinity(libc::getpid(), size, &mut set) == 0 {
+            libc::sched_setaffinity(0, size, &set);
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "android", target_os = "linux")))]
+fn take_process_cpus() {}
+
 pub struct WorkerThread<T: Send + 'static> {
     worker: Option<(Event, JoinHandle<T>)>,
 }
@@ -71,6 +93,7 @@ impl<T: Send + 'static> WorkerThread<T> {
                 // handler -- kills the process with no diagnostic at all. With an altstack the
                 // crash handler still runs and prints the faulting pc.
                 install_altstack();
+                take_process_cpus();
                 thread_func(thread_stop_event)
             })
             .expect("thread spawn failed");
