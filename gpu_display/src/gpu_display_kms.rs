@@ -896,9 +896,46 @@ impl Drop for Surface {
         }
     }
 }
+/// msm_drm only PRIME-imports mem_buf dma-bufs, and guest blobs are udmabufs. DroidVM's udmabuf
+/// module (gunyah_host_mod/udmabuf) can export them dressed as mem_buf buffers; its `msm_prime`
+/// switch is read at each create, so turning it on here -- before the guest allocates anything --
+/// lets every later scanout import directly. Without the module the import is refused and the
+/// frame falls back to the CPU copy as before. The previous value is put back on drop.
+struct MsmPrime {
+    path: std::path::PathBuf,
+    previous: String,
+}
+impl MsmPrime {
+    fn enable() -> Option<Self> {
+        let path = std::fs::read_dir("/sys/module")
+            .ok()?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("udmabuf_gki_"))
+            .map(|e| e.path().join("parameters/msm_prime"))
+            .find(|p| p.exists());
+        let Some(path) = path else {
+            base::warn!("kms: udmabuf msm_prime unavailable; guest scanouts will be CPU-copied");
+            return None;
+        };
+        let previous = std::fs::read_to_string(&path).ok()?.trim().to_string();
+        if let Err(e) = std::fs::write(&path, "1") {
+            base::warn!("kms: cannot enable {}: {e}", path.display());
+            return None;
+        }
+        base::info!("kms: {} enabled (was {previous})", path.display());
+        Some(Self { path, previous })
+    }
+}
+impl Drop for MsmPrime {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.previous);
+    }
+}
+
 pub struct DisplayKms {
     device: Rc<RefCell<Device>>,
     event: Event,
+    _msm_prime: Option<MsmPrime>,
 }
 impl DisplayKms {
     pub fn new(path: &Path, split: bool) -> GpuDisplayResult<Self> {
@@ -907,6 +944,7 @@ impl DisplayKms {
                 GpuDisplayError::Listen(format!("KMS {}: {e:#}", path.display()))
             })?)),
             event: Event::new()?,
+            _msm_prime: MsmPrime::enable(),
         })
     }
 }
