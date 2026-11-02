@@ -2077,8 +2077,9 @@ pub struct RunCommand {
 
     #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB,venus-host-mb=MB,media-host-mb=MB,media-guest-mb=MB,test-pool-mb=MB,test-pool-prealloc-mb=MB,test-pool-step-mb=MB")]
     #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// pre-allocated pool sizes (MB). Boot-blessed regions laid out above guest RAM and SHARE'd
+    #[merge(strategy = append)]
+    /// pre-allocated pool sizes (MB). May be given more than once: the keys add up, a repeated
+    /// one takes the last value. Boot-blessed regions laid out above guest RAM and SHARE'd
     /// rather than lent, so host and guest reach the same pages without a runtime SHARE per
     /// buffer. crosvm exports these to the consumer as NCTX_* env before anything reads the
     /// memory layout, so the user no longer hand-exports them. A key that is absent means that
@@ -2095,7 +2096,7 @@ pub struct RunCommand {
     ///     test-pool-mb=<MB> - growable TEST pool window; nothing but the test driver uses it
     ///     test-pool-prealloc-mb=<MB> - its boot-SHARE'd floor; defaults to the whole window
     ///     test-pool-step-mb=<MB> - its grant granularity (0 = fully pre-shared, does not grow)
-    pub pre_alloc: Option<PreAllocConfig>,
+    pub pre_alloc: Vec<PreAllocConfig>,
 
     #[argh(switch)]
     #[serde(skip)]
@@ -3407,7 +3408,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.virtio_mmio_media = cmd.virtio_mmio_media.unwrap_or_default();
 
         cfg.pmems = cmd.pmem;
-        cfg.pre_alloc = cmd.pre_alloc;
+        cfg.pre_alloc = cmd.pre_alloc.into_iter().reduce(PreAllocConfig::merge);
 
         if !cmd.pmem_device.is_empty() || !cmd.rw_pmem_device.is_empty() {
             log::warn!(

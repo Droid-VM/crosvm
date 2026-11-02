@@ -1000,6 +1000,27 @@ pub struct PreAllocConfig {
     pub test_pool_step_mb: Option<u64>,
 }
 
+impl PreAllocConfig {
+    /// `later`'s keys over this one's: `--pre-alloc` given again (the app passes its pools, a VM's
+    /// own options add another) adds keys and overrides those it repeats.
+    pub fn merge(self, later: Self) -> Self {
+        PreAllocConfig {
+            gfx_host_mb: later.gfx_host_mb.or(self.gfx_host_mb),
+            gpu_guest_mb: later.gpu_guest_mb.or(self.gpu_guest_mb),
+            gpu_guest_prealloc_mb: later.gpu_guest_prealloc_mb.or(self.gpu_guest_prealloc_mb),
+            gpu_guest_step_mb: later.gpu_guest_step_mb.or(self.gpu_guest_step_mb),
+            gpu_guest_max_grants: later.gpu_guest_max_grants.or(self.gpu_guest_max_grants),
+            drm_host_mb: later.drm_host_mb.or(self.drm_host_mb),
+            venus_host_mb: later.venus_host_mb.or(self.venus_host_mb),
+            media_host_mb: later.media_host_mb.or(self.media_host_mb),
+            media_guest_mb: later.media_guest_mb.or(self.media_guest_mb),
+            test_pool_mb: later.test_pool_mb.or(self.test_pool_mb),
+            test_pool_prealloc_mb: later.test_pool_prealloc_mb.or(self.test_pool_prealloc_mb),
+            test_pool_step_mb: later.test_pool_step_mb.or(self.test_pool_step_mb),
+        }
+    }
+}
+
 /// What a `--virtio-media` device is. Defined next to the device, because the vhost-user media
 /// helper is told the same thing in its parameters.
 #[cfg(feature = "media")]
