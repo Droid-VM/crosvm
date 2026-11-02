@@ -32,6 +32,7 @@ rust_library {
         "kms_display",
         "gfxstream",
         "vnc",
+        "webrtc",
     ],
     rustlibs: [
         "libanyhow",
@@ -46,7 +47,7 @@ rust_library {
         "libzerocopy",
     ],
     proc_macros: ["libremain"],
-    static_libs: ["libdisplay_wl", "libvnc_server_bridge"],
+    static_libs: ["libdisplay_wl", "libvnc_server_bridge", "libdatachannel"],
 
     // added manually
     target: {

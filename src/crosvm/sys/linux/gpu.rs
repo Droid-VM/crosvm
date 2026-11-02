@@ -241,6 +241,10 @@ pub fn create_gpu_device(
         transport_cap = service.transport_cap;
     }
 
+    // Taken by whichever of the VNC and WebRTC arms runs; config lets at most one of them.
+    #[cfg(feature = "vnc")]
+    let mut vnc_input = Some(vnc_input);
+
     #[cfg(feature = "vnc")]
     if let Some(vnc_cfg) = cfg.vnc_server_for(DisplayScreen::Gpu0) {
         let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
@@ -264,10 +268,40 @@ pub fn create_gpu_device(
                 // like, and what the app is written to fall back from.
                 hw_encode: vnc_cfg.h264_enabled(),
                 // This screen's own devices, parked for whichever `build` call opens the sink.
-                vnc_input: std::sync::Arc::new(sync::Mutex::new(vnc_input)),
+                vnc_input: std::sync::Arc::new(sync::Mutex::new(
+                    vnc_input.take().unwrap_or_default(),
+                )),
             },
         );
         transport_cap = vnc_cfg.transport_cap;
+    }
+
+    #[cfg(feature = "webrtc")]
+    if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Gpu0) {
+        let (w, h) = cfg
+            .display_input_width
+            .zip(cfg.display_input_height)
+            .unwrap_or((1280, 720));
+        display_backends.insert(
+            0,
+            virtio::DisplayBackend::WebRtc {
+                addr: rtc_cfg.addr(),
+                width: w,
+                height: h,
+                token: rtc_cfg.token.clone(),
+                stun: rtc_cfg.stun.clone(),
+                allow_h265: rtc_cfg.allow_h265(),
+                bitrate_bps: rtc_cfg.bitrate_bps(),
+                adapt: rtc_cfg.adapt,
+                frame_rate: gpu_params
+                    .display_params
+                    .first()
+                    .map(|d| d.refresh_rate)
+                    .unwrap_or(0),
+                input: std::sync::Arc::new(sync::Mutex::new(vnc_input.take().unwrap_or_default())),
+            },
+        );
+        transport_cap = rtc_cfg.transport_cap;
     }
 
     #[cfg(feature = "kms_display")]

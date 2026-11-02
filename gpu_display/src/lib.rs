@@ -53,6 +53,14 @@ mod sys;
 mod vnc_blit;
 #[cfg(feature = "vnc")]
 mod vnc_h264;
+#[cfg(feature = "vnc")]
+mod video_encoder;
+#[cfg(feature = "webrtc")]
+mod gpu_display_webrtc;
+#[cfg(feature = "webrtc")]
+mod webrtc_hub;
+#[cfg(feature = "webrtc")]
+mod webrtc_rtc;
 #[cfg(feature = "vulkan_display")]
 pub mod vulkan;
 
@@ -884,6 +892,53 @@ impl GpuDisplay {
             height,
             password,
             hw_encode,
+            tablet,
+            keyboard,
+        )?;
+
+        let wait_ctx = WaitContext::new()?;
+        wait_ctx.add(&display, DisplayEventToken::Display)?;
+
+        Ok(GpuDisplay {
+            inner: Box::new(display),
+            next_id: 1,
+            event_devices: Default::default(),
+            surfaces: Default::default(),
+            dmabuf_import_capped: false,
+            wait_ctx,
+        })
+    }
+
+    /// A WebRTC endpoint for one screen: the viewer page and signalling on `addr`, the picture
+    /// hardware-encoded and sent to every connected browser. `tablet`/`keyboard` are this
+    /// binding's own devices, as for `open_vnc_tcp`; both `None` is a view-only binding. `token`,
+    /// when set, is required by the signalling endpoints; `stun` is handed to ICE.
+    #[cfg(feature = "webrtc")]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_webrtc(
+        addr: &str,
+        width: u32,
+        height: u32,
+        token: Option<String>,
+        stun: Vec<String>,
+        allow_h265: bool,
+        bitrate_bps: Option<u32>,
+        adapt: bool,
+        frame_rate: u32,
+        tablet: Option<EventDevice>,
+        keyboard: Option<EventDevice>,
+    ) -> GpuDisplayResult<GpuDisplay> {
+        let display = gpu_display_webrtc::DisplayWebrtc::new(
+            addr,
+            width,
+            height,
+            token,
+            stun,
+            allow_h265,
+            bitrate_bps,
+            adapt,
+            frame_rate,
             tablet,
             keyboard,
         )?;

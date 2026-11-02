@@ -114,6 +114,8 @@ use crate::crosvm::config::VhostUserFsOption;
 use crate::crosvm::config::VhostUserOption;
 #[cfg(feature = "vnc")]
 use crate::crosvm::config::VncConfig;
+#[cfg(feature = "webrtc")]
+use crate::crosvm::config::WebrtcConfig;
 #[cfg(feature = "plugin")]
 use crate::crosvm::plugin::parse_plugin_mount_option;
 #[cfg(feature = "plugin")]
@@ -920,6 +922,12 @@ fn bool_default_true() -> bool {
 /// Parse a VNC server configuration string in key=value format.
 #[cfg(feature = "vnc")]
 fn vnc_server_from_str(s: &str) -> Result<VncConfig, String> {
+    from_key_values(s)
+}
+
+/// Parse a WebRTC endpoint configuration string in key=value format.
+#[cfg(feature = "webrtc")]
+fn webrtc_server_from_str(s: &str) -> Result<WebrtcConfig, String> {
     from_key_values(s)
 }
 
@@ -3054,6 +3062,39 @@ pub struct RunCommand {
     /// Named ones are only for IPC
     pub wayland_sock: Vec<(String, PathBuf)>,
 
+    #[cfg(feature = "webrtc")]
+    #[argh(option, arg_name = "CONFIG", from_str_fn(webrtc_server_from_str))]
+    #[serde(skip)]
+    #[merge(strategy = append)]
+    /// serve a screen to browsers over WebRTC, hardware-encoded.
+    /// May be given once per screen; a screen takes at most one
+    /// exporter (VNC, WebRTC or the Android display service).
+    ///     host=HOST - address the viewer page and signalling
+    ///         listen on (default 0.0.0.0).
+    ///     port=PORT - plain-HTTP port for both (default 8080).
+    ///     token=TOKEN - required as ?token= by the signalling
+    ///         endpoints; open the page with the same ?token=.
+    ///     stun=[URL,..] - STUN servers for ICE, e.g.
+    ///         stun:stun.l.google.com:19302. Default none (LAN).
+    ///     view-only=BOOL - as for --vnc-server.
+    ///     screen=SCREEN - "gpu-0" or "simplefb", as for
+    ///         --vnc-server.
+    ///     transport-cap=CAP - "auto" (default), "cpu" or
+    ///         "gpu-hw"; "gpu" is refused (it forbids the encoder).
+    ///     codec=CODEC - "auto" (default): H.265 when every viewer
+    ///         can decode it, else H.264; "h264": H.264 only.
+    ///     bitrate=KBPS - encoder bitrate in kbit/s (500..=100000):
+    ///         fixed, and the most a viewer's REMB estimate can
+    ///         lower it from. Default: from the screen size,
+    ///         about 6200 for 1080p.
+    ///     adapt=BOOL - follow the viewers' REMB bandwidth estimate
+    ///         down from bitrate (default true); false holds the
+    ///         rate fixed.
+    /// Examples:
+    ///   --webrtc-server port=8080
+    ///   --webrtc-server port=8081,screen=simplefb,token=secret
+    pub webrtc_server: Vec<WebrtcConfig>,
+
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(option, arg_name = "DISPLAY")]
     #[serde(skip)] // TODO(b/255223604)
@@ -3804,6 +3845,11 @@ impl TryFrom<RunCommand> for super::config::Config {
             // The flags themselves still work for whoever passes them: they are the X11 display
             // window's, and that path is untouched.
             cfg.vnc_server = cmd.vnc_server;
+        }
+
+        #[cfg(feature = "webrtc")]
+        {
+            cfg.webrtc_server = cmd.webrtc_server;
         }
 
         #[cfg(all(unix, feature = "net"))]

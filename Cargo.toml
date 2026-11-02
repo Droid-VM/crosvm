@@ -244,6 +244,8 @@ android_display_stub = ["devices/android_display_stub"]
 
 # Enables the VNC display backend for remote access to the VM display.
 vnc = ["devices/vnc", "gpu_display/vnc"]
+## WebRTC display output backend (hardware H.264 to browsers); Android only in practice.
+webrtc = ["vnc", "devices/webrtc", "gpu_display/webrtc"]
 
 #! ### Video features
 #!

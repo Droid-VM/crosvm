@@ -1947,6 +1947,27 @@ pub enum DisplayBackend {
         /// The lock is an artifact of `&self`, not of sharing: after `build`, one thread owns them.
         vnc_input: Arc<Mutex<VncBindingInput>>,
     },
+    #[cfg(feature = "webrtc")]
+    /// Serve the screen to browsers over WebRTC, hardware-encoded; `addr` is the plain-HTTP
+    /// listener for the viewer page and the offer/answer exchange.
+    WebRtc {
+        addr: String,
+        width: u32,
+        height: u32,
+        token: Option<String>,
+        stun: Vec<String>,
+        /// Whether H.265 is offered next to H.264 (`codec=auto`).
+        allow_h265: bool,
+        /// `bitrate=`, in bits per second: the encoder's fixed rate and REMB ceiling.
+        bitrate_bps: Option<u32>,
+        /// `adapt=`: whether REMB may lower the rate.
+        adapt: bool,
+        /// The screen's refresh rate, declared to the encoder.
+        frame_rate: u32,
+        /// Parked exactly as for `VncTcp`, for the same reason: the input devices are the same
+        /// per-screen tablet and keyboard, only the transport carrying the events differs.
+        input: Arc<Mutex<VncBindingInput>>,
+    },
 }
 
 impl DisplayBackend {
@@ -1970,6 +1991,8 @@ impl DisplayBackend {
             DisplayBackend::Android(_) => "android",
             #[cfg(feature = "vnc")]
             DisplayBackend::VncTcp { .. } => "vnc",
+            #[cfg(feature = "webrtc")]
+            DisplayBackend::WebRtc { .. } => "webrtc",
         }
     }
 
@@ -2017,6 +2040,34 @@ impl DisplayBackend {
                     *height,
                     password.clone(),
                     *hw_encode,
+                    input.tablet,
+                    input.keyboard,
+                )
+            }
+            #[cfg(feature = "webrtc")]
+            DisplayBackend::WebRtc {
+                addr,
+                width,
+                height,
+                token,
+                stun,
+                allow_h265,
+                bitrate_bps,
+                adapt,
+                frame_rate,
+                input,
+            } => {
+                let input = std::mem::take(&mut *input.lock());
+                GpuDisplay::open_webrtc(
+                    addr,
+                    *width,
+                    *height,
+                    token.clone(),
+                    stun.clone(),
+                    *allow_h265,
+                    *bitrate_bps,
+                    *adapt,
+                    *frame_rate,
                     input.tablet,
                     input.keyboard,
                 )

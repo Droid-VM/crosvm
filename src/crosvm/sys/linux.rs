@@ -318,12 +318,12 @@ fn create_vnc_binding_input(
     screen: DisplayScreen,
     devs: &mut Vec<VirtioDeviceStub>,
 ) -> DeviceResult<VncBindingInput> {
-    let Some(vnc_cfg) = cfg.vnc_server_for(screen) else {
+    let Some(wants_input) = cfg.binding_wants_input(screen) else {
         return Ok(VncBindingInput::default());
     };
-    if !vnc_cfg.wants_input_devices() {
+    if !wants_input {
         info!(
-            "vnc: screen {} is view-only; no tablet or keyboard, RFB input dropped",
+            "vnc/webrtc: screen {} is view-only; no tablet or keyboard, remote input dropped",
             screen.as_str()
         );
         return Ok(VncBindingInput::default());
@@ -4504,7 +4504,35 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 transport_cap,
             ),
             None => {
-                #[cfg(feature = "vnc")]
+                #[cfg(feature = "webrtc")]
+                if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Simplefb) {
+                    (
+                        simplefb_display::SimplefbDisplayTarget::WebRtc {
+                            addr: rtc_cfg.addr(),
+                            token: rtc_cfg.token.clone(),
+                            stun: rtc_cfg.stun.clone(),
+                            allow_h265: rtc_cfg.allow_h265(),
+                            bitrate_bps: rtc_cfg.bitrate_bps(),
+                            adapt: rtc_cfg.adapt,
+                            input: simplefb_vnc_input,
+                        },
+                        rtc_cfg.transport_cap,
+                    )
+                } else {
+                    let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
+                    let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+                    let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+                    (
+                        simplefb_display::SimplefbDisplayTarget::Vnc {
+                            addr: format!("{}:{}", host, port),
+                            password: vnc_cfg.password.clone(),
+                            hw_encode: vnc_cfg.h264_enabled(),
+                            input: simplefb_vnc_input,
+                        },
+                        vnc_cfg.transport_cap,
+                    )
+                }
+                #[cfg(all(feature = "vnc", not(feature = "webrtc")))]
                 {
                     let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
                     let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);

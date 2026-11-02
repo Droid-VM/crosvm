@@ -1,0 +1,160 @@
+// libdatachannel v0.24.6 and its submodules, vendored for the WebRTC display backend
+// (win3d/docs/webrtc). Trimmed to what the library build compiles: no tests, examples, JSON or
+// upstream build files. Sources and defines mirror the upstream CMake build as configured with
+// -DNO_EXAMPLES=ON -DNO_TESTS=ON and the OpenSSL backend, which here is BoringSSL, linked
+// statically so the phone's own system libcrypto never enters the picture.
+//
+//   libdatachannel  MPL-2.0       https://github.com/paullouisageneau/libdatachannel  v0.24.6
+//   libjuice        MPL-2.0       deps/libjuice   b89c792
+//   usrsctp         BSD-3-Clause  deps/usrsctp    fec583d
+//   libsrtp         BSD-3-Clause  deps/libsrtp    24b3bf8 (2.8.0)
+//   plog            MIT           deps/plog       94899e0
+
+package {
+    default_visibility: ["//external/crosvm:__subpackages__"],
+}
+
+cc_defaults {
+    name: "libdatachannel_deps_defaults",
+    host_supported: true,
+    cflags: [
+        "-Wno-error",
+        "-Wno-unused-parameter",
+        "-Wno-sign-compare",
+        "-Wno-missing-field-initializers",
+    ],
+    target: {
+        darwin: {
+            enabled: false,
+        },
+    },
+}
+
+cc_library_headers {
+    name: "libdatachannel_plog_headers",
+    host_supported: true,
+    export_include_dirs: ["deps/plog/include"],
+}
+
+cc_library_static {
+    name: "libdatachannel_juice",
+    defaults: ["libdatachannel_deps_defaults"],
+    srcs: ["deps/libjuice/src/*.c"],
+    local_include_dirs: [
+        "deps/libjuice/include/juice",
+        "deps/libjuice/src",
+    ],
+    export_include_dirs: ["deps/libjuice/include"],
+    cflags: [
+        "-DJUICE_EXPORTS",
+        "-DJUICE_STATIC",
+        "-DUSE_NETTLE=0",
+    ],
+}
+
+cc_library_static {
+    name: "libdatachannel_usrsctp",
+    defaults: ["libdatachannel_deps_defaults"],
+    srcs: [
+        "deps/usrsctp/usrsctplib/netinet6/sctp6_usrreq.c",
+        "deps/usrsctp/usrsctplib/netinet/*.c",
+        "deps/usrsctp/usrsctplib/user_environment.c",
+        "deps/usrsctp/usrsctplib/user_mbuf.c",
+        "deps/usrsctp/usrsctplib/user_recv_thread.c",
+        "deps/usrsctp/usrsctplib/user_socket.c",
+    ],
+    export_include_dirs: ["deps/usrsctp/usrsctplib"],
+    cflags: [
+        "-DHAVE_LINUX_IF_ADDR_H",
+        "-DHAVE_LINUX_RTNETLINK_H",
+        "-DHAVE_NETINET_IP_ICMP_H",
+        "-DHAVE_NET_ROUTE_H",
+        "-DHAVE_STDATOMIC_H",
+        "-DHAVE_SYS_QUEUE_H",
+        "-DSCTP_DEBUG",
+        "-DSCTP_PROCESS_LEVEL_LOCKS",
+        "-DSCTP_SIMPLE_ALLOCATOR",
+        "-D_GNU_SOURCE",
+        "-D__Userspace__",
+        "-Wno-unused-but-set-variable",
+        "-Wno-unused-variable",
+        "-Wno-address-of-packed-member",
+        "-Wno-unreachable-code-loop-increment",
+    ],
+}
+
+cc_library_static {
+    name: "libdatachannel_srtp",
+    defaults: ["libdatachannel_deps_defaults"],
+    srcs: [
+        "deps/libsrtp/crypto/cipher/aes_gcm_ossl.c",
+        "deps/libsrtp/crypto/cipher/aes_icm_ossl.c",
+        "deps/libsrtp/crypto/cipher/cipher.c",
+        "deps/libsrtp/crypto/cipher/cipher_test_cases.c",
+        "deps/libsrtp/crypto/cipher/null_cipher.c",
+        "deps/libsrtp/crypto/hash/auth.c",
+        "deps/libsrtp/crypto/hash/auth_test_cases.c",
+        "deps/libsrtp/crypto/hash/hmac_ossl.c",
+        "deps/libsrtp/crypto/hash/null_auth.c",
+        "deps/libsrtp/crypto/kernel/alloc.c",
+        "deps/libsrtp/crypto/kernel/crypto_kernel.c",
+        "deps/libsrtp/crypto/kernel/err.c",
+        "deps/libsrtp/crypto/kernel/key.c",
+        "deps/libsrtp/crypto/math/datatypes.c",
+        "deps/libsrtp/crypto/replay/rdb.c",
+        "deps/libsrtp/crypto/replay/rdbx.c",
+        "deps/libsrtp/srtp/srtp.c",
+    ],
+    local_include_dirs: ["deps/libsrtp/android"],
+    export_include_dirs: [
+        "deps/libsrtp/crypto/include",
+        "deps/libsrtp/include",
+    ],
+    cflags: ["-DHAVE_CONFIG_H"],
+    static_libs: ["libcrypto_static"],
+}
+
+cc_library_static {
+    name: "libdatachannel",
+    defaults: ["libdatachannel_deps_defaults"],
+    srcs: [
+        "src/*.cpp",
+        "src/impl/*.cpp",
+    ],
+    local_include_dirs: [
+        "include/rtc",
+        "src",
+    ],
+    export_include_dirs: ["include"],
+    cflags: [
+        "-DJUICE_STATIC",
+        "-DRTC_ENABLE_MEDIA=1",
+        "-DRTC_ENABLE_WEBSOCKET=1",
+        "-DRTC_EXPORTS",
+        "-DRTC_STATIC",
+        "-DRTC_SYSTEM_JUICE=0",
+        "-DRTC_SYSTEM_SRTP=0",
+        "-DUSE_GNUTLS=0",
+        "-DUSE_NICE=0",
+        "-Wno-deprecated-declarations",
+        // Soong turns this one into an error globally; upstream's impl::Channel trips it.
+        "-Wno-non-virtual-dtor",
+    ],
+    cppflags: [
+        "-std=c++17",
+        "-fexceptions",
+    ],
+    rtti: true,
+    header_libs: ["libdatachannel_plog_headers"],
+    // BoringSSL is folded in rather than left as a static dependency: Soong does not carry a
+    // static library's own static_libs into the final link, and libcrypto_static is not visible
+    // to the modules that link this one.
+    whole_static_libs: [
+        "libdatachannel_juice",
+        "libdatachannel_usrsctp",
+        "libdatachannel_srtp",
+        "libssl",
+        "libcrypto_static",
+    ],
+    export_static_lib_headers: ["libdatachannel_juice"],
+}

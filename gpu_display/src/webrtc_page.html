@@ -1,0 +1,398 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: GPL-2.0-or-later. DroidVM WebRTC viewer, served by gpu_display/src/webrtc_hub.rs. -->
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DroidVM</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: contain; outline: none; cursor: default; }
+  #cursor { position: fixed; left: 0; top: 0; pointer-events: none; display: none; }
+  #stats { position: fixed; left: 8px; top: 8px; margin: 0; color: #e8e8e8; font: 12px/1.45 monospace;
+           background: rgba(0,0,0,.72); padding: 6px 10px; border-radius: 4px; pointer-events: none;
+           display: none; white-space: pre; z-index: 2; }
+  #statsbtn { position: fixed; right: 8px; top: 8px; z-index: 3; font: 12px sans-serif; color: #ddd;
+              background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.25); border-radius: 4px;
+              padding: 2px 8px; cursor: pointer; opacity: .5; }
+  #statsbtn:hover { opacity: 1; }
+  #codecsel { position: fixed; right: 56px; top: 8px; z-index: 3; font: 12px sans-serif; color: #ddd;
+              background: rgba(0,0,0,.45); border: 1px solid rgba(255,255,255,.25); border-radius: 4px;
+              padding: 1px 4px; opacity: .5; }
+  #codecsel:hover, #codecsel:focus { opacity: 1; }
+  #status { position: fixed; left: 8px; top: 8px; color: #ccc; font: 12px monospace;
+            background: rgba(0,0,0,.6); padding: 2px 6px; pointer-events: none; }
+</style>
+</head>
+<body>
+<video id="v" autoplay muted playsinline tabindex="0"></video>
+<canvas id="cursor" width="64" height="64"></canvas>
+<div id="status">connecting…</div>
+<pre id="stats"></pre>
+<select id="codecsel" title="编码（切换后重连）">
+  <option value="auto">自动</option><option value="h264">H.264</option><option value="h265">H.265</option>
+</select>
+<button id="statsbtn" title="统计 (Ctrl+Alt+Shift+S)">统计</button>
+<script>
+'use strict';
+const video = document.getElementById('v');
+const status = document.getElementById('status');
+const token = new URLSearchParams(location.search).get('token');
+const q = token ? '&token=' + encodeURIComponent(token) : '';
+let input = null;
+let peer = null;
+
+// ---- Statistics overlay ------------------------------------------------------------------
+// Three sources: the sink's report over the input channel (encoder side, once a second while on),
+// this browser's getStats() (network, decode), and per displayed frame requestVideoFrameCallback,
+// which with the RTP timestamp and a clock synced to the sink's gives the latency from the sink
+// taking the frame to it being on screen. Lines whose data this browser does not give are left out.
+const statsEl = document.getElementById('stats');
+const stats = {
+  on: localStorage.getItem('droidvm.stats') === '1',
+  timers: [], server: null, prev: null,
+  clock: [],          // {rtt, offset}: offset = sink clock - page clock, ms
+  frames: [],         // per displayed frame, last LATENCY_WINDOW ms: {t, e2e, net, show, dec}
+  sticky: {},         // section/label -> last text shown, kept while the screen is still
+  rvfc: false,
+  armed: false,       // a requestVideoFrameCallback chain is running
+};
+const LATENCY_WINDOW = 5000;  // ms of displayed frames the latency figures cover
+const pageNow = () => performance.timeOrigin + performance.now();
+const clockOffset = () => {
+  if (!stats.clock.length) return null;
+  return stats.clock.reduce((a, b) => (b.rtt < a.rtt ? b : a)).offset;  // least-delayed sample
+};
+
+function ping() {
+  const m = new DataView(new ArrayBuffer(9));
+  m.setUint8(0, 5); m.setFloat64(1, pageNow(), true);
+  send(new Uint8Array(m.buffer));
+}
+
+function onSinkText(text) {
+  let m; try { m = JSON.parse(text); } catch (_) { return; }
+  if (m.type === 'stats') stats.server = m;
+  if (m.type === 'pong') {
+    const t1 = pageNow(), rtt = t1 - m.c;
+    stats.clock.push({ rtt, offset: m.s - (m.c + t1) / 2 });
+    if (stats.clock.length > 20) stats.clock.shift();
+  }
+}
+
+function onFrame(now, md) {
+  if (!stats.on) { stats.armed = false; return; }
+  video.requestVideoFrameCallback(onFrame);
+  const off = clockOffset(), srv = stats.server;
+  if (md.rtpTimestamp === undefined || off === null || !srv || !srv.epoch_unix_ms) return;
+  stats.rvfc = true;
+  const shown = performance.timeOrigin + (md.expectedDisplayTime || md.presentationTime) + off;
+  // The RTP timestamp is the sink's offer time (90 kHz from its encoder epoch), 32 bits: unwrap
+  // against where it should be now.
+  const nominal = (shown - srv.epoch_unix_ms) * 90;
+  const rtp = md.rtpTimestamp >>> 0;
+  const k = Math.round((nominal - rtp) / 4294967296);
+  const fed = srv.epoch_unix_ms + (rtp + k * 4294967296) / 90;
+  const f = { e2e: shown - fed };
+  if (md.receiveTime !== undefined) {
+    const recv = performance.timeOrigin + md.receiveTime + off;
+    f.net = recv - fed; f.show = shown - recv;
+  }
+  if (md.processingDuration !== undefined) f.dec = md.processingDuration * 1000;
+  f.t = performance.now();
+  if (f.e2e > -50 && f.e2e < 10000) stats.frames.push(f);
+}
+
+const fmt = (v, d = 1) => (v === undefined || v === null || Number.isNaN(v) ? null : v.toFixed(d));
+function avg(a) { return a.length ? a.reduce((x, y) => x + y, 0) / a.length : undefined; }
+function p95(a) { if (!a.length) return undefined; const s = [...a].sort((x, y) => x - y); return s[Math.min(s.length - 1, Math.floor(s.length * 0.95))]; }
+
+async function renderStats() {
+  if (!stats.on) return;
+  const lines = [];
+  // A still screen produces no frames, so anything measured per frame has nothing new to say.
+  // Rather than vanish, such a line keeps its last value marked "静止"; a line this browser never
+  // had a value for stays absent. Section headers appear with their first line.
+  let section = '', headed = '';
+  const head = (name) => { section = name; };
+  const emit = (text) => { if (headed !== section) { lines.push(section); headed = section; } lines.push(text); };
+  const line = (label, ...parts) => {
+    const key = section + '/' + label;
+    const p = parts.filter((x) => x !== null && x !== undefined && x !== '');
+    if (p.length) { const text = label.padEnd(8) + p.join('  '); stats.sticky[key] = text; emit(text); }
+    else if (stats.sticky[key]) emit(stats.sticky[key].replace(/ \(静止\)$/, '') + '  (静止)');
+  };
+  const srv = stats.server;
+
+  // Latency.
+  const nowMs = performance.now();
+  stats.frames = stats.frames.filter((f) => nowMs - f.t < LATENCY_WINDOW);
+  const fr = stats.frames;
+  head('延迟');
+  if (fr.length) {
+    const e = fr.map((f) => f.e2e);
+    const still = nowMs - fr[fr.length - 1].t > 1500;
+    line('  端到端', fmt(avg(e)) + ' ms 平均', fmt(p95(e)) + ' ms p95',
+         fr.length + ' 帧/' + LATENCY_WINDOW / 1000 + 's' + (still ? ' (静止)' : ''));
+    const net = fr.filter((f) => f.net !== undefined);
+    const parts = [];
+    if (srv && srv.enc_ms >= 0) parts.push('编码 ' + fmt(srv.enc_ms));
+    if (net.length) {
+      const n = avg(net.map((f) => f.net)) - (srv && srv.enc_ms >= 0 ? srv.enc_ms : 0);
+      parts.push('传输 ' + fmt(n));
+      parts.push('接收→显示 ' + fmt(avg(net.map((f) => f.show))));
+    }
+    const dec = fr.filter((f) => f.dec !== undefined);
+    if (dec.length) parts.push('其中解码 ' + fmt(avg(dec.map((f) => f.dec))));
+    if (parts.length) line('  分段', parts.join(' / ') + ' ms');
+    if (stats.clock.length) line('  对时', '误差 ±' + fmt(Math.min(...stats.clock.map((c) => c.rtt)) / 2) + ' ms');
+  } else {
+    line('  端到端'); line('  分段'); line('  对时');
+  }
+
+  // Encoder (the sink's report).
+  if (srv && srv.encoder) {
+    head('编码');
+    line('  编码器', srv.encoder, srv.codec, srv.width + 'x' + srv.height, srv.route === 'gpu' ? 'GPU 零拷贝' : 'CPU 上传');
+    line('  帧率', fmt(srv.fps) + ' fps 编码', fmt(srv.fed_fps) + ' fps guest');
+    line('  码率', fmt(srv.kbps, 0) + ' kbps 实际', srv.target_kbps + ' kbps 目标',
+         srv.set_kbps !== undefined ? srv.set_kbps + ' kbps 编码器设定' : null,
+         srv.remb_kbps !== null ? srv.remb_kbps + ' kbps REMB' : null);
+    line('  其他', '编码延迟 ' + (srv.enc_ms >= 0 ? fmt(srv.enc_ms) + '/' + fmt(srv.enc_ms_max) + ' ms 平均/最大' : '-'), 'IDR ' + srv.idr, '观看端 ' + srv.viewers);
+  }
+
+  // Network and decode (this browser).
+  if (peer) {
+    let inb, pair, report;
+    try { report = await peer.getStats(); } catch (_) { report = null; }
+    if (report) {
+      report.forEach((s) => {
+        if (s.type === 'inbound-rtp' && s.kind === 'video') inb = s;
+        if (s.type === 'transport' && s.selectedCandidatePairId) pair = report.get(s.selectedCandidatePairId);
+      });
+      if (!pair) report.forEach((s) => { if (s.type === 'candidate-pair' && s.state === 'succeeded' && (s.selected || s.nominated)) pair = s; });
+      const prev = stats.prev; stats.prev = inb ? { ...inb } : null;
+      const d = (k) => (inb && prev && inb[k] !== undefined && prev[k] !== undefined ? inb[k] - prev[k] : undefined);
+      const dt = inb && prev ? (inb.timestamp - prev.timestamp) / 1000 : undefined;
+
+      head('网络');
+      if (pair) {
+        const lc = report.get(pair.localCandidateId), rc = report.get(pair.remoteCandidateId);
+        line('  RTT', pair.currentRoundTripTime !== undefined ? fmt(pair.currentRoundTripTime * 1000) + ' ms' : null,
+             lc && rc ? lc.candidateType + '→' + rc.candidateType + ' ' + (lc.protocol || '') : null);
+      }
+      if (inb) {
+        const lost = d('packetsLost'), got = d('packetsReceived');
+        line('  丢包', inb.packetsLost !== undefined ? inb.packetsLost + ' 累计' : null,
+             lost !== undefined && got !== undefined && lost + got > 0 ? fmt(100 * lost / (lost + got), 2) + '% 近 1s' : null);
+        line('  抖动', inb.jitter !== undefined ? fmt(inb.jitter * 1000) + ' ms' : null,
+             d('jitterBufferEmittedCount') > 0 ? '缓冲 ' + fmt(1000 * d('jitterBufferDelay') / d('jitterBufferEmittedCount')) + ' ms' : null);
+        line('  重传', inb.nackCount !== undefined ? 'NACK ' + inb.nackCount : null, inb.pliCount !== undefined ? 'PLI ' + inb.pliCount : null);
+        line('  接收', dt ? fmt(d('bytesReceived') * 8 / 1000 / dt, 0) + ' kbps' : null);
+
+        head('解码');
+        const codec = inb.codecId ? report.get(inb.codecId) : null;
+        line('  解码器', inb.decoderImplementation || null,
+             inb.powerEfficientDecoder === undefined ? null : inb.powerEfficientDecoder ? '硬件' : '软件',
+             codec ? codec.mimeType.replace('video/', '') : null,
+             inb.frameWidth ? inb.frameWidth + 'x' + inb.frameHeight : null);
+        line('  耗时', d('framesDecoded') > 0 && d('totalDecodeTime') !== undefined ? fmt(1000 * d('totalDecodeTime') / d('framesDecoded'), 2) + ' ms/帧' : null);
+        line('  帧率', inb.framesPerSecond !== undefined ? fmt(inb.framesPerSecond) + ' fps 解码' : null,
+             dt && d('framesDecoded') !== undefined ? fmt(d('framesDecoded') / dt) + ' fps 近 1s' : null);
+        line('  丢帧', inb.framesDropped !== undefined ? inb.framesDropped + ' 丢弃' : null,
+             // Chrome counts any long gap between frames as a freeze, a still screen included.
+             inb.freezeCount !== undefined ? inb.freezeCount + ' 次卡顿' : null,
+             inb.totalFreezesDuration !== undefined ? fmt(inb.totalFreezesDuration, 1) + ' s 卡顿（含画面静止）' : null);
+      }
+    }
+  }
+  statsEl.textContent = lines.join('\n');
+}
+
+function setStats(on) {
+  stats.on = on;
+  localStorage.setItem('droidvm.stats', on ? '1' : '0');
+  stats.timers.forEach(clearInterval); stats.timers = [];
+  send(new Uint8Array([4, on ? 1 : 0]));
+  statsEl.style.display = on ? 'block' : 'none';
+  if (!on) return;
+  stats.clock = []; stats.frames = []; stats.prev = null; stats.sticky = {};
+  for (let i = 0; i < 5; i++) setTimeout(ping, i * 200);
+  stats.timers.push(setInterval(ping, 2000));
+  stats.timers.push(setInterval(renderStats, 1000));
+  if (!stats.armed && video.requestVideoFrameCallback) {  // one callback chain, however often turned on
+    stats.armed = true;
+    video.requestVideoFrameCallback(onFrame);
+  }
+}
+document.getElementById('statsbtn').addEventListener('click', () => setStats(!stats.on));
+
+// The codec this viewer asks for (`/offer?codec=`). "自动" takes H.265 when this browser and every
+// other viewer can decode it. A change reconnects, since the codec is settled in the offer.
+const codecSel = document.getElementById('codecsel');
+const codecPref = ['auto', 'h264', 'h265'].includes(localStorage.getItem('droidvm.codec'))
+  ? localStorage.getItem('droidvm.codec') : 'auto';
+codecSel.value = codecPref;
+codecSel.addEventListener('change', () => { localStorage.setItem('droidvm.codec', codecSel.value); location.reload(); });
+statsEl.style.display = stats.on ? 'block' : 'none';
+
+// The guest's hardware cursor, from the sink (gpu_display_webrtc.rs). With input, it is this
+// page's own pointer while over the picture (a CSS cursor: no network between hand and arrow);
+// otherwise -- view-only, or the hand elsewhere -- it is drawn where the guest says it is.
+const overlay = document.getElementById('cursor');
+const cur = { inputEnabled: false, shape: null, css: '', hx: 0, hy: 0, x: 0, y: 0, visible: false, hover: false };
+
+function cursorShape(dv, bytes) {
+  const w = dv.getUint16(1, true), h = dv.getUint16(3, true);
+  cur.hx = dv.getUint16(5, true); cur.hy = dv.getUint16(7, true);
+  overlay.width = w; overlay.height = h;
+  const img = new ImageData(w, h);
+  for (let i = 0; i < w * h * 4; i += 4) {  // B,G,R,A -> R,G,B,A
+    img.data[i] = bytes[9 + i + 2]; img.data[i + 1] = bytes[9 + i + 1];
+    img.data[i + 2] = bytes[9 + i]; img.data[i + 3] = bytes[9 + i + 3];
+  }
+  overlay.getContext('2d').putImageData(img, 0, 0);
+  cur.shape = img;
+  cur.css = 'url(' + overlay.toDataURL() + ') ' + cur.hx + ' ' + cur.hy + ', default';
+}
+
+function drawCursor() {
+  const local = cur.inputEnabled && cur.hover;
+  video.style.cursor = !local || !cur.shape ? 'default' : (cur.visible ? cur.css : 'none');
+  if (local || !cur.shape || !cur.visible || !video.videoWidth) { overlay.style.display = 'none'; return; }
+  const r = video.getBoundingClientRect();
+  const scale = Math.min(r.width / video.videoWidth, r.height / video.videoHeight);
+  const left = r.left + (r.width - video.videoWidth * scale) / 2;
+  const top = r.top + (r.height - video.videoHeight * scale) / 2;
+  overlay.style.width = overlay.width * scale + 'px';
+  overlay.style.height = overlay.height * scale + 'px';
+  overlay.style.transform = 'translate(' + (left + (cur.x - cur.hx) * scale) + 'px,' + (top + (cur.y - cur.hy) * scale) + 'px)';
+  overlay.style.display = 'block';
+}
+
+function onSinkMessage(e) {
+  if (typeof e.data === 'string') { onSinkText(e.data); return; }
+  const bytes = new Uint8Array(e.data);
+  const dv = new DataView(e.data);
+  switch (bytes[0]) {
+    case 0x10: cur.inputEnabled = bytes[1] !== 0; break;
+    case 0x11: if (bytes.length >= 9) cursorShape(dv, bytes); break;
+    case 0x12: cur.x = dv.getInt32(1, true); cur.y = dv.getInt32(5, true); break;
+    case 0x13: cur.visible = bytes[1] !== 0; break;
+    default: return;
+  }
+  drawCursor();
+}
+
+// KeyboardEvent.code -> Linux input keycode (linux/input-event-codes.h).
+const KEYS = {
+  Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8,
+  Digit8: 9, Digit9: 10, Digit0: 11, Minus: 12, Equal: 13, Backspace: 14, Tab: 15,
+  KeyQ: 16, KeyW: 17, KeyE: 18, KeyR: 19, KeyT: 20, KeyY: 21, KeyU: 22, KeyI: 23, KeyO: 24,
+  KeyP: 25, BracketLeft: 26, BracketRight: 27, Enter: 28, ControlLeft: 29, KeyA: 30, KeyS: 31,
+  KeyD: 32, KeyF: 33, KeyG: 34, KeyH: 35, KeyJ: 36, KeyK: 37, KeyL: 38, Semicolon: 39,
+  Quote: 40, Backquote: 41, ShiftLeft: 42, Backslash: 43, KeyZ: 44, KeyX: 45, KeyC: 46,
+  KeyV: 47, KeyB: 48, KeyN: 49, KeyM: 50, Comma: 51, Period: 52, Slash: 53, ShiftRight: 54,
+  NumpadMultiply: 55, AltLeft: 56, Space: 57, CapsLock: 58, F1: 59, F2: 60, F3: 61, F4: 62,
+  F5: 63, F6: 64, F7: 65, F8: 66, F9: 67, F10: 68, NumLock: 69, ScrollLock: 70, Numpad7: 71,
+  Numpad8: 72, Numpad9: 73, NumpadSubtract: 74, Numpad4: 75, Numpad5: 76, Numpad6: 77,
+  NumpadAdd: 78, Numpad1: 79, Numpad2: 80, Numpad3: 81, Numpad0: 82, NumpadDecimal: 83,
+  IntlBackslash: 86, F11: 87, F12: 88, NumpadEnter: 96, ControlRight: 97, NumpadDivide: 98,
+  PrintScreen: 99, AltRight: 100, Home: 102, ArrowUp: 103, PageUp: 104, ArrowLeft: 105,
+  ArrowRight: 106, End: 107, ArrowDown: 108, PageDown: 109, Insert: 110, Delete: 111,
+  Pause: 119, MetaLeft: 125, MetaRight: 126, ContextMenu: 127,
+};
+
+function send(bytes) {
+  if (input && input.readyState === 'open') input.send(bytes);
+}
+
+function sendKey(e, down) {
+  if (e.code === 'KeyS' && e.ctrlKey && e.altKey && e.shiftKey) {  // the overlay's, not the guest's
+    e.preventDefault();
+    if (down) setStats(!stats.on);
+    return;
+  }
+  const code = KEYS[e.code];
+  if (code === undefined) return;
+  e.preventDefault();
+  const m = new Uint8Array(4);
+  m[0] = 1; m[1] = down ? 1 : 0; m[2] = code & 0xff; m[3] = code >> 8;
+  send(m);
+}
+
+// Position inside the picture, 0..65535 on each axis, accounting for object-fit letterboxing.
+function picturePos(e) {
+  const r = video.getBoundingClientRect();
+  const vw = video.videoWidth || r.width, vh = video.videoHeight || r.height;
+  const scale = Math.min(r.width / vw, r.height / vh);
+  const w = vw * scale, h = vh * scale;
+  const x = (e.clientX - r.left - (r.width - w) / 2) / w;
+  const y = (e.clientY - r.top - (r.height - h) / 2) / h;
+  const c = (v) => Math.max(0, Math.min(65535, Math.round(v * 65535)));
+  return [c(x), c(y)];
+}
+
+// DOM buttons: bit0 left, bit1 right, bit2 middle. Wire (RFB order): bit0 left, bit1 middle, bit2 right.
+function buttons(e) {
+  const b = e.buttons;
+  return (b & 1) | ((b & 4) ? 2 : 0) | ((b & 2) ? 4 : 0);
+}
+
+function sendPointer(e) {
+  const [x, y] = picturePos(e);
+  const m = new Uint8Array(6);
+  m[0] = 2; m[1] = buttons(e); m[2] = x & 0xff; m[3] = x >> 8; m[4] = y & 0xff; m[5] = y >> 8;
+  send(m);
+}
+
+video.addEventListener('pointermove', sendPointer);
+video.addEventListener('pointerenter', () => { cur.hover = true; drawCursor(); });
+video.addEventListener('pointerleave', () => { cur.hover = false; drawCursor(); });
+window.addEventListener('resize', drawCursor);
+video.addEventListener('resize', drawCursor);
+video.addEventListener('pointerdown', (e) => { video.focus(); video.setPointerCapture(e.pointerId); sendPointer(e); e.preventDefault(); });
+video.addEventListener('pointerup', (e) => { sendPointer(e); e.preventDefault(); });
+video.addEventListener('contextmenu', (e) => e.preventDefault());
+video.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  if (e.deltaY === 0) return;
+  const steps = e.deltaY < 0 ? 1 : -1;
+  const m = new Uint8Array(3);
+  m[0] = 3; m[1] = steps & 0xff; m[2] = (steps >> 8) & 0xff;
+  send(m);
+}, { passive: false });
+video.addEventListener('keydown', (e) => sendKey(e, true));
+video.addEventListener('keyup', (e) => sendKey(e, false));
+
+async function connect() {
+  const pc = new RTCPeerConnection();
+  peer = pc;
+  pc.ontrack = (e) => { video.srcObject = e.streams[0] || new MediaStream([e.track]); };
+  pc.ondatachannel = (e) => { if (e.channel.label === 'input') { input = e.channel; input.binaryType = 'arraybuffer'; input.onmessage = onSinkMessage; input.onopen = () => { if (stats.on) setStats(true); }; } };
+  pc.onconnectionstatechange = () => {
+    status.textContent = pc.connectionState;
+    if (pc.connectionState === 'connected') setTimeout(() => { status.style.display = 'none'; }, 1500);
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+      status.style.display = '';
+      setTimeout(() => location.reload(), 3000);
+    }
+  };
+  const res = await fetch('/offer?codec=' + codecPref + q);
+  if (!res.ok) throw new Error(res.status + ' ' + await res.text());
+  const peerId = res.headers.get('X-Peer');
+  await pc.setRemoteDescription({ type: 'offer', sdp: await res.text() });
+  await pc.setLocalDescription(await pc.createAnswer());
+  await new Promise((done) => {
+    if (pc.iceGatheringState === 'complete') return done();
+    pc.addEventListener('icegatheringstatechange', () => pc.iceGatheringState === 'complete' && done());
+    setTimeout(done, 3000);
+  });
+  const ans = await fetch('/answer?peer=' + peerId + q, { method: 'POST', body: pc.localDescription.sdp });
+  if (!ans.ok) throw new Error(ans.status + ' ' + await ans.text());
+  video.focus();
+}
+connect().catch((e) => { status.textContent = 'error: ' + e.message; });
+</script>
+</body>
+</html>

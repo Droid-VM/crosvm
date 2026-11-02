@@ -335,6 +335,102 @@ impl VncConfig {
     }
 }
 
+/// Address a WebRTC endpoint listens on when the option does not say.
+#[cfg(feature = "webrtc")]
+pub const DEFAULT_WEBRTC_HOST: &str = "0.0.0.0";
+#[cfg(feature = "webrtc")]
+pub const DEFAULT_WEBRTC_PORT: u32 = 8080;
+
+/// Which codecs a WebRTC endpoint offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg(feature = "webrtc")]
+pub enum WebrtcCodec {
+    /// H.265 to viewers that can all decode it (Chrome 136+ and Safari 18+ with hardware decode),
+    /// H.264 otherwise.
+    #[default]
+    Auto,
+    /// H.264 only.
+    H264,
+}
+
+/// One WebRTC endpoint: where its viewer page and signalling listen, and which screen it serves.
+///
+/// The same binding shape as `VncConfig` -- `screen=`, `view-only=`, `transport-cap=` mean what
+/// they mean there -- because the two are the same kind of thing: an exporter for one screen, with
+/// that screen's own tablet and keyboard. A screen carries at most one of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[cfg(feature = "webrtc")]
+pub struct WebrtcConfig {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u32>,
+    /// Required as `?token=` by the signalling endpoints when set. The viewer page passes on the
+    /// one it was opened with.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// STUN servers for ICE, as `stun:host:port`. Empty (the default) offers host candidates only,
+    /// which is all a LAN needs.
+    #[serde(default)]
+    pub stun: Vec<String>,
+    #[serde(default)]
+    pub view_only: bool,
+    #[serde(default)]
+    pub screen: Option<DisplayScreen>,
+    /// Ceiling on this binding's transport. `gpu` is refused at validation: it forbids the
+    /// hardware encoder, and a WebRTC endpoint without one has nothing to send.
+    #[serde(default)]
+    pub transport_cap: TransportCap,
+    #[serde(default)]
+    pub codec: WebrtcCodec,
+    /// Encoder bitrate in kbit/s: fixed, and the ceiling a viewer's REMB can lower it from.
+    /// Unset derives it from the screen size (1080p: about 6200).
+    #[serde(default)]
+    pub bitrate: Option<u32>,
+    /// Follow the viewers' bandwidth estimate (REMB) down from `bitrate`. `false` holds the rate
+    /// fixed, for a LAN where the estimate can only be wrong.
+    #[serde(default = "default_webrtc_adapt")]
+    pub adapt: bool,
+}
+
+#[cfg(feature = "webrtc")]
+fn default_webrtc_adapt() -> bool {
+    true
+}
+
+#[cfg(feature = "webrtc")]
+impl WebrtcConfig {
+    /// `bitrate=` in bits per second.
+    pub fn bitrate_bps(&self) -> Option<u32> {
+        self.bitrate.map(|kbps| kbps.saturating_mul(1000))
+    }
+
+    /// Whether H.265 is offered next to H.264.
+    pub fn allow_h265(&self) -> bool {
+        self.codec == WebrtcCodec::Auto
+    }
+
+    pub fn effective_port(&self) -> u32 {
+        self.port.unwrap_or(DEFAULT_WEBRTC_PORT)
+    }
+
+    /// `host:port` for the listener.
+    pub fn addr(&self) -> String {
+        format!(
+            "{}:{}",
+            self.host.as_deref().unwrap_or(DEFAULT_WEBRTC_HOST),
+            self.effective_port()
+        )
+    }
+
+    /// See `VncConfig::wants_input_devices`.
+    pub fn wants_input_devices(&self) -> bool {
+        !self.view_only
+    }
+}
+
 /// Direct scanout owns the Android display for the lifetime of this VM.
 #[cfg(feature = "kms_display")]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
@@ -1407,6 +1503,9 @@ pub struct Config {
     #[cfg(feature = "vtpm")]
     pub vtpm_proxy: bool,
     pub wayland_socket_paths: BTreeMap<String, PathBuf>,
+    /// WebRTC endpoints, one per screen they export. Empty is the normal case.
+    #[cfg(feature = "webrtc")]
+    pub webrtc_server: Vec<WebrtcConfig>,
     #[cfg(all(windows, feature = "gpu"))]
     pub window_procedure_thread_split_config: Option<WindowProcedureThreadSplitConfig>,
     pub x_display: Option<String>,
@@ -1628,6 +1727,8 @@ impl Default for Config {
             vhost_user_fs: Vec::new(),
             #[cfg(feature = "vnc")]
             vnc_server: Vec::new(),
+            #[cfg(feature = "webrtc")]
+            webrtc_server: Vec::new(),
             vsock: None,
             #[cfg(feature = "video-decoder")]
             video_dec: Vec::new(),
@@ -1672,6 +1773,28 @@ impl Config {
     #[cfg(feature = "vnc")]
     pub fn vnc_server_for(&self, screen: DisplayScreen) -> Option<&VncConfig> {
         self.vnc_server.iter().find(|v| v.screen == Some(screen))
+    }
+
+    /// The WebRTC endpoint bound to `screen`. Same resolution caveat as `vnc_server_for`.
+    #[cfg(feature = "webrtc")]
+    pub fn webrtc_server_for(&self, screen: DisplayScreen) -> Option<&WebrtcConfig> {
+        self.webrtc_server.iter().find(|w| w.screen == Some(screen))
+    }
+
+    /// Whether the exporter bound to `screen` gets a tablet and keyboard of its own: `None` for a
+    /// screen with no exporter that has per-binding input (VNC or WebRTC), else the binding's
+    /// answer. One question for both, because device creation has to ask it before it knows which
+    /// sink will be built.
+    #[cfg(feature = "vnc")]
+    pub fn binding_wants_input(&self, screen: DisplayScreen) -> Option<bool> {
+        if let Some(vnc) = self.vnc_server_for(screen) {
+            return Some(vnc.wants_input_devices());
+        }
+        #[cfg(feature = "webrtc")]
+        if let Some(webrtc) = self.webrtc_server_for(screen) {
+            return Some(webrtc.wants_input_devices());
+        }
+        None
     }
 
     /// The Android display service bound to `screen`, or `None` if that screen has no native
@@ -1745,6 +1868,10 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     for service in cfg.android_display_service.iter_mut() {
         let _ = service.screen.get_or_insert(default_screen);
     }
+    #[cfg(feature = "webrtc")]
+    for webrtc in cfg.webrtc_server.iter_mut() {
+        let _ = webrtc.screen.get_or_insert(default_screen);
+    }
 
     // A binding to a screen that does not exist. Rejecting is the point: the alternative is an
     // exporter that is configured, reports no error, and never shows anything -- which is how a
@@ -1759,6 +1886,32 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
                 screen.as_str(),
                 screen.source_option(),
             ));
+        }
+    }
+    #[cfg(feature = "webrtc")]
+    for webrtc in cfg.webrtc_server.iter() {
+        let screen = webrtc.screen.expect("resolved above");
+        if !screen_exists(screen) {
+            return Err(format!(
+                "`webrtc-server` is bound to screen `{}`, but no {} device is configured",
+                screen.as_str(),
+                screen.source_option(),
+            ));
+        }
+        if webrtc.transport_cap == TransportCap::Gpu {
+            return Err(
+                "`webrtc-server` cannot take `transport-cap=gpu`: that ceiling forbids the \
+                 hardware encoder, and WebRTC has nothing to send without it"
+                    .into(),
+            );
+        }
+        if let Some(kbps) = webrtc.bitrate {
+            if !(500..=100_000).contains(&kbps) {
+                return Err(format!(
+                    "`webrtc-server` bitrate={} is out of range; give kbit/s, 500 to 100000",
+                    kbps
+                ));
+            }
         }
     }
     #[cfg(feature = "android_display")]
@@ -1791,6 +1944,18 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
             if ports.contains(&port) {
                 return Err(format!(
                     "port {} is claimed by two `vnc-server` options; each needs its own",
+                    port
+                ));
+            }
+            ports.push(port);
+        }
+        #[cfg(feature = "webrtc")]
+        for webrtc in cfg.webrtc_server.iter() {
+            let port = webrtc.effective_port();
+            if ports.contains(&port) {
+                return Err(format!(
+                    "port {} is claimed twice (`webrtc-server` and another exporter); each needs \
+                     its own",
                     port
                 ));
             }
@@ -1831,6 +1996,10 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
             .filter(|s| s.screen == Some(screen))
         {
             exporters.push(format!("`android-display-service` `{}`", service.name));
+        }
+        #[cfg(feature = "webrtc")]
+        for webrtc in cfg.webrtc_server.iter().filter(|w| w.screen == Some(screen)) {
+            exporters.push(format!("`webrtc-server` on port {}", webrtc.effective_port()));
         }
         #[cfg(feature = "kms_display")]
         if cfg.kms_display.as_ref().map(|k| k.screen) == Some(screen) {

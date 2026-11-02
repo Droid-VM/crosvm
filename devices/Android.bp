@@ -46,6 +46,7 @@ rust_test {
         "virgl_renderer",
         "virtio-media",
         "vnc",
+        "webrtc",
     ],
     rustlibs: [
         "libacpi_tables",
@@ -158,6 +159,7 @@ rust_test {
         "virgl_renderer",
         "virtio-media",
         "vnc",
+        "webrtc",
     ],
     rustlibs: [
         "libacpi_tables",
@@ -258,6 +260,7 @@ rust_library {
         "virgl_renderer",
         "virtio-media",
         "vnc",
+        "webrtc",
     ],
     rustlibs: [
         "libacpi_tables",

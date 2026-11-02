@@ -17,6 +17,8 @@ android_display = []
 android_display_stub = []
 gfxstream = []
 vnc = []
+# WebRTC output: one screen served to browsers, hardware-encoded (win3d/docs/webrtc).
+webrtc = ["vnc"]
 
 [dependencies]
 anyhow = "1"
