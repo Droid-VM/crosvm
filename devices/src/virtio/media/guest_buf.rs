@@ -397,8 +397,58 @@ impl Drop for GuestShadowMapping {
     }
 }
 
+/// A single guest-physical range seen through the mapping the `GuestMemory` already holds.
+///
+/// An arena is a fresh VMA per import, so every byte the backend writes into it takes a first-touch
+/// fault again on every QBUF (a 4K NV12 frame is ~3200 faults); the region's own mapping keeps its
+/// page tables populated from one frame to the next.
+pub struct GuestRegionView {
+    mem: GuestMemory,
+    addr: GuestAddress,
+    len: usize,
+}
+
+impl GuestRegionView {
+    pub fn new(
+        mem: &GuestMemory,
+        addr: GuestAddress,
+        len: usize,
+        policy: &HostAccessPolicy,
+    ) -> Result<Self, ImportError> {
+        policy.check(mem, addr, len)?;
+        let (mapping, offset, _) = mem.find_region(addr).map_err(|e| access_error(addr, len, e))?;
+        if offset.checked_add(len).map_or(true, |end| end > mapping.size()) {
+            return Err(ImportError::InvalidRange(
+                addr.offset(),
+                len,
+                GuestMemoryError::InvalidGuestAddress(addr),
+            ));
+        }
+        Ok(Self {
+            mem: mem.clone(),
+            addr,
+            len,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn as_ptr(&self) -> *const u8 {
+        let (mapping, offset, _) = self.mem.find_region(self.addr).unwrap();
+        // SAFETY: `new` checked that `offset + len` lies inside the region's mapping.
+        unsafe { mapping.as_ptr().add(offset) }
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.as_ptr() as *mut u8
+    }
+}
+
 /// A chunk of guest memory which can be either directly mapped, or copied into a shadow buffer.
 pub enum GuestMemoryChunk {
+    Region(GuestRegionView),
     Mapping(GuestArenaMapping),
     Shadow(GuestShadowMapping),
 }
@@ -406,6 +456,7 @@ pub enum GuestMemoryChunk {
 impl GuestMemoryChunk {
     pub fn as_ptr(&self) -> *const u8 {
         match self {
+            GuestMemoryChunk::Region(r) => r.as_ptr(),
             GuestMemoryChunk::Mapping(m) => m.as_ptr(),
             GuestMemoryChunk::Shadow(s) => s.as_ptr(),
         }
@@ -413,6 +464,7 @@ impl GuestMemoryChunk {
 
     pub fn as_mut_ptr(&mut self) -> *mut u8 {
         match self {
+            GuestMemoryChunk::Region(r) => r.as_mut_ptr(),
             GuestMemoryChunk::Mapping(m) => m.as_mut_ptr(),
             GuestMemoryChunk::Shadow(s) => s.as_mut_ptr(),
         }
@@ -420,6 +472,7 @@ impl GuestMemoryChunk {
 
     pub fn len(&self) -> usize {
         match self {
+            GuestMemoryChunk::Region(r) => r.len(),
             GuestMemoryChunk::Mapping(m) => m.len(),
             GuestMemoryChunk::Shadow(s) => s.len(),
         }
@@ -464,7 +517,9 @@ impl GuestBufferImport {
             return Err(ImportError::Empty);
         }
 
-        let mapping = if total_size >= MAPPING_THRESHOLD {
+        let mapping = if total_size >= MAPPING_THRESHOLD && sgs.len() == 1 {
+            GuestMemoryChunk::Region(GuestRegionView::new(mem, sgs[0].0, sgs[0].1, policy)?)
+        } else if total_size >= MAPPING_THRESHOLD {
             GuestMemoryChunk::Mapping(GuestArenaMapping::new(mem, &sgs, prot, policy)?)
         } else {
             GuestMemoryChunk::Shadow(GuestShadowMapping::new(mem, sgs.clone(), policy)?)
