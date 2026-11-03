@@ -610,6 +610,32 @@ pub fn call_with_extended_max_files<T, E>(
     Ok(r)
 }
 
+/// Raises the soft and hard limits of open files to the system's per-process ceiling
+/// (/proc/sys/fs/nr_open, at most 1 << 20) as far as the process may: raising the hard limit takes
+/// CAP_SYS_RESOURCE, and without it the soft limit goes up to the hard one. Returns the limits now
+/// in force.
+pub fn raise_max_open_files_to_ceiling() -> Result<libc::rlimit64> {
+    let current = max_open_files()?;
+    let ceiling = std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(current.rlim_max)
+        .min(1 << 20);
+    let wanted = libc::rlimit64 {
+        rlim_cur: ceiling.max(current.rlim_cur),
+        rlim_max: ceiling.max(current.rlim_max),
+    };
+    if wanted.rlim_cur > current.rlim_cur || wanted.rlim_max > current.rlim_max {
+        if set_max_open_files(wanted).is_err() && current.rlim_max > current.rlim_cur {
+            set_max_open_files(libc::rlimit64 {
+                rlim_cur: current.rlim_max,
+                ..current
+            })?;
+        }
+    }
+    max_open_files()
+}
+
 /// Set the soft and hard limits of max number of open files to the given value.
 fn set_max_open_files(limit: libc::rlimit64) -> Result<()> {
     // SAFETY: RLIMIT_NOFILE is known only to read a buffer of size rlimit64, and we have always

@@ -2564,6 +2564,13 @@ fn get_default_hypervisor() -> Option<HypervisorKind> {
 }
 
 pub fn run_config(cfg: Config) -> Result<ExitState> {
+    // Every GPU blob a guest makes holds host descriptors (its dma-buf, the renderer object's and the
+    // resource's export): an iPadOS benchmark holding 12,000 buffers at once took crosvm to its 65,536
+    // and the next blob failed with EMFILE, which the guest's driver met as an allocation failure.
+    match base::linux::raise_max_open_files_to_ceiling() {
+        Ok(limit) => info!("open files limit {} (hard {})", limit.rlim_cur, limit.rlim_max),
+        Err(e) => warn!("could not raise the open files limit: {}", e),
+    }
     // Bridge the `--pre-alloc` GPU pool sizes to the env the in-process renderer + early memory
     // setup expect (NCTX_GFX_POOL_MB), BEFORE any of guest_memory_layout, the gpu device, or the
     // gunyah size-max reads them. The user sets `--pre-alloc`; crosvm no longer requires a
