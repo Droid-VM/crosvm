@@ -1638,6 +1638,7 @@ pub struct RunCommand {
     ///     multi-touch[path=PATH,width=W,height=H,name=N]
     ///     rotary[path=PATH]
     ///     single-touch[path=PATH,width=W,height=H,name=N]
+    ///     stylus[path=PATH,width=W,height=H,name=N]
     ///     switches[path=PATH]
     ///     trackpad[path=PATH,width=W,height=H,name=N]
     ///     multi-touch-trackpad[path=PATH,width=W,height=H,name=N]

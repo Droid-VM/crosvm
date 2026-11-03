@@ -635,6 +635,19 @@ pub enum InputDeviceOption {
         height: Option<u32>,
         name: Option<String>,
     },
+    // A pen on one output, as evdev describes a pen tablet: INPUT_PROP_DIRECT, BTN_TOOL_PEN and
+    // BTN_TOOL_RUBBER for the end that is in range (the tip or the eraser), BTN_TOUCH for contact,
+    // BTN_STYLUS/BTN_STYLUS2 for the barrel buttons, ABS_X/ABS_Y, ABS_PRESSURE, ABS_DISTANCE above
+    // the surface and ABS_TILT_X/ABS_TILT_Y in degrees (resolution in units per radian, as evdev
+    // defines it for tilt). A position with a BTN_TOOL_* down and no BTN_TOUCH is hover. `name`
+    // for the same reason as the touch devices': its coordinates belong to one output.
+    // Omitted width/height give the normalized range, as MultiTouch's.
+    Stylus {
+        path: PathBuf,
+        width: Option<u32>,
+        height: Option<u32>,
+        name: Option<String>,
+    },
     #[serde(rename_all = "kebab-case")]
     Custom {
         path: PathBuf,

@@ -193,6 +193,84 @@ fn default_motion_absinfo() -> BTreeMap<u16, virtio_input_absinfo> {
     absinfo
 }
 
+/// The pen's pressure range (12 bits, as most pen digitizers report it), its distance range above
+/// the surface, and its tilt bound in degrees with the resolution evdev wants for tilt: units per
+/// radian (180 / pi rounded, so one unit is one degree).
+pub const STYLUS_PRESSURE_MAX: u32 = 4095;
+pub const STYLUS_DISTANCE_MAX: u32 = 255;
+pub const STYLUS_TILT_MAX: i32 = 90;
+pub const STYLUS_TILT_PER_RADIAN: u32 = 57;
+
+/// Instantiates a VirtioInputConfig object with the default configuration for a pen over one
+/// output, as evdev describes a pen tablet (Linux's wacom and hid-multitouch pens, libinput's
+/// tablet tool): INPUT_PROP_DIRECT; BTN_TOOL_PEN or BTN_TOOL_RUBBER held while that end is in
+/// range, BTN_TOUCH while it touches, BTN_STYLUS and BTN_STYLUS2 for the barrel buttons; ABS_X/Y,
+/// ABS_PRESSURE, ABS_DISTANCE and ABS_TILT_X/Y (degrees from the normal, positive towards +X and
+/// +Y).
+pub fn new_stylus_config(
+    idx: u32,
+    width: u32,
+    height: u32,
+    name: Option<&str>,
+) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Stylus {idx}"));
+    VirtioInputConfig::new(
+        virtio_input_device_ids::new(0, 0, 0, 0),
+        name,
+        format!("virtio-stylus-{idx}"),
+        virtio_input_bitmap::from_bits(&[INPUT_PROP_DIRECT]),
+        default_stylus_events(),
+        default_stylus_absinfo(width, height),
+    )
+}
+
+fn default_stylus_events() -> BTreeMap<u16, virtio_input_bitmap> {
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(
+        EV_KEY,
+        virtio_input_bitmap::from_bits(&[
+            BTN_TOOL_PEN,
+            BTN_TOOL_RUBBER,
+            BTN_TOUCH,
+            BTN_STYLUS,
+            BTN_STYLUS2,
+        ]),
+    );
+    supported_events.insert(
+        EV_ABS,
+        virtio_input_bitmap::from_bits(&[
+            ABS_X,
+            ABS_Y,
+            ABS_PRESSURE,
+            ABS_DISTANCE,
+            ABS_TILT_X,
+            ABS_TILT_Y,
+        ]),
+    );
+    supported_events
+}
+
+fn default_stylus_absinfo(width: u32, height: u32) -> BTreeMap<u16, virtio_input_absinfo> {
+    let tilt = virtio_input_absinfo::new(-STYLUS_TILT_MAX as u32, STYLUS_TILT_MAX as u32, 0, 0)
+        .with_res(STYLUS_TILT_PER_RADIAN);
+    let mut absinfo: BTreeMap<u16, virtio_input_absinfo> = BTreeMap::new();
+    absinfo.insert(ABS_X, virtio_input_absinfo::new(0, width, 0, 0));
+    absinfo.insert(ABS_Y, virtio_input_absinfo::new(0, height, 0, 0));
+    absinfo.insert(
+        ABS_PRESSURE,
+        virtio_input_absinfo::new(0, STYLUS_PRESSURE_MAX, 0, 0),
+    );
+    absinfo.insert(
+        ABS_DISTANCE,
+        virtio_input_absinfo::new(0, STYLUS_DISTANCE_MAX, 0, 0),
+    );
+    absinfo.insert(ABS_TILT_X, tilt);
+    absinfo.insert(ABS_TILT_Y, tilt);
+    absinfo
+}
+
 /// Instantiates a VirtioInputConfig object with the default configuration for a touchscreen (no
 /// multitouch support).
 pub fn new_single_touch_config(
