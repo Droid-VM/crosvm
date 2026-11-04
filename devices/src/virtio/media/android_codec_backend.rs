@@ -17,6 +17,8 @@ mod android;
 #[cfg(target_os = "android")]
 mod android_encoder;
 #[cfg(target_os = "android")]
+mod vidc;
+#[cfg(target_os = "android")]
 pub use android::MediaCodecDecoderBackend;
 #[cfg(target_os = "android")]
 pub use android::MediaCodecDecoderSession;
@@ -24,6 +26,8 @@ pub use android::MediaCodecDecoderSession;
 pub use android_encoder::MediaCodecEncoderBackend;
 #[cfg(target_os = "android")]
 pub use android_encoder::MediaCodecEncoderSession;
+#[cfg(target_os = "android")]
+pub use vidc::HwDecoderBackend;
 
 #[cfg(not(target_os = "android"))]
 mod stub;

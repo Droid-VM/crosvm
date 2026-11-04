@@ -451,6 +451,9 @@ pub enum GuestMemoryChunk {
     Region(GuestRegionView),
     Mapping(GuestArenaMapping),
     Shadow(GuestShadowMapping),
+    /// No host view at all, `len` bytes: the pages reach the hardware only as the import's
+    /// dma-buf ([`GuestBufferImport::unmapped`]). The pointers are null.
+    Unmapped(usize),
 }
 
 impl GuestMemoryChunk {
@@ -459,6 +462,7 @@ impl GuestMemoryChunk {
             GuestMemoryChunk::Region(r) => r.as_ptr(),
             GuestMemoryChunk::Mapping(m) => m.as_ptr(),
             GuestMemoryChunk::Shadow(s) => s.as_ptr(),
+            GuestMemoryChunk::Unmapped(_) => std::ptr::null(),
         }
     }
 
@@ -467,6 +471,7 @@ impl GuestMemoryChunk {
             GuestMemoryChunk::Region(r) => r.as_mut_ptr(),
             GuestMemoryChunk::Mapping(m) => m.as_mut_ptr(),
             GuestMemoryChunk::Shadow(s) => s.as_mut_ptr(),
+            GuestMemoryChunk::Unmapped(_) => std::ptr::null_mut(),
         }
     }
 
@@ -475,6 +480,7 @@ impl GuestMemoryChunk {
             GuestMemoryChunk::Region(r) => r.len(),
             GuestMemoryChunk::Mapping(m) => m.len(),
             GuestMemoryChunk::Shadow(s) => s.len(),
+            GuestMemoryChunk::Unmapped(len) => *len,
         }
     }
 
@@ -495,9 +501,18 @@ impl GuestMemoryChunk {
 pub struct GuestBufferImport {
     mem: GuestMemory,
     sgs: Vec<(GuestAddress, usize)>,
+    prot: Protection,
     mapping: GuestMemoryChunk,
     dmabuf: OnceCell<SafeDescriptor>,
+    /// The udmabuf driver to build [`Self::dmabuf`] with when a backend asks for one through the
+    /// mapping (`GuestMemoryRange::dmabuf`); shared with the mapper that made the import, and
+    /// opened the first time any import needs it.
+    udmabuf: Option<SharedUdmabuf>,
 }
+
+/// A udmabuf driver opened on first use and shared by a mapper's imports: `None` inside when
+/// `/dev/udmabuf` could not be opened (said once, in the log).
+pub type SharedUdmabuf = std::sync::Arc<std::sync::OnceLock<Option<UdmabufDriver>>>;
 
 impl GuestBufferImport {
     /// Import `sgs`, mapped with `prot` (the direction the device will access it in: read-only
@@ -528,9 +543,89 @@ impl GuestBufferImport {
         Ok(Self {
             mem: mem.clone(),
             sgs,
+            prot,
             mapping,
             dmabuf: OnceCell::new(),
+            udmabuf: None,
         })
+    }
+
+    /// Import `sgs` for the hardware alone: `policy` checked as for [`Self::new`], but no host
+    /// view of the bytes is made, only (later) the dma-buf.
+    pub fn unmapped(
+        mem: &GuestMemory,
+        sgs: Vec<(GuestAddress, usize)>,
+        prot: Protection,
+        policy: &HostAccessPolicy,
+    ) -> Result<Self, ImportError> {
+        let mut total_size = 0usize;
+        for &(addr, len) in &sgs {
+            policy.check(mem, addr, len)?;
+            total_size = total_size.checked_add(len).ok_or(ImportError::Overflow)?;
+        }
+        if total_size == 0 {
+            return Err(ImportError::Empty);
+        }
+        Ok(Self {
+            mem: mem.clone(),
+            sgs,
+            prot,
+            mapping: GuestMemoryChunk::Unmapped(total_size),
+            dmabuf: OnceCell::new(),
+            udmabuf: None,
+        })
+    }
+
+    /// Whether this import has no host view ([`Self::unmapped`]).
+    pub fn is_unmapped(&self) -> bool {
+        matches!(self.mapping, GuestMemoryChunk::Unmapped(_))
+    }
+
+    /// Let [`Self::shared_dmabuf`] build a dma-buf with `driver`.
+    pub fn set_udmabuf(&mut self, driver: SharedUdmabuf) {
+        self.udmabuf = Some(driver);
+    }
+
+    /// The dma-buf over the buffer's pages, built with the shared driver, for a backend whose
+    /// hardware writes the guest's memory itself. `None` without a driver, for a shadow (its
+    /// write-back on drop would overwrite what the hardware wrote), or when the import fails
+    /// (logged).
+    pub fn shared_dmabuf(&self) -> Option<&SafeDescriptor> {
+        if self.is_shadowed() {
+            return None;
+        }
+        let driver = self.udmabuf.as_ref()?.get_or_init(|| match UdmabufDriver::new() {
+            Ok(driver) => Some(driver),
+            Err(e) => {
+                base::warn!("guest buffers get no dma-buf: cannot open /dev/udmabuf: {}", e);
+                None
+            }
+        });
+        match self.dmabuf(driver.as_ref()?) {
+            Ok(fd) => Some(fd),
+            Err(e) => {
+                base::warn!("no dma-buf for a {}-entry guest buffer: {}", self.sgs.len(), e);
+                None
+            }
+        }
+    }
+
+    /// Make `fd`, a dma-buf over exactly this import's pages, the one [`Self::shared_dmabuf`]
+    /// returns, rather than building another.
+    pub fn adopt_dmabuf(&mut self, fd: SafeDescriptor) {
+        let _ = self.dmabuf.set(fd);
+    }
+
+    /// Whether this import sees the guest's pages themselves, not a copy taken when it was made
+    /// (and written back when it drops).
+    pub fn is_direct(&self) -> bool {
+        !matches!(self.mapping, GuestMemoryChunk::Shadow(_))
+    }
+
+    /// Whether this import is what `new` would make of `sgs` and `prot`, seeing the guest's pages
+    /// themselves.
+    pub fn maps(&self, sgs: &[(GuestAddress, usize)], prot: Protection) -> bool {
+        self.is_direct() && self.prot == prot && self.sgs == sgs
     }
 
     /// The guest ranges this buffer is made of.

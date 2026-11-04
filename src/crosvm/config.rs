@@ -1052,6 +1052,12 @@ pub struct MediaDeviceConfig {
     /// decoder should get one.
     #[serde(default)]
     pub allow_sw: bool,
+    /// Decode with the host's msm_vidc V4L2 decoder (/dev/video32) directly, writing frames
+    /// straight into the guest's `CAPTURE` buffers through udmabuf, and fall back to MediaCodec
+    /// where it cannot (`kind=decoder`). Off by default: a 10-bit stream then comes out as P010,
+    /// which a guest has to know.
+    #[serde(default)]
+    pub vidc: bool,
     /// Run the device's backend in its own process under this host uid, the way `--virtio-snd`
     /// does, because the host's camera and codec services decide from the real uid. Unset keeps
     /// the device in the VMM's process. Only meaningful for `camera`, `decoder` and `encoder`.

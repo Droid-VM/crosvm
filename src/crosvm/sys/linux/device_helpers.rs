@@ -1520,6 +1520,7 @@ fn create_unprivileged_virtio_media_device(
         camera_id: config.camera_id.clone(),
         role: config.role.clone(),
         allow_sw: config.allow_sw,
+        vidc: config.vidc,
         pool_gpa,
         access_windows: host_accessible_windows(mem, protection_type.isolates_memory())
             .into_iter()
@@ -1538,14 +1539,23 @@ fn create_unprivileged_virtio_media_device(
         base::Tube::pair().context("failed to create the media pool tube pair")?;
     let pool_helper_fd = pool_helper_end.as_raw_descriptor();
 
-    // No supplementary groups: nothing a media device needs is granted by group membership, and
-    // crosvm's own groups are root's.
+    // No supplementary groups -- crosvm's own groups are root's -- except the one a decoder that
+    // talks to msm_vidc itself (`vidc=true`) needs: /dev/video32 is `system:camera 0660`.
+    // That decoder hands the driver guest buffers as udmabufs, one entry per scattered guest
+    // page run: a 4K P010 frame in 16 KiB guest pages is ~1700 entries, past the module's default
+    // `list_limit` of 1024, which only root may raise -- so it is raised here, best effort.
+    let supp_gids = if config.vidc && config.kind == MediaDeviceKind::Decoder {
+        raise_udmabuf_list_limit(16384);
+        vec![AID_CAMERA]
+    } else {
+        Vec::new()
+    };
     let (vmm_end, pid) = crate::crosvm::sys::linux::device_helper::launch(
         "media",
         config_json,
         uid,
         gid,
-        Vec::new(),
+        supp_gids,
         Some(pool_helper_fd),
     )
     .context("failed to launch the unprivileged media backend")?;
@@ -1616,6 +1626,26 @@ fn create_unprivileged_virtio_media_device(
         // No sandbox here: virtqueue handling happens in the backend process.
         jail: None,
     })
+}
+
+/// Android's `camera` group (`AID_CAMERA`), which owns the video codec nodes.
+const AID_CAMERA: u32 = 1006;
+
+/// Raise the udmabuf module's per-buffer entry limit to at least `wanted`, if it is lower and
+/// this process may write it. A failure is logged and otherwise ignored: buffers with fewer
+/// entries still work, and the decoder falls back to MediaCodec for one it cannot import.
+fn raise_udmabuf_list_limit(wanted: u32) {
+    const PATH: &str = "/sys/module/udmabuf/parameters/list_limit";
+    let current = std::fs::read_to_string(PATH)
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    if current.is_some_and(|limit| limit >= wanted) {
+        return;
+    }
+    match std::fs::write(PATH, wanted.to_string()) {
+        Ok(()) => info!("udmabuf list_limit {:?} -> {}", current, wanted),
+        Err(e) => warn!("cannot raise udmabuf list_limit ({:?}) to {}: {}", current, wanted, e),
+    }
 }
 
 /// How long the VMM waits for a media helper to answer the vhost-user handshake.
