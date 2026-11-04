@@ -75,6 +75,8 @@ use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -136,6 +138,45 @@ pub(super) const CODEC_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// thread that runs them. Nothing of the guest's is at stake by then (the FIFOs are already
 /// empty); the bound only keeps `REQBUFS(0)` / close from waiting on a wedged component.
 pub(super) const CODEC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The pixels of every hardware decoder this process runs at once, at most
+/// [`decode_budget_pixels`]: a 4096x2160 hardware decoder holds about 500 MB of the host's
+/// memory in its own output buffers (`dmabuf`), which no guest memory limit bounds. A macOS
+/// guest's lock-screen video opened a new 4K session every few seconds without closing the last
+/// (its decoder refused frames), and five of them took 2.5 GB in half a minute until the host's
+/// low-memory killer ended the VM. A session past the budget is refused at `STREAMON(OUTPUT)`
+/// (`EBUSY`), which a guest takes as a decoder it cannot have and decodes elsewhere.
+static DECODING_PIXELS: AtomicU64 = AtomicU64::new(0);
+
+/// The budget: two 4096x2160 pictures, or `CROSVM_MEDIA_DECODE_MAX_MPX` megapixels.
+fn decode_budget_pixels() -> u64 {
+    std::env::var("CROSVM_MEDIA_DECODE_MAX_MPX")
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .map_or(2 * 4096 * 2160, |mpx| mpx * 1_000_000)
+}
+
+/// A hardware decoder's share of [`DECODING_PIXELS`], given back when it drops.
+struct DecodeBudget(u64);
+
+impl DecodeBudget {
+    /// `pixels` more of the budget, or `None` where they do not fit.
+    fn take(pixels: u64) -> Option<DecodeBudget> {
+        let budget = decode_budget_pixels();
+        DECODING_PIXELS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(pixels).filter(|&total| total <= budget)
+            })
+            .ok()
+            .map(|_| DecodeBudget(pixels))
+    }
+}
+
+impl Drop for DecodeBudget {
+    fn drop(&mut self) {
+        DECODING_PIXELS.fetch_sub(self.0, Ordering::AcqRel);
+    }
+}
 /// How long an `InputBufferDone` is held behind a `SOURCE_CHANGE` the client is waiting for
 /// before it is returned anyway (D55/D56). The hold ends the instant the codec announces
 /// (`announce` -> `release_deferred_input_done`); this is the ceiling for the case the codec
@@ -851,11 +892,18 @@ pub(super) fn timeval_from(pts_us: i64) -> bindings::timeval {
     }
 }
 
+/// Ceiling of `KEY_MAX_INPUT_SIZE`. The codec keeps about two dozen input buffers of this size
+/// per session (23 x 6.3 MiB of dma-buf for one 4K HEVC session), and a compressed 4K picture is
+/// far smaller than ffmpeg's half-a-raw-frame estimate; an access unit larger than this still
+/// goes in, split over several input buffers with `BUFFER_FLAG_PARTIAL_FRAME` (`pump_input`).
+const MAX_INPUT_BUFFER_SIZE: usize = 2 << 20;
+
 /// `KEY_MAX_INPUT_SIZE` for a coded size: ffmpeg's own sizing of its bitstream buffers
-/// (`v4l2_get_framesize_compressed`, `(w*h*3/2)/2 + 128`) with the device's 1 MiB floor, so a
-/// buffer the guest was allowed to queue fits the codec's in one piece.
+/// (`v4l2_get_framesize_compressed`, `(w*h*3/2)/2 + 128`) between the device's 1 MiB floor and
+/// [`MAX_INPUT_BUFFER_SIZE`].
 fn max_input_size(coded: (u32, u32)) -> usize {
-    ((coded.0 as usize * coded.1 as usize * 3 / 2) / 2 + 128).max(MIN_INPUT_BUFFER_SIZE)
+    ((coded.0 as usize * coded.1 as usize * 3 / 2) / 2 + 128)
+        .clamp(MIN_INPUT_BUFFER_SIZE, MAX_INPUT_BUFFER_SIZE)
 }
 
 /// Whether `data` is a whole access unit of nothing but parameter sets (SPS/PPS, no slice): a
@@ -1040,6 +1088,8 @@ pub struct MediaCodecDecoderSession {
     /// Wakes the worker when a held `InputBufferDone` outlives [`ANNOUNCE_GRACE`] with no codec
     /// event (D56). Dropped with the session, which joins its thread.
     grace: GraceTimer,
+    /// The hardware decoder's share of the process's decoding budget, while it runs.
+    budget: Option<DecodeBudget>,
 }
 
 impl MediaCodecDecoderSession {
@@ -1086,6 +1136,7 @@ impl MediaCodecDecoderSession {
             inputs: 0,
             frames: 0,
             started_at: None,
+            budget: None,
         }
     }
 
@@ -1858,41 +1909,80 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
             .find(|c| c.fourcc == coded_format)
             .cloned()
             .ok_or(libc::EINVAL)?;
-        let mut format = MediaFormat::new().map_err(|e| errno_for(&e))?;
-        format
-            .set_str(keys::MIME, &chosen.mime)
-            .map_err(|e| errno_for(&e))?;
-        format.set_i32(keys::WIDTH, coded_size.0.min(i32::MAX as u32) as i32);
-        format.set_i32(keys::HEIGHT, coded_size.1.min(i32::MAX as u32) as i32);
-        format.set_i32(keys::COLOR_FORMAT, COLOR_FORMAT_YUV420_FLEXIBLE);
+        let budget = if chosen.hardware {
+            let pixels = u64::from(coded_size.0) * u64::from(coded_size.1);
+            match DecodeBudget::take(pixels) {
+                Some(budget) => Some(budget),
+                None => {
+                    warn!(
+                        "decoder session {}: refused {} at {}x{}: the hardware decoders running \
+                         already hold {} of {} pixels",
+                        self.id,
+                        chosen.name,
+                        coded_size.0,
+                        coded_size.1,
+                        DECODING_PIXELS.load(Ordering::Acquire),
+                        decode_budget_pixels()
+                    );
+                    return Err(libc::EBUSY);
+                }
+            }
+        } else {
+            None
+        };
         let input_size = max_input_size(coded_size);
-        format.set_i32(
-            keys::MAX_INPUT_SIZE,
-            input_size.min(i32::MAX as usize) as i32,
-        );
-        if chosen.low_latency {
-            format.set_i32(keys::LOW_LATENCY, 1);
-        }
-        // D91: the QTI AVC decoder emits in DISPLAY order, holding each picture until the
-        // reorder window lets it out, and that is what deadlocks an adaptive/MSE client: it
-        // blocks on the very picture it just submitted, and the picture needs 7 more access
-        // units to come back (self-delay p95 7, 54 of 300 pictures at the maximum, 3 never
-        // released before EOS) against a feed-ahead budget measured at 7-8 AUs (D85 §3.3,
-        // D91-lowlat-probe §5). This vendor switch makes the component emit in DECODE order
-        // instead: self-delay p50 = p95 = 1, nothing held, `nonmono` 157 -> 0, the EOS tail
-        // 3 -> 0, and all 300 frames bit-identical per PTS -- the pictures do not change, only
-        // the order they leave in (§4, §6). Decode order is what this backend wants anyway:
-        // every CAPTURE buffer is claimed by its access unit's own timestamp tag and the VA
-        // client reorders by POC itself, so display order is something the guest side has to
-        // undo (D91 §5.1). Note what this is NOT: `KEY_LOW_LATENCY` and the `.low_latency`
-        // sibling are both inert here, neither moves the reorder by a single frame, and the
-        // sibling also costs two thirds of the bitrate ceiling (§2, §4). It has to be set here,
-        // before `configure()`: a `setParameters` after `start()` is accepted and ignored (§3).
-        // AVC only -- the key survives readback on HEVC/VP9/AV1 as well, but its effect there
-        // is unmeasured, so those keep the behaviour they ship with today (§8).
-        if chosen.mime == "video/avc" {
-            format.set_i32(keys::QTI_PICTURE_ORDER, 1);
-        }
+        // The format, `fast` with the decode-as-fast-as-it-can keys (below) or without them.
+        let build = |fast: bool| -> std::result::Result<MediaFormat, i32> {
+            let mut format = MediaFormat::new().map_err(|e| errno_for(&e))?;
+            format
+                .set_str(keys::MIME, &chosen.mime)
+                .map_err(|e| errno_for(&e))?;
+            format.set_i32(keys::WIDTH, coded_size.0.min(i32::MAX as u32) as i32);
+            format.set_i32(keys::HEIGHT, coded_size.1.min(i32::MAX as u32) as i32);
+            format.set_i32(keys::COLOR_FORMAT, COLOR_FORMAT_YUV420_FLEXIBLE);
+            format.set_i32(
+                keys::MAX_INPUT_SIZE,
+                input_size.min(i32::MAX as usize) as i32,
+            );
+            if chosen.low_latency {
+                format.set_i32(keys::LOW_LATENCY, 1);
+            }
+            // D91: the QTI AVC decoder emits in DISPLAY order, holding each picture until the
+            // reorder window lets it out, and that is what deadlocks an adaptive/MSE client: it
+            // blocks on the very picture it just submitted, and the picture needs 7 more access
+            // units to come back (self-delay p95 7, 54 of 300 pictures at the maximum, 3 never
+            // released before EOS) against a feed-ahead budget measured at 7-8 AUs (D85 §3.3,
+            // D91-lowlat-probe §5). This vendor switch makes the component emit in DECODE order
+            // instead: self-delay p50 = p95 = 1, nothing held, `nonmono` 157 -> 0, the EOS tail
+            // 3 -> 0, and all 300 frames bit-identical per PTS -- the pictures do not change, only
+            // the order they leave in (§4, §6). Decode order is what this backend wants anyway:
+            // every CAPTURE buffer is claimed by its access unit's own timestamp tag and the VA
+            // client reorders by POC itself, so display order is something the guest side has to
+            // undo (D91 §5.1). Note what this is NOT: `KEY_LOW_LATENCY` and the `.low_latency`
+            // sibling are both inert here, neither moves the reorder by a single frame, and the
+            // sibling also costs two thirds of the bitrate ceiling (§2, §4). It has to be set here,
+            // before `configure()`: a `setParameters` after `start()` is accepted and ignored (§3).
+            // AVC only -- the key survives readback on HEVC/VP9/AV1 as well, but its effect there
+            // is unmeasured, so those keep the behaviour they ship with today (§8). It does not
+            // shrink HEVC's buffers: on a 4K Main10 stream the component reports the same output
+            // delay (11 -> 19 -> 22) with the key on.
+            if chosen.mime == "video/avc" {
+                format.set_i32(keys::QTI_PICTURE_ORDER, 1);
+            }
+            // A guest's timestamps are its own (macOS's VideoToolbox host puts the frame number in
+            // tv_sec, a second apart), so a codec that sets its clocks by them reads 1 fps: a 4K
+            // Main10 lock-screen stream came out at ~25 fps with nothing else busy. Realtime
+            // priority at the highest operating rate asks it to decode as fast as it can. Some
+            // components refuse a rate they cannot meet at configure; the start below retries
+            // without the two keys then.
+            if fast {
+                format.set_i32(keys::PRIORITY, 0);
+                format.set_f32(keys::OPERATING_RATE, f32::from(i16::MAX));
+            }
+            Ok(format)
+        };
+        let format = build(true)?;
+        let plain = build(false)?;
         info!(
             "decoder session {}: creating {} for {} at {}x{}: {}",
             self.id, chosen.name, coded_format, coded_size.0, coded_size.1, format
@@ -1901,6 +1991,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
         let sink = self.sink.clone();
         let name = chosen.name.clone();
         let id = self.id;
+        let retry_sink = self.sink.clone();
         let created = bounded("decoder", id, "start", CODEC_START_TIMEOUT, move || {
             let mut codec = Codec::create_by_name(&name)?;
             // Every callback bumps the device session's eventfd once it has queued its event:
@@ -1911,7 +2002,21 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                     "the codec already had a wake hook; nothing would wake the session".into(),
                 ));
             }
-            codec.configure(&format, false)?;
+            if let Err(e) = codec.configure(&format, false) {
+                warn!(
+                    "decoder session {}: {} refused priority 0 / operating-rate: {}; again \
+                     without",
+                    id, name, e
+                );
+                drop(codec);
+                codec = Codec::create_by_name(&name)?;
+                if !codec.set_wake_hook(Box::new(move || retry_sink.signal())) {
+                    return Err(CodecError::Event(
+                        "the codec already had a wake hook; nothing would wake the session".into(),
+                    ));
+                }
+                codec.configure(&plain, false)?;
+            }
             codec.start()?;
             Ok::<Codec, CodecError>(codec)
         });
@@ -1950,6 +2055,7 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                 self.chosen = Some(chosen);
                 self.codec = Some(codec);
                 self.started_at = Some(Instant::now());
+                self.budget = budget;
                 Ok(())
             }
             Some(Err(e)) => {
@@ -2228,6 +2334,8 @@ impl VideoDecoderBackendSession for MediaCodecDecoderSession {
                 self.format_changes
             );
         }
+        // Given back once the codec is stopped (or left stopping on its thread).
+        self.budget = None;
     }
 
     fn take_events(&mut self) -> Vec<DecoderEvent> {
