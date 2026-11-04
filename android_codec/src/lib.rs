@@ -651,6 +651,8 @@ pub mod keys {
     pub const LEVEL: &CStr = c"level";
     pub const MAX_INPUT_SIZE: &CStr = c"max-input-size";
     pub const LOW_LATENCY: &CStr = c"low-latency";
+    pub const PRIORITY: &CStr = c"priority";
+    pub const OPERATING_RATE: &CStr = c"operating-rate";
     /// Qualcomm's decoder-side "emit in picture (decode) order, do not hold pictures back for
     /// display reorder" switch, measured on `c2.qti.avc.decoder` in WP `D91-lowlat-probe`: it
     /// turns display-order output (`0 3 2 1 4 6 5 ...`) into decode-order output (`0 1 2 3 ...`)
