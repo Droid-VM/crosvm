@@ -553,6 +553,35 @@ async fn pcm_worker_loop(
                         return Err(Error::InvalidPCMWorkerState);
                     }
                     Ok(Some(mut desc_chain)) => {
+                        // Periods that went by unfed were played as filler. A guest that stalled
+                        // then sends what it owed all at once, and played on arrival that would
+                        // put the sound as far behind the picture as the stall was long, for
+                        // good. So what is already queued behind this period, up to what was
+                        // owed, is completed unplayed. One that came on its own after a gap is
+                        // a guest starting again, and is played.
+                        let mut owed = starvation.periods;
+                        while owed > 0 {
+                            let Ok(Some(next)) = desc_receiver.try_next() else {
+                                break;
+                            };
+                            sender
+                                .send(PcmResponse {
+                                    desc_chain,
+                                    status: Result::<u32, Error>::Ok(0).into(),
+                                    done: None,
+                                })
+                                .await
+                                .map_err(Error::MpscSend)?;
+                            desc_chain = next;
+                            owed -= 1;
+                        }
+                        if owed < starvation.periods {
+                            warn!(
+                                "[Card {}] playback: {} late periods dropped to keep the stream on time",
+                                card_index,
+                                starvation.periods - owed
+                            );
+                        }
                         starvation.fed(card_index, "playback");
                         let reader = if muted.load(Ordering::Relaxed) {
                             None

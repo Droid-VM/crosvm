@@ -9,6 +9,11 @@ mod libaaudio_stub;
 
 use std::os::raw::c_void;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -84,6 +89,141 @@ const AAUDIO_UNSPECIFIED_VALUE: i32 = 0;
 const AAUDIO_FORMAT_PCM_I16: AaudioFormatT = 1;
 const AAUDIO_FORMAT_PCM_FLOAT: AaudioFormatT = 2;
 const AAUDIO_FORMAT_PCM_I32: AaudioFormatT = 4;
+/// `AAUDIO_PERFORMANCE_MODE_LOW_LATENCY`. Without it an output stream is a normal AudioFlinger
+/// track, mixed by the normal mixer behind a buffer of its own: 68 ms reported on the phone,
+/// against the fast mixer's 21. Asking is not enough on its own: a stream fed by blocking writes
+/// is refused the fast mixer ("AUDIO_OUTPUT_FLAG_FAST denied by client ... TRANSFER_SYNC") and
+/// lands on the deep-buffer output instead, 168 ms. Hence the data callback.
+const AAUDIO_PERFORMANCE_MODE_LOW_LATENCY: i32 = 12;
+const AAUDIO_CALLBACK_RESULT_CONTINUE: i32 = 0;
+/// Guest periods the output ring holds. The ring is what paces an output stream: periods are
+/// taken from the guest as fast as it has room, so what the guest queued ahead (40 ms for the
+/// macOS driver) moves here, where it covers a stall of this side as well as one of the guest's.
+/// More room than that costs nothing, the latency being whatever the guest queued.
+const OUTPUT_RING_PERIODS: usize = 8;
+
+/// Where the guest's periods wait for the endpoint's data callback. The callback runs on the
+/// platform's real-time thread and takes what it asks for; what is not there yet is silence.
+struct OutputRing {
+    state: Mutex<RingState>,
+    /// Signalled by the callback as it makes room.
+    space: Condvar,
+    /// Set by the error callback: the endpoint is gone, and the stream may not be closed from
+    /// inside the callback, so the next period does it.
+    lost: AtomicBool,
+}
+
+struct RingState {
+    data: std::collections::VecDeque<u8>,
+    capacity: usize,
+    frame_size: usize,
+    /// Bytes of silence the callback played for want of data since the stream was first fed.
+    /// The audio they stood in for is still on its way, and playing it would put the sound that
+    /// much further behind the picture for good -- so that much is dropped as it arrives.
+    debt: usize,
+    /// Fed at least once since the stream started: the wait for the first period is not a gap.
+    primed: bool,
+}
+
+impl OutputRing {
+    fn new(capacity: usize, frame_size: usize) -> Self {
+        OutputRing {
+            state: Mutex::new(RingState {
+                data: std::collections::VecDeque::with_capacity(capacity),
+                capacity,
+                frame_size,
+                debt: 0,
+                primed: false,
+            }),
+            space: Condvar::new(),
+            lost: AtomicBool::new(false),
+        }
+    }
+
+    /// Empties the ring for a fresh stream.
+    fn reset(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.data.clear();
+        state.debt = 0;
+        state.primed = false;
+        self.lost.store(false, Ordering::Relaxed);
+    }
+
+    /// How long until the endpoint has played enough to make room for `frames` more.
+    fn wait_for_room(&self, frames: usize, frame_rate: u32) -> Duration {
+        let state = self.state.lock().unwrap();
+        let free = state.capacity.saturating_sub(state.data.len()) / state.frame_size.max(1);
+        if free >= frames || frame_rate == 0 {
+            return Duration::ZERO;
+        }
+        Duration::from_nanos((frames - free) as u64 * NANOS_PER_SEC as u64 / u64::from(frame_rate))
+    }
+
+    /// Queues `data`, waiting up to `timeout` for room. Returns how many bytes were taken,
+    /// dropped ones (repaying the callback's debt) included.
+    fn push(&self, data: &[u8], timeout: Duration) -> usize {
+        let deadline = Instant::now() + timeout;
+        let mut state = self.state.lock().unwrap();
+        state.primed = true;
+        let frame_size = state.frame_size.max(1);
+        let repay = state.debt.min(data.len()) / frame_size * frame_size;
+        state.debt -= repay;
+        let mut taken = repay;
+        while taken < data.len() {
+            let room = state.capacity.saturating_sub(state.data.len());
+            if room > 0 {
+                let n = room.min(data.len() - taken);
+                state.data.extend(&data[taken..taken + n]);
+                taken += n;
+                continue;
+            }
+            let now = Instant::now();
+            if now >= deadline || self.lost.load(Ordering::Relaxed) {
+                break;
+            }
+            state = self.space.wait_timeout(state, deadline - now).unwrap().0;
+        }
+        taken
+    }
+}
+
+/// The output stream's data callback. `user` is the stream's [`OutputRing`], which outlives the
+/// stream: it is held by the [`OpenParams`] the stream was opened with, and the stream is closed
+/// (which waits for a running callback) before that is dropped.
+extern "C" fn output_data_callback(
+    _stream: *mut AAudioStream,
+    user: *mut c_void,
+    audio: *mut c_void,
+    num_frames: i32,
+) -> i32 {
+    // SAFETY: see above.
+    let ring = unsafe { &*(user as *const OutputRing) };
+    let mut state = ring.state.lock().unwrap();
+    let frame_size = state.frame_size;
+    let want = num_frames.max(0) as usize * frame_size;
+    // SAFETY: AAudio hands over a buffer of num_frames frames in the stream's format.
+    let out = unsafe { std::slice::from_raw_parts_mut(audio as *mut u8, want) };
+    let n = state.data.len().min(want);
+    let (a, b) = state.data.as_slices();
+    let from_a = a.len().min(n);
+    out[..from_a].copy_from_slice(&a[..from_a]);
+    out[from_a..n].copy_from_slice(&b[..n - from_a]);
+    state.data.drain(..n);
+    if state.primed {
+        state.debt += want - n;
+    }
+    drop(state);
+    out[n..].fill(0);
+    ring.space.notify_one();
+    AAUDIO_CALLBACK_RESULT_CONTINUE
+}
+
+extern "C" fn output_error_callback(_stream: *mut AAudioStream, user: *mut c_void, _error: i32) {
+    // SAFETY: as for output_data_callback.
+    let ring = unsafe { &*(user as *const OutputRing) };
+    ring.lost.store(true, Ordering::Relaxed);
+    ring.space.notify_one();
+}
 
 /// The AAudio format that carries this one byte for byte, or `None` when there is none.
 ///
@@ -110,6 +250,17 @@ extern "C" {
         num_frames: i32,
     );
     fn AAudioStreamBuilder_setDirection(builder: *mut AAudioStreamBuilder, direction: u32);
+    fn AAudioStreamBuilder_setPerformanceMode(builder: *mut AAudioStreamBuilder, mode: i32);
+    fn AAudioStreamBuilder_setDataCallback(
+        builder: *mut AAudioStreamBuilder,
+        callback: extern "C" fn(*mut AAudioStream, *mut c_void, *mut c_void, i32) -> i32,
+        user: *mut c_void,
+    );
+    fn AAudioStreamBuilder_setErrorCallback(
+        builder: *mut AAudioStreamBuilder,
+        callback: extern "C" fn(*mut AAudioStream, *mut c_void, i32),
+        user: *mut c_void,
+    );
     fn AAudioStreamBuilder_setFormat(builder: *mut AAudioStreamBuilder, format: AaudioFormatT);
     fn AAudioStreamBuilder_setSampleRate(builder: *mut AAudioStreamBuilder, sample_rate: i32);
     fn AAudioStreamBuilder_setChannelCount(builder: *mut AAudioStreamBuilder, channel_count: i32);
@@ -133,6 +284,8 @@ extern "C" {
         stream: *mut *mut AAudioStream,
     ) -> AaudioResultT;
     fn AAudioStream_getBufferSizeInFrames(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getPerformanceMode(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_getFramesPerBurst(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_requestStart(stream: *mut AAudioStream) -> AaudioResultT;
     fn AAudioStream_read(
         stream: *mut AAudioStream,
@@ -167,6 +320,8 @@ struct OpenParams {
     host_key: String,
     table_path: PathBuf,
     device_id: i32,
+    /// For output: what the data callback plays from. None for input, which is still read.
+    ring: Option<Arc<OutputRing>>,
 }
 
 /// The open AAudio stream, and what it takes to open it again.
@@ -446,6 +601,14 @@ fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> 
         }
         AAudioStreamBuilder_setDirection(builder, open.direction as u32);
         AAudioStreamBuilder_setBufferCapacityInFrames(builder, open.buffer_size as i32 * 2);
+        if let Some(ring) = &open.ring {
+            let user = Arc::as_ptr(ring) as *mut c_void;
+            AAudioStreamBuilder_setPerformanceMode(builder, AAUDIO_PERFORMANCE_MODE_LOW_LATENCY);
+            AAudioStreamBuilder_setDataCallback(builder, output_data_callback, user);
+            AAudioStreamBuilder_setErrorCallback(builder, output_error_callback, user);
+            // Before the stream starts, so the callback does not take a gap for a debt.
+            ring.reset();
+        }
         AAudioStreamBuilder_setFormat(builder, format);
         AAudioStreamBuilder_setSampleRate(builder, open.frame_rate as i32);
         AAudioStreamBuilder_setChannelCount(builder, open.num_channels as i32);
@@ -483,6 +646,22 @@ fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> 
             AAudioStream_close(stream_ptr);
             return Err(Box::new(AAudioError::StreamStart));
         }
+    }
+
+    if open.ring.is_some() {
+        // SAFETY: the stream was opened and started just above.
+        let (mode, burst, size) = unsafe {
+            (
+                AAudioStream_getPerformanceMode(stream_ptr),
+                AAudioStream_getFramesPerBurst(stream_ptr),
+                AAudioStream_getBufferSizeInFrames(stream_ptr),
+            )
+        };
+        base::info!(
+            "host audio output: performance mode {} (12 is low latency), burst {} frames, \
+             buffer {} frames, ring {} frames",
+            mode, burst, size, open.buffer_size * OUTPUT_RING_PERIODS
+        );
     }
 
     // Every frame written from here on is laid out the way the guest declared in SET_PARAMS, so a
@@ -582,12 +761,14 @@ impl AsyncBufferCommit for AndroidAudioStreamCommit {
         match self.direction {
             AndroidAudioStreamDirection::Input => {}
             AndroidAudioStreamDirection::Output => {
-                // Upstream passed a zero timeout and threw away whatever AAudio would not
-                // take, which is an audible click every time the device buffer happens to be
-                // full. Wait instead, then finish the remainder: the period is only worth a
-                // few milliseconds of audio, and pacing to the device is what this path is
-                // for. The wait is bounded at twice the audio the buffer holds so a wedged
-                // stream cannot stall the virtio-snd worker.
+                // The periods go into the ring the data callback plays from. A full ring is
+                // waited on, bounded at twice the audio the period holds so a wedged stream
+                // cannot stall the virtio-snd worker; past that the rest is dropped, and said so.
+                if let Some(ring) = self.stream.open.ring.clone() {
+                    if ring.lost.load(Ordering::Relaxed) {
+                        self.stream.mark_lost("disconnected");
+                    }
+                }
                 self.stream.try_reconnect();
                 if !self.stream.connected() {
                     // Nowhere to put it. The guest's stream is still running, so this period is
@@ -596,38 +777,28 @@ impl AsyncBufferCommit for AndroidAudioStreamCommit {
                     // taking the application's stream down with it.
                     return;
                 }
-                let mut written = 0usize;
-                while written < nwritten {
-                    let remaining = nwritten - written;
-                    let timeout_ns = if self.frame_rate > 0 {
-                        (remaining as i64)
-                            .saturating_mul(2 * NANOS_PER_SEC)
-                            / i64::from(self.frame_rate)
-                    } else {
-                        0
-                    };
-                    // SAFETY: see above; buffer_ptr stays valid and `written` never exceeds
-                    // nwritten, which is within the buffer.
-                    let frames_written: i32 = unsafe {
-                        AAudioStream_write(
-                            self.stream.stream_ptr,
-                            self.buffer_ptr.add(written * self.frame_size) as *const c_void,
-                            remaining as i32,
-                            timeout_ns,
-                        )
-                    };
-                    if frames_written < 0 {
-                        self.stream.mark_lost("write failed");
-                        break;
-                    }
-                    if frames_written == 0 {
-                        // Timed out with no progress: dropping the rest is all that is left,
-                        // but say so -- silently discarding audio is what made this hard to
-                        // find in the first place.
-                        warn!("Android Audio Stream: dropping {} frames after timeout", remaining);
-                        break;
-                    }
-                    written += frames_written as usize;
+                let Some(ring) = self.stream.open.ring.clone() else {
+                    return;
+                };
+                let timeout = if self.frame_rate > 0 {
+                    Duration::from_nanos(
+                        nwritten as u64 * 2 * NANOS_PER_SEC as u64 / u64::from(self.frame_rate),
+                    )
+                } else {
+                    Duration::ZERO
+                };
+                // SAFETY: buffer_ptr points at the stream's buffer, which holds at least
+                // nwritten frames.
+                let data = unsafe {
+                    std::slice::from_raw_parts(self.buffer_ptr, nwritten * self.frame_size)
+                };
+                let taken = ring.push(data, timeout);
+                if taken < data.len() {
+                    base::warn!(
+                        "host audio output: the endpoint took nothing for {:?}, {} frames dropped",
+                        timeout,
+                        (data.len() - taken) / self.frame_size
+                    );
                 }
             }
         }
@@ -746,10 +917,27 @@ impl AsyncPlaybackBufferStream for AudioStream {
         ex: &dyn AudioStreamsExecutor,
     ) -> Result<AsyncPlaybackBuffer<'a>, BoxError> {
         let buffer_size = self.buffer.len() / self.frame_size;
-        self.total_frames += buffer_size as u64;
-        let start_time = self.pace(ex, buffer_size).await?;
-        self.next_frame =
-            start_time + Duration::from_millis(self.total_frames * 1000 / self.frame_rate as u64);
+        let ring = self.buffer_drop.stream.open.ring.clone();
+        if let Some(ring) = ring.filter(|_| self.buffer_drop.stream.connected()) {
+            // The ring paces: its room is what the endpoint has played. A schedule of its own
+            // here would only fall behind at every stall of this thread and, re-anchoring, leave
+            // that much more of the guest's audio queued behind it for good -- the sound drifting
+            // further behind the picture with each one. Re-anchors when it is next needed.
+            self.start_time = None;
+            self.total_frames = 0;
+            // Waited here, on the executor, and not in the commit: the guest's periods reach this
+            // stream through a task on the same executor, and a thread blocked in the commit
+            // never lets it run -- every period then comes up empty and plays as silence.
+            let wait = ring.wait_for_room(buffer_size, self.frame_rate);
+            if !wait.is_zero() {
+                ex.delay(wait).await?;
+            }
+        } else {
+            self.total_frames += buffer_size as u64;
+            let start_time = self.pace(ex, buffer_size).await?;
+            self.next_frame = start_time
+                + Duration::from_millis(self.total_frames * 1000 / self.frame_rate as u64);
+        }
         Ok(
             AsyncPlaybackBuffer::new(self.frame_size, self.buffer.as_mut(), &mut self.buffer_drop)
                 .map_err(Box::new)?,
@@ -884,6 +1072,16 @@ impl AndroidAudioStreamSource {
             host_key: self.host_key.clone(),
             table_path: self.table_path.clone(),
             device_id: self.device_id,
+            ring: match direction {
+                AndroidAudioStreamDirection::Output => {
+                    let frame_size = format.sample_bytes() * num_channels;
+                    Some(Arc::new(OutputRing::new(
+                        buffer_size * OUTPUT_RING_PERIODS * frame_size,
+                        frame_size,
+                    )))
+                }
+                AndroidAudioStreamDirection::Input => None,
+            },
         }
     }
 }
@@ -1096,6 +1294,7 @@ mod tests {
                         host_key: String::new(),
                         table_path: PathBuf::new(),
                         device_id: AAUDIO_DEVICE_UNSPECIFIED,
+                        ring: None,
                     },
                     // Far enough out that nothing tries to reopen the endpoint mid-test.
                     retry_at: Instant::now() + Duration::from_secs(3600),
