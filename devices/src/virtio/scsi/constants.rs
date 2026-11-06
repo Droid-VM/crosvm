@@ -20,6 +20,10 @@ pub const INQUIRY: u8 = 0x12;
 pub const MODE_SELECT_6: u8 = 0x15;
 /// Opcode for MODE SENSE(6) command.
 pub const MODE_SENSE_6: u8 = 0x1a;
+/// Opcode for START STOP UNIT command.
+pub const START_STOP_UNIT: u8 = 0x1b;
+/// Opcode for PREVENT ALLOW MEDIUM REMOVAL command.
+pub const PREVENT_ALLOW_MEDIUM_REMOVAL: u8 = 0x1e;
 /// Opcode for READ CAPACITY(10) command.
 pub const READ_CAPACITY_10: u8 = 0x25;
 /// Opcode for READ(10) command.
@@ -32,6 +36,14 @@ pub const SYNCHRONIZE_CACHE_10: u8 = 0x35;
 pub const WRITE_SAME_10: u8 = 0x41;
 /// Opcode for UNMAP command.
 pub const UNMAP: u8 = 0x42;
+/// Opcode for READ TOC/PMA/ATIP command.
+pub const READ_TOC: u8 = 0x43;
+/// Opcode for GET CONFIGURATION command.
+pub const GET_CONFIGURATION: u8 = 0x46;
+/// Opcode for GET EVENT STATUS NOTIFICATION command.
+pub const GET_EVENT_STATUS_NOTIFICATION: u8 = 0x4a;
+/// Opcode for MODE SENSE(10) command.
+pub const MODE_SENSE_10: u8 = 0x5a;
 /// Opcode for WRITE SAME(16) command.
 pub const WRITE_SAME_16: u8 = 0x93;
 /// Opcode for SERVICE ACTION IN(16) command.
@@ -40,6 +52,8 @@ pub const SERVICE_ACTION_IN_16: u8 = 0x9e;
 pub const REPORT_LUNS: u8 = 0xa0;
 /// Opcode for MAINTENANCE IN command.
 pub const MAINTENANCE_IN: u8 = 0xa3;
+/// Opcode for READ(12) command.
+pub const READ_12: u8 = 0xa8;
 
 // The service actions of MAINTENANCE IN command.
 /// REPORT SUPPORTED TASK MANAGEMENT FUNCTIONS

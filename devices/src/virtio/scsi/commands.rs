@@ -15,18 +15,25 @@ use zerocopy::Immutable;
 use zerocopy::IntoBytes;
 use zerocopy::KnownLayout;
 
+use crate::virtio::scsi::constants::GET_CONFIGURATION;
+use crate::virtio::scsi::constants::GET_EVENT_STATUS_NOTIFICATION;
 use crate::virtio::scsi::constants::INQUIRY;
 use crate::virtio::scsi::constants::MAINTENANCE_IN;
 use crate::virtio::scsi::constants::MODE_SELECT_6;
+use crate::virtio::scsi::constants::MODE_SENSE_10;
 use crate::virtio::scsi::constants::MODE_SENSE_6;
+use crate::virtio::scsi::constants::PREVENT_ALLOW_MEDIUM_REMOVAL;
 use crate::virtio::scsi::constants::READ_10;
+use crate::virtio::scsi::constants::READ_12;
 use crate::virtio::scsi::constants::READ_6;
 use crate::virtio::scsi::constants::READ_CAPACITY_10;
 use crate::virtio::scsi::constants::READ_CAPACITY_16;
+use crate::virtio::scsi::constants::READ_TOC;
 use crate::virtio::scsi::constants::REQUEST_SENSE;
 use crate::virtio::scsi::constants::REPORT_LUNS;
 use crate::virtio::scsi::constants::REPORT_SUPPORTED_TASK_MANAGEMENT_FUNCTIONS;
 use crate::virtio::scsi::constants::SERVICE_ACTION_IN_16;
+use crate::virtio::scsi::constants::START_STOP_UNIT;
 use crate::virtio::scsi::constants::SYNCHRONIZE_CACHE_10;
 use crate::virtio::scsi::constants::TEST_UNIT_READY;
 use crate::virtio::scsi::constants::TYPE_CDROM;
@@ -49,11 +56,18 @@ pub enum Command {
     Inquiry(Inquiry),
     ModeSelect6(ModeSelect6),
     ModeSense6(ModeSense6),
+    StartStopUnit(StartStopUnit),
+    PreventAllowMediumRemoval(PreventAllowMediumRemoval),
     ReadCapacity10(ReadCapacity10),
     ReadCapacity16(ReadCapacity16),
     Read10(Read10),
+    Read12(Read12),
     Write10(Write10),
     SynchronizeCache10(SynchronizeCache10),
+    ReadToc(ReadToc),
+    GetConfiguration(GetConfiguration),
+    GetEventStatusNotification(GetEventStatusNotification),
+    ModeSense10(ModeSense10),
     WriteSame10(WriteSame10),
     Unmap(Unmap),
     WriteSame16(WriteSame16),
@@ -71,10 +85,21 @@ impl Command {
             INQUIRY => Ok(Self::Inquiry(Self::parse_command(cdb)?)),
             MODE_SELECT_6 => Ok(Self::ModeSelect6(Self::parse_command(cdb)?)),
             MODE_SENSE_6 => Ok(Self::ModeSense6(Self::parse_command(cdb)?)),
+            START_STOP_UNIT => Ok(Self::StartStopUnit(Self::parse_command(cdb)?)),
+            PREVENT_ALLOW_MEDIUM_REMOVAL => {
+                Ok(Self::PreventAllowMediumRemoval(Self::parse_command(cdb)?))
+            }
             READ_CAPACITY_10 => Ok(Self::ReadCapacity10(Self::parse_command(cdb)?)),
             READ_10 => Ok(Self::Read10(Self::parse_command(cdb)?)),
+            READ_12 => Ok(Self::Read12(Self::parse_command(cdb)?)),
             WRITE_10 => Ok(Self::Write10(Self::parse_command(cdb)?)),
             SYNCHRONIZE_CACHE_10 => Ok(Self::SynchronizeCache10(Self::parse_command(cdb)?)),
+            READ_TOC => Ok(Self::ReadToc(Self::parse_command(cdb)?)),
+            GET_CONFIGURATION => Ok(Self::GetConfiguration(Self::parse_command(cdb)?)),
+            GET_EVENT_STATUS_NOTIFICATION => Ok(Self::GetEventStatusNotification(
+                Self::parse_command(cdb)?,
+            )),
+            MODE_SENSE_10 => Ok(Self::ModeSense10(Self::parse_command(cdb)?)),
             WRITE_SAME_10 => Ok(Self::WriteSame10(Self::parse_command(cdb)?)),
             UNMAP => Ok(Self::Unmap(Self::parse_command(cdb)?)),
             WRITE_SAME_16 => Ok(Self::WriteSame16(Self::parse_command(cdb)?)),
@@ -138,13 +163,22 @@ impl Command {
             Self::Inquiry(inquiry) => inquiry.emulate(writer, dev),
             Self::ModeSelect6(mode_select_6) => mode_select_6.emulate(reader, dev),
             Self::ModeSense6(mode_sense_6) => mode_sense_6.emulate(writer, dev),
+            Self::StartStopUnit(start_stop_unit) => start_stop_unit.emulate(),
+            Self::PreventAllowMediumRemoval(prevent_allow) => prevent_allow.emulate(),
             Self::ReadCapacity10(read_capacity_10) => read_capacity_10.emulate(writer, dev),
             Self::ReadCapacity16(read_capacity_16) => read_capacity_16.emulate(writer, dev),
             Self::Read10(read_10) => read_10.emulate(writer, dev).await,
+            Self::Read12(read_12) => read_12.emulate(writer, dev).await,
             Self::Write10(write_10) => write_10.emulate(reader, dev).await,
             Self::SynchronizeCache10(synchronize_cache_10) => {
                 synchronize_cache_10.emulate(dev).await
             }
+            Self::ReadToc(read_toc) => read_toc.emulate(writer, dev),
+            Self::GetConfiguration(get_configuration) => get_configuration.emulate(writer, dev),
+            Self::GetEventStatusNotification(get_event_status_notification) => {
+                get_event_status_notification.emulate(writer, dev)
+            }
+            Self::ModeSense10(mode_sense_10) => mode_sense_10.emulate(writer, dev),
             Self::WriteSame10(write_same_10) => write_same_10.emulate(reader, dev).await,
             Self::Unmap(unmap) => unmap.emulate(reader, dev).await,
             Self::WriteSame16(write_same_16) => write_same_16.emulate(reader, dev).await,
@@ -1222,6 +1256,365 @@ impl ReportSupportedTMFs {
         let reserved = [0u8; 3];
         writer.write_all(&reserved).map_err(ExecuteError::Write)?;
         Ok(())
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq, Eq,
+)]
+#[repr(C, packed)]
+pub struct StartStopUnit {
+    opcode: u8,
+    _reserved: u8,
+    _reserved2: [u8; 2],
+    _power_condition: u8,
+    control: u8,
+}
+
+impl StartStopUnit {
+    fn emulate(&self) -> Result<(), ExecuteError> {
+        // The image is always present and spun up, so this is a no-op.
+        Ok(())
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq, Eq,
+)]
+#[repr(C, packed)]
+pub struct PreventAllowMediumRemoval {
+    opcode: u8,
+    _reserved: [u8; 3],
+    _prevent: u8,
+    control: u8,
+}
+
+impl PreventAllowMediumRemoval {
+    fn emulate(&self) -> Result<(), ExecuteError> {
+        // The medium cannot be ejected from crosvm, so this is a no-op.
+        Ok(())
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq, Eq,
+)]
+#[repr(C, packed)]
+pub struct Read12 {
+    opcode: u8,
+    _rdprotect: u8,
+    lba_bytes: [u8; 4],
+    xfer_len_bytes: [u8; 4],
+    _group_number: u8,
+    control: u8,
+}
+
+impl Read12 {
+    fn xfer_len(&self) -> usize {
+        u32::from_be_bytes(self.xfer_len_bytes) as usize
+    }
+
+    fn lba(&self) -> u64 {
+        u32::from_be_bytes(self.lba_bytes) as u64
+    }
+
+    async fn emulate(
+        &self,
+        writer: &mut Writer,
+        dev: &AsyncLogicalUnit,
+    ) -> Result<(), ExecuteError> {
+        let xfer_len = self.xfer_len();
+        let lba = self.lba();
+        let _trace = cros_tracing::trace_event!(VirtioScsi, "READ(12)", lba, xfer_len);
+        read_from_disk(writer, dev, xfer_len, lba).await
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq, Eq,
+)]
+#[repr(C, packed)]
+pub struct ReadToc {
+    opcode: u8,
+    msf: u8,
+    format: u8,
+    _reserved: [u8; 3],
+    start_track: u8,
+    alloc_len_bytes: [u8; 2],
+    control: u8,
+}
+
+impl ReadToc {
+    fn alloc_len(&self) -> usize {
+        u16::from_be_bytes(self.alloc_len_bytes) as usize
+    }
+
+    fn msf(&self) -> bool {
+        self.msf & 0x2 != 0
+    }
+
+    fn format(&self) -> u8 {
+        self.format & 0xf
+    }
+
+    fn write_address(dst: &mut [u8], address: u64, msf: bool) {
+        if msf {
+            // The address is minutes:seconds:frames, preceded by a reserved byte.
+            let frames = address + 150;
+            dst[0] = 0;
+            dst[1] = (frames / (75 * 60)) as u8;
+            dst[2] = ((frames / 75) % 60) as u8;
+            dst[3] = (frames % 75) as u8;
+        } else {
+            dst.copy_from_slice(&(address as u32).to_be_bytes());
+        }
+    }
+
+    fn build_toc(
+        dev: &AsyncLogicalUnit,
+        msf: bool,
+        start_track: u8,
+        outbuf: &mut [u8],
+    ) -> Result<usize, ExecuteError> {
+        if start_track > 1 && start_track != 0xaa {
+            return Err(ExecuteError::InvalidField);
+        }
+        // outbuf[0..2]: TOC data length, filled at the end.
+        // outbuf[2]: first track. outbuf[3]: last track.
+        outbuf[2] = 1;
+        outbuf[3] = 1;
+        let mut idx = 4;
+        // The image contains a single data track starting at LBA 0.
+        if start_track <= 1 {
+            outbuf[idx] = 0; // reserved
+            outbuf[idx + 1] = 0x14; // ADR = 1, CONTROL = data track
+            outbuf[idx + 2] = 1; // track number
+            outbuf[idx + 3] = 0; // reserved
+            Self::write_address(&mut outbuf[idx + 4..idx + 8], 0, msf);
+            idx += 8;
+        }
+        // Lead-out entry.
+        outbuf[idx] = 0;
+        outbuf[idx + 1] = 0x14;
+        outbuf[idx + 2] = 0xaa;
+        outbuf[idx + 3] = 0;
+        Self::write_address(&mut outbuf[idx + 4..idx + 8], dev.max_lba, msf);
+        idx += 8;
+        outbuf[0..2].copy_from_slice(&((idx - 2) as u16).to_be_bytes());
+        Ok(idx)
+    }
+
+    fn emulate(&self, writer: &mut Writer, dev: &AsyncLogicalUnit) -> Result<(), ExecuteError> {
+        let _trace = cros_tracing::trace_event!(VirtioScsi, "READ_TOC");
+        let mut outbuf = [0u8; 4096];
+        let len = match self.format() {
+            0 => Self::build_toc(dev, self.msf(), self.start_track, &mut outbuf)?,
+            1 => {
+                // Multi-session information: a single session starting at track 1.
+                outbuf[1] = 0x0a;
+                outbuf[2] = 0x01;
+                outbuf[3] = 0x01;
+                12
+            }
+            _ => return Err(ExecuteError::InvalidField),
+        };
+        writer
+            .write_all(&outbuf[..cmp::min(self.alloc_len(), len)])
+            .map_err(ExecuteError::Write)
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq, Eq,
+)]
+#[repr(C, packed)]
+pub struct GetConfiguration {
+    opcode: u8,
+    _reserved: u8,
+    _starting_feature_bytes: [u8; 2],
+    _reserved2: [u8; 3],
+    alloc_len_bytes: [u8; 2],
+    control: u8,
+}
+
+impl GetConfiguration {
+    fn emulate(&self, writer: &mut Writer, dev: &AsyncLogicalUnit) -> Result<(), ExecuteError> {
+        let _trace = cros_tracing::trace_event!(VirtioScsi, "GET_CONFIGURATION");
+        if dev.device_type != ScsiDeviceType::Cdrom {
+            return Err(ExecuteError::InvalidField);
+        }
+        const MMC_PROFILE_CD_ROM: u16 = 0x0008;
+        const MMC_PROFILE_DVD_ROM: u16 = 0x0010;
+        let total_bytes = dev.max_lba.saturating_mul(dev.block_size as u64);
+        // Report a disc larger than an 80-minute CD as DVD-ROM, like QEMU does.
+        let current_profile = if total_bytes > 405_000 * 2048 {
+            MMC_PROFILE_DVD_ROM
+        } else {
+            MMC_PROFILE_CD_ROM
+        };
+        let mut outbuf = [0u8; 40];
+        outbuf[0..4].copy_from_slice(&36u32.to_be_bytes());
+        outbuf[6..8].copy_from_slice(&current_profile.to_be_bytes());
+        // Feature 0x0000: profile list.
+        outbuf[10] = 0x03; // persistent, current
+        outbuf[11] = 8; // two profiles
+        outbuf[12..14].copy_from_slice(&MMC_PROFILE_DVD_ROM.to_be_bytes());
+        outbuf[14] = (current_profile == MMC_PROFILE_DVD_ROM) as u8;
+        outbuf[16..18].copy_from_slice(&MMC_PROFILE_CD_ROM.to_be_bytes());
+        outbuf[18] = (current_profile == MMC_PROFILE_CD_ROM) as u8;
+        // Feature 0x0001: core.
+        outbuf[20..22].copy_from_slice(&1u16.to_be_bytes());
+        outbuf[22] = 0x0b; // version 2, persistent, current
+        outbuf[23] = 8;
+        outbuf[24..28].copy_from_slice(&1u32.to_be_bytes()); // SCSI interface
+        outbuf[28] = 1; // DBE = 1, mandatory
+        // Feature 0x0003: removable medium.
+        outbuf[32..34].copy_from_slice(&3u16.to_be_bytes());
+        outbuf[34] = 0x0b;
+        outbuf[35] = 4;
+        outbuf[36] = 0x39; // tray, load/eject, lockable
+        let alloc_len = u16::from_be_bytes(self.alloc_len_bytes) as usize;
+        writer
+            .write_all(&outbuf[..cmp::min(alloc_len, outbuf.len())])
+            .map_err(ExecuteError::Write)
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq, Eq,
+)]
+#[repr(C, packed)]
+pub struct GetEventStatusNotification {
+    opcode: u8,
+    polled: u8,
+    _reserved: [u8; 2],
+    notification_class: u8,
+    _reserved2: [u8; 2],
+    alloc_len_bytes: [u8; 2],
+    control: u8,
+}
+
+impl GetEventStatusNotification {
+    fn emulate(&self, writer: &mut Writer, dev: &AsyncLogicalUnit) -> Result<(), ExecuteError> {
+        let _trace = cros_tracing::trace_event!(VirtioScsi, "GET_EVENT_STATUS_NOTIFICATION");
+        const GESN_MEDIA: u8 = 4;
+        const MS_MEDIA_PRESENT: u8 = 2;
+        // Only polled notifications are supported, like QEMU.
+        if dev.device_type != ScsiDeviceType::Cdrom || self.polled & 0x1 == 0 {
+            return Err(ExecuteError::InvalidField);
+        }
+        let mut outbuf = [0u8; 8];
+        // Supported events.
+        outbuf[3] = 1 << GESN_MEDIA;
+        let len = if self.notification_class & (1 << GESN_MEDIA) != 0 {
+            outbuf[2] = GESN_MEDIA;
+            // Media event descriptor: no change, media present.
+            outbuf[4] = 0;
+            outbuf[5] = MS_MEDIA_PRESENT;
+            8
+        } else {
+            // No events supported.
+            outbuf[2] = 0x80;
+            4
+        };
+        outbuf[0..2].copy_from_slice(&((len - 4) as u16).to_be_bytes());
+        let alloc_len = u16::from_be_bytes(self.alloc_len_bytes) as usize;
+        writer
+            .write_all(&outbuf[..cmp::min(alloc_len, len)])
+            .map_err(ExecuteError::Write)
+    }
+}
+
+#[derive(
+    Copy, Clone, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq, Eq,
+)]
+#[repr(C, packed)]
+pub struct ModeSense10 {
+    opcode: u8,
+    dbd_field: u8,
+    page_control_and_page_code: u8,
+    subpage_code: u8,
+    _reserved: [u8; 3],
+    alloc_len_bytes: [u8; 2],
+    control: u8,
+}
+
+impl ModeSense10 {
+    fn disable_block_desc(&self) -> bool {
+        self.dbd_field & 0x8 != 0
+    }
+
+    fn emulate(&self, writer: &mut Writer, dev: &AsyncLogicalUnit) -> Result<(), ExecuteError> {
+        let _trace = cros_tracing::trace_event!(VirtioScsi, "MODE_SENSE(10)");
+        let alloc_len = u16::from_be_bytes(self.alloc_len_bytes) as usize;
+        let mut outbuf = vec![0u8; cmp::max(4096, alloc_len)];
+        // outbuf[0..2]: data length, filled at the end.
+        // outbuf[2]: medium type should be 0.
+        // outbuf[3]: device specific parameter.
+        outbuf[3] = if dev.read_only { 0x80 } else { 0x00 };
+        let mut idx = if !self.disable_block_desc() && dev.max_lba > 0 {
+            // Block descriptor length.
+            outbuf[6..8].copy_from_slice(&8u16.to_be_bytes());
+            let sectors = dev.max_lba;
+            if sectors <= 0xffffff {
+                outbuf[9..12].copy_from_slice(&(sectors as u32).to_be_bytes()[1..]);
+            }
+            outbuf[13..16].copy_from_slice(&dev.block_size.to_be_bytes()[1..]);
+            16
+        } else {
+            8
+        };
+        let page_control = match self.page_control_and_page_code >> 6 {
+            0 => PageControl::Current,
+            1 => PageControl::Changable,
+            2 => PageControl::Default,
+            _ => return Err(ExecuteError::SavingParamNotSupported),
+        };
+        let page_code = self.page_control_and_page_code & 0x3f;
+        let subpage_code = self.subpage_code;
+        // The page dispatch mirrors MODE SENSE(6); only the header differs.
+        match (page_code, subpage_code) {
+            (0x3f, 0x00) => {
+                ModeSense6::add_all_page_codes(subpage_code, page_control, &mut outbuf, &mut idx)
+            }
+            (0x3f, 0xff) => {
+                for subpage_code in 0..0xff {
+                    ModeSense6::add_all_page_codes(
+                        subpage_code,
+                        page_control,
+                        &mut outbuf,
+                        &mut idx,
+                    )
+                }
+            }
+            (0x3f, _) => return Err(ExecuteError::InvalidField),
+            (_, 0xff) => {
+                for subpage_code in 0..0xff {
+                    match fill_mode_page(
+                        page_code,
+                        subpage_code,
+                        page_control,
+                        &mut outbuf[idx as usize..],
+                    ) {
+                        Some(n) => idx += n,
+                        None => return Err(ExecuteError::InvalidField),
+                    };
+                }
+            }
+            (_, _) => match fill_mode_page(
+                page_code,
+                subpage_code,
+                page_control,
+                &mut outbuf[idx as usize..],
+            ) {
+                Some(n) => idx += n,
+                None => return Err(ExecuteError::InvalidField),
+            },
+        };
+        outbuf[0..2].copy_from_slice(&((idx as u16) - 2).to_be_bytes());
+        writer
+            .write_all(&outbuf[..cmp::min(alloc_len, outbuf.len())])
+            .map_err(ExecuteError::Write)
     }
 }
 
