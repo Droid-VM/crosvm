@@ -623,11 +623,23 @@ pub enum InputDeviceOption {
     Switches {
         path: PathBuf,
     },
+    // Without `contacts`, a one-finger trackpad with left and right buttons. With it, a trackpad
+    // as evdev describes a touchpad: INPUT_PROP_POINTER, one MT slot per finger (at most five),
+    // BTN_TOOL_FINGER.. for how many are down, no buttons -- a click is the guest's tap, the
+    // surface being a phone's screen that cannot be pressed -- ABS_MT_TOOL_TYPE for a palm and
+    // MSC_TIMESTAMP per frame. `res` is units per millimetre on both position axes (0 or omitted:
+    // unknown, which libinput answers by assuming a 69x50 mm pad). `touch-size` adds
+    // ABS_MT_TOUCH_MAJOR/MINOR (0..255, a fraction of the host panel's most): only for a host
+    // whose panel reports contact size, so a guest never mistakes "not measured" for zero.
+    #[serde(rename_all = "kebab-case")]
     Trackpad {
         path: PathBuf,
         width: Option<u32>,
         height: Option<u32>,
         name: Option<String>,
+        contacts: Option<u32>,
+        res: Option<u32>,
+        touch_size: Option<bool>,
     },
     MultiTouchTrackpad {
         path: PathBuf,
@@ -3144,7 +3156,10 @@ mod tests {
                 path: PathBuf::from("/dev/single-touch-test"),
                 width: None,
                 height: None,
-                name: None
+                name: None,
+                contacts: None,
+                res: None,
+                touch_size: None
             }
         );
     }
@@ -3227,8 +3242,38 @@ mod tests {
                 path: PathBuf::from("/dev/single-touch-test"),
                 width: Some(5678),
                 height: Some(9876),
-                name: None
+                name: None,
+                contacts: None,
+                res: None,
+                touch_size: None
             }
+        );
+    }
+
+    #[test]
+    fn multi_finger_trackpad_options() {
+        let config: Config = crate::crosvm::cmdline::RunCommand::from_args(
+            &[],
+            &[
+                "--input",
+                "trackpad[path=/dev/tp,width=5480,height=5480,res=20,contacts=5,touch-size=true]",
+                "/dev/null",
+            ],
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            config.virtio_input,
+            vec![InputDeviceOption::Trackpad {
+                path: PathBuf::from("/dev/tp"),
+                width: Some(5480),
+                height: Some(5480),
+                name: None,
+                contacts: Some(5),
+                res: Some(20),
+                touch_size: Some(true)
+            }]
         );
     }
 

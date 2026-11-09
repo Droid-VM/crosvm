@@ -845,6 +845,42 @@ pub fn create_trackpad_device<T: IntoUnixStream>(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn create_multi_finger_trackpad_device<T: IntoUnixStream>(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    trackpad_socket: T,
+    width: u32,
+    height: u32,
+    res: u32,
+    contacts: u32,
+    touch_size: bool,
+    name: Option<&str>,
+    idx: u32,
+) -> DeviceResult {
+    let socket = trackpad_socket
+        .into_unix_stream()
+        .context("failed configuring virtio trackpad")?;
+
+    let dev = virtio::input::new_multi_finger_trackpad(
+        idx,
+        socket,
+        width,
+        height,
+        res,
+        contacts,
+        touch_size,
+        name,
+        virtio::base_features(protection_type),
+    )
+    .context("failed to set up input device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
 pub fn create_stylus_device<T: IntoUnixStream>(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,

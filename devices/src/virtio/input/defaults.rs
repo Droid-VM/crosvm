@@ -52,6 +52,108 @@ pub fn new_multitouch_trackpad_config(
     )
 }
 
+/// The most fingers a multi-finger trackpad reports: evdev counts them up to BTN_TOOL_QUINTTAP, and
+/// a Windows Precision Touchpad reports at most five as well.
+pub const TRACKPAD_MAX_CONTACTS: u32 = 5;
+/// The top of a multi-finger trackpad's contact size axes. A fraction of the most the host's panel
+/// reports rather than a length: phone panels report contact size in units of their own, which
+/// Android does not calibrate, so there is no millimetre to give.
+pub const TRACKPAD_TOUCH_SIZE_MAX: u32 = 255;
+
+/// Instantiates a VirtioInputConfig object for a multi-finger trackpad, as evdev describes a
+/// touchpad (Linux's hid-multitouch and libinput's): INPUT_PROP_POINTER and no buttons, so a click
+/// is the guest's (a tap) -- the surface it stands for is a phone's screen, which cannot be pressed.
+/// One MT slot per finger, BTN_TOUCH and BTN_TOOL_FINGER.. for the number of fingers down,
+/// ABS_MT_POSITION_X/Y and ABS_X/Y at `res` units per millimetre, ABS_MT_TOOL_TYPE to mark a palm,
+/// ABS_MT_TOUCH_MAJOR/MINOR only when `touch_size` says the host has them, and MSC_TIMESTAMP for
+/// when the host sampled each frame (they arrive batched).
+pub fn new_multi_finger_trackpad_config(
+    idx: u32,
+    width: u32,
+    height: u32,
+    res: u32,
+    contacts: u32,
+    touch_size: bool,
+    name: Option<&str>,
+) -> VirtioInputConfig {
+    let contacts = contacts.clamp(1, TRACKPAD_MAX_CONTACTS);
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Trackpad {idx}"));
+    VirtioInputConfig::new(
+        virtio_input_device_ids::new(0, 0, 0, 0),
+        name,
+        format!("virtio-trackpad-{idx}"),
+        virtio_input_bitmap::from_bits(&[INPUT_PROP_POINTER]),
+        multi_finger_trackpad_events(contacts, touch_size),
+        multi_finger_trackpad_absinfo(width, height, res, contacts, touch_size),
+    )
+}
+
+fn multi_finger_trackpad_events(
+    contacts: u32,
+    touch_size: bool,
+) -> BTreeMap<u16, virtio_input_bitmap> {
+    let tools = [
+        BTN_TOOL_FINGER,
+        BTN_TOOL_DOUBLETAP,
+        BTN_TOOL_TRIPLETAP,
+        BTN_TOOL_QUADTAP,
+        BTN_TOOL_QUINTTAP,
+    ];
+    let mut keys = vec![BTN_TOUCH];
+    keys.extend_from_slice(&tools[..contacts as usize]);
+    let mut axes = vec![
+        ABS_X,
+        ABS_Y,
+        ABS_MT_SLOT,
+        ABS_MT_TRACKING_ID,
+        ABS_MT_POSITION_X,
+        ABS_MT_POSITION_Y,
+        ABS_MT_TOOL_TYPE,
+    ];
+    if touch_size {
+        axes.extend_from_slice(&[ABS_MT_TOUCH_MAJOR, ABS_MT_TOUCH_MINOR]);
+    }
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(EV_KEY, virtio_input_bitmap::from_bits(&keys));
+    supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&axes));
+    supported_events.insert(EV_MSC, virtio_input_bitmap::from_bits(&[MSC_TIMESTAMP]));
+    supported_events
+}
+
+fn multi_finger_trackpad_absinfo(
+    width: u32,
+    height: u32,
+    res: u32,
+    contacts: u32,
+    touch_size: bool,
+) -> BTreeMap<u16, virtio_input_absinfo> {
+    let x = virtio_input_absinfo::new(0, width, 0, 0).with_res(res);
+    let y = virtio_input_absinfo::new(0, height, 0, 0).with_res(res);
+    let mut absinfo: BTreeMap<u16, virtio_input_absinfo> = BTreeMap::new();
+    absinfo.insert(ABS_X, x);
+    absinfo.insert(ABS_Y, y);
+    absinfo.insert(
+        ABS_MT_SLOT,
+        virtio_input_absinfo::new(0, contacts - 1, 0, 0),
+    );
+    absinfo.insert(
+        ABS_MT_TRACKING_ID,
+        virtio_input_absinfo::new(0, 65535, 0, 0),
+    );
+    absinfo.insert(ABS_MT_POSITION_X, x);
+    absinfo.insert(ABS_MT_POSITION_Y, y);
+    // MT_TOOL_FINGER (0) up to MT_TOOL_PALM (2).
+    absinfo.insert(ABS_MT_TOOL_TYPE, virtio_input_absinfo::new(0, 2, 0, 0));
+    if touch_size {
+        let size = virtio_input_absinfo::new(0, TRACKPAD_TOUCH_SIZE_MAX, 0, 0);
+        absinfo.insert(ABS_MT_TOUCH_MAJOR, size);
+        absinfo.insert(ABS_MT_TOUCH_MINOR, size);
+    }
+    absinfo
+}
+
 /// Instantiates a VirtioInputConfig object with the default configuration for a mouse.
 /// It supports left, right and middle buttons, as wel as X, Y and wheel relative axes.
 pub fn new_mouse_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {

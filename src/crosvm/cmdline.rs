@@ -1640,7 +1640,7 @@ pub struct RunCommand {
     ///     single-touch[path=PATH,width=W,height=H,name=N]
     ///     stylus[path=PATH,width=W,height=H,name=N]
     ///     switches[path=PATH]
-    ///     trackpad[path=PATH,width=W,height=H,name=N]
+    ///     trackpad[path=PATH,width=W,height=H,name=N,contacts=C,res=R,touch-size=BOOL]
     ///     multi-touch-trackpad[path=PATH,width=W,height=H,name=N]
     /// See <https://crosvm.dev/book/devices/input.html> for more
     /// information.
@@ -3619,6 +3619,9 @@ impl TryFrom<RunCommand> for super::config::Config {
                             width: trackpad.width,
                             height: trackpad.height,
                             name: trackpad.name,
+                            contacts: None,
+                            res: None,
+                            touch_size: None,
                         }),
                 );
         }

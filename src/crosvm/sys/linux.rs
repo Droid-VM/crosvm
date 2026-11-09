@@ -982,6 +982,31 @@ fn create_virtio_devices(
                 width,
                 height,
                 name,
+                contacts: Some(contacts),
+                res,
+                touch_size,
+            } => {
+                let dev = create_multi_finger_trackpad_device(
+                    cfg.protection_type,
+                    cfg.jail_config.as_ref(),
+                    path.as_path(),
+                    width.unwrap_or(DEFAULT_TOUCH_DEVICE_WIDTH),
+                    height.unwrap_or(DEFAULT_TOUCH_DEVICE_HEIGHT),
+                    res.unwrap_or(0),
+                    *contacts,
+                    touch_size.unwrap_or(false),
+                    name.as_deref(),
+                    trackpad_idx,
+                )?;
+                trackpad_idx += 1;
+                dev
+            }
+            InputDeviceOption::Trackpad {
+                path,
+                width,
+                height,
+                name,
+                ..
             } => {
                 let dev = create_trackpad_device(
                     cfg.protection_type,

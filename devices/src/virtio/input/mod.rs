@@ -794,6 +794,33 @@ where
     })
 }
 
+/// Creates a new virtio multi-finger trackpad: one MT slot per finger, no buttons (the guest's taps
+/// click), positions in `res` units per millimetre, contact size when `touch_size`.
+#[allow(clippy::too_many_arguments)]
+pub fn new_multi_finger_trackpad<T>(
+    idx: u32,
+    source: T,
+    width: u32,
+    height: u32,
+    res: u32,
+    contacts: u32,
+    touch_size: bool,
+    name: Option<&str>,
+    virtio_features: u64,
+) -> Result<Input<SocketEventSource<T>>>
+where
+    T: Read + Write + AsRawDescriptor + Send + 'static,
+{
+    Ok(Input {
+        worker_thread: None,
+        config: defaults::new_multi_finger_trackpad_config(
+            idx, width, height, res, contacts, touch_size, name,
+        ),
+        source: Some(SocketEventSource::new(source)),
+        virtio_features,
+    })
+}
+
 /// Creates a new virtio trackpad device which supports multi touch, primary and secondary
 /// buttons as well as X and Y axis.
 pub fn new_multitouch_trackpad<T>(
