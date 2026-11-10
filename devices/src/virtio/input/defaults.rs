@@ -228,6 +228,38 @@ pub fn new_switches_config(idx: u32) -> VirtioInputConfig {
     )
 }
 
+/// FF_RUMBLE from <linux/input.h>: the one effect a vibrator offers.
+pub const FF_RUMBLE: u16 = 0x50;
+/// The vibrator's ids (BUS_VIRTUAL and DroidVM's), by which a guest driver finds it: Linux's
+/// virtio-input gives a device no force feedback of its own, so a guest that offers rumble on the
+/// vibrator's behalf has nothing but the ids to know it by.
+pub const VIBRATOR_BUSTYPE: u16 = 0x06;
+pub const VIBRATOR_VENDOR: u16 = 0x4456;
+pub const VIBRATOR_PRODUCT: u16 = 0x0001;
+
+/// Instantiates a VirtioInputConfig object with the default configuration for a vibrator: a device
+/// that only listens, declaring EV_FF with FF_RUMBLE. The guest drives it through the status queue,
+/// one event per change: EV_FF, code FF_RUMBLE, value the strong magnitude in the high 16 bits and
+/// the weak in the low (0..0xffff each, as an ff_rumble_effect has them; both 0 stops). The guest
+/// times its effects itself (Linux's memless force feedback does), so the host only follows the
+/// magnitude it is told. Everything the guest sends goes to the device's socket.
+pub fn new_vibrator_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
+    let name = name
+        .map(str::to_owned)
+        .unwrap_or(format!("Crosvm Virtio Vibrator {idx}"));
+    let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
+    supported_events.insert(EV_FF, virtio_input_bitmap::from_bits(&[FF_RUMBLE]));
+    VirtioInputConfig::new(
+        // new() takes the product before the vendor.
+        virtio_input_device_ids::new(VIBRATOR_BUSTYPE, VIBRATOR_PRODUCT, VIBRATOR_VENDOR, 1),
+        name,
+        format!("virtio-vibrator-{idx}"),
+        virtio_input_bitmap::new([0u8; 128]),
+        supported_events,
+        BTreeMap::new(),
+    )
+}
+
 /// Instantiates a VirtioInputConfig object with the default configuration for a collection of
 /// rotary.
 pub fn new_rotary_config(idx: u32) -> VirtioInputConfig {

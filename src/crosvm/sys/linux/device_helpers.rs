@@ -1003,6 +1003,27 @@ pub fn create_switches_device<T: IntoUnixStream>(
     })
 }
 
+pub fn create_vibrator_device<T: IntoUnixStream>(
+    protection_type: ProtectionType,
+    jail_config: Option<&JailConfig>,
+    vibrator_socket: T,
+    name: Option<&str>,
+    idx: u32,
+) -> DeviceResult {
+    let socket = vibrator_socket
+        .into_unix_stream()
+        .context("failed configuring virtio vibrator")?;
+
+    let dev =
+        virtio::input::new_vibrator(idx, socket, virtio::base_features(protection_type), name)
+            .context("failed to set up input device")?;
+
+    Ok(VirtioDeviceStub {
+        dev: Box::new(dev),
+        jail: simple_jail(jail_config, "input_device")?,
+    })
+}
+
 pub fn create_rotary_device<T: IntoUnixStream>(
     protection_type: ProtectionType,
     jail_config: Option<&JailConfig>,

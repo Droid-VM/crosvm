@@ -1641,6 +1641,7 @@ pub struct RunCommand {
     ///     stylus[path=PATH,width=W,height=H,name=N]
     ///     switches[path=PATH]
     ///     trackpad[path=PATH,width=W,height=H,name=N,contacts=C,res=R,touch-size=BOOL]
+    ///     vibrator[path=PATH,name=N]
     ///     multi-touch-trackpad[path=PATH,width=W,height=H,name=N]
     /// See <https://crosvm.dev/book/devices/input.html> for more
     /// information.

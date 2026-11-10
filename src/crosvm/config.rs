@@ -623,6 +623,12 @@ pub enum InputDeviceOption {
     Switches {
         path: PathBuf,
     },
+    // A vibrator (EV_FF, FF_RUMBLE): it only listens, and what the guest sends it, the rumble
+    // magnitude as each effect starts and stops (defaults::new_vibrator_config), goes to `path`.
+    Vibrator {
+        path: PathBuf,
+        name: Option<String>,
+    },
     // Without `contacts`, a one-finger trackpad with left and right buttons. With it, a trackpad
     // as evdev describes a touchpad: INPUT_PROP_POINTER, one MT slot per finger (at most five),
     // BTN_TOOL_FINGER.. for how many are down, no buttons -- a click is the guest's tap, the
