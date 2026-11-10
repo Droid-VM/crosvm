@@ -1512,7 +1512,9 @@ impl arch::LinuxArch for AArch64 {
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
 
         // virtio-mmio devices: a page each from AARCH64_VIRTIO_MMIO_BASE, a level SPI each (the
-        // virtio-pci INTx shape), and their queue-notify ioevents registered with the hypervisor.
+        // virtio-pci INTx shape) or, with --virtio-mmio-edge-irq, an edge SPI (Gunyah loses level
+        // irqfd interrupts to WFI vCPUs), and their queue-notify ioevents registered with the
+        // hypervisor.
         // They live in this process; a jail would need a proxy that only PCI devices get here.
         if virtio_mmio_devices.len() > AARCH64_VIRTIO_MMIO_MAX {
             return Err(Error::VirtioMmioTooMany(virtio_mmio_devices.len()));
@@ -1529,22 +1531,31 @@ impl arch::LinuxArch for AArch64 {
                 vm.register_ioevent(event, IoEventAddress::Mmio(addr), datamatch)
                     .map_err(Error::RegisterIoevent)?;
             }
-            irq_chip
-                .register_level_irq_event(
-                    irq,
-                    &irq_evt,
-                    IrqEventSource {
-                        device_id: dev.device_id(),
-                        queue_id: 0,
-                        device_name: dev.debug_label(),
-                    },
-                )
-                .map_err(Error::RegisterIrqfd)?;
+            let source = IrqEventSource {
+                device_id: dev.device_id(),
+                queue_id: 0,
+                device_name: dev.debug_label(),
+            };
+            let edge = dev.edge_irq();
+            if edge {
+                // The device writes the level event's trigger; nothing waits on its resample.
+                let edge_evt = devices::IrqEdgeEvent::from_event(
+                    irq_evt.get_trigger().try_clone().map_err(Error::CloneEvent)?,
+                );
+                irq_chip
+                    .register_edge_irq_event(irq, &edge_evt, source)
+                    .map_err(Error::RegisterIrqfd)?;
+            } else {
+                irq_chip
+                    .register_level_irq_event(irq, &irq_evt, source)
+                    .map_err(Error::RegisterIrqfd)?;
+            }
             base::info!(
-                "virtio-mmio: {} at {:#x} irq {}",
+                "virtio-mmio: {} at {:#x} irq {} {}",
                 dev.debug_label(),
                 base,
-                irq
+                irq,
+                if edge { "edge" } else { "level" }
             );
             // These devices stay in the VMM after PCI/platform sandbox setup. Forward the
             // same lifecycle callback as the other buses: GPU starts its renderer worker here.
@@ -1556,7 +1567,7 @@ impl arch::LinuxArch for AArch64 {
                     devices::virtio::VIRTIO_MMIO_REGION_SZ,
                 )
                 .map_err(Error::RegisterVirtioMmio)?;
-            virtio_mmio_fdt.push((base, devices::virtio::VIRTIO_MMIO_REGION_SZ, irq));
+            virtio_mmio_fdt.push((base, devices::virtio::VIRTIO_MMIO_REGION_SZ, irq, edge));
         }
 
         let (vmwdt_host_tube, vmwdt_control_tube) = Tube::pair().map_err(Error::CreateTube)?;

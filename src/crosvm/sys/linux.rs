@@ -1656,8 +1656,9 @@ fn create_devices(
                 disk.path.display()
             );
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1665,8 +1666,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio input runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio input device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1676,8 +1678,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio net runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio net device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1688,8 +1691,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio GPU runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio GPU device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1699,8 +1703,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio sound runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio sound device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1711,8 +1716,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio media runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio media device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 

@@ -192,6 +192,29 @@ impl Interrupt {
         }
     }
 
+    /// An `Interrupt` for an edge line (`--virtio-mmio-edge-irq`): every signal writes the
+    /// trigger, since an edge the device does not send while the status is still set is not
+    /// re-asserted by a resample, and the guest may have read the status before this update.
+    pub fn new_edge(irq_evt_lvl: IrqLevelEvent) -> Interrupt {
+        Interrupt {
+            inner: Arc::new(InterruptInner {
+                interrupt_status: AtomicUsize::new(0),
+                async_intr_status: true,
+                transport: Transport::Pci {
+                    pci: TransportPci {
+                        irq_evt_lvl,
+                        msix_config: None,
+                        config_msix_vector: VIRTIO_MSI_NO_VECTOR,
+                    },
+                },
+                pm_state: PmState::new(
+                    #[cfg(target_arch = "x86_64")]
+                    None,
+                ),
+            }),
+        }
+    }
+
     /// Create a new `Interrupt`, restoring internal state to match `snapshot`.
     ///
     /// The other arguments are assumed to be snapshot'd and restore'd elsewhere.

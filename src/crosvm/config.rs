@@ -1508,6 +1508,8 @@ pub struct Config {
     pub virtio_media: Vec<MediaDeviceConfig>,
     /// Block devices on the virtio-mmio transport (`--virtio-mmio-block`).
     pub virtio_mmio_disks: Vec<DiskOption>,
+    /// The virtio-mmio devices interrupt on edge SPIs, not level SPIs (`--virtio-mmio-edge-irq`).
+    pub virtio_mmio_edge_irq: bool,
     /// The GPU goes on virtio-mmio, after net, without a PCI shared-memory aperture.
     pub virtio_mmio_gpu: bool,
     /// The virtio input devices go on the virtio-mmio transport (`--virtio-mmio-input`).
@@ -1769,6 +1771,7 @@ impl Default for Config {
             virt_cpufreq_v2: false,
             virtio_input: Vec::new(),
             virtio_mmio_disks: Vec::new(),
+            virtio_mmio_edge_irq: false,
             virtio_mmio_gpu: false,
             virtio_mmio_input: false,
             virtio_mmio_media: false,

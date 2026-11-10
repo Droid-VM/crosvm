@@ -2911,6 +2911,14 @@ pub struct RunCommand {
     #[argh(switch)]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
+    /// signal the virtio-mmio devices on edge SPIs instead of level SPIs (aarch64 only): every
+    /// interrupt is a new edge and nothing is resampled. Gunyah loses level irqfd interrupts to a
+    /// vCPU in WFI; the guest must take the edge type from the device tree.
+    virtio_mmio_edge_irq: Option<bool>,
+
+    #[argh(switch)]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
     /// put the --gpu device on virtio-mmio instead of virtio-pci (aarch64 only), after the
     /// virtio-mmio net devices. Blob mappings require a pre-shared pool; MMIO has no SHM aperture.
     virtio_mmio_gpu: Option<bool>,
@@ -3407,6 +3415,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             .collect();
         cfg.virtio_mmio_input = cmd.virtio_mmio_input.unwrap_or_default();
         cfg.virtio_mmio_net = cmd.virtio_mmio_net.unwrap_or_default();
+        cfg.virtio_mmio_edge_irq = cmd.virtio_mmio_edge_irq.unwrap_or_default();
         cfg.virtio_mmio_gpu = cmd.virtio_mmio_gpu.unwrap_or_default();
         cfg.virtio_mmio_snd = cmd.virtio_mmio_snd.unwrap_or_default();
         cfg.virtio_mmio_media = cmd.virtio_mmio_media.unwrap_or_default();
