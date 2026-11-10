@@ -925,13 +925,14 @@ pub fn new_motion<T>(
     source: T,
     virtio_features: u64,
     name: Option<&str>,
+    magnetometer: bool,
 ) -> Result<Input<SocketEventSource<T>>>
 where
     T: Read + Write + AsRawDescriptor + Send + 'static,
 {
     Ok(Input {
         worker_thread: None,
-        config: defaults::new_motion_config(idx, name),
+        config: defaults::new_motion_config(idx, name, magnetometer),
         source: Some(SocketEventSource::new(source)),
         virtio_features,
     })

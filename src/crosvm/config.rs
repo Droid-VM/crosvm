@@ -671,11 +671,14 @@ pub enum InputDeviceOption {
     // device's natural frame, so the guest has them whether or not anything is showing it. Frames
     // written to `path` override them while they keep coming, for a presenter that turns the
     // guest's picture or wants the guest to see other values. Either source may be left out.
+    // `magnetometer` adds the magnetic field and the heading (defaults::MOTION_MAGN_FIRST_AXIS).
     #[serde(rename_all = "kebab-case")]
     Motion {
         path: Option<PathBuf>,
         #[serde(default)]
         host_sensors: bool,
+        #[serde(default)]
+        magnetometer: bool,
         name: Option<String>,
     },
 }

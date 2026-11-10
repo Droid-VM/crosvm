@@ -249,6 +249,19 @@ pub const MOTION_ACCEL_MAX: i32 = 16 * MOTION_ACCEL_PER_G;
 pub const MOTION_GYRO_PER_DEG_S: i32 = 16;
 pub const MOTION_GYRO_MAX: i32 = 32767;
 
+/// The magnetometer's axes on a motion-sensor device that has one: the magnetic field on the
+/// first three hat axes (ABS_HAT0X, ABS_HAT0Y, ABS_HAT1X: evdev has no codes for a magnetic field,
+/// and a hat is something no accelerometer has) in units per microtesla, and on the fourth
+/// (ABS_HAT1Y) the heading: the angle from magnetic north to the device's Y axis, clockwise seen
+/// from above, tilt-compensated with the acceleration (what Android's getOrientation calls the
+/// azimuth), in hundredths of a degree. What an HID Compass 3D sensor reports, field and heading.
+pub const MOTION_MAGN_FIRST_AXIS: u16 = ABS_HAT0X;
+pub const MOTION_HEADING_AXIS: u16 = ABS_HAT1Y;
+pub const MOTION_MAGN_PER_UT: i32 = 16;
+pub const MOTION_MAGN_MAX: i32 = 32767;
+pub const MOTION_HEADING_PER_DEG: i32 = 100;
+pub const MOTION_HEADING_MAX: i32 = 360 * MOTION_HEADING_PER_DEG - 1;
+
 /// Instantiates a VirtioInputConfig object with the default configuration for motion sensors, as
 /// evdev describes them: one device marked INPUT_PROP_ACCELEROMETER with the acceleration on
 /// ABS_X/Y/Z, the angular velocity on ABS_RX/RY/RZ and MSC_TIMESTAMP, in the frame of the device's
@@ -256,7 +269,10 @@ pub const MOTION_GYRO_MAX: i32 = 32767;
 /// read it (iio-sensor-proxy: Y negative is "normal", X positive "left-up", 1 g about 256): upright
 /// and at rest, Y reads -1 g. The angular velocity is counter-clockwise positive about each axis.
 /// The same as devices/tests/data/input/example_custom_motion_sensor_config.json.
-pub fn new_motion_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
+///
+/// With `magnetometer`, also the magnetic field and heading (MOTION_MAGN_FIRST_AXIS,
+/// MOTION_HEADING_AXIS), in the same frame.
+pub fn new_motion_config(idx: u32, name: Option<&str>, magnetometer: bool) -> VirtioInputConfig {
     let name = name
         .map(str::to_owned)
         .unwrap_or(format!("Crosvm Virtio Motion Sensors {idx}"));
@@ -265,32 +281,52 @@ pub fn new_motion_config(idx: u32, name: Option<&str>) -> VirtioInputConfig {
         name,
         format!("virtio-motion-sensors-{idx}"),
         virtio_input_bitmap::from_bits(&[INPUT_PROP_ACCELEROMETER]),
-        default_motion_events(),
-        default_motion_absinfo(),
+        default_motion_events(magnetometer),
+        default_motion_absinfo(magnetometer),
     )
 }
 
-fn default_motion_events() -> BTreeMap<u16, virtio_input_bitmap> {
+fn default_motion_events(magnetometer: bool) -> BTreeMap<u16, virtio_input_bitmap> {
     let mut supported_events: BTreeMap<u16, virtio_input_bitmap> = BTreeMap::new();
-    supported_events.insert(
-        EV_ABS,
-        virtio_input_bitmap::from_bits(&[ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ]),
-    );
+    let mut axes = vec![ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ];
+    if magnetometer {
+        axes.extend([
+            MOTION_MAGN_FIRST_AXIS,
+            MOTION_MAGN_FIRST_AXIS + 1,
+            MOTION_MAGN_FIRST_AXIS + 2,
+            MOTION_HEADING_AXIS,
+        ]);
+    }
+    supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&axes));
     supported_events.insert(EV_MSC, virtio_input_bitmap::from_bits(&[MSC_TIMESTAMP]));
     supported_events
 }
 
-fn default_motion_absinfo() -> BTreeMap<u16, virtio_input_absinfo> {
+fn default_motion_absinfo(magnetometer: bool) -> BTreeMap<u16, virtio_input_absinfo> {
     let accel = virtio_input_absinfo::new(-MOTION_ACCEL_MAX as u32, MOTION_ACCEL_MAX as u32, 0, 0)
         .with_res(MOTION_ACCEL_PER_G as u32);
-    let gyro = virtio_input_absinfo::new(-(MOTION_GYRO_MAX + 1) as u32, MOTION_GYRO_MAX as u32, 0, 0)
-        .with_res(MOTION_GYRO_PER_DEG_S as u32);
+    let gyro =
+        virtio_input_absinfo::new(-(MOTION_GYRO_MAX + 1) as u32, MOTION_GYRO_MAX as u32, 0, 0)
+            .with_res(MOTION_GYRO_PER_DEG_S as u32);
     let mut absinfo: BTreeMap<u16, virtio_input_absinfo> = BTreeMap::new();
     for axis in [ABS_X, ABS_Y, ABS_Z] {
         absinfo.insert(axis, accel);
     }
     for axis in [ABS_RX, ABS_RY, ABS_RZ] {
         absinfo.insert(axis, gyro);
+    }
+    if magnetometer {
+        let magn =
+            virtio_input_absinfo::new(-(MOTION_MAGN_MAX + 1) as u32, MOTION_MAGN_MAX as u32, 0, 0)
+                .with_res(MOTION_MAGN_PER_UT as u32);
+        for axis in MOTION_MAGN_FIRST_AXIS..MOTION_MAGN_FIRST_AXIS + 3 {
+            absinfo.insert(axis, magn);
+        }
+        absinfo.insert(
+            MOTION_HEADING_AXIS,
+            virtio_input_absinfo::new(0, MOTION_HEADING_MAX as u32, 0, 0)
+                .with_res(MOTION_HEADING_PER_DEG as u32),
+        );
     }
     absinfo
 }

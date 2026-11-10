@@ -2,8 +2,8 @@
 // Copyright DroidVM contributors
 // Additional permissions apply; see ADDITIONAL-PERMISSIONS in the repository root.
 
-//! What feeds a motion-sensor device (new_motion): the host's own accelerometer and gyroscope, and
-//! an outside writer -- the host app that shows the guest, say -- whose events override them for as
+//! What feeds a motion-sensor device (new_motion): the host's own accelerometer and gyroscope (and
+//! magnetometer, when the device has one), and an outside writer -- the host app that shows the guest, say -- whose events override them for as
 //! long as they keep coming.
 //!
 //! The host's sensors report in the host device's natural frame, which is the guest's whenever
@@ -36,6 +36,12 @@ use super::defaults::MOTION_ACCEL_MAX;
 use super::defaults::MOTION_ACCEL_PER_G;
 use super::defaults::MOTION_GYRO_MAX;
 use super::defaults::MOTION_GYRO_PER_DEG_S;
+use super::defaults::MOTION_HEADING_AXIS;
+use super::defaults::MOTION_HEADING_MAX;
+use super::defaults::MOTION_HEADING_PER_DEG;
+use super::defaults::MOTION_MAGN_FIRST_AXIS;
+use super::defaults::MOTION_MAGN_MAX;
+use super::defaults::MOTION_MAGN_PER_UT;
 
 /// How long an outside writer's last frame holds off the host's sensors.
 const OVERRIDE_HOLD: Duration = Duration::from_secs(1);
@@ -74,12 +80,14 @@ impl Output {
 }
 
 /// Feed a motion-sensor device through `device` (the other end of the socket new_motion reads):
-/// from the host's sensors when `host_sensors` is set and the host has them, and from `external`
-/// (virtio_input_event frames, each ending in SYN_REPORT), which overrides them while it writes.
+/// from the host's sensors when `host_sensors` is set and the host has them (its magnetometer too
+/// when the device has one, `magnetometer`), and from `external` (virtio_input_event frames, each
+/// ending in SYN_REPORT), which overrides them while it writes.
 pub fn spawn_motion_feeder(
     external: Option<UnixStream>,
     device: UnixStream,
     host_sensors: bool,
+    magnetometer: bool,
 ) -> anyhow::Result<()> {
     let output = Arc::new(Mutex::new(Output {
         device,
@@ -99,7 +107,7 @@ pub fn spawn_motion_feeder(
         let output = output.clone();
         thread::Builder::new()
             .name("v_motion_host".to_owned())
-            .spawn(move || host::run(&output))
+            .spawn(move || host::run(&output, magnetometer))
             .context("failed to start the host's motion sensors")?;
     }
     Ok(())
@@ -161,6 +169,55 @@ fn gyro_units(radians_per_s: f32) -> i32 {
     (units.round() as i32).clamp(-MOTION_GYRO_MAX - 1, MOTION_GYRO_MAX)
 }
 
+/// A magnetic field component in microtesla as the device's units.
+fn magn_units(microtesla: f32) -> i32 {
+    let units = microtesla * MOTION_MAGN_PER_UT as f32;
+    (units.round() as i32).clamp(-MOTION_MAGN_MAX - 1, MOTION_MAGN_MAX)
+}
+
+/// The heading of the device's Y axis from magnetic north, clockwise, in the device's units, from
+/// the acceleration as an accelerometer measures it (the reaction: lying flat, Z is +9.81) and the
+/// magnetic field, both in the device's frame. Android's SensorManager.getRotationMatrix and
+/// getOrientation: east is the field crossed with the reaction, north the reaction crossed with
+/// east, and the heading the angle of the Y axis between them. None when there is no east to find:
+/// free fall, or a field along gravity.
+fn heading_units(reaction: [f32; 3], field: [f32; 3]) -> Option<i32> {
+    let [ax, ay, az] = reaction;
+    let [ex, ey, ez] = field;
+    let (hx, hy, hz) = (ey * az - ez * ay, ez * ax - ex * az, ex * ay - ey * ax);
+    let east = (hx * hx + hy * hy + hz * hz).sqrt();
+    let down = (ax * ax + ay * ay + az * az).sqrt();
+    // Android refuses an east shorter than 0.1 (in uT times m/s^2).
+    if east < 0.1 || down == 0.0 {
+        return None;
+    }
+    let (hx, hy, hz) = (hx / east, hy / east, hz / east);
+    let (ax, az) = (ax / down, az / down);
+    let my = az * hx - ax * hz;
+    let degrees = hy.atan2(my).to_degrees().rem_euclid(360.0);
+    let units = (degrees * MOTION_HEADING_PER_DEG as f32).round() as i32;
+    Some(if units > MOTION_HEADING_MAX { 0 } else { units })
+}
+
+/// One magnetometer frame: the field and, when it can be had, the heading.
+fn magnetic_frame(
+    field: [i32; 3],
+    heading: Option<i32>,
+    timestamp_ns: i64,
+) -> Vec<virtio_input_event> {
+    let mut frame = vec![
+        virtio_input_event::absolute(MOTION_MAGN_FIRST_AXIS, field[0]),
+        virtio_input_event::absolute(MOTION_MAGN_FIRST_AXIS + 1, field[1]),
+        virtio_input_event::absolute(MOTION_MAGN_FIRST_AXIS + 2, field[2]),
+    ];
+    if let Some(heading) = heading {
+        frame.push(virtio_input_event::absolute(MOTION_HEADING_AXIS, heading));
+    }
+    frame.push(timestamp_event(timestamp_ns));
+    frame.push(virtio_input_event::syn());
+    frame
+}
+
 /// One frame of three axes (ABS_X/Y/Z or ABS_RX/RY/RZ) with its timestamp.
 fn axes_frame(first_axis: u16, values: [i32; 3], timestamp_ns: i64) -> [virtio_input_event; 5] {
     [
@@ -191,12 +248,16 @@ mod host {
     use super::accel_units;
     use super::axes_frame;
     use super::gyro_units;
+    use super::heading_units;
+    use super::magn_units;
+    use super::magnetic_frame;
     use super::Output;
     use linux_input_sys::constants::ABS_RX;
     use linux_input_sys::constants::ABS_X;
 
     // <android/sensor.h>
     const ASENSOR_TYPE_ACCELEROMETER: c_int = 1;
+    const ASENSOR_TYPE_MAGNETIC_FIELD: c_int = 2;
     const ASENSOR_TYPE_GYROSCOPE: c_int = 4;
     // <android/looper.h>
     const ALOOPER_PREPARE_ALLOW_NON_CALLBACKS: c_int = 1;
@@ -204,7 +265,8 @@ mod host {
     // 50 Hz: enough for the guest's orientation and for motion controls.
     const SAMPLING_PERIOD_US: i32 = 20_000;
 
-    // ASensorEvent from <android/sensor.h>: 104 bytes; for both sensors data[0..3] is x, y, z.
+    // ASensorEvent from <android/sensor.h>: 104 bytes; for all three sensors data[0..3] is x, y, z
+    // (the magnetic field calibrated, in microtesla).
     #[repr(C)]
     #[derive(Clone, Copy)]
     struct ASensorEvent {
@@ -292,7 +354,7 @@ mod host {
         }
     }
 
-    pub(super) fn run(output: &Mutex<Output>) {
+    pub(super) fn run(output: &Mutex<Output>, magnetometer: bool) {
         let Some(ndk) = Ndk::load() else {
             warn!("motion sensors: the NDK's sensor calls are not available; no host sensors");
             return;
@@ -318,10 +380,14 @@ mod host {
                 return;
             }
             let mut registered = 0;
-            for (kind, label) in [
+            let mut sensors = vec![
                 (ASENSOR_TYPE_ACCELEROMETER, "accelerometer"),
                 (ASENSOR_TYPE_GYROSCOPE, "gyroscope"),
-            ] {
+            ];
+            if magnetometer {
+                sensors.push((ASENSOR_TYPE_MAGNETIC_FIELD, "magnetometer"));
+            }
+            for (kind, label) in sensors {
                 let sensor = (ndk.get_default_sensor)(manager, kind);
                 if sensor.is_null() {
                     warn!("motion sensors: the host has no {}", label);
@@ -336,8 +402,17 @@ mod host {
             }
             queue
         };
-        info!("motion sensors: feeding the host's accelerometer and gyroscope");
+        info!(
+            "motion sensors: feeding the host's accelerometer and gyroscope{}",
+            if magnetometer {
+                " and magnetometer"
+            } else {
+                ""
+            }
+        );
         let mut events = [ASensorEvent::default(); 16];
+        // The latest acceleration as measured, for the magnetometer's heading.
+        let mut reaction: Option<[f32; 3]> = None;
         loop {
             // SAFETY: blocks on this thread's looper until the queue has events.
             let ident = unsafe {
@@ -348,8 +423,7 @@ mod host {
             }
             loop {
                 // SAFETY: `events` holds `events.len()` ASensorEvents for the queue to fill.
-                let count =
-                    unsafe { (ndk.get_events)(queue, events.as_mut_ptr(), events.len()) };
+                let count = unsafe { (ndk.get_events)(queue, events.as_mut_ptr(), events.len()) };
                 if count <= 0 {
                     break;
                 }
@@ -358,14 +432,24 @@ mod host {
                     let frame = match event.type_ {
                         // Android reports what the accelerometer measures, the reaction to gravity
                         // (upright, Y is +9.81); the device reports gravity itself.
-                        ASENSOR_TYPE_ACCELEROMETER => axes_frame(
-                            ABS_X,
-                            [accel_units(-x), accel_units(-y), accel_units(-z)],
-                            event.timestamp,
-                        ),
+                        ASENSOR_TYPE_ACCELEROMETER => {
+                            reaction = Some([x, y, z]);
+                            axes_frame(
+                                ABS_X,
+                                [accel_units(-x), accel_units(-y), accel_units(-z)],
+                                event.timestamp,
+                            )
+                            .to_vec()
+                        }
                         ASENSOR_TYPE_GYROSCOPE => axes_frame(
                             ABS_RX,
                             [gyro_units(x), gyro_units(y), gyro_units(z)],
+                            event.timestamp,
+                        )
+                        .to_vec(),
+                        ASENSOR_TYPE_MAGNETIC_FIELD if magnetometer => magnetic_frame(
+                            [magn_units(x), magn_units(y), magn_units(z)],
+                            reaction.and_then(|reaction| heading_units(reaction, [x, y, z])),
                             event.timestamp,
                         ),
                         _ => continue,
@@ -387,7 +471,7 @@ mod host {
 
     use super::Output;
 
-    pub(super) fn run(_output: &Mutex<Output>) {
+    pub(super) fn run(_output: &Mutex<Output>, _magnetometer: bool) {
         warn!("motion sensors: this host has no sensors crosvm can read");
     }
 }
@@ -400,7 +484,36 @@ mod tests {
     fn units() {
         assert_eq!(accel_units(9.80665), MOTION_ACCEL_PER_G);
         assert_eq!(accel_units(-1000.0), -MOTION_ACCEL_MAX);
-        assert_eq!(gyro_units(std::f32::consts::PI), 180 * MOTION_GYRO_PER_DEG_S);
+        assert_eq!(
+            gyro_units(std::f32::consts::PI),
+            180 * MOTION_GYRO_PER_DEG_S
+        );
+        assert_eq!(magn_units(1.0), MOTION_MAGN_PER_UT);
+        assert_eq!(magn_units(-1e6), -MOTION_MAGN_MAX - 1);
+    }
+
+    #[test]
+    fn heading() {
+        let flat = [0.0, 0.0, 9.81];
+        // Lying flat, the field pointing along Y (and down, as north of the equator): Y is north.
+        assert_eq!(heading_units(flat, [0.0, 20.0, -40.0]), Some(0));
+        // North along +X: Y points west.
+        assert_eq!(
+            heading_units(flat, [20.0, 0.0, -40.0]),
+            Some(270 * MOTION_HEADING_PER_DEG)
+        );
+        // North along -X: Y points east.
+        assert_eq!(
+            heading_units(flat, [-20.0, 0.0, -40.0]),
+            Some(90 * MOTION_HEADING_PER_DEG)
+        );
+        // North halfway between +Y and -X: Y points 45 degrees east of it.
+        assert_eq!(
+            heading_units(flat, [-14.142, 14.142, -40.0]),
+            Some(45 * MOTION_HEADING_PER_DEG)
+        );
+        // A field along gravity has no east.
+        assert_eq!(heading_units(flat, [0.0, 0.0, -40.0]), None);
     }
 
     #[test]

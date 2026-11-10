@@ -1071,6 +1071,7 @@ fn create_virtio_devices(
             InputDeviceOption::Motion {
                 path,
                 host_sensors,
+                magnetometer,
                 name,
             } => {
                 let dev = create_motion_device(
@@ -1078,6 +1079,7 @@ fn create_virtio_devices(
                     cfg.jail_config.as_ref(),
                     path.as_deref(),
                     *host_sensors,
+                    *magnetometer,
                     name.as_deref(),
                     motion_idx,
                 )?;
