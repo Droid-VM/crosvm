@@ -106,12 +106,19 @@ fn process_control_msg(
             Ok(())
         }
         VIRTIO_CONSOLE_PORT_OPEN => {
+            // The host side of a port is always open. The guest's side only matters to a port
+            // gated on it (`ConsolePort::gate_input_on_guest_open`); the rest just log it.
+            let port = ports.get(id as usize);
             match value {
-                // Currently, port state change is not supported, default is open.
-                // And only print debug info here.
                 0 => debug!("console port{id} close"),
                 1 => debug!("console port{id} open"),
-                _ => error!("console port{id} unknown value {value}"),
+                _ => {
+                    error!("console port{id} unknown value {value}");
+                    return Ok(());
+                }
+            }
+            if let Some(port) = port {
+                port.set_guest_open(value == 1);
             }
             Ok(())
         }

@@ -4,6 +4,8 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -92,6 +94,7 @@ pub(in crate::virtio::console) fn spawn_input_thread(
     mut rx: Box<named_pipes::PipeConnection>,
     in_avail_evt: Event,
     input_buffer: Arc<Mutex<VecDeque<u8>>>,
+    guest_open: Arc<AtomicBool>,
 ) -> WorkerThread<Box<named_pipes::PipeConnection>> {
     WorkerThread::start("v_console_input", move |kill_evt| {
         // If there is already data, signal immediately.
@@ -105,7 +108,7 @@ pub(in crate::virtio::console) fn spawn_input_thread(
             Ok(()) => (),
         }
 
-        read_input(&mut rx, &in_avail_evt, input_buffer, kill_evt);
+        read_input(&mut rx, &in_avail_evt, input_buffer, &guest_open, kill_evt);
         rx
     })
 }
@@ -114,6 +117,7 @@ fn read_input(
     rx: &mut Box<named_pipes::PipeConnection>,
     thread_in_avail_evt: &Event,
     buffer: Arc<Mutex<VecDeque<u8>>>,
+    guest_open: &AtomicBool,
     kill_evt: Event,
 ) {
     let buffer_max_size = 1 << 12;
@@ -132,10 +136,11 @@ fn read_input(
         let res = rx.read_overlapped_blocking(&mut rx_buf, &mut read_overlapped, &kill_evt);
 
         match res {
-            Ok(()) => {
+            Ok(()) if guest_open.load(Ordering::Acquire) => {
                 buffer.lock().extend(&rx_buf[..]);
                 thread_in_avail_evt.signal().unwrap();
             }
+            Ok(()) => {} // Nobody on the guest side to hear it.
             Err(e) if e.kind() == io::ErrorKind::Interrupted => {
                 // Exit event triggered
                 break;

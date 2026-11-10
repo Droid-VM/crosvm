@@ -5,6 +5,8 @@
 //! Virtio console device per-port functionality.
 
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -46,6 +48,12 @@ pub struct ConsolePort {
     // available in `input_buffer`.
     in_avail_evt: Event,
 
+    // Whether input is taken in: shared with the input thread, which drops what it reads while
+    // this is false. Always true unless `gate_input_on_guest_open` was called, after which it
+    // follows the guest's VIRTIO_CONSOLE_PORT_OPEN for the port.
+    guest_open: Arc<AtomicBool>,
+    gated: bool,
+
     input_thread: Option<WorkerThread<InStreamType>>,
 
     keep_descriptors: Vec<Descriptor>,
@@ -72,6 +80,8 @@ impl ConsolePort {
             info,
             input_buffer,
             in_avail_evt,
+            guest_open: Arc::new(AtomicBool::new(true)),
+            gated: false,
             input_thread: None,
             keep_descriptors: keep_rds.iter().map(|rd| Descriptor(*rd)).collect(),
         }
@@ -99,6 +109,31 @@ impl ConsolePort {
         self.info.as_ref()
     }
 
+    /// Makes the port take input only while the guest has it open (VIRTIO_CONSOLE_PORT_OPEN),
+    /// dropping what arrives otherwise, the way a serial line nobody listens on loses it. For a
+    /// port that streams rather than converses: without this, everything the host writes before
+    /// the guest's driver binds, or while no program has the port open, or forever in a guest
+    /// with no driver for it, piles up in `input_buffer` and comes out stale on the next open.
+    /// Only meaningful on a multiport device, the only kind whose guest reports opening a port.
+    pub fn gate_input_on_guest_open(&mut self) {
+        self.gated = true;
+        self.guest_open.store(false, Ordering::Release);
+    }
+
+    /// The flag the worker sets from the guest's PORT_OPEN, or None when the port is not gated.
+    pub fn guest_open_flag(&self) -> Option<Arc<AtomicBool>> {
+        self.gated.then(|| self.guest_open.clone())
+    }
+
+    /// A device reset closes a gated port: the guest's driver is gone and opens it again when it
+    /// comes back.
+    pub fn reset_guest_open(&mut self) {
+        if self.gated {
+            self.guest_open.store(false, Ordering::Release);
+            self.input_buffer.lock().clear();
+        }
+    }
+
     pub fn start_input_thread(&mut self) {
         // Spawn a separate thread to poll input.
         // A thread is used because io::Read only provides a blocking interface, and there is no
@@ -113,7 +148,12 @@ impl ConsolePort {
                 .clone_in_avail_evt()
                 .expect("failed creating input available Event pair");
 
-            let thread = spawn_input_thread(input, thread_in_avail_evt, self.input_buffer.clone());
+            let thread = spawn_input_thread(
+                input,
+                thread_in_avail_evt,
+                self.input_buffer.clone(),
+                self.guest_open.clone(),
+            );
             self.input_thread = Some(thread);
         }
     }

@@ -25,6 +25,7 @@ use crate::serial::sys::InStreamType;
 use crate::virtio::console::device::ConsoleDevice;
 use crate::virtio::console::device::ConsoleSnapshot;
 use crate::virtio::console::port::ConsolePort;
+use crate::virtio::console::port::ConsolePortInfo;
 use crate::virtio::DeviceType;
 use crate::virtio::Interrupt;
 use crate::virtio::Queue;
@@ -50,6 +51,35 @@ impl Console {
     ) -> Console {
         let port = ConsolePort::new(input, output, None, keep_rds);
         let console = ConsoleDevice::new_single_port(protection_type, port);
+        Console::with_device(console, pci_address)
+    }
+
+    /// A console whose one port has a name (`--serial ...,name=NAME`). The name only reaches the
+    /// guest through the control queue (VIRTIO_CONSOLE_PORT_NAME), which exists only with
+    /// VIRTIO_CONSOLE_F_MULTIPORT, so this is a multiport device with a single port: a Linux guest
+    /// finds it as `/dev/virtio-ports/NAME` instead of an anonymous hvc. A named port is a channel
+    /// a program opens rather than a terminal, so it takes input only while the guest has it open
+    /// (`ConsolePort::gate_input_on_guest_open`); unless it is also the console, which a guest
+    /// opens itself.
+    #[cfg_attr(windows, allow(dead_code))]
+    fn new_named(
+        protection_type: ProtectionType,
+        input: Option<InStreamType>,
+        output: Option<Box<dyn std::io::Write + Send>>,
+        info: ConsolePortInfo,
+        keep_rds: Vec<RawDescriptor>,
+        pci_address: Option<PciAddress>,
+    ) -> Console {
+        let console_port = info.console;
+        let mut port = ConsolePort::new(input, output, Some(info), keep_rds);
+        if !console_port {
+            port.gate_input_on_guest_open();
+        }
+        let console = ConsoleDevice::new_multi_port(protection_type, vec![port]);
+        Console::with_device(console, pci_address)
+    }
+
+    fn with_device(console: ConsoleDevice, pci_address: Option<PciAddress>) -> Console {
         let queue_sizes = vec![QUEUE_SIZE; console.max_queues()];
 
         Console {

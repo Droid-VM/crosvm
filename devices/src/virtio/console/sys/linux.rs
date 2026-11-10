@@ -4,6 +4,8 @@
 
 use std::collections::VecDeque;
 use std::io;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -39,13 +41,26 @@ impl SerialDevice for Console {
         options: SerialOptions,
         keep_rds: Vec<RawDescriptor>,
     ) -> Console {
-        Console::new(
-            protection_type,
-            input,
-            output,
-            keep_rds,
-            options.pci_address,
-        )
+        match options.name {
+            Some(name) => Console::new_named(
+                protection_type,
+                input,
+                output,
+                ConsolePortInfo {
+                    name: Some(name),
+                    console: options.console,
+                },
+                keep_rds,
+                options.pci_address,
+            ),
+            None => Console::new(
+                protection_type,
+                input,
+                output,
+                keep_rds,
+                options.pci_address,
+            ),
+        }
     }
 }
 
@@ -97,17 +112,26 @@ impl SerialDevice for ConsolePort {
 ///
 /// * `input` - Data source that the reader thread will wait on to send data back to the buffer
 /// * `in_avail_evt` - Event triggered by the thread when new input is available on the buffer
+/// * `guest_open` - While false, what is read is dropped rather than buffered (see
+///   `ConsolePort::gate_input_on_guest_open`)
 pub(in crate::virtio::console) fn spawn_input_thread(
     mut input: InStreamType,
     in_avail_evt: Event,
     input_buffer: Arc<Mutex<VecDeque<u8>>>,
+    guest_open: Arc<AtomicBool>,
 ) -> WorkerThread<InStreamType> {
     WorkerThread::start("v_console_input", move |kill_evt| {
         // If there is already data, signal immediately.
         if !input_buffer.lock().is_empty() {
             in_avail_evt.signal().unwrap();
         }
-        if let Err(e) = read_input(&mut input, &in_avail_evt, input_buffer, kill_evt) {
+        if let Err(e) = read_input(
+            &mut input,
+            &in_avail_evt,
+            input_buffer,
+            &guest_open,
+            kill_evt,
+        ) {
             error!("console input thread exited with error: {:#}", e);
         }
         input
@@ -118,6 +142,7 @@ fn read_input(
     input: &mut InStreamType,
     thread_in_avail_evt: &Event,
     buffer: Arc<Mutex<VecDeque<u8>>>,
+    guest_open: &AtomicBool,
     kill_evt: Event,
 ) -> anyhow::Result<()> {
     #[derive(EventToken)]
@@ -164,10 +189,11 @@ fn read_input(
                 Token::ConsoleEvent => {
                     match input.read(&mut rx_buf) {
                         Ok(0) => break 'wait, // Assume the stream of input has ended.
-                        Ok(size) => {
+                        Ok(size) if guest_open.load(Ordering::Acquire) => {
                             buffer.lock().extend(&rx_buf[0..size]);
                             thread_in_avail_evt.signal().unwrap();
                         }
+                        Ok(_) => {} // Nobody on the guest side to hear it.
                         // Being interrupted is not an error, but everything else is.
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                         Err(e) => {

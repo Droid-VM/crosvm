@@ -132,6 +132,9 @@ impl ConsoleDevice {
             let _ = self.stop_queue(idx);
         }
         self.ensure_worker_stopped();
+        for port in self.ports.iter_mut() {
+            port.reset_guest_open();
+        }
         Ok(())
     }
 

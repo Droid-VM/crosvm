@@ -6,6 +6,8 @@
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::Arc;
 
@@ -40,6 +42,9 @@ pub struct WorkerPort {
     in_avail_evt: Event,
     input_buffer: Arc<Mutex<VecDeque<u8>>>,
     output: Box<dyn std::io::Write + Send>,
+
+    // Some for a port that takes input only while the guest has it open.
+    guest_open: Option<Arc<AtomicBool>>,
 }
 
 impl WorkerPort {
@@ -50,11 +55,13 @@ impl WorkerPort {
             .take_output()
             .unwrap_or_else(|| Box::new(std::io::sink()));
         let info = port.port_info().cloned();
+        let guest_open = port.guest_open_flag();
         WorkerPort {
             info,
             in_avail_evt,
             input_buffer,
             output,
+            guest_open,
         }
     }
 
@@ -72,6 +79,17 @@ impl WorkerPort {
 
     pub fn name(&self) -> Option<&str> {
         self.info.as_ref().and_then(ConsolePortInfo::name)
+    }
+
+    /// The guest opened (true) or closed the port. Matters only to a gated port, which drops
+    /// what is still buffered when it closes: that was meant for the program that just left.
+    pub fn set_guest_open(&self, open: bool) {
+        if let Some(flag) = &self.guest_open {
+            flag.store(open, Ordering::Release);
+            if !open {
+                self.input_buffer.lock().clear();
+            }
+        }
     }
 }
 
