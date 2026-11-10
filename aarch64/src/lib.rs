@@ -220,6 +220,11 @@ const AARCH64_VIRTIO_MMIO_MAX: usize = 16;
 // One 4k page keeps the whole FADT-declared block inside a single mapping.
 const AARCH64_PMRESET_ADDR: u64 = 0x5000;
 const AARCH64_PMRESET_SIZE: u64 = 0x1000;
+// GICv3 message-based interrupts (--mbi-spis): the doorbell frame (devices::MbiFrame, a GICv2m MSI
+// frame) that mbi-alias and the MADT's GIC MSI Frame point at; an MSI's address is its
+// MSI_SETSPI_NS. The MBI SPIs follow the ones the board wires (AARCH64_GIC_NR_SPIS).
+const AARCH64_MBI_FRAME_ADDR: u64 = 0x7000;
+const AARCH64_MBI_FRAME_SIZE: u64 = 0x1000;
 // The GPIO controller gets one 4k page
 const AARCH64_GPIO_SIZE: u64 = 0x1000;
 // The GPIO controller uses a fixed high SPI (like the vmwdt) so it does not
@@ -426,6 +431,8 @@ pub enum Error {
     CustomPvmFwLoadFailure(arch::LoadImageError),
     #[error("vm created wrong kind of vcpu")]
     DowncastVcpu,
+    #[error("failed to set up the MBI SPIs: {0}")]
+    EnableMbi(base::Error),
     #[error("failed to enable singlestep execution: {0}")]
     EnableSinglestep(base::Error),
     #[error("failed to finalize IRQ chip: {0}")]
@@ -490,6 +497,8 @@ pub enum Error {
     RegisterIoevent(base::Error),
     #[error("failed to register irq fd: {0}")]
     RegisterIrqfd(base::Error),
+    #[error("error registering the MBI doorbell frame: {0}")]
+    RegisterMbiFrame(BusError),
     #[error("error registering PCI bus: {0}")]
     RegisterPci(BusError),
     #[error("error registering pflash device: {0}")]
@@ -2029,6 +2038,42 @@ impl arch::LinuxArch for AArch64 {
             found
         };
 
+        // --mbi-spis: MSI/MSI-X for PCI devices on GIC MBI SPIs. Their lines are registered now,
+        // before the hypervisor's part of the tree is written, as Gunyah wants; from here on, an
+        // edge event the irq chip is given is an MSI vector it relays to one of them.
+        let mbi = if components.mbi_spis > 0 {
+            let base_spi = devices::AARCH64_GIC_NR_SPIS;
+            for spi in base_spi..base_spi + components.mbi_spis {
+                if !system_allocator.reserve_irq(spi) {
+                    return Err(Error::AllocateIrq);
+                }
+            }
+            let spis = irq_chip
+                .enable_mbi(
+                    base_spi,
+                    components.mbi_spis,
+                    AARCH64_MBI_FRAME_ADDR + devices::MBI_SETSPI_NS,
+                )
+                .map_err(Error::EnableMbi)?;
+            let base_intid = 32 + base_spi;
+            mmio_bus
+                .insert(
+                    Arc::new(Mutex::new(devices::MbiFrame::new(base_intid, spis))),
+                    AARCH64_MBI_FRAME_ADDR,
+                    AARCH64_MBI_FRAME_SIZE,
+                )
+                .map_err(Error::RegisterMbiFrame)?;
+            base::info!(
+                "MBI: INTID {}..{} doorbell {:#x}",
+                base_intid,
+                base_intid + components.mbi_spis - 1,
+                AARCH64_MBI_FRAME_ADDR + devices::MBI_SETSPI_NS
+            );
+            Some((base_intid, components.mbi_spis, AARCH64_MBI_FRAME_ADDR))
+        } else {
+            None
+        };
+
         // The tree has a smaller slot in a pseudo-unprotected VM: it shares a 2 MiB lent region
         // with the shim instead of sitting in 2 MiB of its own at the top of RAM.
         let fdt_max_size = if shares_guest_ram {
@@ -2098,6 +2143,7 @@ impl arch::LinuxArch for AArch64 {
             pflash_cfg,
             sbsa_uart_cfg,
             &virtio_mmio_fdt,
+            mbi,
         )
         .map_err(Error::CreateFdt)?;
 

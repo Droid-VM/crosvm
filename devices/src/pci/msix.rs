@@ -369,12 +369,19 @@ impl MsixConfig {
                 msi_data,
             })
             .map_err(MsixError::AddMsiRouteSend)?;
-        if let VmIrqResponse::Err(e) = self
+        match self
             .msi_device_socket
             .recv()
             .map_err(MsixError::AddMsiRouteRecv)?
         {
-            return Err(MsixError::AddMsiRoute(e));
+            VmIrqResponse::Err(e) => return Err(MsixError::AddMsiRoute(e)),
+            // The vector now signals the line the message names (Gunyah MBI SPIs).
+            VmIrqResponse::MsiRouteEvent { event } => {
+                if let Some(irq) = self.irq_vec.get_mut(index as usize).and_then(Option::as_mut) {
+                    irq.irqfd = event;
+                }
+            }
+            _ => {}
         }
         Ok(())
     }

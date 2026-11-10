@@ -2167,6 +2167,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         boot_cpu: cfg.boot_cpu,
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         virt_cpufreq_v2: cfg.virt_cpufreq_v2,
+        mbi_spis: cfg.mbi_spis.unwrap_or(0),
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         sve_config: cfg.sve.unwrap_or_default(),
     })
@@ -5495,7 +5496,7 @@ fn handle_irq_tube_request(
 ) {
     match tube.recv::<VmIrqRequest>() {
         Ok(request) => {
-            let response = {
+            let mut response = {
                 request.execute(
                     |setup| match setup {
                         IrqSetup::Event(irq, ev, device_id, queue_id, device_name) => {
@@ -5526,6 +5527,15 @@ fn handle_irq_tube_request(
                     &mut sys_allocator_mutex.lock(),
                 )
             };
+            // --mbi-spis: hand the device the MBI SPI's line, so that its MSI goes to the
+            // hypervisor without a trip through this thread.
+            #[cfg(target_arch = "aarch64")]
+            if let (VmIrqRequest::AddMsiRoute { gsi, .. }, VmIrqResponse::Ok) = (&request, &response)
+            {
+                if let Some(event) = irq_chip.mbi_route_event(*gsi) {
+                    response = VmIrqResponse::MsiRouteEvent { event };
+                }
+            }
             if let Err(e) = tube.send(&response) {
                 error!("failed to send VmIrqResponse: {}", e);
             }

@@ -1734,6 +1734,14 @@ pub struct RunCommand {
     /// MAC address for VM
     pub mac_address: Option<net_util::MacAddress>,
 
+    #[argh(option, arg_name = "N")]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// give PCI devices MSI/MSI-X on N GIC MBI SPIs (aarch64 Gunyah only): a GICv2m-style doorbell
+    /// frame, `mbi-ranges`/`mbi-alias` on the GIC node, `msi-parent` on the PCI node. Each enabled
+    /// MSI-X vector takes one SPI; when they run out the guest falls back to fewer vectors or INTx.
+    pub mbi_spis: Option<u32>,
+
     #[cfg(all(unix, feature = "media", feature = "video-decoder"))]
     #[argh(option, arg_name = "[backend]")]
     #[serde(default)]
@@ -3275,6 +3283,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.delay_rt = cmd.delay_rt.unwrap_or_default();
 
         let mem = cmd.mem.unwrap_or_default();
+        cfg.mbi_spis = cmd.mbi_spis;
         cfg.memory = mem.size;
 
         #[cfg(target_arch = "aarch64")]

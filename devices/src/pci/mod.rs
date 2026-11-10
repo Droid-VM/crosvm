@@ -147,6 +147,7 @@ pub enum CrosvmDeviceId {
     Pl061 = 24,
     SbsaUart = 25,
     PmReset = 26,
+    MbiFrame = 27,
 }
 
 impl TryFrom<u16> for CrosvmDeviceId {
@@ -178,6 +179,7 @@ impl TryFrom<u16> for CrosvmDeviceId {
             24 => Ok(CrosvmDeviceId::Pl061),
             25 => Ok(CrosvmDeviceId::SbsaUart),
             26 => Ok(CrosvmDeviceId::PmReset),
+            27 => Ok(CrosvmDeviceId::MbiFrame),
             _ => Err(base::Error::new(EINVAL)),
         }
     }

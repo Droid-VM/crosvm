@@ -1389,6 +1389,7 @@ pub struct Config {
     pub log_file: Option<String>,
     #[cfg(windows)]
     pub logs_directory: Option<String>,
+    pub mbi_spis: Option<u32>,
     #[cfg(all(feature = "media", feature = "video-decoder"))]
     pub media_decoder: Vec<VideoDeviceConfig>,
     pub memory: Option<u64>,
@@ -1665,6 +1666,7 @@ impl Default for Config {
             boost_uclamp: false,
             #[cfg(all(feature = "media", feature = "video-decoder"))]
             media_decoder: Default::default(),
+            mbi_spis: None,
             memory: None,
             memory_file: None,
             mmio_address_ranges: Vec::new(),

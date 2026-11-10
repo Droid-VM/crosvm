@@ -395,7 +395,15 @@ fn create_cpu_nodes(
     Ok(())
 }
 
-fn create_gic_node(fdt: &mut Fdt, is_gicv3: bool, num_cpus: u64) -> Result<()> {
+/// `mbi`: GICv3 message-based interrupts (`--mbi-spis`) as (first INTID, number of SPIs, doorbell
+/// frame). The binding's `mbi-ranges` and `mbi-alias` make the GIC an MSI controller for Linux,
+/// and edk2's GunyahMbiAcpiDxe turns the same two properties into the MADT's GIC MSI Frame.
+fn create_gic_node(
+    fdt: &mut Fdt,
+    is_gicv3: bool,
+    num_cpus: u64,
+    mbi: Option<(u32, u32, u64)>,
+) -> Result<()> {
     let mut gic_reg_prop = [AARCH64_GIC_DIST_BASE, AARCH64_GIC_DIST_SIZE, 0, 0];
 
     let intc_node = fdt.root_mut().subnode_mut("intc")?;
@@ -414,6 +422,11 @@ fn create_gic_node(fdt: &mut Fdt, is_gicv3: bool, num_cpus: u64) -> Result<()> {
     intc_node.set_prop("phandle", PHANDLE_GIC)?;
     intc_node.set_prop("#address-cells", 2u32)?;
     intc_node.set_prop("#size-cells", 2u32)?;
+    if let Some((base_intid, count, frame)) = mbi {
+        intc_node.set_prop("msi-controller", ())?;
+        intc_node.set_prop("mbi-ranges", &[base_intid, count])?;
+        intc_node.set_prop("mbi-alias", frame)?;
+    }
     add_symbols_entry(fdt, "intc", "/intc")?;
     Ok(())
 }
@@ -727,6 +740,7 @@ fn create_pci_nodes(
     cfg: PciConfigRegion,
     ranges: &[PciRange],
     dma_pool_phandle: Option<u32>,
+    msi: bool,
 ) -> Result<()> {
     // Add devicetree nodes describing a PCI generic host controller.
     // See Documentation/devicetree/bindings/pci/host-generic-pci.txt in the kernel
@@ -790,6 +804,10 @@ fn create_pci_nodes(
     pci_node.set_prop("interrupt-map", interrupts)?;
     pci_node.set_prop("interrupt-map-mask", &masks)?;
     pci_node.set_prop("dma-coherent", ())?;
+    if msi {
+        // MSI/MSI-X through the GIC's MBI SPIs (create_gic_node); INTx stays for the rest.
+        pci_node.set_prop("msi-parent", PHANDLE_GIC)?;
+    }
     if let Some(dma_pool_phandle) = dma_pool_phandle {
         pci_node.set_prop("memory-region", dma_pool_phandle)?;
     }
@@ -1048,6 +1066,7 @@ pub fn create_fdt(
     pflash_cfg: Option<PflashDtConfig>,
     sbsa_uart_cfg: Option<(u64, u32, bool)>,
     virtio_mmio: &[(u64, u64, u32, bool)],
+    mbi: Option<(u32, u32, u64)>,
 ) -> Result<()> {
     let mut fdt = Fdt::new(&[]);
     let mut phandles_key_cache = Vec::new();
@@ -1221,7 +1240,7 @@ pub fn create_fdt(
         dynamic_power_coefficient,
         cpu_frequencies.clone(),
     )?;
-    create_gic_node(&mut fdt, is_gicv3, num_cpus as u64)?;
+    create_gic_node(&mut fdt, is_gicv3, num_cpus as u64, mbi)?;
     create_timer_node(&mut fdt, num_cpus)?;
     if use_pmu {
         create_pmu_node(&mut fdt, num_cpus)?;
@@ -1234,7 +1253,7 @@ pub fn create_fdt(
         create_virtio_mmio_node(&mut fdt, base, size, irq, edge)?;
     }
     create_psci_node(&mut fdt, &psci_version)?;
-    create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges, dma_pool_phandle)?;
+    create_pci_nodes(&mut fdt, pci_irqs, pci_cfg, pci_ranges, dma_pool_phandle, mbi.is_some())?;
     create_rtc_node(&mut fdt)?;
     create_gpio_node(&mut fdt)?;
     if let Some((bat_mmio_base, bat_irq)) = bat_mmio_base_and_irq {

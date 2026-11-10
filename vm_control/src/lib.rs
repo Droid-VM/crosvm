@@ -1521,6 +1521,10 @@ impl VmIrqRequest {
 #[derive(Serialize, Deserialize, Debug)]
 pub enum VmIrqResponse {
     AllocateOneMsi { gsi: u32 },
+    /// The route was added, and the message is delivered by signalling `event` (an MBI SPI's
+    /// line on Gunyah, `--mbi-spis`): the device signals it directly instead of its own irqfd,
+    /// which the irq chip would otherwise have to relay.
+    MsiRouteEvent { event: Event },
     Ok,
     Err(SysError),
 }

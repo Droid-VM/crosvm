@@ -19,6 +19,7 @@ mod fw_cfg;
 mod i8042;
 mod irq_event;
 pub mod irqchip;
+mod mbi_frame;
 mod pci;
 mod pflash;
 pub mod pl030;
@@ -122,6 +123,8 @@ pub use self::pci::PciVirtualConfigMmio;
 pub use self::pci::PreferredIrq;
 #[cfg(feature = "pci-hotplug")]
 pub use self::pci::ResourceCarrier;
+pub use self::mbi_frame::MbiFrame;
+pub use self::mbi_frame::MBI_SETSPI_NS;
 pub use self::pci::StubPciDevice;
 pub use self::pci::StubPciParameters;
 pub use self::pflash::Pflash;
