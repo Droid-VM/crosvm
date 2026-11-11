@@ -2568,7 +2568,10 @@ impl VirtioGpu {
                     scanout.create_surface(
                         &self.display,
                         Some(scanout_parent_surface_id),
-                        scanout_rect,
+                        Some(virtio_gpu_rect {
+                            x: 0.into(), y: 0.into(),
+                            width: resource.width.into(), height: resource.height.into(),
+                        }),
                     )?;
                     // The parenting just happened (or was already in force -- create_surface is a
                     // no-op when the parent is unchanged); record which scanout it was against.
