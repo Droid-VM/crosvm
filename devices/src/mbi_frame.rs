@@ -8,8 +8,11 @@
 //! crosvm's own devices never write it: an MSI-X vector of a virtio-pci device is an event that
 //! the irq chip relays to the SPI the message names. The frame is for the guest: Linux's ACPI
 //! GICv2m driver reads MSI_TYPER, and a write to MSI_SETSPI_NS (data = INTID) raises that SPI.
+//! macOS's PCIe bridge (AppleVirtualPlatformPCIEMSIController) takes the frame too, and refuses
+//! one whose MSI_TYPER has bit 31 clear (QEMU's GICv2m sets it for vmapple as `macos_compat`);
+//! Linux masks the fields and Windows takes them from the MADT, so the bit is always set.
 //!
-//!   0x008  MSI_TYPER      read: base INTID << 16 | number of SPIs
+//!   0x008  MSI_TYPER      read: 1 << 31 | base INTID << 16 | number of SPIs
 //!   0x040  MSI_SETSPI_NS  write: INTID to raise
 //!   0xfcc  MSI_IIDR       read: 0
 
@@ -24,6 +27,7 @@ use crate::DeviceId;
 use crate::Suspendable;
 
 const MSI_TYPER: u64 = 0x008;
+const MSI_TYPER_VALID: u32 = 1 << 31;
 /// Offset of the doorbell register: an MSI's address is the frame's base plus this.
 pub const MBI_SETSPI_NS: u64 = 0x040;
 
@@ -50,7 +54,7 @@ impl BusDevice for MbiFrame {
 
     fn read(&mut self, info: BusAccessInfo, data: &mut [u8]) {
         let value: u32 = match info.offset {
-            MSI_TYPER => (self.base_intid << 16) | self.spis.len() as u32,
+            MSI_TYPER => MSI_TYPER_VALID | (self.base_intid << 16) | self.spis.len() as u32,
             _ => 0,
         };
         for (i, b) in data.iter_mut().enumerate() {
