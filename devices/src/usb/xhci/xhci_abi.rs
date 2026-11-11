@@ -253,9 +253,9 @@ impl Trb {
     }
 
     /// Get interrupt target.
-    pub fn interrupter_target(&self) -> u8 {
+    pub fn interrupter_target(&self) -> u16 {
         const STATUS_INTERRUPTER_TARGET_OFFSET: u8 = 22;
-        (self.get_status() >> STATUS_INTERRUPTER_TARGET_OFFSET) as u8
+        (self.get_status() >> STATUS_INTERRUPTER_TARGET_OFFSET) as u16
     }
 
     /// Only some of trb types could appear in transfer ring.

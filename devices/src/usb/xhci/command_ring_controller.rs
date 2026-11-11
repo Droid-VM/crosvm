@@ -463,7 +463,7 @@ mod tests {
     /// Runs one command through the handler the way the command ring does and returns the
     /// event it was handed to signal when done.
     fn run(f: &Fixture, trb: Trb) -> Event {
-        let handler = CommandRingTrbHandler::new(f.slots.clone(), f.interrupter.clone());
+        let handler = CommandRingTrbHandler::new(f.slots.clone(), f.interrupter.primary().clone());
         let complete = Event::new().unwrap();
         handler
             .handle_transfer_descriptor(

@@ -20,7 +20,7 @@ use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 use vm_memory::GuestMemoryError;
 
-use super::interrupter::Interrupter;
+use super::interrupter::Interrupters;
 use super::transfer_ring_controller::TransferRingController;
 use super::transfer_ring_controller::TransferRingControllerError;
 use super::transfer_ring_controller::TransferRingControllers;
@@ -163,7 +163,7 @@ impl DeviceSlots {
         fail_handle: Arc<dyn FailHandle>,
         dcbaap: Register<u64>,
         hub: Arc<UsbHub>,
-        interrupter: Arc<Mutex<Interrupter>>,
+        interrupter: Interrupters,
         event_loop: Arc<EventLoop>,
         mem: GuestMemory,
     ) -> DeviceSlots {
@@ -318,7 +318,7 @@ pub struct DeviceSlot {
     port_id: PortId, // Valid port id starts from 1, to MAX_PORTS.
     dcbaap: Register<u64>,
     hub: Arc<UsbHub>,
-    interrupter: Arc<Mutex<Interrupter>>,
+    interrupter: Interrupters,
     event_loop: Arc<EventLoop>,
     mem: GuestMemory,
     enabled: AtomicBool,
@@ -335,7 +335,7 @@ impl DeviceSlot {
         slot_id: u8,
         dcbaap: Register<u64>,
         hub: Arc<UsbHub>,
-        interrupter: Arc<Mutex<Interrupter>>,
+        interrupter: Interrupters,
         event_loop: Arc<EventLoop>,
         mem: GuestMemory,
     ) -> Self {
@@ -1716,7 +1716,7 @@ pub(crate) mod test_util {
         pub mem: GuestMemory,
         pub slots: DeviceSlots,
         pub hub: Arc<UsbHub>,
-        pub interrupter: Arc<Mutex<Interrupter>>,
+        pub interrupter: Interrupters,
         pub fail_handle: Arc<TestFailHandle>,
         pub irq: Event,
         event_loop: Arc<EventLoop>,
@@ -1738,7 +1738,7 @@ pub(crate) mod test_util {
             let (_mmio, regs) = init_xhci_mmio_space_and_regs();
             regs.dcbaap.set_value(DCBAA);
             let irq = Event::new().unwrap();
-            let mut interrupter = Interrupter::new(
+            let mut interrupter = super::super::interrupter::Interrupter::new(
                 mem.clone(),
                 irq.try_clone().unwrap(),
                 &regs,
@@ -1753,8 +1753,8 @@ pub(crate) mod test_util {
                 .set_event_ring_dequeue_pointer(GuestAddress(EVENT_RING), false)
                 .unwrap();
             interrupter.set_enabled(true).unwrap();
-            let interrupter = Arc::new(Mutex::new(interrupter));
-            let hub = Arc::new(UsbHub::new(&regs, interrupter.clone()));
+            let interrupter = Interrupters(Arc::new(vec![Arc::new(Mutex::new(interrupter))]));
+            let hub = Arc::new(UsbHub::new(&regs, interrupter.primary().clone()));
             let fail_handle = Arc::new(TestFailHandle(AtomicBool::new(false)));
             let (event_loop, join) = EventLoop::start("test".to_string(), None).unwrap();
             let event_loop = Arc::new(event_loop);

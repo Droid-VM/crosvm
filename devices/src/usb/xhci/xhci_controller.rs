@@ -38,6 +38,7 @@ use crate::register_space::RegisterSpace;
 use crate::usb::xhci::xhci_backend_device_provider::XhciBackendDeviceProvider;
 use crate::usb::xhci::xhci_regs::init_xhci_mmio_space_and_regs;
 use crate::usb::xhci::xhci_regs::XhciRegs;
+use crate::usb::xhci::xhci_regs::MAX_INTERRUPTER;
 use crate::usb::xhci::Xhci;
 use crate::utils::FailHandle;
 use crate::IrqLevelEvent;
@@ -147,14 +148,20 @@ impl XhciController {
             0,
         );
         let msix = Arc::new(Mutex::new(MsixConfig::new(
-            1,
+            u16::from(MAX_INTERRUPTER),
             msi_tube,
             0x000d_1b36,
             "xhci controller".to_owned(),
         )));
         config_regs
             .add_capability(
-                &MsixCap::new(0, 1, MSIX_TABLE_OFFSET as u32, 0, MSIX_PBA_OFFSET as u32),
+                &MsixCap::new(
+                    0,
+                    u16::from(MAX_INTERRUPTER),
+                    MSIX_TABLE_OFFSET as u32,
+                    0,
+                    MSIX_PBA_OFFSET as u32,
+                ),
                 Some(Box::new(msix.clone())),
             )
             .expect("xHCI MSI-X capability fits in PCI configuration space");
@@ -335,7 +342,7 @@ impl PciDevice for XhciController {
             return;
         }
 
-        if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + 16).contains(&offset) {
+        if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + 16 * u64::from(MAX_INTERRUPTER)).contains(&offset) {
             self.msix.lock().read_msix_table(offset - MSIX_TABLE_OFFSET, data);
             return;
         }
@@ -359,7 +366,7 @@ impl PciDevice for XhciController {
             return;
         }
 
-        if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + 16).contains(&offset) {
+        if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + 16 * u64::from(MAX_INTERRUPTER)).contains(&offset) {
             self.msix.lock().write_msix_table(offset - MSIX_TABLE_OFFSET, data);
             return;
         }

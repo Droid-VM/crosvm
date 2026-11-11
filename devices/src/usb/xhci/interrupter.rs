@@ -62,6 +62,20 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Event rings indexed by the Transfer TRB's Interrupter Target.
+#[derive(Clone)]
+pub struct Interrupters(pub Arc<Vec<Arc<Mutex<Interrupter>>>>);
+
+impl Interrupters {
+    pub fn primary(&self) -> &Arc<Mutex<Interrupter>> {
+        &self.0[0]
+    }
+
+    pub fn target(&self, index: u16) -> &Arc<Mutex<Interrupter>> {
+        &self.0[usize::from(index)]
+    }
+}
+
 /// See spec 4.17 for interrupters. Controller can send an event back to guest kernel driver
 /// through interrupter.
 pub struct Interrupter {
@@ -69,6 +83,7 @@ pub struct Interrupter {
     interrupt_evt: Event,
     msix: Option<Arc<Mutex<MsixConfig>>>,
     intx_disabled: Arc<AtomicBool>,
+    vector: u16,
     usbsts: Register<u32>,
     iman: Register<u32>,
     erdp: Register<u64>,
@@ -89,13 +104,25 @@ pub struct Interrupter {
 }
 
 impl Interrupter {
-    /// Create a new interrupter.
+    /// Create the primary interrupter for existing unit fixtures.
+    #[cfg(test)]
     pub fn new(
         mem: GuestMemory,
         irq_evt: Event,
         regs: &XhciRegs,
         msix: Option<Arc<Mutex<MsixConfig>>>,
         intx_disabled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        Self::new_indexed(mem, irq_evt, regs, msix, intx_disabled, 0)
+    }
+
+    pub fn new_indexed(
+        mem: GuestMemory,
+        irq_evt: Event,
+        regs: &XhciRegs,
+        msix: Option<Arc<Mutex<MsixConfig>>>,
+        intx_disabled: Arc<AtomicBool>,
+        index: usize,
     ) -> Result<Self> {
         let clock = Clock::new();
         let moderation_timer = Timer::new().map_err(Error::CreateModerationTimer)?;
@@ -104,9 +131,10 @@ impl Interrupter {
             interrupt_evt: irq_evt,
             msix,
             intx_disabled,
+            vector: index as u16,
             usbsts: regs.usbsts.clone(),
-            iman: regs.iman.clone(),
-            erdp: regs.erdp.clone(),
+            iman: regs.interrupters[index].iman.clone(),
+            erdp: regs.interrupters[index].erdp.clone(),
             event_handler_busy: false,
             enabled: false,
             moderation_interval: 4000, // default to 1ms as per xhci 5.5.2.2
@@ -301,11 +329,11 @@ impl Interrupter {
         if let Some(msix) = &self.msix {
             let mut msix = msix.lock();
             if msix.enabled() {
-                msix.trigger(0);
+                msix.trigger(self.vector);
                 return Ok(());
             }
         }
-        if !self.intx_disabled.load(Ordering::SeqCst) {
+        if self.vector == 0 && !self.intx_disabled.load(Ordering::SeqCst) {
             self.interrupt_evt.signal().map_err(Error::SendInterrupt)?;
         }
         Ok(())
