@@ -2886,6 +2886,15 @@ pub struct RunCommand {
     #[argh(switch)]
     #[serde(skip)]
     #[merge(strategy = overwrite_option)]
+    /// put the virtio-console devices (--serial hardware=virtio-console) on the virtio-mmio
+    /// transport instead of virtio-pci (aarch64 only), after the virtio-mmio media devices, for a
+    /// guest that has a virtio-mmio driver but no PCI host driver. A named port keeps its
+    /// multiport device; only the transport differs.
+    virtio_mmio_console: Option<bool>,
+
+    #[argh(switch)]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
     /// put the --gpu device on virtio-mmio instead of virtio-pci (aarch64 only), after the
     /// virtio-mmio net devices. Blob mappings require a pre-shared pool; MMIO has no SHM aperture.
     virtio_mmio_gpu: Option<bool>,
@@ -3352,6 +3361,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.virtio_mmio_gpu = cmd.virtio_mmio_gpu.unwrap_or_default();
         cfg.virtio_mmio_snd = cmd.virtio_mmio_snd.unwrap_or_default();
         cfg.virtio_mmio_media = cmd.virtio_mmio_media.unwrap_or_default();
+        cfg.virtio_mmio_console = cmd.virtio_mmio_console.unwrap_or_default();
 
         cfg.pmems = cmd.pmem;
         cfg.pre_alloc = cmd.pre_alloc;

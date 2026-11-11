@@ -210,10 +210,12 @@ const AARCH64_SBSA_UART_BASE: u64 = 0x6000;
 const AARCH64_SBSA_UART_SIZE: u64 = 0x1000;
 
 // virtio-mmio devices (--virtio-mmio-block): one 4 KiB page each from a free spot of the low
-// MMIO area, below the GIC and inside what Gunyah traps to the VMM.
+// MMIO area, below the GIC and inside what Gunyah traps to the VMM. 32 pages, to 0x0a02_0000
+// (nothing else lives there; pflash ends at 0x0480_0000): an iPadOS guest's disks, input
+// devices, net, GPU, sound and media devices took all 16 before any virtio-console port.
 const AARCH64_VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
 const AARCH64_VIRTIO_MMIO_STRIDE: u64 = 0x1000;
-const AARCH64_VIRTIO_MMIO_MAX: usize = 16;
+const AARCH64_VIRTIO_MMIO_MAX: usize = 32;
 // DroidVM PmReset: ACPI reduced-hardware power controller backing the FADT's
 // SLEEP_CONTROL_REG (0x5000) / SLEEP_STATUS_REG (0x5004) / RESET_REG (0x5008).
 // Windows-on-ARM has no PSCI, so power-off/reboot come through these registers.

@@ -1607,6 +1607,7 @@ fn create_devices(
     let mut mmio_gpus = Vec::new();
     let mut mmio_snds = Vec::new();
     let mut mmio_medias = Vec::new();
+    let mut mmio_consoles = Vec::new();
     for stub in stubs {
         if cfg.virtio_mmio_input && stub.dev.device_type() == DeviceType::Input {
             mmio_inputs.push(stub);
@@ -1626,6 +1627,10 @@ fn create_devices(
         }
         if cfg.virtio_mmio_media && stub.dev.device_type() == DeviceType::Media {
             mmio_medias.push(stub);
+            continue;
+        }
+        if cfg.virtio_mmio_console && stub.dev.device_type() == DeviceType::Console {
+            mmio_consoles.push(stub);
             continue;
         }
         let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
@@ -1745,6 +1750,18 @@ fn create_devices(
         }
         let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio media device")?;
+        devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
+    }
+
+    // --virtio-mmio-console: the virtio-console devices, after the media devices so that adding
+    // one renumbers nothing. A named port is a multiport device with its control queues; the
+    // transport does not change that.
+    for stub in mmio_consoles {
+        if stub.jail.is_some() {
+            warn!("virtio-mmio console runs in the VMM process, outside its jail");
+        }
+        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+            .context("failed to create virtio-mmio console device")?;
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 

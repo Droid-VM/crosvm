@@ -1372,6 +1372,9 @@ pub struct Config {
     pub virtio_input: Vec<InputDeviceOption>,
     #[cfg(feature = "media")]
     pub virtio_media: Vec<MediaDeviceConfig>,
+    /// The virtio-console devices (`--serial hardware=virtio-console`) go on the virtio-mmio
+    /// transport, after the media devices (`--virtio-mmio-console`).
+    pub virtio_mmio_console: bool,
     /// Block devices on the virtio-mmio transport (`--virtio-mmio-block`).
     pub virtio_mmio_disks: Vec<DiskOption>,
     /// The GPU goes on virtio-mmio, after net, without a PCI shared-memory aperture.
@@ -1627,6 +1630,7 @@ impl Default for Config {
             virt_cpufreq: false,
             virt_cpufreq_v2: false,
             virtio_input: Vec::new(),
+            virtio_mmio_console: false,
             virtio_mmio_disks: Vec::new(),
             virtio_mmio_gpu: false,
             virtio_mmio_input: false,
