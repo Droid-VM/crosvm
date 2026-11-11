@@ -637,6 +637,8 @@ pub enum InputDeviceOption {
     // unknown, which libinput answers by assuming a 69x50 mm pad). `touch-size` adds
     // ABS_MT_TOUCH_MAJOR/MINOR (0..255, a fraction of the host panel's most): only for a host
     // whose panel reports contact size, so a guest never mistakes "not measured" for zero.
+    // `haptics` declares the EV_FF waveforms of haptic feedback, which a guest driver written for
+    // it sends back and the device hands to `path` (defaults::TRACKPAD_HAPTIC_*).
     #[serde(rename_all = "kebab-case")]
     Trackpad {
         path: PathBuf,
@@ -646,6 +648,7 @@ pub enum InputDeviceOption {
         contacts: Option<u32>,
         res: Option<u32>,
         touch_size: Option<bool>,
+        haptics: Option<bool>,
     },
     MultiTouchTrackpad {
         path: PathBuf,
@@ -3168,7 +3171,8 @@ mod tests {
                 name: None,
                 contacts: None,
                 res: None,
-                touch_size: None
+                touch_size: None,
+                haptics: None
             }
         );
     }
@@ -3254,7 +3258,8 @@ mod tests {
                 name: None,
                 contacts: None,
                 res: None,
-                touch_size: None
+                touch_size: None,
+                haptics: None
             }
         );
     }
@@ -3265,7 +3270,7 @@ mod tests {
             &[],
             &[
                 "--input",
-                "trackpad[path=/dev/tp,width=5480,height=5480,res=20,contacts=5,touch-size=true]",
+                "trackpad[path=/dev/tp,width=5480,height=5480,res=20,contacts=5,touch-size=true,haptics=true]",
                 "/dev/null",
             ],
         )
@@ -3281,7 +3286,8 @@ mod tests {
                 name: None,
                 contacts: Some(5),
                 res: Some(20),
-                touch_size: Some(true)
+                touch_size: Some(true),
+                haptics: Some(true)
             }]
         );
     }

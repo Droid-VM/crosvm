@@ -795,7 +795,8 @@ where
 }
 
 /// Creates a new virtio multi-finger trackpad: one MT slot per finger, no buttons (the guest's taps
-/// click), positions in `res` units per millimetre, contact size when `touch_size`.
+/// click), positions in `res` units per millimetre, contact size when `touch_size`, haptic feedback
+/// back to the socket when `haptics` (defaults::TRACKPAD_HAPTIC_*).
 #[allow(clippy::too_many_arguments)]
 pub fn new_multi_finger_trackpad<T>(
     idx: u32,
@@ -805,6 +806,7 @@ pub fn new_multi_finger_trackpad<T>(
     res: u32,
     contacts: u32,
     touch_size: bool,
+    haptics: bool,
     name: Option<&str>,
     virtio_features: u64,
 ) -> Result<Input<SocketEventSource<T>>>
@@ -814,7 +816,7 @@ where
     Ok(Input {
         worker_thread: None,
         config: defaults::new_multi_finger_trackpad_config(
-            idx, width, height, res, contacts, touch_size, name,
+            idx, width, height, res, contacts, touch_size, haptics, name,
         ),
         source: Some(SocketEventSource::new(source)),
         virtio_features,

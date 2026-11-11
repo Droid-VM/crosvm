@@ -3623,6 +3623,7 @@ impl TryFrom<RunCommand> for super::config::Config {
                             contacts: None,
                             res: None,
                             touch_size: None,
+                            haptics: None,
                         }),
                 );
         }

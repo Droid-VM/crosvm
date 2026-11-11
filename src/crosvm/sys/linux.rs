@@ -997,6 +997,7 @@ fn create_virtio_devices(
                 contacts: Some(contacts),
                 res,
                 touch_size,
+                haptics,
             } => {
                 let dev = create_multi_finger_trackpad_device(
                     cfg.protection_type,
@@ -1007,6 +1008,7 @@ fn create_virtio_devices(
                     res.unwrap_or(0),
                     *contacts,
                     touch_size.unwrap_or(false),
+                    haptics.unwrap_or(false),
                     name.as_deref(),
                     trackpad_idx,
                 )?;

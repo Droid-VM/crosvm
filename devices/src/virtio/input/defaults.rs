@@ -60,13 +60,30 @@ pub const TRACKPAD_MAX_CONTACTS: u32 = 5;
 /// Android does not calibrate, so there is no millimetre to give.
 pub const TRACKPAD_TOUCH_SIZE_MAX: u32 = 255;
 
+/// A multi-finger trackpad's haptic feedback (`haptics`), which the guest sends the device through
+/// the status queue and the device hands to the socket: EV_FF, the code a waveform of the HID
+/// Haptics page (0x0e) a haptic touchpad plays -- the low byte of its usage, 0x1003 Click being 0x03
+/// -- and the value its intensity in percent (bits 0-7; 0 for the host's own), how many times more
+/// to play it (bits 8-15) and the milliseconds from one start to the next (bits 16-31). A
+/// continuous waveform plays until a stop. None of the guests' own drivers read EV_FF on a
+/// trackpad: this is for the ones written for it (a Windows Precision Touchpad's haptics, the
+/// actuator of a macOS guest's Magic Trackpad).
+pub const TRACKPAD_HAPTIC_STOP: u16 = 0x02;
+pub const TRACKPAD_HAPTIC_CLICK: u16 = 0x03;
+pub const TRACKPAD_HAPTIC_BUZZ: u16 = 0x04;
+pub const TRACKPAD_HAPTIC_RUMBLE: u16 = 0x05;
+pub const TRACKPAD_HAPTIC_PRESS: u16 = 0x06;
+pub const TRACKPAD_HAPTIC_RELEASE: u16 = 0x07;
+
 /// Instantiates a VirtioInputConfig object for a multi-finger trackpad, as evdev describes a
 /// touchpad (Linux's hid-multitouch and libinput's): INPUT_PROP_POINTER and no buttons, so a click
 /// is the guest's (a tap) -- the surface it stands for is a phone's screen, which cannot be pressed.
 /// One MT slot per finger, BTN_TOUCH and BTN_TOOL_FINGER.. for the number of fingers down,
 /// ABS_MT_POSITION_X/Y and ABS_X/Y at `res` units per millimetre, ABS_MT_TOOL_TYPE to mark a palm,
-/// ABS_MT_TOUCH_MAJOR/MINOR only when `touch_size` says the host has them, and MSC_TIMESTAMP for
-/// when the host sampled each frame (they arrive batched).
+/// ABS_MT_TOUCH_MAJOR/MINOR only when `touch_size` says the host has them, MSC_TIMESTAMP for
+/// when the host sampled each frame (they arrive batched), and with `haptics` the EV_FF waveforms
+/// of its haptic feedback (TRACKPAD_HAPTIC_*).
+#[allow(clippy::too_many_arguments)]
 pub fn new_multi_finger_trackpad_config(
     idx: u32,
     width: u32,
@@ -74,6 +91,7 @@ pub fn new_multi_finger_trackpad_config(
     res: u32,
     contacts: u32,
     touch_size: bool,
+    haptics: bool,
     name: Option<&str>,
 ) -> VirtioInputConfig {
     let contacts = contacts.clamp(1, TRACKPAD_MAX_CONTACTS);
@@ -85,7 +103,7 @@ pub fn new_multi_finger_trackpad_config(
         name,
         format!("virtio-trackpad-{idx}"),
         virtio_input_bitmap::from_bits(&[INPUT_PROP_POINTER]),
-        multi_finger_trackpad_events(contacts, touch_size),
+        multi_finger_trackpad_events(contacts, touch_size, haptics),
         multi_finger_trackpad_absinfo(width, height, res, contacts, touch_size),
     )
 }
@@ -93,6 +111,7 @@ pub fn new_multi_finger_trackpad_config(
 fn multi_finger_trackpad_events(
     contacts: u32,
     touch_size: bool,
+    haptics: bool,
 ) -> BTreeMap<u16, virtio_input_bitmap> {
     let tools = [
         BTN_TOOL_FINGER,
@@ -119,6 +138,19 @@ fn multi_finger_trackpad_events(
     supported_events.insert(EV_KEY, virtio_input_bitmap::from_bits(&keys));
     supported_events.insert(EV_ABS, virtio_input_bitmap::from_bits(&axes));
     supported_events.insert(EV_MSC, virtio_input_bitmap::from_bits(&[MSC_TIMESTAMP]));
+    if haptics {
+        supported_events.insert(
+            EV_FF,
+            virtio_input_bitmap::from_bits(&[
+                TRACKPAD_HAPTIC_STOP,
+                TRACKPAD_HAPTIC_CLICK,
+                TRACKPAD_HAPTIC_BUZZ,
+                TRACKPAD_HAPTIC_RUMBLE,
+                TRACKPAD_HAPTIC_PRESS,
+                TRACKPAD_HAPTIC_RELEASE,
+            ]),
+        );
+    }
     supported_events
 }
 

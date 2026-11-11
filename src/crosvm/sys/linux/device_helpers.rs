@@ -855,6 +855,7 @@ pub fn create_multi_finger_trackpad_device<T: IntoUnixStream>(
     res: u32,
     contacts: u32,
     touch_size: bool,
+    haptics: bool,
     name: Option<&str>,
     idx: u32,
 ) -> DeviceResult {
@@ -870,6 +871,7 @@ pub fn create_multi_finger_trackpad_device<T: IntoUnixStream>(
         res,
         contacts,
         touch_size,
+        haptics,
         name,
         virtio::base_features(protection_type),
     )
