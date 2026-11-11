@@ -1724,10 +1724,13 @@ fn create_devices(
 
     #[cfg(feature = "usb")]
     if cfg.usb {
-        // Create xhci controller.
+        // Create xhci controller with the same MSI routing channel as other PCI devices.
+        let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+        add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
         let usb_controller = Box::new(XhciController::new(
             vm.get_memory().clone(),
             Box::new(usb_provider),
+            msi_device_tube,
         ));
         devices.push((
             usb_controller,

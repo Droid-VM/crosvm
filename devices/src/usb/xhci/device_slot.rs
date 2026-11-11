@@ -1738,8 +1738,13 @@ pub(crate) mod test_util {
             let (_mmio, regs) = init_xhci_mmio_space_and_regs();
             regs.dcbaap.set_value(DCBAA);
             let irq = Event::new().unwrap();
-            let mut interrupter =
-                Interrupter::new(mem.clone(), irq.try_clone().unwrap(), &regs).unwrap();
+            let mut interrupter = Interrupter::new(
+                mem.clone(),
+                irq.try_clone().unwrap(),
+                &regs,
+                None,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ).unwrap();
             interrupter.set_event_ring_seg_table_size(1).unwrap();
             interrupter
                 .set_event_ring_seg_table_base_addr(GuestAddress(0x8))

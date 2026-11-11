@@ -29,6 +29,7 @@ pub mod xhci_controller;
 pub mod xhci_transfer;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 
 use base::debug;
@@ -43,6 +44,7 @@ use thiserror::Error;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
+use crate::pci::MsixConfig;
 use crate::register_space::RegisterInterface;
 use crate::usb::backend::error::Error as BackendProviderError;
 use crate::usb::xhci::command_ring_controller::CommandRingController;
@@ -135,6 +137,8 @@ impl Xhci {
         mem: GuestMemory,
         device_provider: Box<dyn XhciBackendDeviceProvider>,
         interrupt_evt: IrqLevelEvent,
+        msix: Arc<Mutex<MsixConfig>>,
+        intx_disabled: Arc<AtomicBool>,
         regs: XhciRegs,
     ) -> Result<Arc<Self>> {
         let (event_loop, join_handle) =
@@ -145,7 +149,7 @@ impl Xhci {
             .try_clone()
             .map_err(Error::CloneIrqEvent)?;
         let interrupter = Arc::new(Mutex::new(
-            Interrupter::new(mem.clone(), irq_evt, &regs).map_err(Error::CreateInterrupter)?,
+            Interrupter::new(mem.clone(), irq_evt, &regs, Some(msix), intx_disabled).map_err(Error::CreateInterrupter)?,
         ));
         let event_loop = Arc::new(event_loop);
         let irq_resample_evt = interrupt_evt
