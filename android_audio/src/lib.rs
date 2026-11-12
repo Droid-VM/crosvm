@@ -287,6 +287,13 @@ extern "C" {
     fn AAudioStream_getPerformanceMode(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_getFramesPerBurst(stream: *mut AAudioStream) -> i32;
     fn AAudioStream_requestStart(stream: *mut AAudioStream) -> AaudioResultT;
+    fn AAudioStream_getState(stream: *mut AAudioStream) -> i32;
+    fn AAudioStream_waitForStateChange(
+        stream: *mut AAudioStream,
+        input_state: i32,
+        next_state: *mut i32,
+        timeout_nanoseconds: i64,
+    ) -> AaudioResultT;
     fn AAudioStream_read(
         stream: *mut AAudioStream,
         buffer: *mut c_void,
@@ -645,6 +652,25 @@ fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> 
         if AAudioStream_requestStart(stream_ptr) != AAUDIO_OK {
             AAudioStream_close(stream_ptr);
             return Err(Box::new(AAudioError::StreamStart));
+        }
+        if open.ring.is_some() {
+            // requestStart is asynchronous. The legacy callback may still be waiting for
+            // its priority boost: returning PREPARE now lets the guest fill the ring and
+            // drop periods before Android has invoked the first callback.
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut state = AAudioStream_getState(stream_ptr);
+            while state != 4 { // AAUDIO_STREAM_STATE_STARTED
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if state != 3 // AAUDIO_STREAM_STATE_STARTING
+                    || remaining.is_zero()
+                    || AAudioStream_waitForStateChange(
+                        stream_ptr, state, &mut state, remaining.as_nanos() as i64,
+                    ) != AAUDIO_OK
+                {
+                    AAudioStream_close(stream_ptr);
+                    return Err(Box::new(AAudioError::StreamStart));
+                }
+            }
         }
     }
 
