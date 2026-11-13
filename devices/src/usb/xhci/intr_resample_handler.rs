@@ -51,7 +51,7 @@ impl EventHandler for IntrResampleHandler {
             .wait()
             .context("cannot read resample evt")?;
         let mut interrupter = self.interrupter.lock();
-        if !interrupter.event_ring_is_empty() {
+        if !interrupter.uses_msix() && !interrupter.event_ring_is_empty() {
             debug!("irq resample re-assert irq event");
             // There could be a race condition. When we get resample_evt and other
             // component is sending interrupt at the same time.

@@ -1,0 +1,13 @@
+// On-device smoke test for the vendored stack: the P0 interop server (win3d/docs/webrtc,
+// webrtc实施状态.md P0-1) built for Android. Not shipped; pushed by hand.
+cc_binary {
+    name: "libdatachannel_smoke",
+    srcs: ["p0_server.cpp"],
+    cppflags: [
+        "-std=c++17",
+        "-fexceptions",
+    ],
+    rtti: true,
+    static_libs: ["libdatachannel"],
+    installable: false,
+}

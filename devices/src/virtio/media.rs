@@ -42,6 +42,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use base::error;
+use base::AsRawDescriptor;
 use base::warn;
 use base::Descriptor;
 use base::EventToken;
@@ -81,6 +82,7 @@ use crate::virtio::device_constants::media::QUEUE_SIZES;
 #[cfg(feature = "video-decoder")]
 use crate::virtio::device_constants::video::VideoBackendType;
 use crate::virtio::media::guest_buf::GuestBufferImport;
+use crate::virtio::media::guest_buf::SharedUdmabuf;
 use crate::virtio::media::guest_buf::HostAccessPolicy;
 use crate::virtio::media::kill::KillSignal;
 use crate::virtio::media::kill::Wakeup;
@@ -506,6 +508,18 @@ impl GuestMemoryRange for GuestBufferImport {
     fn len(&self) -> usize {
         GuestBufferImport::len(self)
     }
+
+    /// A direct mapping only reads and writes the guest's pages in place; a shadow's drop is
+    /// what writes it back.
+    fn outlives_return(&self) -> bool {
+        GuestBufferImport::is_direct(self)
+    }
+
+    fn dmabuf(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        // SAFETY: the descriptor is owned by `self`, which the returned borrow cannot outlive.
+        self.shared_dmabuf()
+            .map(|fd| unsafe { std::os::fd::BorrowedFd::borrow_raw(fd.as_raw_descriptor()) })
+    }
 }
 
 /// Implements `VirtioMediaGuestMemoryMapper` on a `GuestMemory` and a `HostAccessPolicy`.
@@ -522,7 +536,19 @@ impl GuestMemoryRange for GuestBufferImport {
 pub struct GuestMemoryMapper {
     mem: GuestMemory,
     policy: HostAccessPolicy,
+    /// The udmabuf driver every import shares, opened when a backend first wants a dma-buf.
+    udmabuf: SharedUdmabuf,
+    /// The last [`DMABUF_CACHE`] dma-bufs made for [`VirtioMediaGuestMemoryMapper::renew_dmabuf_for`],
+    /// by the guest ranges they cover, most recent last.
+    dmabufs: Mutex<Vec<(Vec<(GuestAddress, usize)>, Protection, SafeDescriptor)>>,
 }
+
+/// Dma-bufs kept for guest buffers lent to the hardware again. A guest decoding into its player's
+/// pixel buffers lends a different pool surface each time it queues a slot; msm_vidc keeps every
+/// dma-buf it was ever given for the session, so a new udmabuf per QBUF (85 a second, 26 MB of
+/// pages each) grew the phone's dma-buf total by 2.8 GB in 20 s. The same surface now comes back
+/// as the same dma-buf, and the driver sees as many as the pool has surfaces.
+const DMABUF_CACHE: usize = 32;
 
 impl GuestMemoryMapper {
     /// The in-VMM shape: `mem` knows its purposes and whether the VM is protected.
@@ -531,7 +557,12 @@ impl GuestMemoryMapper {
     }
 
     pub fn with_policy(mem: GuestMemory, policy: HostAccessPolicy) -> Self {
-        Self { mem, policy }
+        Self {
+            mem,
+            policy,
+            udmabuf: SharedUdmabuf::default(),
+            dmabufs: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn guest_memory(&self) -> &GuestMemory {
@@ -541,14 +572,38 @@ impl GuestMemoryMapper {
 
 impl GuestMemoryMapper {
     fn import(&self, sgs: Vec<SgEntry>, prot: Protection) -> anyhow::Result<GuestBufferImport> {
+        self.reimport(None, sgs, prot)
+    }
+
+    /// `import`, handing back `spare` when it maps exactly these ranges with `prot` and the
+    /// policy still lets the host touch every one (asked again: on a protected VM the guest may
+    /// have taken pages back since).
+    fn reimport(
+        &self,
+        spare: Option<GuestBufferImport>,
+        sgs: Vec<SgEntry>,
+        prot: Protection,
+    ) -> anyhow::Result<GuestBufferImport> {
         let ranges: Vec<(GuestAddress, usize)> = sgs
             .iter()
             .map(|sg| (GuestAddress(sg.start), sg.len as usize))
             .collect();
-        GuestBufferImport::new(&self.mem, ranges, prot, &self.policy).map_err(|e| {
+        if let Some(spare) = spare {
+            if spare.maps(&ranges, prot)
+                && !spare.is_unmapped()
+                && ranges
+                    .iter()
+                    .all(|&(addr, len)| self.policy.check(&self.mem, addr, len).is_ok())
+            {
+                return Ok(spare);
+            }
+        }
+        let mut import = GuestBufferImport::new(&self.mem, ranges, prot, &self.policy).map_err(|e| {
             // The errno travels as the error's root so the device can hand it to the guest.
             anyhow::Error::from(GuestMappingError(e.errno())).context(e.to_string())
-        })
+        })?;
+        import.set_udmabuf(self.udmabuf.clone());
+        Ok(import)
     }
 }
 
@@ -572,6 +627,83 @@ impl VirtioMediaGuestMemoryMapper for GuestMemoryMapper {
                 Protection::read()
             },
         )
+    }
+
+    fn renew_mapping_for(
+        &self,
+        spare: Option<Self::GuestMemoryMapping>,
+        sgs: Vec<SgEntry>,
+        writable: bool,
+    ) -> anyhow::Result<Self::GuestMemoryMapping> {
+        self.reimport(
+            spare,
+            sgs,
+            if writable {
+                Protection::read_write()
+            } else {
+                Protection::read()
+            },
+        )
+    }
+
+    fn renew_dmabuf_for(
+        &self,
+        spare: Option<Self::GuestMemoryMapping>,
+        sgs: Vec<SgEntry>,
+        writable: bool,
+    ) -> anyhow::Result<Self::GuestMemoryMapping> {
+        let prot = if writable {
+            Protection::read_write()
+        } else {
+            Protection::read()
+        };
+        let ranges: Vec<(GuestAddress, usize)> = sgs
+            .iter()
+            .map(|sg| (GuestAddress(sg.start), sg.len as usize))
+            .collect();
+        if let Some(spare) = spare {
+            if spare.is_unmapped()
+                && spare.maps(&ranges, prot)
+                && ranges
+                    .iter()
+                    .all(|&(addr, len)| self.policy.check(&self.mem, addr, len).is_ok())
+            {
+                return Ok(spare);
+            }
+        }
+        let mut import =
+            GuestBufferImport::unmapped(&self.mem, ranges.clone(), prot, &self.policy).map_err(
+                |e| anyhow::Error::from(GuestMappingError(e.errno())).context(e.to_string()),
+            )?;
+        import.set_udmabuf(self.udmabuf.clone());
+        let mut dmabufs = self.dmabufs.lock();
+        if let Some(i) = dmabufs.iter().position(|(r, p, _)| *p == prot && *r == ranges) {
+            let entry = dmabufs.remove(i);
+            match entry.2.try_clone() {
+                Ok(fd) => import.adopt_dmabuf(fd),
+                Err(e) => warn!("cannot share a guest buffer's dma-buf again: {}", e),
+            }
+            dmabufs.push(entry);
+        }
+        // Built now: without it the buffer is of no use to anyone, and the guest should hear so
+        // at QBUF rather than see a decoder that never fills it.
+        let Some(fd) = import.shared_dmabuf() else {
+            return Err(anyhow::Error::from(GuestMappingError(libc::ENOMEM))
+                .context("no dma-buf for a guest buffer with no host view"));
+        };
+        if dmabufs.last().map_or(true, |(r, p, _)| *p != prot || *r != ranges) {
+            match fd.try_clone() {
+                Ok(fd) => {
+                    if dmabufs.len() >= DMABUF_CACHE {
+                        dmabufs.remove(0);
+                    }
+                    dmabufs.push((ranges, prot, fd));
+                }
+                Err(e) => warn!("cannot keep a guest buffer's dma-buf: {}", e),
+            }
+        }
+        drop(dmabufs);
+        Ok(import)
     }
 }
 

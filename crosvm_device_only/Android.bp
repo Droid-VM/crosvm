@@ -41,6 +41,7 @@ rust_binary {
     features: [
         "android-sparse",
         "android_display",
+        "kms_display",
         "android_display_stub",
         "audio",
         "audio_aaudio",
@@ -62,6 +63,7 @@ rust_binary {
         "usb",
         "virgl_renderer",
         "vnc",
+        "webrtc",
     ],
     rustlibs: [
         "libacpi_tables",

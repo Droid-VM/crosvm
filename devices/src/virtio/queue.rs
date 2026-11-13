@@ -157,8 +157,11 @@ impl QueueConfig {
 
     /// Sets the interrupt vector for this queue.
     pub fn set_vector(&mut self, val: u16) {
-        if self.ready {
-            warn!("ignoring write to vector on ready queue");
+        // A ready queue still takes its vector until the device is activated: NetKVM enables its
+        // queues first and assigns their MSI-X vectors later (ParaNdis_ConfigureMSIXVectors), then
+        // reads them back and fails to start on a mismatch. QEMU accepts these writes too.
+        if self.activated {
+            warn!("ignoring write to vector on activated queue");
             return;
         }
 

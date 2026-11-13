@@ -29,6 +29,7 @@ pub mod xhci_controller;
 pub mod xhci_transfer;
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 
 use base::debug;
@@ -43,6 +44,7 @@ use thiserror::Error;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
 
+use crate::pci::MsixConfig;
 use crate::register_space::RegisterInterface;
 use crate::usb::backend::error::Error as BackendProviderError;
 use crate::usb::xhci::command_ring_controller::CommandRingController;
@@ -51,6 +53,7 @@ use crate::usb::xhci::device_slot::DeviceSlots;
 use crate::usb::xhci::device_slot::Error as DeviceSlotError;
 use crate::usb::xhci::interrupter::Error as InterrupterError;
 use crate::usb::xhci::interrupter::Interrupter;
+use crate::usb::xhci::interrupter::Interrupters;
 use crate::usb::xhci::intr_moderation_handler::IntrModerationHandler;
 use crate::usb::xhci::intr_resample_handler::IntrResampleHandler;
 use crate::usb::xhci::ring_buffer_stop_cb::fallible_closure;
@@ -110,7 +113,7 @@ type Result<T> = std::result::Result<T, Error>;
 pub struct Xhci {
     fail_handle: Arc<dyn FailHandle>,
     regs: XhciRegs,
-    interrupter: Arc<Mutex<Interrupter>>,
+    interrupter: Interrupters,
     command_ring_controller: Arc<CommandRingController>,
     device_slots: DeviceSlots,
     event_loop: Arc<EventLoop>,
@@ -123,7 +126,7 @@ pub struct Xhci {
     #[allow(dead_code)]
     intr_resample_handler: Arc<IntrResampleHandler>,
     #[allow(dead_code)]
-    intr_moderation_handler: Arc<IntrModerationHandler>,
+    intr_moderation_handler: Vec<Arc<IntrModerationHandler>>,
     #[allow(dead_code)]
     device_provider: Box<dyn XhciBackendDeviceProvider>,
 }
@@ -135,30 +138,37 @@ impl Xhci {
         mem: GuestMemory,
         device_provider: Box<dyn XhciBackendDeviceProvider>,
         interrupt_evt: IrqLevelEvent,
+        msix: Arc<Mutex<MsixConfig>>,
+        intx_disabled: Arc<AtomicBool>,
         regs: XhciRegs,
     ) -> Result<Arc<Self>> {
         let (event_loop, join_handle) =
             EventLoop::start("xhci".to_string(), Some(fail_handle.clone()))
                 .map_err(Error::StartEventLoop)?;
-        let irq_evt = interrupt_evt
-            .get_trigger()
-            .try_clone()
-            .map_err(Error::CloneIrqEvent)?;
-        let interrupter = Arc::new(Mutex::new(
-            Interrupter::new(mem.clone(), irq_evt, &regs).map_err(Error::CreateInterrupter)?,
-        ));
+        let mut interrupters = Vec::new();
+        for index in 0..regs.interrupters.len() {
+            let irq_evt = interrupt_evt.get_trigger().try_clone().map_err(Error::CloneIrqEvent)?;
+            interrupters.push(Arc::new(Mutex::new(
+                Interrupter::new_indexed(mem.clone(), irq_evt, &regs, Some(msix.clone()),
+                    intx_disabled.clone(), index).map_err(Error::CreateInterrupter)?,
+            )));
+        }
+        let interrupter = Interrupters(Arc::new(interrupters));
         let event_loop = Arc::new(event_loop);
         let irq_resample_evt = interrupt_evt
             .get_resample()
             .try_clone()
             .map_err(Error::CloneResampleEvent)?;
         let intr_resample_handler =
-            IntrResampleHandler::start(&event_loop, interrupter.clone(), irq_resample_evt)
+            IntrResampleHandler::start(&event_loop, interrupter.primary().clone(), irq_resample_evt)
                 .ok_or(Error::StartResampleHandler)?;
-        let intr_moderation_handler =
-            IntrModerationHandler::start(&event_loop, interrupter.clone())
-                .ok_or(Error::StartModerationHandler)?;
-        let hub = Arc::new(UsbHub::new(&regs, interrupter.clone()));
+        let mut intr_moderation_handler = Vec::new();
+        for intr in interrupter.0.iter() {
+            intr_moderation_handler.push(
+                IntrModerationHandler::start(&event_loop, intr.clone())
+                    .ok_or(Error::StartModerationHandler)?);
+        }
+        let hub = Arc::new(UsbHub::new(&regs, interrupter.primary().clone()));
 
         let mut device_provider = device_provider;
         device_provider
@@ -177,7 +187,7 @@ impl Xhci {
             mem,
             event_loop.clone(),
             device_slots.clone(),
-            interrupter.clone(),
+            interrupter.primary().clone(),
         )
         .map_err(Error::CreateCommandRingController)?;
         let xhci = Arc::new(Xhci {
@@ -240,45 +250,47 @@ impl Xhci {
             });
         }
 
-        let xhci_weak = Arc::downgrade(xhci);
-        xhci.regs.iman.set_write_cb(move |val: u32| {
-            let xhci = xhci_weak.upgrade().unwrap();
-            let r = xhci.iman_callback(val);
-            xhci.handle_register_callback_result(r, ());
-            val
-        });
+        for index in 0..xhci.regs.interrupters.len() {
+            let xhci_weak = Arc::downgrade(xhci);
+            xhci.regs.interrupters[index].iman.set_write_cb(move |val: u32| {
+                let xhci = xhci_weak.upgrade().unwrap();
+                let r = xhci.iman_callback(index, val);
+                xhci.handle_register_callback_result(r, ());
+                val
+            });
 
-        let xhci_weak = Arc::downgrade(xhci);
-        xhci.regs.imod.set_write_cb(move |val: u32| {
-            let xhci = xhci_weak.upgrade().unwrap();
-            let r = xhci.imod_callback(val);
-            xhci.handle_register_callback_result(r, ());
-            val
-        });
+            let xhci_weak = Arc::downgrade(xhci);
+            xhci.regs.interrupters[index].imod.set_write_cb(move |val: u32| {
+                let xhci = xhci_weak.upgrade().unwrap();
+                let r = xhci.imod_callback(index, val);
+                xhci.handle_register_callback_result(r, ());
+                val
+            });
 
-        let xhci_weak = Arc::downgrade(xhci);
-        xhci.regs.erstsz.set_write_cb(move |val: u32| {
-            let xhci = xhci_weak.upgrade().unwrap();
-            let r = xhci.erstsz_callback(val);
-            xhci.handle_register_callback_result(r, ());
-            val
-        });
+            let xhci_weak = Arc::downgrade(xhci);
+            xhci.regs.interrupters[index].erstsz.set_write_cb(move |val: u32| {
+                let xhci = xhci_weak.upgrade().unwrap();
+                let r = xhci.erstsz_callback(index, val);
+                xhci.handle_register_callback_result(r, ());
+                val
+            });
 
-        let xhci_weak = Arc::downgrade(xhci);
-        xhci.regs.erstba.set_write_cb(move |val: u64| {
-            let xhci = xhci_weak.upgrade().unwrap();
-            let r = xhci.erstba_callback(val);
-            xhci.handle_register_callback_result(r, ());
-            val
-        });
+            let xhci_weak = Arc::downgrade(xhci);
+            xhci.regs.interrupters[index].erstba.set_write_cb(move |val: u64| {
+                let xhci = xhci_weak.upgrade().unwrap();
+                let r = xhci.erstba_callback(index, val);
+                xhci.handle_register_callback_result(r, ());
+                val
+            });
 
-        let xhci_weak = Arc::downgrade(xhci);
-        xhci.regs.erdp.set_write_cb(move |val: u64| {
-            let xhci = xhci_weak.upgrade().unwrap();
-            let r = xhci.erdp_callback(val);
-            xhci.handle_register_callback_result(r, ());
-            val
-        });
+            let xhci_weak = Arc::downgrade(xhci);
+            xhci.regs.interrupters[index].erdp.set_write_cb(move |val: u64| {
+                let xhci = xhci_weak.upgrade().unwrap();
+                let r = xhci.erdp_callback(index, val);
+                xhci.handle_register_callback_result(r, ());
+                val
+            });
+        }
     }
 
     fn handle_register_callback_result<T>(&self, r: Result<T>, t: T) -> T {
@@ -320,14 +332,12 @@ impl Xhci {
             self.regs.crcr.clear_bits(CRCR_COMMAND_RING_RUNNING);
         }
 
-        // Enable interrupter if needed.
-        let enabled = (value & USB_CMD_INTERRUPTER_ENABLE) > 0
-            && (self.regs.iman.get_value() & IMAN_INTERRUPT_ENABLE) > 0;
-        debug!("xhci_controller: interrupter enable?: {}", enabled);
-        self.interrupter
-            .lock()
-            .set_enabled(enabled)
-            .map_err(Error::EnableInterrupter)?;
+        for (index, regs) in self.regs.interrupters.iter().enumerate() {
+            let enabled = (value & USB_CMD_INTERRUPTER_ENABLE) > 0
+                && (regs.iman.get_value() & IMAN_INTERRUPT_ENABLE) > 0;
+            self.interrupter.0[index].lock().set_enabled(enabled)
+                .map_err(Error::EnableInterrupter)?;
+        }
         Ok(value)
     }
 
@@ -381,7 +391,7 @@ impl Xhci {
                 self.fail_handle.clone(),
                 move || -> Result<()> {
                     crcr.clear_bits(CRCR_COMMAND_RING_RUNNING);
-                    interrupter
+                    interrupter.primary()
                         .lock()
                         .send_command_completion_trb(
                             TrbCompletionCode::CommandRingStopped,
@@ -425,7 +435,7 @@ impl Xhci {
             && (value & PORTSC_CURRENT_CONNECT_STATUS) != 0
         {
             value |= PORTSC_PORT_LINK_STATE_CHANGE;
-            self.interrupter
+            self.interrupter.primary()
                 .lock()
                 .send_port_status_change_trb(port_id)
                 .map_err(Error::SendInterrupt)?;
@@ -449,7 +459,7 @@ impl Xhci {
             if warm {
                 value |= PORTSC_WARM_RESET_CHANGE;
             }
-            self.interrupter
+            self.interrupter.primary()
                 .lock()
                 .send_port_status_change_trb(port_id)
                 .map_err(Error::SendInterrupt)?;
@@ -486,20 +496,20 @@ impl Xhci {
     }
 
     // Callback for iman register write.
-    fn iman_callback(&self, value: u32) -> Result<()> {
+    fn iman_callback(&self, index: usize, value: u32) -> Result<()> {
         let _trace = cros_tracing::trace_event!(USB, "iman_callback", value);
         let enabled = ((value & IMAN_INTERRUPT_ENABLE) > 0)
             && ((self.regs.usbcmd.get_value() & USB_CMD_INTERRUPTER_ENABLE) > 0);
-        self.interrupter
+        self.interrupter.0[index]
             .lock()
             .set_enabled(enabled)
             .map_err(Error::EnableInterrupter)
     }
 
     // Callback for imod register write.
-    fn imod_callback(&self, value: u32) -> Result<()> {
+    fn imod_callback(&self, index: usize, value: u32) -> Result<()> {
         let _trace = cros_tracing::trace_event!(USB, "imod_callback", value);
-        self.interrupter
+        self.interrupter.0[index]
             .lock()
             .set_moderation(
                 (value & IMOD_INTERRUPT_MODERATION_INTERVAL) as u16,
@@ -509,18 +519,18 @@ impl Xhci {
     }
 
     // Callback for erstsz register write.
-    fn erstsz_callback(&self, value: u32) -> Result<()> {
+    fn erstsz_callback(&self, index: usize, value: u32) -> Result<()> {
         let _trace = cros_tracing::trace_event!(USB, "erstsz_callback", value);
-        self.interrupter
+        self.interrupter.0[index]
             .lock()
             .set_event_ring_seg_table_size((value & ERSTSZ_SEGMENT_TABLE_SIZE) as u16)
             .map_err(Error::SetupEventRing)
     }
 
     // Callback for erstba register write.
-    fn erstba_callback(&self, value: u64) -> Result<()> {
+    fn erstba_callback(&self, index: usize, value: u64) -> Result<()> {
         let _trace = cros_tracing::trace_event!(USB, "erstba_callback", value);
-        self.interrupter
+        self.interrupter.0[index]
             .lock()
             .set_event_ring_seg_table_base_addr(GuestAddress(
                 value & ERSTBA_SEGMENT_TABLE_BASE_ADDRESS,
@@ -529,9 +539,9 @@ impl Xhci {
     }
 
     // Callback for erdp register write.
-    fn erdp_callback(&self, value: u64) -> Result<()> {
+    fn erdp_callback(&self, index: usize, value: u64) -> Result<()> {
         let _trace = cros_tracing::trace_event!(USB, "erdp_callback", value);
-        self.interrupter
+        self.interrupter.0[index]
             .lock()
             .set_event_ring_dequeue_pointer(
                 GuestAddress(value & ERDP_EVENT_RING_DEQUEUE_POINTER),
@@ -564,11 +574,7 @@ impl Xhci {
         let dcbaap = self.regs.dcbaap.clone();
         let config = self.regs.config.clone();
         let dnctrl = self.regs.dnctrl.clone();
-        let iman = self.regs.iman.clone();
-        let imod = self.regs.imod.clone();
-        let erstsz = self.regs.erstsz.clone();
-        let erstba = self.regs.erstba.clone();
-        let erdp = self.regs.erdp.clone();
+        let intr_regs = self.regs.interrupters.clone();
         let command_ring_controller = self.command_ring_controller.clone();
         let interrupter = self.interrupter.clone();
         let device_slots = self.device_slots.clone();
@@ -588,15 +594,14 @@ impl Xhci {
                 // The interrupter forgets its event ring before the hub below re-announces its
                 // ports: those changes then wait in PORTSC (as they do before the guest set a
                 // ring up at all) rather than land in the ring the guest just gave up.
-                interrupter
-                    .lock()
-                    .reset()
-                    .map_err(Error::ResetInterrupter)?;
-                iman.reset();
-                imod.reset();
-                erstsz.reset();
-                erstba.reset();
-                erdp.reset();
+                for (intr, regs) in interrupter.0.iter().zip(&intr_regs) {
+                    intr.lock().reset().map_err(Error::ResetInterrupter)?;
+                    regs.iman.reset();
+                    regs.imod.reset();
+                    regs.erstsz.reset();
+                    regs.erstba.reset();
+                    regs.erdp.reset();
+                }
                 // USBSTS back to its reset value, HCH alone (spec 5.4.2), with CNR kept up
                 // until the end; the hub below sets PCD again for the ports it re-announces.
                 usbsts.set_value(USB_STS_HALTED | USB_STS_CONTROLLER_NOT_READY);

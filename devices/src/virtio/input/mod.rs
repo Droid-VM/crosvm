@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+mod axis_scale;
 #[allow(dead_code)]
 mod defaults;
 mod evdev;
@@ -509,7 +510,11 @@ impl<T: EventSource> Worker<T> {
         };
 
         'wait: loop {
-            let wait_events = match wait_ctx.wait() {
+            let waited = match self.event_source.idle_timeout() {
+                Some(timeout) => wait_ctx.wait_timeout(timeout),
+                None => wait_ctx.wait(),
+            };
+            let wait_events = match waited {
                 Ok(wait_events) => wait_events,
                 Err(e) => {
                     error!("failed polling for events: {}", e);
@@ -556,6 +561,8 @@ impl<T: EventSource> Worker<T> {
                 }
             }
 
+            self.event_source.idle_report();
+            eventq_needs_interrupt |= self.send_events();
             if eventq_needs_interrupt {
                 self.event_queue.trigger_interrupt();
             }
@@ -700,14 +707,49 @@ where
 }
 
 /// Creates a new virtio input device from an event device node
-pub fn new_evdev<T>(source: T, virtio_features: u64) -> Result<Input<EvdevEventSource<T>>>
+pub fn new_evdev<T>(
+    source: T,
+    virtio_features: u64,
+    physical_size_mm: Option<(std::num::NonZeroU32, std::num::NonZeroU32)>,
+) -> Result<Input<EvdevEventSource<T>>>
 where
     T: Read + Write + AsRawDescriptor + Send + 'static,
 {
+    let mut config = VirtioInputConfig::from_evdev(&source)?;
+    let mut scales = BTreeMap::new();
+    for code in [ABS_X, ABS_Y, ABS_MT_POSITION_X, ABS_MT_POSITION_Y] {
+        if let Some(info) = config.axis_info.get_mut(&code) {
+            if let Some(scale) = axis_scale::AxisScale::new(
+                u32::from(info.min) as i32, u32::from(info.max) as i32,
+            ) {
+                info.min = Le32::from(0);
+                info.max = Le32::from(axis_scale::AxisScale::MAX);
+                info.fuzz = Le32::from(scale.distance(info.fuzz.into()));
+                info.flat = Le32::from(scale.distance(info.flat.into()));
+                let resolution = u32::from(info.res);
+                if resolution != 0 {
+                    info.res = Le32::from(scale.distance(resolution).max(1));
+                }
+                scales.insert(code, scale);
+            }
+            if let Some((width, height)) = physical_size_mm {
+                let mm = if code == ABS_X || code == ABS_MT_POSITION_X {
+                    width
+                } else {
+                    height
+                };
+                let span = u32::from(info.max).saturating_sub(u32::from(info.min));
+                info.res = Le32::from(
+                    ((u64::from(span) + u64::from(mm.get()) / 2) / u64::from(mm.get()))
+                        .max(1) as u32,
+                );
+            }
+        }
+    }
     Ok(Input {
         worker_thread: None,
-        config: VirtioInputConfig::from_evdev(&source)?,
-        source: Some(EvdevEventSource::new(source)),
+        config,
+        source: Some(EvdevEventSource::new(source, scales)),
         virtio_features,
     })
 }

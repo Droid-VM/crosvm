@@ -154,7 +154,7 @@ pub struct CpuOptions {
 /// for the user is what produced the silent race this replaces, where a VNC server and an Android
 /// display service configured together left the app's Surface waiting forever on a binder that was
 /// never registered.
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DisplayScreen {
     /// virtio-gpu scanout 0.
@@ -169,7 +169,7 @@ pub enum DisplayScreen {
     Simplefb,
 }
 
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 impl DisplayScreen {
     /// The name this screen is written as on the command line, for error messages that have to
     /// quote back what the user typed (or what the compat default resolved to).
@@ -202,7 +202,7 @@ impl DisplayScreen {
 ///
 /// This is a debugging control, not a product setting (plan §4.6). What a panel shows the user is
 /// the negotiated *result*, read-only.
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TransportCap {
@@ -224,7 +224,7 @@ pub enum TransportCap {
     GpuHw,
 }
 
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 impl TransportCap {
     /// Whether this ceiling leaves the dmabuf import available at all.
     ///
@@ -334,6 +334,129 @@ impl VncConfig {
         !self.view_only
     }
 }
+
+/// Address a WebRTC endpoint listens on when the option does not say.
+#[cfg(feature = "webrtc")]
+pub const DEFAULT_WEBRTC_HOST: &str = "0.0.0.0";
+#[cfg(feature = "webrtc")]
+pub const DEFAULT_WEBRTC_PORT: u32 = 8080;
+
+/// Which codecs a WebRTC endpoint offers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg(feature = "webrtc")]
+pub enum WebrtcCodec {
+    /// H.265 to viewers that can all decode it (Chrome 136+ and Safari 18+ with hardware decode),
+    /// H.264 otherwise.
+    #[default]
+    Auto,
+    /// H.264 only.
+    H264,
+}
+
+/// One WebRTC endpoint: where its viewer page and signalling listen, and which screen it serves.
+///
+/// The same binding shape as `VncConfig` -- `screen=`, `view-only=`, `transport-cap=` mean what
+/// they mean there -- because the two are the same kind of thing: an exporter for one screen, with
+/// that screen's own tablet and keyboard. A screen carries at most one of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[cfg(feature = "webrtc")]
+pub struct WebrtcConfig {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<u32>,
+    /// Required as `?token=` by the signalling endpoints when set. The viewer page passes on the
+    /// one it was opened with.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// STUN servers for ICE, as `stun:host:port`. Empty (the default) offers host candidates only,
+    /// which is all a LAN needs.
+    #[serde(default)]
+    pub stun: Vec<String>,
+    #[serde(default)]
+    pub view_only: bool,
+    #[serde(default)]
+    pub screen: Option<DisplayScreen>,
+    /// Ceiling on this binding's transport. `gpu` is refused at validation: it forbids the
+    /// hardware encoder, and a WebRTC endpoint without one has nothing to send.
+    #[serde(default)]
+    pub transport_cap: TransportCap,
+    #[serde(default)]
+    pub codec: WebrtcCodec,
+    /// Encoder bitrate in kbit/s: fixed, and the ceiling a viewer's REMB can lower it from.
+    /// Unset derives it from the screen size (1080p: about 6200).
+    #[serde(default)]
+    pub bitrate: Option<u32>,
+    /// Follow the viewers' bandwidth estimate (REMB) down from `bitrate`. `false` holds the rate
+    /// fixed, for a LAN where the estimate can only be wrong.
+    #[serde(default = "default_webrtc_adapt")]
+    pub adapt: bool,
+}
+
+#[cfg(feature = "webrtc")]
+fn default_webrtc_adapt() -> bool {
+    true
+}
+
+#[cfg(feature = "webrtc")]
+impl WebrtcConfig {
+    /// `bitrate=` in bits per second.
+    pub fn bitrate_bps(&self) -> Option<u32> {
+        self.bitrate.map(|kbps| kbps.saturating_mul(1000))
+    }
+
+    /// Whether H.265 is offered next to H.264.
+    pub fn allow_h265(&self) -> bool {
+        self.codec == WebrtcCodec::Auto
+    }
+
+    pub fn effective_port(&self) -> u32 {
+        self.port.unwrap_or(DEFAULT_WEBRTC_PORT)
+    }
+
+    /// `host:port` for the listener.
+    pub fn addr(&self) -> String {
+        format!(
+            "{}:{}",
+            self.host.as_deref().unwrap_or(DEFAULT_WEBRTC_HOST),
+            self.effective_port()
+        )
+    }
+
+    /// See `VncConfig::wants_input_devices`.
+    pub fn wants_input_devices(&self) -> bool {
+        !self.view_only
+    }
+}
+
+/// Direct scanout owns the Android display for the lifetime of this VM.
+#[cfg(feature = "kms_display")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, FromKeyValues)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct KmsDisplayConfig {
+    pub card: PathBuf,
+    pub screen: DisplayScreen,
+    pub takeover: KmsTakeoverMode,
+    #[serde(default)]
+    pub planes: KmsPlanes,
+}
+
+#[cfg(feature = "kms_display")]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KmsTakeoverMode {
+    /// crosvm stops Android and starts its own restoration sentinel (adb debugging).
+    Display,
+    /// The launcher has stopped Android and owns the restoration sentinel.
+    External,
+}
+
+#[cfg(feature = "kms_display")]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KmsPlanes { #[default] Split, Single }
 
 /// One Android display service: the name crosvm registers with the service manager, and which
 /// screen's frames go into the Surface the app hands back through it.
@@ -564,6 +687,12 @@ pub fn parse_touch_device_option(s: &str) -> Result<TouchDeviceOption, String> {
 pub enum InputDeviceOption {
     Evdev {
         path: PathBuf,
+        /// Physical touch surface width in mm; must be paired with height-mm.
+        #[serde(rename = "width-mm")]
+        width_mm: Option<std::num::NonZeroU32>,
+        /// Physical touch surface height in mm; overrides missing/incorrect evdev resolution.
+        #[serde(rename = "height-mm")]
+        height_mm: Option<std::num::NonZeroU32>,
     },
     // `name` is here for a different reason than the touch devices' below, and the difference is
     // worth stating because it looks like the same field. A keyboard reports no coordinates, so it
@@ -895,6 +1024,27 @@ pub struct PreAllocConfig {
     pub test_pool_step_mb: Option<u64>,
 }
 
+impl PreAllocConfig {
+    /// `later`'s keys over this one's: `--pre-alloc` given again (the app passes its pools, a VM's
+    /// own options add another) adds keys and overrides those it repeats.
+    pub fn merge(self, later: Self) -> Self {
+        PreAllocConfig {
+            gfx_host_mb: later.gfx_host_mb.or(self.gfx_host_mb),
+            gpu_guest_mb: later.gpu_guest_mb.or(self.gpu_guest_mb),
+            gpu_guest_prealloc_mb: later.gpu_guest_prealloc_mb.or(self.gpu_guest_prealloc_mb),
+            gpu_guest_step_mb: later.gpu_guest_step_mb.or(self.gpu_guest_step_mb),
+            gpu_guest_max_grants: later.gpu_guest_max_grants.or(self.gpu_guest_max_grants),
+            drm_host_mb: later.drm_host_mb.or(self.drm_host_mb),
+            venus_host_mb: later.venus_host_mb.or(self.venus_host_mb),
+            media_host_mb: later.media_host_mb.or(self.media_host_mb),
+            media_guest_mb: later.media_guest_mb.or(self.media_guest_mb),
+            test_pool_mb: later.test_pool_mb.or(self.test_pool_mb),
+            test_pool_prealloc_mb: later.test_pool_prealloc_mb.or(self.test_pool_prealloc_mb),
+            test_pool_step_mb: later.test_pool_step_mb.or(self.test_pool_step_mb),
+        }
+    }
+}
+
 /// What a `--virtio-media` device is. Defined next to the device, because the vhost-user media
 /// helper is told the same thing in its parameters.
 #[cfg(feature = "media")]
@@ -926,6 +1076,12 @@ pub struct MediaDeviceConfig {
     /// decoder should get one.
     #[serde(default)]
     pub allow_sw: bool,
+    /// Decode with the host's msm_vidc V4L2 decoder (/dev/video32) directly, writing frames
+    /// straight into the guest's `CAPTURE` buffers through udmabuf, and fall back to MediaCodec
+    /// where it cannot (`kind=decoder`). Off by default: a 10-bit stream then comes out as P010,
+    /// which a guest has to know.
+    #[serde(default)]
+    pub vidc: bool,
     /// Run the device's backend in its own process under this host uid, the way `--virtio-snd`
     /// does, because the host's camera and codec services decide from the real uid. Unset keeps
     /// the device in the VMM's process. Only meaningful for `camera`, `decoder` and `encoder`.
@@ -1249,12 +1405,15 @@ pub struct Config {
     pub jail_config: Option<JailConfig>,
     #[cfg(windows)]
     pub kernel_log_file: Option<String>,
+    #[cfg(feature = "kms_display")]
+    pub kms_display: Option<KmsDisplayConfig>,
     #[cfg(any(target_os = "android", target_os = "linux"))]
     pub lock_guest_memory: bool,
     #[cfg(windows)]
     pub log_file: Option<String>,
     #[cfg(windows)]
     pub logs_directory: Option<String>,
+    pub mbi_spis: Option<u32>,
     #[cfg(all(feature = "media", feature = "video-decoder"))]
     pub media_decoder: Vec<VideoDeviceConfig>,
     pub memory: Option<u64>,
@@ -1377,6 +1536,8 @@ pub struct Config {
     pub virtio_mmio_console: bool,
     /// Block devices on the virtio-mmio transport (`--virtio-mmio-block`).
     pub virtio_mmio_disks: Vec<DiskOption>,
+    /// The virtio-mmio devices interrupt on edge SPIs, not level SPIs (`--virtio-mmio-edge-irq`).
+    pub virtio_mmio_edge_irq: bool,
     /// The GPU goes on virtio-mmio, after net, without a PCI shared-memory aperture.
     pub virtio_mmio_gpu: bool,
     /// The virtio input devices go on the virtio-mmio transport (`--virtio-mmio-input`).
@@ -1399,6 +1560,9 @@ pub struct Config {
     #[cfg(feature = "vtpm")]
     pub vtpm_proxy: bool,
     pub wayland_socket_paths: BTreeMap<String, PathBuf>,
+    /// WebRTC endpoints, one per screen they export. Empty is the normal case.
+    #[cfg(feature = "webrtc")]
+    pub webrtc_server: Vec<WebrtcConfig>,
     #[cfg(all(windows, feature = "gpu"))]
     pub window_procedure_thread_split_config: Option<WindowProcedureThreadSplitConfig>,
     pub x_display: Option<String>,
@@ -1412,6 +1576,8 @@ impl Default for Config {
             acpi_tables: Vec::new(),
             #[cfg(feature = "android_display")]
             android_display_service: Vec::new(),
+            #[cfg(feature = "kms_display")]
+            kms_display: None,
             android_fstab: None,
             async_executor: None,
             #[cfg(feature = "balloon")]
@@ -1527,6 +1693,7 @@ impl Default for Config {
             boost_uclamp: false,
             #[cfg(all(feature = "media", feature = "video-decoder"))]
             media_decoder: Default::default(),
+            mbi_spis: None,
             memory: None,
             memory_file: None,
             mmio_address_ranges: Vec::new(),
@@ -1618,6 +1785,8 @@ impl Default for Config {
             vhost_user_fs: Vec::new(),
             #[cfg(feature = "vnc")]
             vnc_server: Vec::new(),
+            #[cfg(feature = "webrtc")]
+            webrtc_server: Vec::new(),
             vsock: None,
             #[cfg(feature = "video-decoder")]
             video_dec: Vec::new(),
@@ -1632,6 +1801,7 @@ impl Default for Config {
             virtio_input: Vec::new(),
             virtio_mmio_console: false,
             virtio_mmio_disks: Vec::new(),
+            virtio_mmio_edge_irq: false,
             virtio_mmio_gpu: false,
             virtio_mmio_input: false,
             virtio_mmio_media: false,
@@ -1665,6 +1835,28 @@ impl Config {
         self.vnc_server.iter().find(|v| v.screen == Some(screen))
     }
 
+    /// The WebRTC endpoint bound to `screen`. Same resolution caveat as `vnc_server_for`.
+    #[cfg(feature = "webrtc")]
+    pub fn webrtc_server_for(&self, screen: DisplayScreen) -> Option<&WebrtcConfig> {
+        self.webrtc_server.iter().find(|w| w.screen == Some(screen))
+    }
+
+    /// Whether the exporter bound to `screen` gets a tablet and keyboard of its own: `None` for a
+    /// screen with no exporter that has per-binding input (VNC or WebRTC), else the binding's
+    /// answer. One question for both, because device creation has to ask it before it knows which
+    /// sink will be built.
+    #[cfg(feature = "vnc")]
+    pub fn binding_wants_input(&self, screen: DisplayScreen) -> Option<bool> {
+        if let Some(vnc) = self.vnc_server_for(screen) {
+            return Some(vnc.wants_input_devices());
+        }
+        #[cfg(feature = "webrtc")]
+        if let Some(webrtc) = self.webrtc_server_for(screen) {
+            return Some(webrtc.wants_input_devices());
+        }
+        None
+    }
+
     /// The Android display service bound to `screen`, or `None` if that screen has no native
     /// exporter. Same resolution caveat as `vnc_server_for`.
     #[cfg(feature = "android_display")]
@@ -1685,7 +1877,7 @@ impl Config {
 /// line configured, and that is only settled once everything has been folded into the `Config`.
 /// The answer is written back into the entry, so no consumer downstream ever has to decide again
 /// what an unspecified screen meant -- and none of them can decide it differently.
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     // Which screens exist. `validate_gpu_config` has already run and given a GPU with no
     // `displays=` its one default display, so the presence of the device is the whole question.
@@ -1694,6 +1886,22 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     #[cfg(not(feature = "gpu"))]
     let has_gpu_screen = false;
     let has_simplefb_screen = cfg.simplefb.is_some();
+    #[cfg(feature = "kms_display")]
+    if let Some(kms) = &cfg.kms_display {
+        if !cfg!(target_os = "android") {
+            return Err("kms-display takeover requires Android".into());
+        }
+        if kms.screen != DisplayScreen::Gpu0 || !has_gpu_screen {
+            return Err("kms-display requires screen=gpu-0 and --gpu".into());
+        }
+        if cfg.jail_config.is_some() {
+            return Err("kms-display requires --disable-sandbox".into());
+        }
+        if !kms.card.is_absolute() || !cfg.wayland_socket_paths.is_empty() {
+            return Err("kms-display requires an absolute card path and no Wayland exporter".into());
+        }
+    }
+
 
     let screen_exists = |screen: DisplayScreen| match screen {
         DisplayScreen::Gpu0 => has_gpu_screen,
@@ -1720,6 +1928,10 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
     for service in cfg.android_display_service.iter_mut() {
         let _ = service.screen.get_or_insert(default_screen);
     }
+    #[cfg(feature = "webrtc")]
+    for webrtc in cfg.webrtc_server.iter_mut() {
+        let _ = webrtc.screen.get_or_insert(default_screen);
+    }
 
     // A binding to a screen that does not exist. Rejecting is the point: the alternative is an
     // exporter that is configured, reports no error, and never shows anything -- which is how a
@@ -1734,6 +1946,32 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
                 screen.as_str(),
                 screen.source_option(),
             ));
+        }
+    }
+    #[cfg(feature = "webrtc")]
+    for webrtc in cfg.webrtc_server.iter() {
+        let screen = webrtc.screen.expect("resolved above");
+        if !screen_exists(screen) {
+            return Err(format!(
+                "`webrtc-server` is bound to screen `{}`, but no {} device is configured",
+                screen.as_str(),
+                screen.source_option(),
+            ));
+        }
+        if webrtc.transport_cap == TransportCap::Gpu {
+            return Err(
+                "`webrtc-server` cannot take `transport-cap=gpu`: that ceiling forbids the \
+                 hardware encoder, and WebRTC has nothing to send without it"
+                    .into(),
+            );
+        }
+        if let Some(kbps) = webrtc.bitrate {
+            if !(500..=100_000).contains(&kbps) {
+                return Err(format!(
+                    "`webrtc-server` bitrate={} is out of range; give kbit/s, 500 to 100000",
+                    kbps
+                ));
+            }
         }
     }
     #[cfg(feature = "android_display")]
@@ -1766,6 +2004,18 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
             if ports.contains(&port) {
                 return Err(format!(
                     "port {} is claimed by two `vnc-server` options; each needs its own",
+                    port
+                ));
+            }
+            ports.push(port);
+        }
+        #[cfg(feature = "webrtc")]
+        for webrtc in cfg.webrtc_server.iter() {
+            let port = webrtc.effective_port();
+            if ports.contains(&port) {
+                return Err(format!(
+                    "port {} is claimed twice (`webrtc-server` and another exporter); each needs \
+                     its own",
                     port
                 ));
             }
@@ -1806,6 +2056,14 @@ fn validate_display_exporters(cfg: &mut Config) -> Result<(), String> {
             .filter(|s| s.screen == Some(screen))
         {
             exporters.push(format!("`android-display-service` `{}`", service.name));
+        }
+        #[cfg(feature = "webrtc")]
+        for webrtc in cfg.webrtc_server.iter().filter(|w| w.screen == Some(screen)) {
+            exporters.push(format!("`webrtc-server` on port {}", webrtc.effective_port()));
+        }
+        #[cfg(feature = "kms_display")]
+        if cfg.kms_display.as_ref().map(|k| k.screen) == Some(screen) {
+            exporters.push("`kms-display`".into());
         }
         if exporters.len() > 1 {
             return Err(format!(
@@ -2034,7 +2292,7 @@ pub fn validate_config(cfg: &mut Config) -> std::result::Result<(), String> {
 
     // After the display devices are all known: which screens exist is exactly the input this
     // needs, and it writes each exporter's resolved screen back into the config.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     validate_display_exporters(cfg)?;
 
     // Validate platform specific things
@@ -2114,13 +2372,13 @@ mod tests {
 
     /// Same as `config_from_args` but keeps a validation failure instead of panicking on it, so a
     /// test can say which rule rejected the command line and not merely that something did.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     fn config_from_args_result(args: &[&str]) -> std::result::Result<Config, String> {
         Config::try_from(crate::crosvm::cmdline::RunCommand::from_args(&[], args).unwrap())
     }
 
     /// A `--simplefb` that parses; the geometry is never used by these tests, only its presence.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     const SIMPLEFB_ARG: &str = "width=1280,height=720";
 
     #[test]

@@ -104,7 +104,12 @@ const POOL_SCANOUT_DMABUF_MIN_SIZE: u64 = 512 * 1024;
 fn is_single_plane_8888_rgb(format: u32) -> bool {
     matches!(
         format,
-        DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 | DRM_FORMAT_XBGR8888 | DRM_FORMAT_ABGR8888
+        DRM_FORMAT_XRGB8888
+            | DRM_FORMAT_ARGB8888
+            | DRM_FORMAT_XBGR8888
+            | DRM_FORMAT_ABGR8888
+            // Also single-plane RGB, 8 bytes a pixel; the display's blit converts it.
+            | DRM_FORMAT_ABGR16161616F
     )
 }
 
@@ -2563,7 +2568,10 @@ impl VirtioGpu {
                     scanout.create_surface(
                         &self.display,
                         Some(scanout_parent_surface_id),
-                        scanout_rect,
+                        Some(virtio_gpu_rect {
+                            x: 0.into(), y: 0.into(),
+                            width: resource.width.into(), height: resource.height.into(),
+                        }),
                     )?;
                     // The parenting just happened (or was already in force -- create_surface is a
                     // no-op when the parent is unchanged); record which scanout it was against.

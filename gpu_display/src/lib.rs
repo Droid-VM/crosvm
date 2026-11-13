@@ -33,6 +33,8 @@ mod event_device;
 mod gpu_display_android;
 #[cfg(feature = "android_display_stub")]
 mod gpu_display_android_stub;
+#[cfg(feature = "kms_display")]
+mod gpu_display_kms;
 mod gpu_display_stub;
 #[cfg(feature = "vnc")]
 mod gpu_display_vnc;
@@ -51,6 +53,14 @@ mod sys;
 mod vnc_blit;
 #[cfg(feature = "vnc")]
 mod vnc_h264;
+#[cfg(feature = "vnc")]
+mod video_encoder;
+#[cfg(feature = "webrtc")]
+mod gpu_display_webrtc;
+#[cfg(feature = "webrtc")]
+mod webrtc_hub;
+#[cfg(feature = "webrtc")]
+mod webrtc_rtc;
 #[cfg(feature = "vulkan_display")]
 pub mod vulkan;
 
@@ -77,6 +87,8 @@ pub const DRM_FORMAT_XRGB8888: u32 = drm_fourcc(b'X', b'R', b'2', b'4');
 pub const DRM_FORMAT_ARGB8888: u32 = drm_fourcc(b'A', b'R', b'2', b'4');
 pub const DRM_FORMAT_XBGR8888: u32 = drm_fourcc(b'X', b'B', b'2', b'4');
 pub const DRM_FORMAT_ABGR8888: u32 = drm_fourcc(b'A', b'B', b'2', b'4');
+/// Half-float R, G, B, A (16 bits each, red first in memory): a macOS guest's 'RGhA' framebuffer.
+pub const DRM_FORMAT_ABGR16161616F: u32 = drm_fourcc(b'A', b'B', b'4', b'H');
 pub const DRM_FORMAT_RGB888: u32 = drm_fourcc(b'R', b'G', b'2', b'4');
 pub const DRM_FORMAT_RGB565: u32 = drm_fourcc(b'R', b'G', b'1', b'6');
 
@@ -833,6 +845,18 @@ impl GpuDisplay {
         Err(GpuDisplayError::Unsupported)
     }
 
+    #[cfg(feature = "kms_display")]
+    pub fn open_kms(path: &std::path::Path, split: bool) -> GpuDisplayResult<GpuDisplay> {
+        let display = gpu_display_kms::DisplayKms::new(path, split)?;
+        let wait_ctx = WaitContext::new()?;
+        wait_ctx.add(&display, DisplayEventToken::Display)?;
+        Ok(GpuDisplay {
+            inner: Box::new(display), next_id: 1,
+            event_devices: Default::default(), surfaces: Default::default(),
+            dmabuf_import_capped: false, wait_ctx,
+        })
+    }
+
     pub fn open_stub() -> GpuDisplayResult<GpuDisplay> {
         let display = gpu_display_stub::DisplayStub::new()?;
         let wait_ctx = WaitContext::new()?;
@@ -868,6 +892,53 @@ impl GpuDisplay {
             height,
             password,
             hw_encode,
+            tablet,
+            keyboard,
+        )?;
+
+        let wait_ctx = WaitContext::new()?;
+        wait_ctx.add(&display, DisplayEventToken::Display)?;
+
+        Ok(GpuDisplay {
+            inner: Box::new(display),
+            next_id: 1,
+            event_devices: Default::default(),
+            surfaces: Default::default(),
+            dmabuf_import_capped: false,
+            wait_ctx,
+        })
+    }
+
+    /// A WebRTC endpoint for one screen: the viewer page and signalling on `addr`, the picture
+    /// hardware-encoded and sent to every connected browser. `tablet`/`keyboard` are this
+    /// binding's own devices, as for `open_vnc_tcp`; both `None` is a view-only binding. `token`,
+    /// when set, is required by the signalling endpoints; `stun` is handed to ICE.
+    #[cfg(feature = "webrtc")]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_webrtc(
+        addr: &str,
+        width: u32,
+        height: u32,
+        token: Option<String>,
+        stun: Vec<String>,
+        allow_h265: bool,
+        bitrate_bps: Option<u32>,
+        adapt: bool,
+        frame_rate: u32,
+        tablet: Option<EventDevice>,
+        keyboard: Option<EventDevice>,
+    ) -> GpuDisplayResult<GpuDisplay> {
+        let display = gpu_display_webrtc::DisplayWebrtc::new(
+            addr,
+            width,
+            height,
+            token,
+            stun,
+            allow_h265,
+            bitrate_bps,
+            adapt,
+            frame_rate,
             tablet,
             keyboard,
         )?;

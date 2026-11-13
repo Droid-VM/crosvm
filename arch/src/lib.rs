@@ -462,6 +462,8 @@ pub struct VmComponents {
     pub hv_cfg: hypervisor::Config,
     pub initrd_image: Option<File>,
     pub itmt: bool,
+    /// GIC MBI SPIs for PCI MSI/MSI-X (aarch64, `--mbi-spis`); 0 = none.
+    pub mbi_spis: u32,
     pub memory_size: u64,
     pub no_i8042: bool,
     pub no_rtc: bool,

@@ -287,6 +287,11 @@ impl Starvation {
         }
     }
 
+    /// Periods are going by unfed right now.
+    fn starving(&self) -> bool {
+        self.since.is_some()
+    }
+
     /// The guest queued something.
     fn fed(&mut self, card_index: usize, direction: &str) {
         let Some(since) = self.since.take() else {
@@ -304,6 +309,37 @@ impl Starvation {
             self.parked = false;
             self.pending = Some(false);
         }
+    }
+}
+
+/// How many periods a guest's period may come late before filler takes its place. The host side
+/// holds several periods ahead (android_audio's ring), so a period that misses its slot by a few
+/// milliseconds is still in time to be heard; filling the slot instead, and then completing the
+/// period unplayed as owed, put a click into the sound at every such jitter -- which is how a
+/// guest that lost its lead in a stall stayed crackling until it stopped.
+const LATE_GRACE_PERIODS: u32 = 3;
+
+/// The guest's next playback period: `None` when there is none, also after waiting up to
+/// `LATE_GRACE_PERIODS` for one unless the stream is already starving (a guest that has stopped
+/// gets its filler at the stream's pace); `Some(None)` when the channel is closed.
+async fn next_guest_period(
+    ex: &Executor,
+    desc_receiver: &mut mpsc::UnboundedReceiver<DescriptorChain>,
+    starving: bool,
+    period_dur: Duration,
+) -> Option<Option<DescriptorChain>> {
+    if let Ok(next) = desc_receiver.try_next() {
+        return Some(next);
+    }
+    if starving || period_dur.is_zero() {
+        return None;
+    }
+    let late = TimerAsync::sleep(ex, period_dur * LATE_GRACE_PERIODS).fuse();
+    let next = desc_receiver.next().fuse();
+    pin_mut!(late, next);
+    select! {
+        next = next => Some(next),
+        _ = late => None,
     }
 }
 
@@ -542,17 +578,46 @@ async fn pcm_worker_loop(
                 WorkerStatus::Pause => {
                     write_data(dst_buf, None, buffer_writer, concealer).await?;
                 }
-                WorkerStatus::Running => match desc_receiver.try_next() {
-                    Err(_) => {
+                WorkerStatus::Running => match next_guest_period(&ex, desc_receiver, starvation.starving(), period_dur).await {
+                    None => {
                         starvation.starved(card_index, "playback");
                         write_data(dst_buf, None, buffer_writer, concealer).await?;
                     }
-                    Ok(None) => {
+                    Some(None) => {
                         error!("[Card {}] Unreachable. status should be Quit when the channel is closed", card_index);
                         write_data(dst_buf, None, buffer_writer, concealer).await?;
                         return Err(Error::InvalidPCMWorkerState);
                     }
-                    Ok(Some(mut desc_chain)) => {
+                    Some(Some(mut desc_chain)) => {
+                        // Periods that went by unfed were played as filler. A guest that stalled
+                        // then sends what it owed all at once, and played on arrival that would
+                        // put the sound as far behind the picture as the stall was long, for
+                        // good. So what is already queued behind this period, up to what was
+                        // owed, is completed unplayed. One that came on its own after a gap is
+                        // a guest starting again, and is played.
+                        let mut owed = starvation.periods;
+                        while owed > 0 {
+                            let Ok(Some(next)) = desc_receiver.try_next() else {
+                                break;
+                            };
+                            sender
+                                .send(PcmResponse {
+                                    desc_chain,
+                                    status: Result::<u32, Error>::Ok(0).into(),
+                                    done: None,
+                                })
+                                .await
+                                .map_err(Error::MpscSend)?;
+                            desc_chain = next;
+                            owed -= 1;
+                        }
+                        if owed < starvation.periods {
+                            warn!(
+                                "[Card {}] playback: {} late periods dropped to keep the stream on time",
+                                card_index,
+                                starvation.periods - owed
+                            );
+                        }
                         starvation.fed(card_index, "playback");
                         let reader = if muted.load(Ordering::Relaxed) {
                             None

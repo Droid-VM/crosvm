@@ -639,13 +639,48 @@ pub struct DisplayVnc {
 /// which is this same number. Two constants that are required to be equal, in two crates, is not
 /// tidy -- it is what the `--input absolute-mouse` feeder already relies on, and this sink is now
 /// one more feeder of the same shape of device.
-const VNC_ABS_MAX: i32 = 0x7FFF;
+pub(crate) const VNC_ABS_MAX: i32 = 0x7FFF;
 
 /// Scale a VNC framebuffer coordinate in `0..extent` (where `extent` is the live framebuffer
 /// width/height, updated on guest resize) to `0..=VNC_ABS_MAX`.
 fn vnc_norm_abs(v: i32, extent: u32) -> i32 {
     let extent = extent.max(1) as i64;
     (((v.max(0) as i64) * (VNC_ABS_MAX as i64)) / extent).clamp(0, VNC_ABS_MAX as i64) as i32
+}
+
+/// One absolute-pointer report for a binding's tablet: the position (already scaled to
+/// `0..=VNC_ABS_MAX`), then a press or release for each button whose bit changed since
+/// `prev_mask`, which is advanced. Mask layout is RFB's, which the WebRTC sink speaks too:
+/// bit0=left, bit1=middle, bit2=right, bit3/4=wheel up/down (a wheel bit going 0->1 is one notch).
+pub(crate) fn pointer_report(
+    prev_mask: &mut u8,
+    cur_mask: u8,
+    abs_x: i32,
+    abs_y: i32,
+) -> Vec<virtio_input_event> {
+    let changed = cur_mask ^ *prev_mask;
+    *prev_mask = cur_mask;
+
+    let mut events = vec![
+        virtio_input_event::absolute_x(abs_x),
+        virtio_input_event::absolute_y(abs_y),
+    ];
+    if changed & 0x01 != 0 {
+        events.push(virtio_input_event::left_click(cur_mask & 0x01 != 0));
+    }
+    if changed & 0x02 != 0 {
+        events.push(virtio_input_event::middle_click(cur_mask & 0x02 != 0));
+    }
+    if changed & 0x04 != 0 {
+        events.push(virtio_input_event::right_click(cur_mask & 0x04 != 0));
+    }
+    if changed & 0x08 != 0 && cur_mask & 0x08 != 0 {
+        events.push(virtio_input_event::wheel(1));
+    }
+    if changed & 0x10 != 0 && cur_mask & 0x10 != 0 {
+        events.push(virtio_input_event::wheel(-1));
+    }
+    events
 }
 
 impl DisplayVnc {
@@ -726,7 +761,7 @@ impl DisplayVnc {
         // names: the consumer list is read without a lock from the producer's thread, so it has to
         // be finished before any frame can be offered.
         let h264 = if hw_encode {
-            H264Consumer::start(server_ptr)
+            H264Consumer::start_vnc(server_ptr)
         } else {
             None
         };
@@ -803,31 +838,12 @@ impl DisplayVnc {
     /// works), button transitions from the RFB mask, wheel as REL_WHEEL.
     /// RFB button mask: bit0=left, bit1=middle, bit2=right, bit3/4=wheel up/down.
     fn pointer_to_mouse_events(&mut self, ev: &VncInputEvent) -> Vec<virtio_input_event> {
-        let cur_mask = ev.button_mask;
-        let prev_mask = self.prev_button_mask;
-        self.prev_button_mask = cur_mask;
-        let changed = cur_mask ^ prev_mask;
-
-        let mut events = vec![
-            virtio_input_event::absolute_x(vnc_norm_abs(ev.x, self.width)),
-            virtio_input_event::absolute_y(vnc_norm_abs(ev.y, self.height)),
-        ];
-        if changed & 0x01 != 0 {
-            events.push(virtio_input_event::left_click(cur_mask & 0x01 != 0));
-        }
-        if changed & 0x02 != 0 {
-            events.push(virtio_input_event::middle_click(cur_mask & 0x02 != 0));
-        }
-        if changed & 0x04 != 0 {
-            events.push(virtio_input_event::right_click(cur_mask & 0x04 != 0));
-        }
-        if changed & 0x08 != 0 && cur_mask & 0x08 != 0 {
-            events.push(virtio_input_event::wheel(1));
-        }
-        if changed & 0x10 != 0 && cur_mask & 0x10 != 0 {
-            events.push(virtio_input_event::wheel(-1));
-        }
-        events
+        pointer_report(
+            &mut self.prev_button_mask,
+            ev.button_mask,
+            vnc_norm_abs(ev.x, self.width),
+            vnc_norm_abs(ev.y, self.height),
+        )
     }
 
     /// Takes one RFB event off the queue and writes it into this binding's own device.

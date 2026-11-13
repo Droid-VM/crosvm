@@ -5,6 +5,7 @@ authors = ["The ChromiumOS Authors"]
 edition = "2021"
 
 [features]
+kms_display = []
 x = []
 kiwi = []
 vulkan_display = [ "vulkano", "ash", "rand", "protos", "protobuf", "euclid", "smallvec"]
@@ -16,6 +17,8 @@ android_display = []
 android_display_stub = []
 gfxstream = []
 vnc = []
+# WebRTC output: one screen served to browsers, hardware-encoded (win3d/docs/webrtc).
+webrtc = ["vnc"]
 
 [dependencies]
 anyhow = "1"

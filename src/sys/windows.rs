@@ -2068,6 +2068,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
     };
 
     Ok(VmComponents {
+        mbi_spis: 0,
         memory_size: cfg
             .memory
             .unwrap_or(256)

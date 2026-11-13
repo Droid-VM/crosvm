@@ -19,6 +19,8 @@ pub(crate) mod pci_hotplug_helpers;
 pub(crate) mod pci_hotplug_manager;
 #[cfg(feature = "vnc")]
 mod simplefb_display;
+#[cfg(all(feature = "kms_display", target_os = "android"))]
+pub(crate) mod kms_takeover;
 #[cfg(feature = "audio")]
 mod vcpu;
 
@@ -206,7 +208,7 @@ use vm_memory::MemoryRegionOptions;
 use x86_64::X8664arch as Arch;
 
 use crate::crosvm::config::Config;
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 use crate::crosvm::config::DisplayScreen;
 #[cfg(feature = "vnc")]
 use crate::crosvm::config::DEFAULT_VNC_HOST;
@@ -316,12 +318,12 @@ fn create_vnc_binding_input(
     screen: DisplayScreen,
     devs: &mut Vec<VirtioDeviceStub>,
 ) -> DeviceResult<VncBindingInput> {
-    let Some(vnc_cfg) = cfg.vnc_server_for(screen) else {
+    let Some(wants_input) = cfg.binding_wants_input(screen) else {
         return Ok(VncBindingInput::default());
     };
-    if !vnc_cfg.wants_input_devices() {
+    if !wants_input {
         info!(
-            "vnc: screen {} is view-only; no tablet or keyboard, RFB input dropped",
+            "vnc/webrtc: screen {} is view-only; no tablet or keyboard, remote input dropped",
             screen.as_str()
         );
         return Ok(VncBindingInput::default());
@@ -850,10 +852,16 @@ fn create_virtio_devices(
     let mut stylus_idx = 0;
     for input in &cfg.virtio_input {
         let input_dev = match input {
-            InputDeviceOption::Evdev { path } => create_vinput_device(
+            InputDeviceOption::Evdev {
+                path,
+                width_mm,
+                height_mm,
+            } => create_vinput_device(
                 cfg.protection_type,
                 cfg.jail_config.as_ref(),
                 path.as_path(),
+                *width_mm,
+                *height_mm,
             )?,
             InputDeviceOption::Keyboard { path, name } => {
                 // One of these per screen with input enabled, not one per VM: `keyboard_idx`
@@ -1229,6 +1237,7 @@ fn create_virtio_devices(
             camera_id: None,
             role: None,
             allow_sw: false,
+            vidc: false,
             uid: None,
             gid: None,
         });
@@ -1693,8 +1702,9 @@ fn create_devices(
                 disk.path.display()
             );
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1702,8 +1712,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio input runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio input device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1713,8 +1724,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio net runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio net device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1725,8 +1737,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio GPU runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio GPU device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1736,8 +1749,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio sound runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio sound device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1748,8 +1762,9 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio media runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio media device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
@@ -1760,17 +1775,21 @@ fn create_devices(
         if stub.jail.is_some() {
             warn!("virtio-mmio console runs in the VMM process, outside its jail");
         }
-        let dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
+        let mut dev = VirtioMmioDevice::new(vm.get_memory().clone(), stub.dev)
             .context("failed to create virtio-mmio console device")?;
+        dev.set_edge_irq(cfg.virtio_mmio_edge_irq);
         devices.push((Box::new(dev) as Box<dyn BusDeviceObj>, None));
     }
 
     #[cfg(feature = "usb")]
     if cfg.usb {
-        // Create xhci controller.
+        // Create xhci controller with the same MSI routing channel as other PCI devices.
+        let (msi_host_tube, msi_device_tube) = Tube::pair().context("failed to create tube")?;
+        add_control_tube(AnyControlTube::IrqTube(msi_host_tube));
         let usb_controller = Box::new(XhciController::new(
             vm.get_memory().clone(),
             Box::new(usb_provider),
+            msi_device_tube,
         ));
         devices.push((
             usb_controller,
@@ -2210,6 +2229,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         boot_cpu: cfg.boot_cpu,
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         virt_cpufreq_v2: cfg.virt_cpufreq_v2,
+        mbi_spis: cfg.mbi_spis.unwrap_or(0),
         #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
         sve_config: cfg.sve.unwrap_or_default(),
     })
@@ -2649,6 +2669,27 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         Ok(limit) => info!("open files limit {} (hard {})", limit.rlim_cur, limit.rlim_max),
         Err(e) => warn!("could not raise the open files limit: {}", e),
     }
+    #[cfg(all(feature = "kms_display", target_os = "android"))]
+    let _kms_takeover = match cfg.kms_display.as_ref().map(|k| &k.takeover) {
+        Some(crate::crosvm::config::KmsTakeoverMode::Display) => {
+            Some(kms_takeover::Takeover::begin()?)
+        }
+        Some(crate::crosvm::config::KmsTakeoverMode::External) => {
+            kms_takeover::preflight_external()?;
+            None
+        }
+        None => None,
+    };
+    #[cfg(all(feature = "kms_display", target_os = "android"))]
+    if let Some(kms) = &cfg.kms_display {
+        // Check master, native mode and all required properties before allocating guest RAM.
+        // The worker subsequently opens its own card; the selected sentinel owns restoration.
+        drop(gpu_display::GpuDisplay::open_kms(
+            &kms.card, kms.planes == crate::crosvm::config::KmsPlanes::Split,
+        ).context("KMS preflight")?);
+    }
+
+
     // Bridge the `--pre-alloc` GPU pool sizes to the env the in-process renderer + early memory
     // setup expect (NCTX_GFX_POOL_MB), BEFORE any of guest_memory_layout, the gpu device, or the
     // gunyah size-max reads them. The user sets `--pre-alloc`; crosvm no longer requires a
@@ -4453,7 +4494,7 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
     //
     // The guest maps it with ioremap_wc(), so it is write-combining: visibility of guest writes to
     // a GPU reader is a real question here, not a formality.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     let _simplefb_display_thread = (|| -> Option<std::thread::JoinHandle<()>> {
         let sfb_cfg = cfg.simplefb.as_ref()?;
         let guest_mem = linux.vm.get_memory().clone();
@@ -4506,7 +4547,16 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
         #[cfg(feature = "android_display")]
         let android_service = cfg
             .android_display_service_for(DisplayScreen::Simplefb)
-            .map(|s| (s.name.clone(), s.transport_cap));
+            .map(|s| (s.name.clone(), s.transport_cap))
+            // A simplefb screen nobody shows is the boot picture of the GPU screen: the firmware,
+            // the bootloader and an early kernel console draw into it before any guest driver sets
+            // a scanout. Its frames go to the GPU screen's window ("#boot": the display service
+            // shared in-process, CPU path, dropped while the GPU scanout presents), so the window
+            // shows something from the first firmware frame on.
+            .or_else(|| {
+                cfg.android_display_service_for(DisplayScreen::Gpu0)
+                    .map(|s| (format!("{}#boot", s.name), s.transport_cap))
+            });
         #[cfg(not(feature = "android_display"))]
         let android_service: Option<(String, crate::crosvm::config::TransportCap)> = None;
 
@@ -4524,7 +4574,35 @@ fn run_control<V: VmArch + 'static, Vcpu: VcpuArch + 'static>(
                 transport_cap,
             ),
             None => {
-                #[cfg(feature = "vnc")]
+                #[cfg(feature = "webrtc")]
+                if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Simplefb) {
+                    (
+                        simplefb_display::SimplefbDisplayTarget::WebRtc {
+                            addr: rtc_cfg.addr(),
+                            token: rtc_cfg.token.clone(),
+                            stun: rtc_cfg.stun.clone(),
+                            allow_h265: rtc_cfg.allow_h265(),
+                            bitrate_bps: rtc_cfg.bitrate_bps(),
+                            adapt: rtc_cfg.adapt,
+                            input: simplefb_vnc_input,
+                        },
+                        rtc_cfg.transport_cap,
+                    )
+                } else {
+                    let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
+                    let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
+                    let port = vnc_cfg.port.unwrap_or(DEFAULT_VNC_PORT);
+                    (
+                        simplefb_display::SimplefbDisplayTarget::Vnc {
+                            addr: format!("{}:{}", host, port),
+                            password: vnc_cfg.password.clone(),
+                            hw_encode: vnc_cfg.h264_enabled(),
+                            input: simplefb_vnc_input,
+                        },
+                        vnc_cfg.transport_cap,
+                    )
+                }
+                #[cfg(all(feature = "vnc", not(feature = "webrtc")))]
                 {
                     let vnc_cfg = cfg.vnc_server_for(DisplayScreen::Simplefb)?;
                     let host = vnc_cfg.host.as_deref().unwrap_or(DEFAULT_VNC_HOST);
@@ -5480,7 +5558,7 @@ fn handle_irq_tube_request(
 ) {
     match tube.recv::<VmIrqRequest>() {
         Ok(request) => {
-            let response = {
+            let mut response = {
                 request.execute(
                     |setup| match setup {
                         IrqSetup::Event(irq, ev, device_id, queue_id, device_name) => {
@@ -5511,6 +5589,15 @@ fn handle_irq_tube_request(
                     &mut sys_allocator_mutex.lock(),
                 )
             };
+            // --mbi-spis: hand the device the MBI SPI's line, so that its MSI goes to the
+            // hypervisor without a trip through this thread.
+            #[cfg(target_arch = "aarch64")]
+            if let (VmIrqRequest::AddMsiRoute { gsi, .. }, VmIrqResponse::Ok) = (&request, &response)
+            {
+                if let Some(event) = irq_chip.mbi_route_event(*gsi) {
+                    response = VmIrqResponse::MsiRouteEvent { event };
+                }
+            }
             if let Err(e) = tube.send(&response) {
                 error!("failed to send VmIrqResponse: {}", e);
             }

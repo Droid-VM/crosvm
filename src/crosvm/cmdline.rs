@@ -114,6 +114,8 @@ use crate::crosvm::config::VhostUserFsOption;
 use crate::crosvm::config::VhostUserOption;
 #[cfg(feature = "vnc")]
 use crate::crosvm::config::VncConfig;
+#[cfg(feature = "webrtc")]
+use crate::crosvm::config::WebrtcConfig;
 #[cfg(feature = "plugin")]
 use crate::crosvm::plugin::parse_plugin_mount_option;
 #[cfg(feature = "plugin")]
@@ -923,6 +925,17 @@ fn vnc_server_from_str(s: &str) -> Result<VncConfig, String> {
     from_key_values(s)
 }
 
+/// Parse a WebRTC endpoint configuration string in key=value format.
+#[cfg(feature = "webrtc")]
+fn webrtc_server_from_str(s: &str) -> Result<WebrtcConfig, String> {
+    from_key_values(s)
+}
+
+#[cfg(feature = "kms_display")]
+fn kms_display_from_str(s: &str) -> Result<crate::crosvm::config::KmsDisplayConfig, String> {
+    serde_keyvalue::from_key_values(s).map_err(|e| e.to_string())
+}
+
 /// Parse an Android display service option. `name` is the first field of the struct, so a bare
 /// service name parses as `name=<that>` and the older form of this option keeps working unchanged.
 #[cfg(feature = "android_display")]
@@ -983,6 +996,7 @@ fn android_display_service_from_str(s: &str) -> Result<AndroidDisplayServiceConf
 #[argh(subcommand, name = "run", description = "Start a new crosvm instance")]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct RunCommand {
+
     #[cfg(all(target_arch = "x86_64", unix))]
     #[argh(switch)]
     #[serde(default)]
@@ -1677,6 +1691,13 @@ pub struct RunCommand {
     /// path to a socket from where to read keyboard input events and write status updates to
     pub keyboard: Vec<PathBuf>,
 
+    #[cfg(feature = "kms_display")]
+    #[argh(option, from_str_fn(kms_display_from_str))]
+    #[serde(default)]
+    #[merge(strategy = overwrite_option)]
+    /// direct SDE command-mode scanout: card=PATH,screen=gpu-0,takeover=display|external[,planes=split|single]
+    pub kms_display: Option<crate::crosvm::config::KmsDisplayConfig>,
+
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(option, arg_name = "PATH")]
     #[serde(skip)] // Deprecated - use `hypervisor` instead.
@@ -1713,6 +1734,14 @@ pub struct RunCommand {
     #[merge(strategy = overwrite_option)]
     /// MAC address for VM
     pub mac_address: Option<net_util::MacAddress>,
+
+    #[argh(option, arg_name = "N")]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// give PCI devices MSI/MSI-X on N GIC MBI SPIs (aarch64 Gunyah only): a GICv2m-style doorbell
+    /// frame, `mbi-ranges`/`mbi-alias` on the GIC node, `msi-parent` on the PCI node. Each enabled
+    /// MSI-X vector takes one SPI; when they run out the guest falls back to fewer vectors or INTx.
+    pub mbi_spis: Option<u32>,
 
     #[cfg(all(unix, feature = "media", feature = "video-decoder"))]
     #[argh(option, arg_name = "[backend]")]
@@ -2057,8 +2086,9 @@ pub struct RunCommand {
 
     #[argh(option, arg_name = "gfx-host-mb=MB,gpu-guest-mb=MB,gpu-guest-prealloc-mb=MB,gpu-guest-step-mb=MB,gpu-guest-max-grants=N,drm-host-mb=MB,venus-host-mb=MB,media-host-mb=MB,media-guest-mb=MB,test-pool-mb=MB,test-pool-prealloc-mb=MB,test-pool-step-mb=MB")]
     #[serde(skip)]
-    #[merge(strategy = overwrite_option)]
-    /// pre-allocated pool sizes (MB). Boot-blessed regions laid out above guest RAM and SHARE'd
+    #[merge(strategy = append)]
+    /// pre-allocated pool sizes (MB). May be given more than once: the keys add up, a repeated
+    /// one takes the last value. Boot-blessed regions laid out above guest RAM and SHARE'd
     /// rather than lent, so host and guest reach the same pages without a runtime SHARE per
     /// buffer. crosvm exports these to the consumer as NCTX_* env before anything reads the
     /// memory layout, so the user no longer hand-exports them. A key that is absent means that
@@ -2075,7 +2105,7 @@ pub struct RunCommand {
     ///     test-pool-mb=<MB> - growable TEST pool window; nothing but the test driver uses it
     ///     test-pool-prealloc-mb=<MB> - its boot-SHARE'd floor; defaults to the whole window
     ///     test-pool-step-mb=<MB> - its grant granularity (0 = fully pre-shared, does not grow)
-    pub pre_alloc: Option<PreAllocConfig>,
+    pub pre_alloc: Vec<PreAllocConfig>,
 
     #[argh(switch)]
     #[serde(skip)]
@@ -2867,6 +2897,10 @@ pub struct RunCommand {
     ///         codecs too, not only hardware ones (decoder,
     ///         encoder; AV1 encoding only with it). Default
     ///         false.
+    ///     vidc=(true,false) - Decode through the host's
+    ///         msm_vidc V4L2 decoder straight into guest
+    ///         buffers, MediaCodec as the fallback (decoder).
+    ///         10-bit streams come out as P010. Default false.
     ///     uid=INT - Run the backend in its own process under
     ///         this host uid, as --virtio-snd does. Any kind
     ///         may use it; camera, decoder and encoder require
@@ -2891,6 +2925,14 @@ pub struct RunCommand {
     /// guest that has a virtio-mmio driver but no PCI host driver. A named port keeps its
     /// multiport device; only the transport differs.
     virtio_mmio_console: Option<bool>,
+
+    #[argh(switch)]
+    #[serde(skip)]
+    #[merge(strategy = overwrite_option)]
+    /// signal the virtio-mmio devices on edge SPIs instead of level SPIs (aarch64 only): every
+    /// interrupt is a new edge and nothing is resampled. Gunyah loses level irqfd interrupts to a
+    /// vCPU in WFI; the guest must take the edge type from the device tree.
+    virtio_mmio_edge_irq: Option<bool>,
 
     #[argh(switch)]
     #[serde(skip)]
@@ -3050,6 +3092,39 @@ pub struct RunCommand {
     /// path to the Wayland socket to use. The unnamed one is used for displaying virtual screens.
     /// Named ones are only for IPC
     pub wayland_sock: Vec<(String, PathBuf)>,
+
+    #[cfg(feature = "webrtc")]
+    #[argh(option, arg_name = "CONFIG", from_str_fn(webrtc_server_from_str))]
+    #[serde(skip)]
+    #[merge(strategy = append)]
+    /// serve a screen to browsers over WebRTC, hardware-encoded.
+    /// May be given once per screen; a screen takes at most one
+    /// exporter (VNC, WebRTC or the Android display service).
+    ///     host=HOST - address the viewer page and signalling
+    ///         listen on (default 0.0.0.0).
+    ///     port=PORT - plain-HTTP port for both (default 8080).
+    ///     token=TOKEN - required as ?token= by the signalling
+    ///         endpoints; open the page with the same ?token=.
+    ///     stun=[URL,..] - STUN servers for ICE, e.g.
+    ///         stun:stun.l.google.com:19302. Default none (LAN).
+    ///     view-only=BOOL - as for --vnc-server.
+    ///     screen=SCREEN - "gpu-0" or "simplefb", as for
+    ///         --vnc-server.
+    ///     transport-cap=CAP - "auto" (default), "cpu" or
+    ///         "gpu-hw"; "gpu" is refused (it forbids the encoder).
+    ///     codec=CODEC - "auto" (default): H.265 when every viewer
+    ///         can decode it, else H.264; "h264": H.264 only.
+    ///     bitrate=KBPS - encoder bitrate in kbit/s (500..=100000):
+    ///         fixed, and the most a viewer's REMB estimate can
+    ///         lower it from. Default: from the screen size,
+    ///         about 6200 for 1080p.
+    ///     adapt=BOOL - follow the viewers' REMB bandwidth estimate
+    ///         down from bitrate (default true); false holds the
+    ///         rate fixed.
+    /// Examples:
+    ///   --webrtc-server port=8080
+    ///   --webrtc-server port=8081,screen=simplefb,token=secret
+    pub webrtc_server: Vec<WebrtcConfig>,
 
     #[cfg(any(target_os = "android", target_os = "linux"))]
     #[argh(option, arg_name = "DISPLAY")]
@@ -3218,6 +3293,7 @@ impl TryFrom<RunCommand> for super::config::Config {
         cfg.delay_rt = cmd.delay_rt.unwrap_or_default();
 
         let mem = cmd.mem.unwrap_or_default();
+        cfg.mbi_spis = cmd.mbi_spis;
         cfg.memory = mem.size;
 
         #[cfg(target_arch = "aarch64")]
@@ -3358,13 +3434,14 @@ impl TryFrom<RunCommand> for super::config::Config {
             .collect();
         cfg.virtio_mmio_input = cmd.virtio_mmio_input.unwrap_or_default();
         cfg.virtio_mmio_net = cmd.virtio_mmio_net.unwrap_or_default();
+        cfg.virtio_mmio_edge_irq = cmd.virtio_mmio_edge_irq.unwrap_or_default();
         cfg.virtio_mmio_gpu = cmd.virtio_mmio_gpu.unwrap_or_default();
         cfg.virtio_mmio_snd = cmd.virtio_mmio_snd.unwrap_or_default();
         cfg.virtio_mmio_media = cmd.virtio_mmio_media.unwrap_or_default();
         cfg.virtio_mmio_console = cmd.virtio_mmio_console.unwrap_or_default();
 
         cfg.pmems = cmd.pmem;
-        cfg.pre_alloc = cmd.pre_alloc;
+        cfg.pre_alloc = cmd.pre_alloc.into_iter().reduce(PreAllocConfig::merge);
 
         if !cmd.pmem_device.is_empty() || !cmd.rw_pmem_device.is_empty() {
             log::warn!(
@@ -3679,7 +3756,11 @@ impl TryFrom<RunCommand> for super::config::Config {
             cfg.virtio_input.extend(
                 cmd.evdev
                     .into_iter()
-                    .map(|path| InputDeviceOption::Evdev { path }),
+                    .map(|path| InputDeviceOption::Evdev {
+                        path,
+                        width_mm: None,
+                        height_mm: None,
+                    }),
             );
         }
 
@@ -3776,6 +3857,9 @@ impl TryFrom<RunCommand> for super::config::Config {
             }
         }
 
+        #[cfg(feature = "kms_display")]
+        { cfg.kms_display = cmd.kms_display; }
+
         // Exporters bind to screens, and a screen can come from the GPU device or from simplefb,
         // so these no longer live inside the `gpu` block that used to decide whether to keep them.
         // Every entry is carried through as given; whether the screen it names exists is settled
@@ -3799,6 +3883,11 @@ impl TryFrom<RunCommand> for super::config::Config {
             // The flags themselves still work for whoever passes them: they are the X11 display
             // window's, and that path is untouched.
             cfg.vnc_server = cmd.vnc_server;
+        }
+
+        #[cfg(feature = "webrtc")]
+        {
+            cfg.webrtc_server = cmd.webrtc_server;
         }
 
         #[cfg(all(unix, feature = "net"))]

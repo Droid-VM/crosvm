@@ -18,7 +18,7 @@ use serde_keyvalue::FromKeyValues;
 
 use super::*;
 use crate::crosvm::config::Config;
-#[cfg(any(feature = "vnc", feature = "android_display"))]
+#[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
 use crate::crosvm::config::DisplayScreen;
 #[cfg(feature = "vnc")]
 use crate::crosvm::config::DEFAULT_VNC_HOST;
@@ -232,7 +232,7 @@ pub fn create_gpu_device(
     // it belongs to. At most one of the two arms below runs (config rejects two exporters on one
     // screen), so there is exactly one answer here, and no binding at all means the default: take
     // whatever gets negotiated.
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     let mut transport_cap = crate::crosvm::config::TransportCap::Auto;
 
     #[cfg(feature = "android_display")]
@@ -240,6 +240,10 @@ pub fn create_gpu_device(
         display_backends.insert(0, virtio::DisplayBackend::Android(service.name.clone()));
         transport_cap = service.transport_cap;
     }
+
+    // Taken by whichever of the VNC and WebRTC arms runs; config lets at most one of them.
+    #[cfg(feature = "vnc")]
+    let mut vnc_input = Some(vnc_input);
 
     #[cfg(feature = "vnc")]
     if let Some(vnc_cfg) = cfg.vnc_server_for(DisplayScreen::Gpu0) {
@@ -264,10 +268,49 @@ pub fn create_gpu_device(
                 // like, and what the app is written to fall back from.
                 hw_encode: vnc_cfg.h264_enabled(),
                 // This screen's own devices, parked for whichever `build` call opens the sink.
-                vnc_input: std::sync::Arc::new(sync::Mutex::new(vnc_input)),
+                vnc_input: std::sync::Arc::new(sync::Mutex::new(
+                    vnc_input.take().unwrap_or_default(),
+                )),
             },
         );
         transport_cap = vnc_cfg.transport_cap;
+    }
+
+    #[cfg(feature = "webrtc")]
+    if let Some(rtc_cfg) = cfg.webrtc_server_for(DisplayScreen::Gpu0) {
+        let (w, h) = cfg
+            .display_input_width
+            .zip(cfg.display_input_height)
+            .unwrap_or((1280, 720));
+        display_backends.insert(
+            0,
+            virtio::DisplayBackend::WebRtc {
+                addr: rtc_cfg.addr(),
+                width: w,
+                height: h,
+                token: rtc_cfg.token.clone(),
+                stun: rtc_cfg.stun.clone(),
+                allow_h265: rtc_cfg.allow_h265(),
+                bitrate_bps: rtc_cfg.bitrate_bps(),
+                adapt: rtc_cfg.adapt,
+                frame_rate: gpu_params
+                    .display_params
+                    .first()
+                    .map(|d| d.refresh_rate)
+                    .unwrap_or(0),
+                input: std::sync::Arc::new(sync::Mutex::new(vnc_input.take().unwrap_or_default())),
+            },
+        );
+        transport_cap = rtc_cfg.transport_cap;
+    }
+
+    #[cfg(feature = "kms_display")]
+    if let Some(kms) = &cfg.kms_display {
+        // A configured KMS failure is fatal: never leave Android stopped while using a stub.
+        display_backends = vec![virtio::DisplayBackend::Kms {
+            card: kms.card.clone(),
+            split: kms.planes == crate::crosvm::config::KmsPlanes::Split,
+        }];
     }
 
     // Use the unnamed socket for GPU display screens.
@@ -311,7 +354,7 @@ pub fn create_gpu_device(
         "GPU-VRAM-BUDGET: {} MiB advertised to the guest KMD (--gpu vram-mb)",
         gpu_params.vram_mb.unwrap_or(2048)
     );
-    #[cfg(any(feature = "vnc", feature = "android_display"))]
+    #[cfg(any(feature = "vnc", feature = "android_display", feature = "kms_display"))]
     if !transport_cap.allows_gpu_copy() {
         dev.cap_transport_to_cpu();
     }

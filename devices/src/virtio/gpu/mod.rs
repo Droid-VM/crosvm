@@ -1064,6 +1064,7 @@ impl Frontend {
                     VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM => DrmFormat::new(b'X', b'R', b'2', b'4'),
                     VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM => DrmFormat::new(b'A', b'R', b'2', b'4'),
                     VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM => DrmFormat::new(b'A', b'B', b'2', b'4'),
+                    VIRTIO_GPU_FORMAT_R16G16B16A16_FLOAT_DROIDVM => DrmFormat::new(b'A', b'B', b'4', b'H'),
                     _ => {
                         error!("unrecognized virtio-gpu format {}", virtio_gpu_format);
                         return Err(GpuResponse::ErrUnspec);
@@ -1916,6 +1917,8 @@ pub enum DisplayBackend {
     /// using the name given here. The entity holding the surface is expected to locate the service
     /// via this name, and pass the surface to it.
     Android(String),
+    #[cfg(feature = "kms_display")]
+    Kms { card: PathBuf, split: bool },
     #[cfg(feature = "vnc")]
     /// Start a VNC server for remote display access on a TCP address.
     ///
@@ -1944,6 +1947,27 @@ pub enum DisplayBackend {
         /// The lock is an artifact of `&self`, not of sharing: after `build`, one thread owns them.
         vnc_input: Arc<Mutex<VncBindingInput>>,
     },
+    #[cfg(feature = "webrtc")]
+    /// Serve the screen to browsers over WebRTC, hardware-encoded; `addr` is the plain-HTTP
+    /// listener for the viewer page and the offer/answer exchange.
+    WebRtc {
+        addr: String,
+        width: u32,
+        height: u32,
+        token: Option<String>,
+        stun: Vec<String>,
+        /// Whether H.265 is offered next to H.264 (`codec=auto`).
+        allow_h265: bool,
+        /// `bitrate=`, in bits per second: the encoder's fixed rate and REMB ceiling.
+        bitrate_bps: Option<u32>,
+        /// `adapt=`: whether REMB may lower the rate.
+        adapt: bool,
+        /// The screen's refresh rate, declared to the encoder.
+        frame_rate: u32,
+        /// Parked exactly as for `VncTcp`, for the same reason: the input devices are the same
+        /// per-screen tablet and keyboard, only the transport carrying the events differs.
+        input: Arc<Mutex<VncBindingInput>>,
+    },
 }
 
 impl DisplayBackend {
@@ -1959,12 +1983,16 @@ impl DisplayBackend {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             DisplayBackend::X(_) => "x",
             DisplayBackend::Stub => "stub",
+            #[cfg(feature = "kms_display")]
+            DisplayBackend::Kms { .. } => "kms",
             #[cfg(windows)]
             DisplayBackend::WinApi => "winapi",
             #[cfg(feature = "android_display")]
             DisplayBackend::Android(_) => "android",
             #[cfg(feature = "vnc")]
             DisplayBackend::VncTcp { .. } => "vnc",
+            #[cfg(feature = "webrtc")]
+            DisplayBackend::WebRtc { .. } => "webrtc",
         }
     }
 
@@ -1979,6 +2007,8 @@ impl DisplayBackend {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             DisplayBackend::X(display) => GpuDisplay::open_x(display.as_deref()),
             DisplayBackend::Stub => GpuDisplay::open_stub(),
+            #[cfg(feature = "kms_display")]
+            DisplayBackend::Kms { card, split } => GpuDisplay::open_kms(card, *split),
             #[cfg(windows)]
             DisplayBackend::WinApi => match wndproc_thread.take() {
                 Some(wndproc_thread) => GpuDisplay::open_winapi(
@@ -2010,6 +2040,34 @@ impl DisplayBackend {
                     *height,
                     password.clone(),
                     *hw_encode,
+                    input.tablet,
+                    input.keyboard,
+                )
+            }
+            #[cfg(feature = "webrtc")]
+            DisplayBackend::WebRtc {
+                addr,
+                width,
+                height,
+                token,
+                stun,
+                allow_h265,
+                bitrate_bps,
+                adapt,
+                frame_rate,
+                input,
+            } => {
+                let input = std::mem::take(&mut *input.lock());
+                GpuDisplay::open_webrtc(
+                    addr,
+                    *width,
+                    *height,
+                    token.clone(),
+                    stun.clone(),
+                    *allow_h265,
+                    *bitrate_bps,
+                    *adapt,
+                    *frame_rate,
                     input.tablet,
                     input.keyboard,
                 )

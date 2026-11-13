@@ -222,6 +222,11 @@ const AARCH64_VIRTIO_MMIO_MAX: usize = 32;
 // One 4k page keeps the whole FADT-declared block inside a single mapping.
 const AARCH64_PMRESET_ADDR: u64 = 0x5000;
 const AARCH64_PMRESET_SIZE: u64 = 0x1000;
+// GICv3 message-based interrupts (--mbi-spis): the doorbell frame (devices::MbiFrame, a GICv2m MSI
+// frame) that mbi-alias and the MADT's GIC MSI Frame point at; an MSI's address is its
+// MSI_SETSPI_NS. The MBI SPIs follow the ones the board wires (AARCH64_GIC_NR_SPIS).
+const AARCH64_MBI_FRAME_ADDR: u64 = 0x7000;
+const AARCH64_MBI_FRAME_SIZE: u64 = 0x1000;
 // The GPIO controller gets one 4k page
 const AARCH64_GPIO_SIZE: u64 = 0x1000;
 // The GPIO controller uses a fixed high SPI (like the vmwdt) so it does not
@@ -428,6 +433,8 @@ pub enum Error {
     CustomPvmFwLoadFailure(arch::LoadImageError),
     #[error("vm created wrong kind of vcpu")]
     DowncastVcpu,
+    #[error("failed to set up the MBI SPIs: {0}")]
+    EnableMbi(base::Error),
     #[error("failed to enable singlestep execution: {0}")]
     EnableSinglestep(base::Error),
     #[error("failed to finalize IRQ chip: {0}")]
@@ -492,6 +499,8 @@ pub enum Error {
     RegisterIoevent(base::Error),
     #[error("failed to register irq fd: {0}")]
     RegisterIrqfd(base::Error),
+    #[error("error registering the MBI doorbell frame: {0}")]
+    RegisterMbiFrame(BusError),
     #[error("error registering PCI bus: {0}")]
     RegisterPci(BusError),
     #[error("error registering pflash device: {0}")]
@@ -1514,7 +1523,9 @@ impl arch::LinuxArch for AArch64 {
         pid_debug_label_map.append(&mut platform_pid_debug_label_map);
 
         // virtio-mmio devices: a page each from AARCH64_VIRTIO_MMIO_BASE, a level SPI each (the
-        // virtio-pci INTx shape), and their queue-notify ioevents registered with the hypervisor.
+        // virtio-pci INTx shape) or, with --virtio-mmio-edge-irq, an edge SPI (Gunyah loses level
+        // irqfd interrupts to WFI vCPUs), and their queue-notify ioevents registered with the
+        // hypervisor.
         // They live in this process; a jail would need a proxy that only PCI devices get here.
         if virtio_mmio_devices.len() > AARCH64_VIRTIO_MMIO_MAX {
             return Err(Error::VirtioMmioTooMany(virtio_mmio_devices.len()));
@@ -1531,22 +1542,31 @@ impl arch::LinuxArch for AArch64 {
                 vm.register_ioevent(event, IoEventAddress::Mmio(addr), datamatch)
                     .map_err(Error::RegisterIoevent)?;
             }
-            irq_chip
-                .register_level_irq_event(
-                    irq,
-                    &irq_evt,
-                    IrqEventSource {
-                        device_id: dev.device_id(),
-                        queue_id: 0,
-                        device_name: dev.debug_label(),
-                    },
-                )
-                .map_err(Error::RegisterIrqfd)?;
+            let source = IrqEventSource {
+                device_id: dev.device_id(),
+                queue_id: 0,
+                device_name: dev.debug_label(),
+            };
+            let edge = dev.edge_irq();
+            if edge {
+                // The device writes the level event's trigger; nothing waits on its resample.
+                let edge_evt = devices::IrqEdgeEvent::from_event(
+                    irq_evt.get_trigger().try_clone().map_err(Error::CloneEvent)?,
+                );
+                irq_chip
+                    .register_edge_irq_event(irq, &edge_evt, source)
+                    .map_err(Error::RegisterIrqfd)?;
+            } else {
+                irq_chip
+                    .register_level_irq_event(irq, &irq_evt, source)
+                    .map_err(Error::RegisterIrqfd)?;
+            }
             base::info!(
-                "virtio-mmio: {} at {:#x} irq {}",
+                "virtio-mmio: {} at {:#x} irq {} {}",
                 dev.debug_label(),
                 base,
-                irq
+                irq,
+                if edge { "edge" } else { "level" }
             );
             // These devices stay in the VMM after PCI/platform sandbox setup. Forward the
             // same lifecycle callback as the other buses: GPU starts its renderer worker here.
@@ -1558,7 +1578,7 @@ impl arch::LinuxArch for AArch64 {
                     devices::virtio::VIRTIO_MMIO_REGION_SZ,
                 )
                 .map_err(Error::RegisterVirtioMmio)?;
-            virtio_mmio_fdt.push((base, devices::virtio::VIRTIO_MMIO_REGION_SZ, irq));
+            virtio_mmio_fdt.push((base, devices::virtio::VIRTIO_MMIO_REGION_SZ, irq, edge));
         }
 
         let (vmwdt_host_tube, vmwdt_control_tube) = Tube::pair().map_err(Error::CreateTube)?;
@@ -2020,6 +2040,42 @@ impl arch::LinuxArch for AArch64 {
             found
         };
 
+        // --mbi-spis: MSI/MSI-X for PCI devices on GIC MBI SPIs. Their lines are registered now,
+        // before the hypervisor's part of the tree is written, as Gunyah wants; from here on, an
+        // edge event the irq chip is given is an MSI vector it relays to one of them.
+        let mbi = if components.mbi_spis > 0 {
+            let base_spi = devices::AARCH64_GIC_NR_SPIS;
+            for spi in base_spi..base_spi + components.mbi_spis {
+                if !system_allocator.reserve_irq(spi) {
+                    return Err(Error::AllocateIrq);
+                }
+            }
+            let spis = irq_chip
+                .enable_mbi(
+                    base_spi,
+                    components.mbi_spis,
+                    AARCH64_MBI_FRAME_ADDR + devices::MBI_SETSPI_NS,
+                )
+                .map_err(Error::EnableMbi)?;
+            let base_intid = 32 + base_spi;
+            mmio_bus
+                .insert(
+                    Arc::new(Mutex::new(devices::MbiFrame::new(base_intid, spis))),
+                    AARCH64_MBI_FRAME_ADDR,
+                    AARCH64_MBI_FRAME_SIZE,
+                )
+                .map_err(Error::RegisterMbiFrame)?;
+            base::info!(
+                "MBI: INTID {}..{} doorbell {:#x}",
+                base_intid,
+                base_intid + components.mbi_spis - 1,
+                AARCH64_MBI_FRAME_ADDR + devices::MBI_SETSPI_NS
+            );
+            Some((base_intid, components.mbi_spis, AARCH64_MBI_FRAME_ADDR))
+        } else {
+            None
+        };
+
         // The tree has a smaller slot in a pseudo-unprotected VM: it shares a 2 MiB lent region
         // with the shim instead of sitting in 2 MiB of its own at the top of RAM.
         let fdt_max_size = if shares_guest_ram {
@@ -2089,6 +2145,7 @@ impl arch::LinuxArch for AArch64 {
             pflash_cfg,
             sbsa_uart_cfg,
             &virtio_mmio_fdt,
+            mbi,
         )
         .map_err(Error::CreateFdt)?;
 

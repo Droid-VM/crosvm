@@ -8,7 +8,8 @@
 //! for guests whose drivers only speak virtio-mmio -- UniXNU's NativeVirtioBlock under XNU, which
 //! has no PCI host bridge driver for a generic ECAM. The device is a plain MMIO bus device in the
 //! VMM process; its interrupt is a level line with resample, the same shape as a virtio-pci INTx,
-//! because that is the path the Gunyah irqfd already carries for virtio-pci.
+//! because that is the path the Gunyah irqfd already carries for virtio-pci; with
+//! --virtio-mmio-edge-irq it is an edge line instead, sent on every signal.
 
 use std::collections::BTreeMap;
 
@@ -66,6 +67,8 @@ pub struct VirtioMmioDevice {
     driver_status: u8,
     mmio_base: u64,
     irq_num: u32,
+    /// The line is an edge (`--virtio-mmio-edge-irq`) instead of a level with resample.
+    edge_irq: bool,
     config_generation: u32,
 }
 
@@ -97,6 +100,7 @@ impl VirtioMmioDevice {
             driver_status: 0,
             mmio_base: 0,
             irq_num: 0,
+            edge_irq: false,
             config_generation: 0,
         })
     }
@@ -145,15 +149,22 @@ impl VirtioMmioDevice {
 
         let mem = self.mem.clone();
         // No MSI-X: a level line whose resample re-asserts while the interrupt status is non-zero,
-        // exactly a virtio-pci device on INTx.
-        let interrupt = Interrupt::new(
-            interrupt_evt,
-            None,
-            VIRTIO_MSI_NO_VECTOR,
-            #[cfg(target_arch = "x86_64")]
-            None,
-        );
-        self.interrupt_resample_worker = interrupt.spawn_resample_thread();
+        // exactly a virtio-pci device on INTx; or, with --virtio-mmio-edge-irq, an edge sent on
+        // every signal (nothing resamples it).
+        let interrupt = if self.edge_irq {
+            Interrupt::new_edge(interrupt_evt)
+        } else {
+            Interrupt::new(
+                interrupt_evt,
+                None,
+                VIRTIO_MSI_NO_VECTOR,
+                #[cfg(target_arch = "x86_64")]
+                None,
+            )
+        };
+        if !self.edge_irq {
+            self.interrupt_resample_worker = interrupt.spawn_resample_thread();
+        }
         self.interrupt = Some(interrupt.clone());
 
         // Use ready queues and their events.
@@ -397,6 +408,15 @@ impl VirtioMmioDevice {
     pub fn assign_irq(&mut self, irq_evt: &IrqLevelEvent, irq_num: u32) {
         self.interrupt_evt = Some(irq_evt.try_clone().unwrap());
         self.irq_num = irq_num;
+    }
+
+    /// Signal the guest on an edge line instead of a level line with resample.
+    pub fn set_edge_irq(&mut self, edge: bool) {
+        self.edge_irq = edge;
+    }
+
+    pub fn edge_irq(&self) -> bool {
+        self.edge_irq
     }
 
     pub fn irq_num(&self) -> u32 {

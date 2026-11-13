@@ -123,6 +123,7 @@ tokio = { version = "1.29.1", features = ["net", "rt-multi-thread", "time", "syn
 snapshot = { path = "snapshot" }
 
 [features]
+kms_display = ["gpu", "devices/kms_display"]
 ## Default features of crosvm. This selection is somewhat arbitrary for historical reasons.
 default = ["audio", "balloon", "config-file", "document-features", "gpu", "qcow", "usb", "libvda-stub", "net", "slirp"]
 
@@ -243,6 +244,8 @@ android_display_stub = ["devices/android_display_stub"]
 
 # Enables the VNC display backend for remote access to the VM display.
 vnc = ["devices/vnc", "gpu_display/vnc"]
+## WebRTC display output backend (hardware H.264 to browsers); Android only in practice.
+webrtc = ["vnc", "devices/webrtc", "gpu_display/webrtc"]
 
 #! ### Video features
 #!

@@ -6,7 +6,7 @@ use crate::register_space::Register;
 use crate::register_space::RegisterSpace;
 
 /// Max interrupter number.
-pub const MAX_INTERRUPTER: u8 = 1;
+pub const MAX_INTERRUPTER: u8 = 3;
 /// For port configuration, see register HCSPARAMS1, spcap1.3 and spcap2.3.
 pub const MAX_SLOTS: u8 = 16;
 
@@ -166,6 +166,15 @@ pub fn valid_stream_id(stream_id: u16) -> bool {
     stream_id > 0 && stream_id < (1 << (MAX_PSA_SIZE + 1))
 }
 
+#[derive(Clone)]
+pub struct InterrupterRegs {
+    pub iman: Register<u32>,
+    pub imod: Register<u32>,
+    pub erstsz: Register<u32>,
+    pub erstba: Register<u64>,
+    pub erdp: Register<u64>,
+}
+
 /// XhciRegs hold all xhci registers.
 pub struct XhciRegs {
     pub usbcmd: Register<u32>,
@@ -176,11 +185,7 @@ pub struct XhciRegs {
     pub config: Register<u64>,
     pub portsc: Vec<Register<u32>>,
     pub doorbells: Vec<Register<u32>>,
-    pub iman: Register<u32>,
-    pub imod: Register<u32>,
-    pub erstsz: Register<u32>,
-    pub erstba: Register<u64>,
-    pub erdp: Register<u64>,
+    pub interrupters: Vec<InterrupterRegs>,
     pub mfindex: Register<u32>,
 }
 
@@ -211,7 +216,7 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
         static_register!(
         ty: u32,
         offset: 0x04,
-        value: 0x10000110, // max_slots = 16, max_interrupters = 1, max_ports = 16
+        value: 0x10000010 | ((MAX_INTERRUPTER as u32) << 8), // max_slots = 16, max_ports = 16
         ),
     );
 
@@ -424,51 +429,58 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
     mmio.add_register(mfindex.clone());
 
     /* Reg Array for interrupters */
-    // Although the following should be register arrays, we only have one interrupter.
-    let iman = register!(
-            name: "iman",
+    let mut interrupters = Vec::new();
+    for index in 0..MAX_INTERRUPTER {
+        let base = 0x3020 + u64::from(index) * 0x20;
+        let iman = register!(
+                name: "iman",
+                ty: u32,
+                offset: base,
+                reset_value: 0,
+                guest_writeable_mask: 0x00000003,
+                guest_write_1_to_clear_mask: 0x00000001,);
+        mmio.add_register(iman.clone());
+
+        let imod = register!(
+                name: "imod",
+                ty: u32,
+                offset: base + 0x4,
+                reset_value: 0x00000FA0,
+                guest_writeable_mask: 0xFFFFFFFF,
+                guest_write_1_to_clear_mask: 0,);
+        mmio.add_register(imod.clone());
+
+        let erstsz = register!(
+            name: "erstsz",
             ty: u32,
-            offset: 0x3020,
+            offset: base + 0x8,
             reset_value: 0,
-            guest_writeable_mask: 0x00000003,
-            guest_write_1_to_clear_mask: 0x00000001,);
-    mmio.add_register(iman.clone());
-
-    let imod = register!(
-            name: "imod",
-            ty: u32,
-            offset: 0x3024,
-            reset_value: 0x00000FA0,
-            guest_writeable_mask: 0xFFFFFFFF,
+            guest_writeable_mask: 0x0000FFFF,
             guest_write_1_to_clear_mask: 0,);
-    mmio.add_register(imod.clone());
+        mmio.add_register(erstsz.clone());
 
-    let erstsz = register!(
-        name: "erstsz",
-        ty: u32,
-        offset: 0x3028,
-        reset_value: 0,
-        guest_writeable_mask: 0x0000FFFF,
-        guest_write_1_to_clear_mask: 0,);
-    mmio.add_register(erstsz.clone());
+        let erstba = register!(
+            name: "erstba",
+            ty: u64,
+            offset: base + 0x10,
+            reset_value: 0,
+            guest_writeable_mask: 0xFFFFFFFFFFFFFFC0,
+            guest_write_1_to_clear_mask: 0,);
+        mmio.add_register(erstba.clone());
 
-    let erstba = register!(
-        name: "erstba",
-        ty: u64,
-        offset: 0x3030,
-        reset_value: 0,
-        guest_writeable_mask: 0xFFFFFFFFFFFFFFC0,
-        guest_write_1_to_clear_mask: 0,);
-    mmio.add_register(erstba.clone());
+        let erdp = register!(
+            name: "erdp",
+            ty: u64,
+            offset: base + 0x18,
+            reset_value: 0,
+            guest_writeable_mask: 0xFFFFFFFFFFFFFFFF,
+            guest_write_1_to_clear_mask: 0x0000000000000008,);
+        mmio.add_register(erdp.clone());
 
-    let erdp = register!(
-        name: "erdp",
-        ty: u64,
-        offset: 0x3038,
-        reset_value: 0,
-        guest_writeable_mask: 0xFFFFFFFFFFFFFFFF,
-        guest_write_1_to_clear_mask: 0x0000000000000008,);
-    mmio.add_register(erdp.clone());
+        interrupters.push(InterrupterRegs {
+            iman, imod, erstsz, erstba, erdp,
+        });
+    }
 
     /* End of Runtime Registers */
 
@@ -481,11 +493,7 @@ pub fn init_xhci_mmio_space_and_regs() -> (RegisterSpace, XhciRegs) {
         config,
         portsc,
         doorbells,
-        iman,
-        imod,
-        erstsz,
-        erstba,
-        erdp,
+        interrupters,
         mfindex,
     };
 

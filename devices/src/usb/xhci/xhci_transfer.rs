@@ -30,7 +30,7 @@ use vm_memory::GuestMemoryError;
 
 use super::device_slot::DeviceSlot;
 use super::interrupter::Error as InterrupterError;
-use super::interrupter::Interrupter;
+use super::interrupter::Interrupters;
 use super::scatter_gather_buffer::Error as BufferError;
 use super::scatter_gather_buffer::ScatterGatherBuffer;
 use super::usb_hub::Error as HubError;
@@ -160,6 +160,7 @@ pub struct StoppedTransfer {
     pub completion_code: TrbCompletionCode,
     /// The TRB in progress, ED = 0.
     pub trb_pointer: u64,
+    pub interrupter_target: u16,
     /// What that TRB had left to move; 0 with `StoppedLengthInvalid`.
     pub residual: u32,
 }
@@ -204,7 +205,7 @@ impl XhciTransferManager {
         &self,
         mem: GuestMemory,
         port: Arc<UsbPort>,
-        interrupter: Arc<Mutex<Interrupter>>,
+        interrupter: Interrupters,
         slot_id: u8,
         endpoint_id: u8,
         transfer_trbs: TransferDescriptor,
@@ -315,7 +316,7 @@ pub struct XhciTransfer {
     state: Arc<Mutex<XhciTransferState>>,
     mem: GuestMemory,
     port: Arc<UsbPort>,
-    interrupter: Arc<Mutex<Interrupter>>,
+    interrupter: Interrupters,
     slot_id: u8,
     // id of endpoint in device slot.
     endpoint_id: u8,
@@ -543,7 +544,7 @@ impl XhciTransfer {
                     } else {
                         TrbCompletionCode::Success
                     };
-                    self.interrupter
+                    self.interrupter.target(atrb.trb.interrupter_target())
                         .lock()
                         .send_transfer_event_trb(
                             code,
@@ -560,7 +561,7 @@ impl XhciTransfer {
                 } else if *status == TransferStatus::Stalled {
                     debug!("xhci: on transfer complete stalled");
                     let residual_transfer_length = edtla - bytes_transferred;
-                    self.interrupter
+                    self.interrupter.target(atrb.trb.interrupter_target())
                         .lock()
                         .send_transfer_event_trb(
                             TrbCompletionCode::StallError,
@@ -578,7 +579,7 @@ impl XhciTransfer {
                     if edtla > bytes_transferred {
                         debug!("xhci: on transfer complete short packet");
                         let residual_transfer_length = edtla - bytes_transferred;
-                        self.interrupter
+                        self.interrupter.target(atrb.trb.interrupter_target())
                             .lock()
                             .send_transfer_event_trb(
                                 TrbCompletionCode::ShortPacket,
@@ -591,7 +592,7 @@ impl XhciTransfer {
                             .map_err(Error::SendInterrupt)?;
                     } else {
                         debug!("xhci: on transfer complete success");
-                        self.interrupter
+                        self.interrupter.target(atrb.trb.interrupter_target())
                             .lock()
                             .send_transfer_event_trb(
                                 TrbCompletionCode::Success,
@@ -655,10 +656,10 @@ impl XhciTransfer {
                 break;
             }
         }
-        let (completion_code, trb_pointer, residual) =
+        let (completion_code, stopped_trb, residual) =
             match in_progress.or_else(|| last_data_trb.map(|atrb| (atrb, 0))) {
-                Some((atrb, residual)) => (TrbCompletionCode::Stopped, atrb.gpa, residual),
-                None => (TrbCompletionCode::StoppedLengthInvalid, first.gpa, 0),
+                Some((atrb, residual)) => (TrbCompletionCode::Stopped, atrb, residual),
+                None => (TrbCompletionCode::StoppedLengthInvalid, first, 0),
             };
         Ok(StoppedTransfer {
             seq: self.seq,
@@ -666,7 +667,8 @@ impl XhciTransfer {
             cycle: first.trb.get_cycle(),
             bytes: bytes_transferred,
             completion_code,
-            trb_pointer,
+            trb_pointer: stopped_trb.gpa,
+            interrupter_target: stopped_trb.trb.interrupter_target(),
             residual,
         })
     }
@@ -711,7 +713,7 @@ impl XhciTransfer {
         let mut valid = true;
         for atrb in &self.transfer_trbs {
             if !trb_is_valid(atrb) {
-                self.interrupter
+                self.interrupter.primary()
                     .lock()
                     .send_transfer_event_trb(
                         TrbCompletionCode::TrbError,
@@ -737,7 +739,7 @@ fn trb_is_valid(atrb: &AddressedTrb) -> bool {
             return false;
         }
     };
-    can_be_in_transfer_ring && (atrb.trb.interrupter_target() < MAX_INTERRUPTER)
+    can_be_in_transfer_ring && (atrb.trb.interrupter_target() < u16::from(MAX_INTERRUPTER))
 }
 
 #[cfg(test)]

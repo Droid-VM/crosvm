@@ -94,6 +94,18 @@ pub enum SimplefbDisplayTarget {
         /// binding, and the other target has no input of its own at all.
         input: VncBindingInput,
     },
+    /// Browsers over WebRTC: `addr` serves the viewer page and the offer/answer exchange. Input
+    /// is this screen's own tablet and keyboard, exactly as for `Vnc`.
+    #[cfg(feature = "webrtc")]
+    WebRtc {
+        addr: String,
+        token: Option<String>,
+        stun: Vec<String>,
+        allow_h265: bool,
+        bitrate_bps: Option<u32>,
+        adapt: bool,
+        input: VncBindingInput,
+    },
     /// The Android Surface the app hands over through the display service binder. Input does
     /// NOT come through the display here -- it arrives on the `--input` evdev sockets, same as
     /// the virtio-gpu native-display path.
@@ -151,6 +163,28 @@ pub fn start_simplefb_display_thread(
                     params.height,
                     password,
                     hw_encode,
+                    input.tablet,
+                    input.keyboard,
+                ),
+                #[cfg(feature = "webrtc")]
+                SimplefbDisplayTarget::WebRtc {
+                    addr,
+                    token,
+                    stun,
+                    allow_h265,
+                    bitrate_bps,
+                    adapt,
+                    input,
+                } => GpuDisplay::open_webrtc(
+                    &addr,
+                    params.width,
+                    params.height,
+                    token,
+                    stun,
+                    allow_h265,
+                    bitrate_bps,
+                    adapt,
+                    params.poll_hz,
                     input.tablet,
                     input.keyboard,
                 ),

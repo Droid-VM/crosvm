@@ -92,6 +92,21 @@ extern "C" fn AAudioStream_requestStart(_stream: *mut AAudioStream) -> AaudioRes
 }
 
 #[no_mangle]
+extern "C" fn AAudioStream_getState(_stream: *mut AAudioStream) -> i32 {
+    unimplemented!();
+}
+
+#[no_mangle]
+extern "C" fn AAudioStream_waitForStateChange(
+    _stream: *mut AAudioStream,
+    _input_state: i32,
+    _next_state: *mut i32,
+    _timeout: i64,
+) -> AaudioResultT {
+    unimplemented!();
+}
+
+#[no_mangle]
 extern "C" fn AAudioStream_read(
     _stream: *mut AAudioStream,
     _buffer: *mut c_void,

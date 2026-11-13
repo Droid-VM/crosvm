@@ -11,12 +11,16 @@ use base::error;
 use base::AsRawDescriptor;
 use base::RawDescriptor;
 use base::SharedMemory;
+use base::Tube;
 use resources::Alloc;
 use resources::AllocOptions;
 use resources::SystemAllocator;
+use sync::Mutex;
 use vm_memory::GuestMemory;
 
 use crate::pci::BarRange;
+use crate::pci::MsixCap;
+use crate::pci::MsixConfig;
 use crate::pci::PciAddress;
 use crate::pci::PciBarConfiguration;
 use crate::pci::PciBarPrefetchable;
@@ -34,12 +38,15 @@ use crate::register_space::RegisterSpace;
 use crate::usb::xhci::xhci_backend_device_provider::XhciBackendDeviceProvider;
 use crate::usb::xhci::xhci_regs::init_xhci_mmio_space_and_regs;
 use crate::usb::xhci::xhci_regs::XhciRegs;
+use crate::usb::xhci::xhci_regs::MAX_INTERRUPTER;
 use crate::usb::xhci::Xhci;
 use crate::utils::FailHandle;
 use crate::IrqLevelEvent;
 use crate::Suspendable;
 
 const XHCI_BAR0_SIZE: u64 = 0x10000;
+const MSIX_TABLE_OFFSET: u64 = 0x8000;
+const MSIX_PBA_OFFSET: u64 = 0x8800;
 
 #[derive(Clone, Copy)]
 enum UsbControllerProgrammingInterface {
@@ -116,20 +123,20 @@ pub struct XhciController {
     pci_address: Option<PciAddress>,
     mem: GuestMemory,
     state: XhciControllerState,
+    msix: Arc<Mutex<MsixConfig>>,
+    intx_disabled: Arc<AtomicBool>,
 }
 
 impl XhciController {
     /// Create new xhci controller.
-    pub fn new(mem: GuestMemory, usb_provider: Box<dyn XhciBackendDeviceProvider>) -> Self {
-        let config_regs = PciConfiguration::new(
-            // QEMU's xHCI id. Upstream borrowed Fresco Logic's FL1400 so that Linux would apply
-            // XHCI_BROKEN_MSI and never try MSI on a model that only raises INTx -- but this
-            // config space carries no MSI capability, so Linux falls back to the line interrupt
-            // on its own, and the model reports short transfers with COMP_SHORT_PACKET, so the
-            // TRUST_TX_LENGTH quirk that id also buys is not needed either. What FL1400 does
-            // cost is Windows: usbxhci.inf lists PCI\VEN_1B73&DEV_1400 under ExcludeID and the
-            // controller stays at CM_PROB_FAILED_INSTALL. 1b36:000d is what qemu-xhci presents,
-            // and both guests bind their generic xHCI driver to it.
+    pub fn new(
+        mem: GuestMemory,
+        usb_provider: Box<dyn XhciBackendDeviceProvider>,
+        msi_tube: Tube,
+    ) -> Self {
+        let mut config_regs = PciConfiguration::new(
+            // QEMU's xHCI ID lets generic drivers bind without Fresco Logic's
+            // XHCI_BROKEN_MSI quirk or Windows' FL1400 ExcludeID.
             0x1b36,
             0x000d,
             PciClassCode::SerialBusController,
@@ -140,8 +147,28 @@ impl XhciController {
             0,
             0,
         );
+        let msix = Arc::new(Mutex::new(MsixConfig::new(
+            u16::from(MAX_INTERRUPTER),
+            msi_tube,
+            0x000d_1b36,
+            "xhci controller".to_owned(),
+        )));
+        config_regs
+            .add_capability(
+                &MsixCap::new(
+                    0,
+                    u16::from(MAX_INTERRUPTER),
+                    MSIX_TABLE_OFFSET as u32,
+                    0,
+                    MSIX_PBA_OFFSET as u32,
+                ),
+                Some(Box::new(msix.clone())),
+            )
+            .expect("xHCI MSI-X capability fits in PCI configuration space");
         XhciController {
             config_regs,
+            msix,
+            intx_disabled: Arc::new(AtomicBool::new(false)),
             pci_address: None,
             mem,
             state: XhciControllerState::Created {
@@ -164,6 +191,8 @@ impl XhciController {
                     self.mem.clone(),
                     device_provider,
                     irq_evt,
+                    self.msix.clone(),
+                    self.intx_disabled.clone(),
                     regs,
                 ) {
                     Ok(xhci) => Some(xhci),
@@ -203,7 +232,7 @@ impl PciDevice for XhciController {
     }
 
     fn keep_rds(&self) -> Vec<RawDescriptor> {
-        match &self.state {
+        let mut rds = match &self.state {
             XhciControllerState::Created { device_provider } => device_provider.keep_rds(),
             XhciControllerState::IrqAssigned {
                 device_provider,
@@ -218,7 +247,9 @@ impl PciDevice for XhciController {
                 error!("xhci controller is in a wrong state");
                 vec![]
             }
-        }
+        };
+        rds.push(self.msix.lock().get_msi_socket());
+        rds
     }
 
     fn assign_irq(&mut self, irq_evt: IrqLevelEvent, pin: PciInterruptPin, irq_num: u32) {
@@ -286,6 +317,12 @@ impl PciDevice for XhciController {
 
     fn write_config_register(&mut self, reg_idx: usize, offset: u64, data: &[u8]) {
         self.config_regs.write_reg(reg_idx, offset, data);
+        if reg_idx == 1 {
+            self.intx_disabled.store(
+                self.config_regs.read_reg(1) & (1 << 10) != 0,
+                Ordering::SeqCst,
+            );
+        }
     }
 
     fn setup_pci_config_mapping(
@@ -305,6 +342,14 @@ impl PciDevice for XhciController {
             return;
         }
 
+        if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + 16 * u64::from(MAX_INTERRUPTER)).contains(&offset) {
+            self.msix.lock().read_msix_table(offset - MSIX_TABLE_OFFSET, data);
+            return;
+        }
+        if (MSIX_PBA_OFFSET..MSIX_PBA_OFFSET + 8).contains(&offset) {
+            self.msix.lock().read_pba_entries(offset - MSIX_PBA_OFFSET, data);
+            return;
+        }
         match &self.state {
             XhciControllerState::Initialized { mmio, .. } => {
                 // Read bar would still work even if it's already failed.
@@ -321,6 +366,14 @@ impl PciDevice for XhciController {
             return;
         }
 
+        if (MSIX_TABLE_OFFSET..MSIX_TABLE_OFFSET + 16 * u64::from(MAX_INTERRUPTER)).contains(&offset) {
+            self.msix.lock().write_msix_table(offset - MSIX_TABLE_OFFSET, data);
+            return;
+        }
+        if (MSIX_PBA_OFFSET..MSIX_PBA_OFFSET + 8).contains(&offset) {
+            self.msix.lock().write_pba_entries(offset - MSIX_PBA_OFFSET, data);
+            return;
+        }
         match &self.state {
             XhciControllerState::Initialized {
                 mmio, fail_handle, ..
@@ -337,6 +390,12 @@ impl PciDevice for XhciController {
 
     fn on_device_sandboxed(&mut self) {
         self.init_when_forked();
+    }
+
+    fn destroy_device(&mut self) {
+        // Stop the event-loop workers before releasing their MSI route.
+        drop(mem::replace(&mut self.state, XhciControllerState::Unknown));
+        self.msix.lock().destroy();
     }
 }
 

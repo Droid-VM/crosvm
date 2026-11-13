@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -12,6 +15,7 @@ use base::Event;
 use base::Timer;
 use base::TimerTrait;
 use remain::sorted;
+use sync::Mutex;
 use thiserror::Error;
 use vm_memory::GuestAddress;
 use vm_memory::GuestMemory;
@@ -30,6 +34,7 @@ use super::xhci_regs::XhciRegs;
 use super::xhci_regs::ERDP_EVENT_HANDLER_BUSY;
 use super::xhci_regs::IMAN_INTERRUPT_PENDING;
 use super::xhci_regs::USB_STS_EVENT_INTERRUPT;
+use crate::pci::MsixConfig;
 use crate::register_space::Register;
 
 #[sorted]
@@ -57,11 +62,28 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// Event rings indexed by the Transfer TRB's Interrupter Target.
+#[derive(Clone)]
+pub struct Interrupters(pub Arc<Vec<Arc<Mutex<Interrupter>>>>);
+
+impl Interrupters {
+    pub fn primary(&self) -> &Arc<Mutex<Interrupter>> {
+        &self.0[0]
+    }
+
+    pub fn target(&self, index: u16) -> &Arc<Mutex<Interrupter>> {
+        &self.0[usize::from(index)]
+    }
+}
+
 /// See spec 4.17 for interrupters. Controller can send an event back to guest kernel driver
 /// through interrupter.
 pub struct Interrupter {
     mem: GuestMemory,
     interrupt_evt: Event,
+    msix: Option<Arc<Mutex<MsixConfig>>>,
+    intx_disabled: Arc<AtomicBool>,
+    vector: u16,
     usbsts: Register<u32>,
     iman: Register<u32>,
     erdp: Register<u64>,
@@ -82,16 +104,37 @@ pub struct Interrupter {
 }
 
 impl Interrupter {
-    /// Create a new interrupter.
-    pub fn new(mem: GuestMemory, irq_evt: Event, regs: &XhciRegs) -> Result<Self> {
+    /// Create the primary interrupter for existing unit fixtures.
+    #[cfg(test)]
+    pub fn new(
+        mem: GuestMemory,
+        irq_evt: Event,
+        regs: &XhciRegs,
+        msix: Option<Arc<Mutex<MsixConfig>>>,
+        intx_disabled: Arc<AtomicBool>,
+    ) -> Result<Self> {
+        Self::new_indexed(mem, irq_evt, regs, msix, intx_disabled, 0)
+    }
+
+    pub fn new_indexed(
+        mem: GuestMemory,
+        irq_evt: Event,
+        regs: &XhciRegs,
+        msix: Option<Arc<Mutex<MsixConfig>>>,
+        intx_disabled: Arc<AtomicBool>,
+        index: usize,
+    ) -> Result<Self> {
         let clock = Clock::new();
         let moderation_timer = Timer::new().map_err(Error::CreateModerationTimer)?;
         Ok(Interrupter {
             mem: mem.clone(),
             interrupt_evt: irq_evt,
+            msix,
+            intx_disabled,
+            vector: index as u16,
             usbsts: regs.usbsts.clone(),
-            iman: regs.iman.clone(),
-            erdp: regs.erdp.clone(),
+            iman: regs.interrupters[index].iman.clone(),
+            erdp: regs.interrupters[index].erdp.clone(),
             event_handler_busy: false,
             enabled: false,
             moderation_interval: 4000, // default to 1ms as per xhci 5.5.2.2
@@ -138,6 +181,11 @@ impl Interrupter {
             .map_err(Error::WaitModerationTimer)?;
         self.moderation_timer_armed = false;
         self.interrupt_if_needed()
+    }
+
+    /// Only legacy line interrupts need reassertion after the irqchip's EOI.
+    pub fn uses_msix(&self) -> bool {
+        self.msix.as_ref().is_some_and(|msix| msix.lock().enabled())
     }
 
     /// Returns true if event ring is empty.
@@ -278,7 +326,17 @@ impl Interrupter {
         self.erdp.set_bits(ERDP_EVENT_HANDLER_BUSY);
         self.moderation_counter = self.moderation_interval;
         self.last_interrupt_time = self.clock.now();
-        self.interrupt_evt.signal().map_err(Error::SendInterrupt)
+        if let Some(msix) = &self.msix {
+            let mut msix = msix.lock();
+            if msix.enabled() {
+                msix.trigger(self.vector);
+                return Ok(());
+            }
+        }
+        if self.vector == 0 && !self.intx_disabled.load(Ordering::SeqCst) {
+            self.interrupt_evt.signal().map_err(Error::SendInterrupt)?;
+        }
+        Ok(())
     }
 
     fn interrupt_interval(&self) -> Duration {
@@ -337,7 +395,13 @@ mod tests {
         gm.write_obj_at_addr(entry, GuestAddress(0x8)).unwrap();
         let (_mmio, regs) = init_xhci_mmio_space_and_regs();
         let irq = Event::new().unwrap();
-        let mut intr = Interrupter::new(gm, irq.try_clone().unwrap(), &regs).unwrap();
+        let mut intr = Interrupter::new(
+            gm,
+            irq.try_clone().unwrap(),
+            &regs,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        ).unwrap();
         intr.set_event_ring_seg_table_size(1).unwrap();
         intr.set_event_ring_seg_table_base_addr(GuestAddress(0x8))
             .unwrap();
@@ -352,6 +416,68 @@ mod tests {
             irq.wait_timeout(Duration::from_millis(200)).unwrap(),
             EventWaitResult::Signaled
         )
+    }
+
+    #[test]
+    fn msix_routes_events_and_replays_masked_pending_without_intx() {
+        use base::Tube;
+        use vm_control::{VmIrqRequest, VmIrqResponse};
+
+        let (mut intr, intx) = interrupter();
+        let (host, device) = Tube::pair().unwrap();
+        let message = Event::new().unwrap();
+        let routed = message.try_clone().unwrap();
+        let worker = thread::spawn(move || {
+            match host.recv::<VmIrqRequest>().unwrap() {
+                VmIrqRequest::AllocateOneMsi { .. } => {
+                    host.send(&VmIrqResponse::AllocateOneMsi { gsi: 40 }).unwrap();
+                }
+                _ => panic!("expected MSI allocation"),
+            }
+            match host.recv::<VmIrqRequest>().unwrap() {
+                VmIrqRequest::AddMsiRoute { gsi, msi_address, msi_data } => {
+                    assert_eq!((gsi, msi_address, msi_data), (40, 0x0800_0040, 96));
+                    host.send(&VmIrqResponse::MsiRouteEvent { event: routed }).unwrap();
+                }
+                _ => panic!("expected MBI route"),
+            }
+        });
+        let msix = Arc::new(Mutex::new(MsixConfig::new(1, device, 0x000d_1b36, "xhci".into())));
+        {
+            let mut config = msix.lock();
+            config.write_msix_table(0, &0x0800_0040u64.to_le_bytes());
+            config.write_msix_table(8, &96u32.to_le_bytes());
+            // Enable MSI-X while the vector is still masked.
+            config.write_msix_capability(2, &0x8000u16.to_le_bytes());
+        }
+        intr.msix = Some(msix.clone());
+        intr.set_moderation(0, 0).unwrap();
+        intr.send_port_status_change_trb(1).unwrap();
+        let mut pending = [0; 8];
+        msix.lock().read_pba_entries(0, &mut pending);
+        assert_eq!(u64::from_le_bytes(pending), 1);
+        assert!(!signaled(&message));
+        assert!(!signaled(&intx));
+        // Unmasking must send the held message through the returned MBI event.
+        msix.lock().write_msix_table(12, &0u32.to_le_bytes());
+        worker.join().unwrap();
+        assert!(signaled(&message));
+        msix.lock().read_pba_entries(0, &mut pending);
+        assert_eq!(u64::from_le_bytes(pending), 0);
+        intr.set_event_ring_dequeue_pointer(GuestAddress(SEGMENT_BASE + TRB_SIZE), false)
+            .unwrap();
+        intr.send_port_status_change_trb(2).unwrap();
+        assert!(signaled(&message));
+        assert!(!signaled(&intx));
+        // PCI MSI-X disable restores legacy delivery, subject to Command.INTxDisable.
+        msix.lock().write_msix_capability(2, &0u16.to_le_bytes());
+        intr.intx_disabled.store(true, Ordering::SeqCst);
+        intr.interrupt().unwrap();
+        assert!(!signaled(&intx));
+        intr.intx_disabled.store(false, Ordering::SeqCst);
+        intr.interrupt().unwrap();
+        assert!(signaled(&intx));
+        assert!(!signaled(&message));
     }
 
     #[test]

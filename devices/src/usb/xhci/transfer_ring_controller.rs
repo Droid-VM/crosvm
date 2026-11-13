@@ -10,11 +10,10 @@ use std::sync::Weak;
 use anyhow::Context;
 use base::debug;
 use base::Event;
-use sync::Mutex;
 use vm_memory::GuestMemory;
 
 use super::device_slot::DeviceSlot;
-use super::interrupter::Interrupter;
+use super::interrupter::Interrupters;
 use super::usb_hub::UsbPort;
 use super::xhci_abi::TransferDescriptor;
 use super::xhci_transfer::XhciTransferManager;
@@ -43,7 +42,7 @@ pub type TransferRingControllerError = RingBufferControllerError;
 pub struct TransferRingTrbHandler {
     mem: GuestMemory,
     port: Arc<UsbPort>,
-    interrupter: Arc<Mutex<Interrupter>>,
+    interrupter: Interrupters,
     slot_id: u8,
     endpoint_id: u8,
     transfer_manager: XhciTransferManager,
@@ -135,7 +134,7 @@ impl TransferDescriptorHandler for TransferRingTrbHandler {
             }
         );
         if reported {
-            self.interrupter
+            self.interrupter.target(stopped.interrupter_target)
                 .lock()
                 .send_transfer_event_trb(
                     stopped.completion_code,
@@ -162,7 +161,7 @@ impl TransferRingController {
         mem: GuestMemory,
         port: Arc<UsbPort>,
         event_loop: Arc<EventLoop>,
-        interrupter: Arc<Mutex<Interrupter>>,
+        interrupter: Interrupters,
         slot_id: u8,
         endpoint_id: u8,
         device_slot: Weak<DeviceSlot>,
