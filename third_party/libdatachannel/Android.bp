@@ -17,6 +17,11 @@ package {
 cc_defaults {
     name: "libdatachannel_deps_defaults",
     host_supported: true,
+    // libgpu_display links libdatachannel, and the com.android.virt APEX carries crosvm.
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
     cflags: [
         "-Wno-error",
         "-Wno-unused-parameter",
@@ -33,6 +38,10 @@ cc_defaults {
 cc_library_headers {
     name: "libdatachannel_plog_headers",
     host_supported: true,
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
     export_include_dirs: ["deps/plog/include"],
 }
 
