@@ -123,6 +123,8 @@ struct RingState {
     debt: usize,
     /// Fed at least once since the stream started: the wait for the first period is not a gap.
     primed: bool,
+    /// Frames the endpoint takes at a time ([`OutputRing::fit_burst`]); 0 until it is known.
+    burst: usize,
 }
 
 impl OutputRing {
@@ -134,6 +136,7 @@ impl OutputRing {
                 frame_size,
                 debt: 0,
                 primed: false,
+                burst: 0,
             }),
             space: Condvar::new(),
             lost: AtomicBool::new(false),
@@ -147,6 +150,26 @@ impl OutputRing {
         state.debt = 0;
         state.primed = false;
         self.lost.store(false, Ordering::Relaxed);
+    }
+
+    /// The endpoint takes `burst_frames` at a time, as it said once opened. On the fast mixer a
+    /// burst is a guest period or less and the ring's eight periods are room to spare. Anywhere
+    /// else -- a stream refused the fast mixer, or one opened for power saving on the deep-buffer
+    /// output, 1922 frames on the phone -- one burst is the whole ring or more: the callback then
+    /// empties it and plays silence for the rest, and the guest's periods find no room for a
+    /// burst's time, longer than they wait, and are dropped. So the ring holds three bursts at
+    /// least, and a period waits as long as two bursts take ([`Self::burst_frames`]).
+    fn fit_burst(&self, burst_frames: usize) -> usize {
+        let mut state = self.state.lock().unwrap();
+        state.burst = burst_frames;
+        let frame_size = state.frame_size.max(1);
+        state.capacity = state.capacity.max(burst_frames * 3 * frame_size);
+        state.capacity / frame_size
+    }
+
+    /// Frames the endpoint takes at a time; 0 until the stream has said.
+    fn burst_frames(&self) -> usize {
+        self.state.lock().unwrap().burst
     }
 
     /// How long until the endpoint has played enough to make room for `frames` more.
@@ -683,10 +706,14 @@ fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> 
                 AAudioStream_getBufferSizeInFrames(stream_ptr),
             )
         };
+        let ring_frames = open
+            .ring
+            .as_ref()
+            .map_or(0, |ring| ring.fit_burst(burst.max(0) as usize));
         base::info!(
             "host audio output: performance mode {} (12 is low latency), burst {} frames, \
              buffer {} frames, ring {} frames",
-            mode, burst, size, open.buffer_size * OUTPUT_RING_PERIODS
+            mode, burst, size, ring_frames
         );
     }
 
@@ -806,9 +833,12 @@ impl AsyncBufferCommit for AndroidAudioStreamCommit {
                 let Some(ring) = self.stream.open.ring.clone() else {
                     return;
                 };
+                // Room comes a burst at a time, so the wait covers two of whichever is longer,
+                // the period or the endpoint's burst.
                 let timeout = if self.frame_rate > 0 {
                     Duration::from_nanos(
-                        nwritten as u64 * 2 * NANOS_PER_SEC as u64 / u64::from(self.frame_rate),
+                        nwritten.max(ring.burst_frames()) as u64 * 2 * NANOS_PER_SEC as u64
+                            / u64::from(self.frame_rate),
                     )
                 } else {
                     Duration::ZERO
