@@ -58,6 +58,10 @@ pub struct Options {
     /// --fd is. Every MMAP buffer's offset is reserved and released through it; this process
     /// has no pool allocator of its own (D49).
     pool_fd: RawDescriptor,
+    #[argh(option, arg_name = "FD")]
+    /// file descriptor of /dev/udmabuf, opened by the VMM before this process dropped its
+    /// privileges (the node is root's): what guest buffers become dma-bufs through.
+    udmabuf_fd: Option<RawDescriptor>,
 }
 
 /// Starts a vhost-user media device.
@@ -75,6 +79,12 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
     let pool_socket = unsafe { UnixSeqpacket::from_raw_descriptor(opts.pool_fd) };
     let pool_tube =
         Tube::try_from(pool_socket).context("cannot wrap --pool-fd into a pool tube")?;
+    if let Some(fd) = opts.udmabuf_fd {
+        // SAFETY: `--udmabuf-fd` names /dev/udmabuf, opened by the VMM for this process alone and
+        // inherited across the exec like --pool-fd; nothing else here owns it.
+        let file = unsafe { std::fs::File::from_raw_descriptor(fd) };
+        crate::virtio::media::guest_buf::hand_udmabuf(file);
+    }
 
     // One arm per device type: the backend is generic over the device it runs, so each kind is
     // its own instantiation. Which kinds exist is `MediaDeviceKind::support`'s table, the same

@@ -514,6 +514,27 @@ pub struct GuestBufferImport {
 /// `/dev/udmabuf` could not be opened (said once, in the log).
 pub type SharedUdmabuf = std::sync::Arc<std::sync::OnceLock<Option<UdmabufDriver>>>;
 
+/// `/dev/udmabuf` as this process was handed it ([`hand_udmabuf`]), when it cannot open the node
+/// itself: the media helper runs as the app's uid and the node is root's (`crw------- root root`
+/// on Android), so the VMM opens it before the helper drops its privileges and passes it down
+/// (`--udmabuf-fd`).
+static HANDED_UDMABUF: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Takes `/dev/udmabuf` already open, for every later import of this process.
+pub fn hand_udmabuf(file: std::fs::File) {
+    let _ = HANDED_UDMABUF.set(file);
+}
+
+/// The udmabuf driver: over the handed node if there is one, else `/dev/udmabuf` opened now.
+fn open_udmabuf() -> Result<UdmabufDriver, UdmabufError> {
+    match HANDED_UDMABUF.get() {
+        Some(file) => Ok(UdmabufDriver::from_file(
+            file.try_clone().map_err(UdmabufError::DriverOpenFailed)?,
+        )),
+        None => UdmabufDriver::new(),
+    }
+}
+
 impl GuestBufferImport {
     /// Import `sgs`, mapped with `prot` (the direction the device will access it in: read-only
     /// for an OUTPUT buffer, read-write for a CAPTURE one; a caller that cannot tell passes
@@ -594,7 +615,7 @@ impl GuestBufferImport {
         if self.is_shadowed() {
             return None;
         }
-        let driver = self.udmabuf.as_ref()?.get_or_init(|| match UdmabufDriver::new() {
+        let driver = self.udmabuf.as_ref()?.get_or_init(|| match open_udmabuf() {
             Ok(driver) => Some(driver),
             Err(e) => {
                 base::warn!("guest buffers get no dma-buf: cannot open /dev/udmabuf: {}", e);

@@ -86,6 +86,10 @@ pub(crate) fn vmm_log_filter() -> String {
 /// allocator. The caller keeps its own end and its own copy of this one -- dropping the copy
 /// after the spawn is the caller's job, so that the child's death is an EOF and not a
 /// half-open socket the VMM itself keeps alive.
+///
+/// `udmabuf_fd`, likewise inherited by number (`--udmabuf-fd`): `/dev/udmabuf` opened by the VMM
+/// for a child that turns guest buffers into dma-bufs but, running as an app uid, cannot open the
+/// root-only node itself. The caller closes its copy after the spawn.
 pub fn launch(
     subcommand: &str,
     params_json: String,
@@ -93,6 +97,7 @@ pub fn launch(
     gid: u32,
     supp_gids: Vec<u32>,
     pool_fd: Option<std::os::fd::RawFd>,
+    udmabuf_fd: Option<std::os::fd::RawFd>,
 ) -> Result<(UnixStream, Pid)> {
     let (vmm_end, backend_end) = UnixStream::pair()
         .with_context(|| format!("failed to create the {subcommand} socketpair"))?;
@@ -103,6 +108,10 @@ pub fn launch(
     if let Some(pool_fd) = pool_fd {
         clear_cloexec(pool_fd)
             .with_context(|| format!("failed to clear CLOEXEC on the {subcommand} pool fd"))?;
+    }
+    if let Some(udmabuf_fd) = udmabuf_fd {
+        clear_cloexec(udmabuf_fd)
+            .with_context(|| format!("failed to clear CLOEXEC on the {subcommand} udmabuf fd"))?;
     }
 
     // Build everything the child needs before forking, the group list included: after the fork
@@ -130,6 +139,9 @@ pub fn launch(
         .arg(&params_json);
     if let Some(pool_fd) = pool_fd {
         command.arg("--pool-fd").arg(pool_fd.to_string());
+    }
+    if let Some(udmabuf_fd) = udmabuf_fd {
+        command.arg("--udmabuf-fd").arg(udmabuf_fd.to_string());
     }
 
     // SAFETY: the closure runs between fork and exec, and calls only async-signal-safe libc

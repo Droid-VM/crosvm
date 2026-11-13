@@ -664,7 +664,7 @@ fn create_unprivileged_virtio_snd_device(
         serde_json::to_string(&snd_params).context("failed to serialise snd parameters")?;
 
     let (vmm_end, pid) =
-        crate::crosvm::sys::linux::device_helper::launch("snd", config, uid, gid, supp_gids, None)
+        crate::crosvm::sys::linux::device_helper::launch("snd", config, uid, gid, supp_gids, None, None)
             .context("failed to launch the unprivileged snd backend")?;
     // So that the child exiting cleanly is not reported as a device crashing, and anything else
     // is, under a name.
@@ -1607,13 +1607,27 @@ fn create_unprivileged_virtio_media_device(
     // That decoder hands the driver guest buffers as udmabufs, one entry per scattered guest
     // page run: a 4K P010 frame in 16 KiB guest pages is ~1700 entries, past the module's default
     // `list_limit` of 1024, which only root may raise -- so it is raised here, best effort.
-    let supp_gids = if config.decoder_backend().may_be_direct()
-        && config.kind == MediaDeviceKind::Decoder
-    {
+    // The node itself is root's (`crw------- root root` on Android): the helper, an app uid, could
+    // not open it and every guest buffer reached the driver without a dma-buf. It is opened here,
+    // before the privileges go, and handed down by number (`--udmabuf-fd`); without it (no udmabuf
+    // driver) the helper still tries the path itself and says why it gets nothing.
+    let direct = config.decoder_backend().may_be_direct() && config.kind == MediaDeviceKind::Decoder;
+    let supp_gids = if direct {
         raise_udmabuf_list_limit(16384);
         vec![AID_CAMERA]
     } else {
         Vec::new()
+    };
+    let udmabuf = if direct {
+        match std::fs::OpenOptions::new().read(true).write(true).open("/dev/udmabuf") {
+            Ok(file) => Some(file),
+            Err(e) => {
+                warn!("media helper: cannot open /dev/udmabuf for it: {}", e);
+                None
+            }
+        }
+    } else {
+        None
     };
     let (vmm_end, pid) = crate::crosvm::sys::linux::device_helper::launch(
         "media",
@@ -1622,9 +1636,11 @@ fn create_unprivileged_virtio_media_device(
         gid,
         supp_gids,
         Some(pool_helper_fd),
+        udmabuf.as_ref().map(std::os::fd::AsRawFd::as_raw_fd),
     )
     .context("failed to launch the unprivileged media backend")?;
     drop(pool_helper_end);
+    drop(udmabuf);
     // The child exists from here on, so it is recorded and labelled BEFORE anything below can
     // fail out of this function (R8-10): a clean exit is then never reported as a device
     // crashing, anything else is reported under a name, and a failed server-thread spawn

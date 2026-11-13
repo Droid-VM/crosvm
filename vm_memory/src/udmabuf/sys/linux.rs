@@ -93,6 +93,15 @@ pub struct UnixUdmabufDriver {
     driver_fd: File,
 }
 
+impl UnixUdmabufDriver {
+    /// A driver over `/dev/udmabuf` opened by someone else: a process that runs unprivileged
+    /// (crosvm's device helpers, as an app uid) cannot open the node, which is root's on Android,
+    /// and is handed one the VMM opened before it dropped its privileges.
+    pub fn from_file(driver_fd: File) -> UnixUdmabufDriver {
+        UnixUdmabufDriver { driver_fd }
+    }
+}
+
 impl UdmabufDriverTrait for UnixUdmabufDriver {
     fn new() -> UdmabufResult<UnixUdmabufDriver> {
         const UDMABUF_PATH: &str = "/dev/udmabuf";
