@@ -239,12 +239,19 @@ impl VideoDecoderBackendSession for HwDecoderSession {
         self.codec.start(coded_format, coded_size)
     }
 
-    fn set_display_delay(&mut self, delay: Option<u32>) -> IoctlResult<()> {
-        if self.driver.is_none() {
+    fn set_display_delay(&mut self, coded_format: PixelFormat, delay: Option<u32>) -> IoctlResult<()> {
+        let Some((driver, _)) = self.driver else {
             return Err(libc::EINVAL);
-        }
+        };
         if self.direct.is_some() {
             return Err(libc::EBUSY);
+        }
+        // Decode order is the driver's to give: for a format it does not decode, the session
+        // would be MediaCodec's, which has display order only. Refused now, the guest knows
+        // before it streams and asks for display order instead -- a guest that adapts (the
+        // DroidVM VideoToolbox host) is then served by MediaCodec, not failed at STREAMON.
+        if delay.is_some() && !driver.takes(coded_format) {
+            return Err(libc::EINVAL);
         }
         self.display_delay = delay;
         Ok(())
