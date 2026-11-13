@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 //! The decoder straight through Qualcomm's msm_vidc V4L2 driver (`/dev/video32`), for
-//! `--virtio-media kind=decoder,vidc=true` (macOS `docs/k27-vt-zero-copy-plan.md`, Z2): the
+//! `--virtio-media kind=decoder,backend=msm-vidc` (macOS `docs/k27-vt-zero-copy-plan.md`, Z2): the
 //! guest's `CAPTURE` buffers go to the driver as udmabufs over their own pages
 //! ([`OutputBuffer::dmabuf`]), so the hardware writes every frame into guest memory and nothing
 //! copies it -- against MediaCodec's path, which has the component convert into a linear block of
@@ -25,8 +25,8 @@
 //! driver sets its clocks from the rate it reads in them; so the driver is given timestamps of a
 //! 240 fps stream, one per access unit, and each frame's is mapped back to the guest's.
 //!
-//! [`HwDecoderBackend`] wraps the MediaCodec backend: a session whose coded format msm_vidc
-//! takes and whose driver opens decodes here, every other one goes to MediaCodec as before.
+//! This is one direct driver ([`super::direct::DirectDriver`], [`MsmVidc`]); which sessions come
+//! here and which go to MediaCodec is [`super::direct::HwDecoderBackend`]'s to say.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -45,20 +45,15 @@ use std::time::Duration;
 
 use base::info;
 use base::warn;
-use virtio_media::devices::video_decoder::DecoderCapabilities;
 use virtio_media::devices::video_decoder::DecoderEvent;
 use virtio_media::devices::video_decoder::DecoderSink;
-use virtio_media::devices::video_decoder::InputBuffer;
-use virtio_media::devices::video_decoder::OutputBuffer;
-use virtio_media::devices::video_decoder::VideoDecoderBackend;
-use virtio_media::devices::video_decoder::VideoDecoderBackendSession;
 use virtio_media::ioctl::IoctlResult;
 use virtio_media::v4l2r::bindings;
 use virtio_media::v4l2r::PixelFormat;
 use virtio_media::v4l2r::Rect;
 
-use super::android::MediaCodecDecoderBackend;
-use super::android::MediaCodecDecoderSession;
+use super::direct::DirectDriver;
+use super::direct::DirectSession;
 
 const DEVICE: &str = "/dev/video32";
 const DMA_HEAP: &str = "/dev/dma_heap/system";
@@ -86,6 +81,7 @@ const fn ioc(dir: u32, kind: u8, nr: u32, size: usize) -> u32 {
 const fn vidioc<T>(dir: u32, nr: u32) -> u32 {
     ioc(dir, b'V', nr, std::mem::size_of::<T>())
 }
+const VIDIOC_QUERYCAP: u32 = vidioc::<bindings::v4l2_capability>(IOC_READ, 0);
 const VIDIOC_ENUM_FMT: u32 = vidioc::<bindings::v4l2_fmtdesc>(IOC_READ | IOC_WRITE, 2);
 const VIDIOC_G_FMT: u32 = vidioc::<bindings::v4l2_format>(IOC_READ | IOC_WRITE, 4);
 const VIDIOC_S_FMT: u32 = vidioc::<bindings::v4l2_format>(IOC_READ | IOC_WRITE, 5);
@@ -766,194 +762,100 @@ impl Drop for VidcSession {
     }
 }
 
-/// The MediaCodec decoder backend, with msm_vidc in front of it where `vidc` is set.
-#[derive(Clone)]
-pub struct HwDecoderBackend {
-    codec: MediaCodecDecoderBackend,
-    vidc: bool,
-}
+/// Qualcomm's msm_vidc as a direct driver: `backend=msm-vidc`, and what `backend=auto` finds on a
+/// Snapdragon phone.
+pub struct MsmVidc;
 
-impl HwDecoderBackend {
-    pub fn new(codec: MediaCodecDecoderBackend, vidc: bool) -> Self {
-        if vidc {
-            info!("decoder: msm_vidc ({}) first, MediaCodec where it cannot", DEVICE);
-        }
-        Self { codec, vidc }
-    }
-}
-
-pub struct HwDecoderSession {
-    id: u32,
-    sink: DecoderSink,
-    vidc_allowed: bool,
-    /// The display delay the guest asked for (`set_display_delay`); `Some`, the session is msm_vidc's
-    /// or nothing: MediaCodec puts frames out in display order only.
-    display_delay: Option<u32>,
-    vidc: Option<VidcSession>,
-    codec: MediaCodecDecoderSession,
-}
-
-impl VideoDecoderBackend for HwDecoderBackend {
-    type Session = HwDecoderSession;
-
-    fn capabilities(&self) -> &DecoderCapabilities {
-        self.codec.capabilities()
+impl DirectDriver for MsmVidc {
+    fn name(&self) -> &'static str {
+        "msm-vidc"
     }
 
-    fn new_session(&mut self, id: u32, sink: DecoderSink) -> IoctlResult<HwDecoderSession> {
-        Ok(HwDecoderSession {
-            id,
-            sink: sink.clone(),
-            vidc_allowed: self.vidc,
-            display_delay: None,
-            vidc: None,
-            codec: self.codec.new_session(id, sink)?,
-        })
-    }
-
-    fn close_session(&mut self, mut session: HwDecoderSession) {
-        if let Some(mut vidc) = session.vidc.take() {
-            vidc.stop();
-        }
-        self.codec.close_session(session.codec);
-    }
-
-    fn min_capture_buffers(&self, fourcc: PixelFormat) -> Option<u32> {
-        self.codec.min_capture_buffers(fourcc)
-    }
-
-    fn decode_order(&self) -> bool {
-        self.vidc
-    }
-}
-
-impl VideoDecoderBackendSession for HwDecoderSession {
-    fn start(&mut self, coded_format: PixelFormat, coded_size: (u32, u32)) -> IoctlResult<()> {
-        if self.vidc_allowed && vidc_takes(coded_format) {
-            match VidcSession::start(self.id, self.sink.clone(), coded_format, coded_size, self.display_delay) {
-                Ok(vidc) => {
-                    self.vidc = Some(vidc);
-                    return Ok(());
-                }
-                Err(e) if self.display_delay.is_some() => {
-                    warn!("decoder session {}: msm_vidc refused ({}), and decode order was asked for", self.id, e);
-                    return Err(libc::EIO);
-                }
-                Err(e) => warn!(
-                    "decoder session {}: msm_vidc refused ({}); MediaCodec instead",
-                    self.id, e
-                ),
-            }
-        }
-        if self.display_delay.is_some() {
-            warn!("decoder session {}: decode order asked for, only msm_vidc gives it", self.id);
-            return Err(libc::EINVAL);
-        }
-        self.codec.start(coded_format, coded_size)
-    }
-
-    fn set_display_delay(&mut self, delay: Option<u32>) -> IoctlResult<()> {
-        if !self.vidc_allowed {
-            return Err(libc::EINVAL);
-        }
-        if self.vidc.is_some() {
-            return Err(libc::EBUSY);
-        }
-        self.display_delay = delay;
-        Ok(())
-    }
-
-    fn decode(&mut self, buffer: InputBuffer) -> IoctlResult<()> {
-        let Some(vidc) = &self.vidc else {
-            return self.codec.decode(buffer);
+    fn present(&self) -> bool {
+        // The node is a number, not a name: it is this driver's only if the driver says so.
+        let Ok(dev) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(DEVICE)
+        else {
+            return false;
         };
-        // The bitstream is copied out at once (an access unit is small) and its buffer given
-        // straight back, so nothing of the guest's is held across a seek.
-        // SAFETY: the device lends `len` readable bytes at `ptr` until `InputBufferDone`.
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.ptr.as_ptr(), buffer.len) }.to_vec();
-        vidc.send(Command::Bitstream(bytes, buffer.timestamp))?;
-        vidc.events.lock().unwrap().push(DecoderEvent::InputBufferDone(buffer.index));
-        self.sink.signal();
-        Ok(())
+        let mut capability: bindings::v4l2_capability = zeroed();
+        if xioctl(dev.as_raw_fd(), VIDIOC_QUERYCAP, &mut capability).is_err() {
+            return false;
+        }
+        let text = |bytes: &[u8]| {
+            let end = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+            String::from_utf8_lossy(&bytes[..end]).into_owned()
+        };
+        let (driver, card) = (text(&capability.driver), text(&capability.card));
+        let ours = driver.contains("msm_vidc") || card.contains("msm_vidc");
+        info!(
+            "decoder: {} is driver \"{}\", card \"{}\": {}",
+            DEVICE,
+            driver,
+            card,
+            if ours { "msm_vidc" } else { "not msm_vidc" }
+        );
+        ours
     }
 
-    fn use_as_capture(&mut self, buffer: OutputBuffer) -> IoctlResult<()> {
-        let Some(vidc) = &self.vidc else {
-            return self.codec.use_as_capture(buffer);
-        };
-        let Some(raw) = buffer.dmabuf else {
-            warn!(
-                "decoder session {}: CAPTURE buffer {} has no dma-buf; msm_vidc cannot write it",
-                self.id, buffer.index
-            );
-            return Err(libc::EINVAL);
-        };
-        // SAFETY: `raw` is open while the buffer is lent; the copy is ours to close.
-        let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(errno());
-        }
-        // SAFETY: just duplicated, owned by no one else.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        vidc.send(Command::Capture {
-            index: buffer.index,
-            fd,
-            len: buffer.len.min(u32::MAX as usize) as u32,
+    fn takes(&self, coded: PixelFormat) -> bool {
+        vidc_takes(coded)
+    }
+
+    fn start(
+        &self,
+        id: u32,
+        sink: DecoderSink,
+        coded: PixelFormat,
+        size: (u32, u32),
+        display_delay: Option<u32>,
+    ) -> Result<Box<dyn DirectSession>, String> {
+        VidcSession::start(id, sink, coded, size, display_delay)
+            .map(|session| Box::new(session) as Box<dyn DirectSession>)
+    }
+}
+
+impl DirectSession for VidcSession {
+    fn decode(&mut self, bitstream: Vec<u8>, timestamp: bindings::timeval) -> IoctlResult<()> {
+        self.send(Command::Bitstream(bitstream, timestamp))
+    }
+
+    fn use_as_capture(&mut self, index: u32, dmabuf: OwnedFd, len: u32) -> IoctlResult<()> {
+        self.send(Command::Capture {
+            index,
+            fd: dmabuf,
+            len,
         })
     }
 
     fn clear_capture_buffers(&mut self) -> IoctlResult<()> {
-        match &self.vidc {
-            Some(vidc) => vidc.send_and_wait(Command::ClearCapture),
-            None => self.codec.clear_capture_buffers(),
-        }
+        self.send_and_wait(Command::ClearCapture)
     }
 
     fn flush(&mut self) -> IoctlResult<()> {
-        match &self.vidc {
-            Some(vidc) => vidc.send_and_wait(Command::Flush),
-            None => self.codec.flush(),
-        }
-    }
-
-    fn reinit(&mut self) -> IoctlResult<()> {
-        match &self.vidc {
-            Some(_) => Ok(()),
-            None => self.codec.reinit(),
-        }
+        self.send_and_wait(Command::Flush)
     }
 
     fn drain(&mut self) -> IoctlResult<()> {
-        match &self.vidc {
-            Some(vidc) => vidc.send(Command::Drain),
-            None => self.codec.drain(),
-        }
+        self.send(Command::Drain)
     }
 
     fn resume(&mut self) {
-        match &self.vidc {
-            Some(vidc) => {
-                let _ = vidc.send(Command::Resume);
-            }
-            None => self.codec.resume(),
-        }
+        let _ = self.send(Command::Resume);
     }
 
     fn stop(&mut self) {
-        if let Some(mut vidc) = self.vidc.take() {
-            vidc.stop();
-        }
-        self.codec.stop();
+        VidcSession::stop(self)
     }
 
     fn take_events(&mut self) -> Vec<DecoderEvent> {
-        match &self.vidc {
-            Some(vidc) => std::mem::take(&mut *vidc.events.lock().unwrap()),
-            None => self.codec.take_events(),
-        }
+        std::mem::take(&mut *self.events.lock().unwrap())
     }
 
-    fn wants_dmabuf(&self) -> bool {
-        self.vidc.is_some()
+    fn push_event(&mut self, event: DecoderEvent) {
+        self.events.lock().unwrap().push(event);
     }
 }

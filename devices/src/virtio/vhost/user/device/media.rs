@@ -76,6 +76,7 @@ use crate::virtio::media::pool::RemotePool;
 use crate::virtio::media::pool::RemotePoolAllocator;
 use crate::virtio::media::start_worker;
 use crate::virtio::media::BufferAllocator;
+use crate::virtio::media::DecoderBackendKind;
 use crate::virtio::media::EventQueue;
 use crate::virtio::media::GuestMemoryMapper;
 use crate::virtio::media::HostMapper;
@@ -107,10 +108,10 @@ pub struct MediaBackendParams {
     /// `kind=encoder`; design §7.4).
     #[serde(default)]
     pub allow_sw: bool,
-    /// Decode through msm_vidc V4L2 straight into guest buffers, MediaCodec as the fallback
-    /// (`kind=decoder`).
+    /// What decodes (`kind=decoder`): MediaCodec, or a direct driver with MediaCodec as the
+    /// fallback.
     #[serde(default)]
-    pub vidc: bool,
+    pub decoder_backend: DecoderBackendKind,
     /// Guest-physical base of the `media_host` pool. The region that starts here in the memory
     /// table the frontend sends is the pool; `MMAP` buffers live in it, at offsets the VMM's
     /// allocator hands this process over the `--pool-fd` tube (a helper has no pool allocator
@@ -385,7 +386,7 @@ mod media_backend_params_tests {
             camera_id: None,
             role: Some("main".into()),
             allow_sw: true,
-            vidc: false,
+            decoder_backend: DecoderBackendKind::Mediacodec,
             pool_gpa: 0x1_4000_0000,
             access_windows: vec![(0x1_4000_0000, 0x1000_0000), (0x9000_0000, 0x40_0000)],
             access_platform: true,

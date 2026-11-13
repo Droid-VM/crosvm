@@ -1049,6 +1049,8 @@ impl PreAllocConfig {
 /// helper is told the same thing in its parameters.
 #[cfg(feature = "media")]
 pub use devices::virtio::media::MediaDeviceKind;
+#[cfg(feature = "media")]
+pub use devices::virtio::media::DecoderBackendKind;
 
 /// One `--virtio-media KEY=VALUE,...` device (`VPU_DESIGN.md` §3.5).
 ///
@@ -1076,10 +1078,16 @@ pub struct MediaDeviceConfig {
     /// decoder should get one.
     #[serde(default)]
     pub allow_sw: bool,
-    /// Decode with the host's msm_vidc V4L2 decoder (/dev/video32) directly, writing frames
-    /// straight into the guest's `CAPTURE` buffers through udmabuf, and fall back to MediaCodec
-    /// where it cannot (`kind=decoder`). Off by default: a 10-bit stream then comes out as P010,
-    /// which a guest has to know.
+    /// What decodes (`kind=decoder`): `mediacodec`, the platform's codec service and the default;
+    /// a direct driver by name (`msm-vidc`: the host's msm_vidc V4L2 decoder, /dev/video32, writing
+    /// frames straight into the guest's `CAPTURE` buffers through udmabuf, MediaCodec where it
+    /// cannot); or `auto`, the direct driver the host has for the sessions that ask for decode
+    /// order and MediaCodec for the rest. Not the default: a direct driver's 10-bit stream comes
+    /// out as P010 and its buffers have to be the guest's own memory, which a guest has to know.
+    #[serde(default)]
+    pub backend: Option<DecoderBackendKind>,
+    /// `vidc=true` is `backend=msm-vidc`, from before there was a choice of driver. `backend=`
+    /// wins where both are given.
     #[serde(default)]
     pub vidc: bool,
     /// Run the device's backend in its own process under this host uid, the way `--virtio-snd`
@@ -1092,9 +1100,38 @@ pub struct MediaDeviceConfig {
     pub gid: Option<u32>,
 }
 
+#[cfg(feature = "media")]
+impl MediaDeviceConfig {
+    /// What decodes for this device: `backend=`, else what `vidc=` says, else MediaCodec.
+    pub fn decoder_backend(&self) -> DecoderBackendKind {
+        self.backend.unwrap_or(if self.vidc {
+            DecoderBackendKind::MsmVidc
+        } else {
+            DecoderBackendKind::Mediacodec
+        })
+    }
+}
+
 #[cfg(all(test, feature = "media"))]
 mod media_device_config_tests {
     use super::*;
+
+    #[test]
+    fn decoder_backend_is_a_key_with_vidc_as_its_old_spelling() {
+        let backend = |text: &str| {
+            from_key_values::<MediaDeviceConfig>(text)
+                .unwrap()
+                .decoder_backend()
+        };
+        assert_eq!(backend("kind=decoder"), DecoderBackendKind::Mediacodec);
+        assert_eq!(backend("kind=decoder,backend=mediacodec"), DecoderBackendKind::Mediacodec);
+        assert_eq!(backend("kind=decoder,backend=auto"), DecoderBackendKind::Auto);
+        assert_eq!(backend("kind=decoder,backend=msm-vidc"), DecoderBackendKind::MsmVidc);
+        assert_eq!(backend("kind=decoder,backend=msm_vidc"), DecoderBackendKind::MsmVidc);
+        assert_eq!(backend("kind=decoder,vidc=true"), DecoderBackendKind::MsmVidc);
+        assert_eq!(backend("kind=decoder,vidc=true,backend=mediacodec"), DecoderBackendKind::Mediacodec);
+        assert!(from_key_values::<MediaDeviceConfig>("kind=decoder,backend=venus").is_err());
+    }
 
     #[test]
     fn parses_every_kind_and_only_known_keys() {

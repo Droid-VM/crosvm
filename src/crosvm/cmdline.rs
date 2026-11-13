@@ -2897,10 +2897,17 @@ pub struct RunCommand {
     ///         codecs too, not only hardware ones (decoder,
     ///         encoder; AV1 encoding only with it). Default
     ///         false.
-    ///     vidc=(true,false) - Decode through the host's
-    ///         msm_vidc V4L2 decoder straight into guest
-    ///         buffers, MediaCodec as the fallback (decoder).
-    ///         10-bit streams come out as P010. Default false.
+    ///     backend=(mediacodec,auto,msm-vidc) - What decodes
+    ///         (decoder). mediacodec, the default, is the
+    ///         platform's codec service. msm-vidc is the host's
+    ///         msm_vidc V4L2 decoder writing straight into guest
+    ///         buffers, with MediaCodec where it cannot: the
+    ///         guest must lend buffers of its own memory, and
+    ///         10-bit streams come out as P010. auto uses the
+    ///         direct driver the host has for the sessions that
+    ///         ask for decode order, MediaCodec for the rest.
+    ///     vidc=(true,false) - The old spelling of
+    ///         backend=msm-vidc. Default false.
     ///     uid=INT - Run the backend in its own process under
     ///         this host uid, as --virtio-snd does. Any kind
     ///         may use it; camera, decoder and encoder require

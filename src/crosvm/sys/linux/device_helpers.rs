@@ -1582,7 +1582,7 @@ fn create_unprivileged_virtio_media_device(
         camera_id: config.camera_id.clone(),
         role: config.role.clone(),
         allow_sw: config.allow_sw,
-        vidc: config.vidc,
+        decoder_backend: config.decoder_backend(),
         pool_gpa,
         access_windows: host_accessible_windows(mem, protection_type.isolates_memory())
             .into_iter()
@@ -1602,11 +1602,14 @@ fn create_unprivileged_virtio_media_device(
     let pool_helper_fd = pool_helper_end.as_raw_descriptor();
 
     // No supplementary groups -- crosvm's own groups are root's -- except the one a decoder that
-    // talks to msm_vidc itself (`vidc=true`) needs: /dev/video32 is `system:camera 0660`.
+    // may talk to the SoC's codec driver itself (`backend=` a direct driver, or `auto`) needs: the
+    // V4L2 codec nodes are `system:camera 0660` (msm_vidc's /dev/video32).
     // That decoder hands the driver guest buffers as udmabufs, one entry per scattered guest
     // page run: a 4K P010 frame in 16 KiB guest pages is ~1700 entries, past the module's default
     // `list_limit` of 1024, which only root may raise -- so it is raised here, best effort.
-    let supp_gids = if config.vidc && config.kind == MediaDeviceKind::Decoder {
+    let supp_gids = if config.decoder_backend().may_be_direct()
+        && config.kind == MediaDeviceKind::Decoder
+    {
         raise_udmabuf_list_limit(16384);
         vec![AID_CAMERA]
     } else {

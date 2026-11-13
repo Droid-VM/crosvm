@@ -1237,6 +1237,7 @@ fn create_virtio_devices(
             camera_id: None,
             role: None,
             allow_sw: false,
+            backend: None,
             vidc: false,
             uid: None,
             gid: None,

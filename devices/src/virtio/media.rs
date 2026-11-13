@@ -118,6 +118,52 @@ pub enum MediaDeviceKind {
     Encoder,
 }
 
+/// What decodes for a `kind=decoder` device: `--virtio-media backend=`.
+///
+/// The guest sees the same stateful V4L2 decoder whichever it is. Lives here, like
+/// [`MediaDeviceKind`], because the helper is told the same thing in its parameters.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DecoderBackendKind {
+    /// The platform's codec service (the MediaCodec NDK): every phone has it and every guest
+    /// works with it; each frame is converted and copied into the guest's buffer.
+    #[default]
+    Mediacodec,
+    /// The direct driver this host has, for the sessions that ask for frames in decode order
+    /// (which only a direct driver gives), and MediaCodec for every other session and on a host
+    /// with no such driver.
+    Auto,
+    /// Qualcomm's msm_vidc V4L2 driver for every session whose codec it takes, writing frames
+    /// straight into the guest's own buffers; MediaCodec where it cannot.
+    #[serde(alias = "msm_vidc")]
+    MsmVidc,
+}
+
+impl DecoderBackendKind {
+    /// The `backend=` spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecoderBackendKind::Mediacodec => "mediacodec",
+            DecoderBackendKind::Auto => "auto",
+            DecoderBackendKind::MsmVidc => "msm-vidc",
+        }
+    }
+
+    /// The direct driver a kind names outright (its `DirectDriver::name`), if it names one.
+    pub fn direct_driver(self) -> Option<&'static str> {
+        match self {
+            DecoderBackendKind::Mediacodec | DecoderBackendKind::Auto => None,
+            DecoderBackendKind::MsmVidc => Some("msm-vidc"),
+        }
+    }
+
+    /// Whether a session may be served by a direct driver, which the helper then needs the means
+    /// for (the codec device node's group, room in udmabuf's entry list).
+    pub fn may_be_direct(self) -> bool {
+        self != DecoderBackendKind::Mediacodec
+    }
+}
+
 /// Where the device for a [`MediaDeviceKind`] is built (`VPU_DESIGN.md` §3.5, §6, §7.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MediaDeviceSupport {
