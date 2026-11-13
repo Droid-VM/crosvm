@@ -268,12 +268,21 @@ impl Starvation {
 
     /// A period went by with nothing from the guest.
     fn starved(&mut self, card_index: usize, direction: &str) {
+        self.unfed(card_index, direction, "is running with nothing queued");
+    }
+
+    /// A period went by with the stream prepared or stopped. Nothing can come until the guest
+    /// starts it, so it parks as an unfed one does: a guest's audio engine prepares a capture
+    /// stream it may never start, and the endpoint used to stay open the whole while -- the
+    /// phone's microphone recording from boot for a guest that had captured nothing.
+    fn paused(&mut self, card_index: usize, direction: &str) {
+        self.unfed(card_index, direction, "is prepared or stopped");
+    }
+
+    fn unfed(&mut self, card_index: usize, direction: &str, why: &str) {
         let now = Instant::now();
         let since = *self.since.get_or_insert_with(|| {
-            warn!(
-                "[Card {}] {} stream is running with nothing queued",
-                card_index, direction
-            );
+            warn!("[Card {}] {} stream {}", card_index, direction, why);
             now
         });
         self.periods += 1;
@@ -576,6 +585,7 @@ async fn pcm_worker_loop(
                     break Ok(());
                 }
                 WorkerStatus::Pause => {
+                    starvation.paused(card_index, "playback");
                     write_data(dst_buf, None, buffer_writer, concealer).await?;
                 }
                 WorkerStatus::Running => match next_guest_period(&ex, desc_receiver, starvation.starving(), period_dur).await {
@@ -667,6 +677,7 @@ async fn pcm_worker_loop(
                     break Ok(());
                 }
                 WorkerStatus::Pause => {
+                    starvation.paused(card_index, "capture");
                     read_data(src_buf, None, period_bytes).await?;
                 }
                 WorkerStatus::Running => match desc_receiver.try_next() {
