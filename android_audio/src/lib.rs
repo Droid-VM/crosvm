@@ -505,6 +505,22 @@ fn input_preset_from_name(name: &str) -> Option<i32> {
     })
 }
 
+/// `aaudio_performance_mode_t`. The default when a key names none is POWER_SAVING: a VM's audio
+/// is media far more often than it is an instrument, and the platform's own default (NONE) puts
+/// an output on the primary mixer, which on a phone wakes every few milliseconds -- a guest
+/// playing nothing but silence cost the host audio stack about a core that way. LOW_LATENCY is
+/// there for what needs the fast path (games, live monitoring).
+fn performance_mode_from_name(name: &str) -> Option<i32> {
+    Some(match name {
+        "none" => AAUDIO_PERFORMANCE_MODE_NONE,
+        "power_saving" => AAUDIO_PERFORMANCE_MODE_POWER_SAVING,
+        "low_latency" => AAUDIO_PERFORMANCE_MODE_LOW_LATENCY,
+        _ => return None,
+    })
+}
+const AAUDIO_PERFORMANCE_MODE_NONE: i32 = 10;
+const AAUDIO_PERFORMANCE_MODE_POWER_SAVING: i32 = 11;
+
 /// Applies one named attribute, saying so when the name is not one we know rather than quietly
 /// leaving the platform's default in place: a setting that was typed and ignored is worse than
 /// one that was never offered.
@@ -665,6 +681,9 @@ fn open_aaudio_stream(open: &OpenParams) -> Result<*mut AAudioStream, BoxError> 
                 });
             }
         }
+        let mut mode = AAUDIO_PERFORMANCE_MODE_POWER_SAVING;
+        apply_attr(attrs, "performance", performance_mode_from_name, |v| mode = v);
+        AAudioStreamBuilder_setPerformanceMode(builder, mode);
         if AAudioStreamBuilder_openStream(builder, &mut stream_ptr) != AAUDIO_OK {
             AAudioStreamBuilder_delete(builder);
             return Err(Box::new(AAudioError::StreamOpen));
@@ -1429,7 +1448,7 @@ mod tests {
         let due = deadline_after(PERIOD_FRAMES as u64);
         assert!(stream.next_frame >= before + due && stream.next_frame <= after + due);
     }
-    // The seven AAudio entry points this fork added and that `libaaudio_stub` never grew. The
+    // The eight AAudio entry points this fork added and that `libaaudio_stub` never grew. The
     // host test binary does not link without them: both paths under test reach
     // `open_aaudio_stream`, through `try_reconnect` on the capture side and through the commit
     // vtable on the playback side, even though no test can ever call it -- these streams have no
@@ -1452,6 +1471,14 @@ mod tests {
     extern "C" fn AAudioStreamBuilder_setInputPreset(
         _builder: *mut AAudioStreamBuilder,
         _input_preset: i32,
+    ) {
+        unimplemented!();
+    }
+
+    #[no_mangle]
+    extern "C" fn AAudioStreamBuilder_setPerformanceMode(
+        _builder: *mut AAudioStreamBuilder,
+        _mode: i32,
     ) {
         unimplemented!();
     }
