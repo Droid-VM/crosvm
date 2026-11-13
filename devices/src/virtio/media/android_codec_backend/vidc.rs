@@ -225,6 +225,9 @@ struct Stream {
     next_driver_us: i64,
     drain_wanted: bool,
     drain_sent: bool,
+    /// The size the guest said the stream is (`S_FMT(OUTPUT)`), the visible size when the driver
+    /// names none ([`Stream::visible_rect`]).
+    stream_size: (u32, u32),
 }
 
 fn driver_us(tv: &bindings::timeval) -> i64 {
@@ -325,6 +328,7 @@ impl Stream {
             next_driver_us: 0,
             drain_wanted: false,
             drain_sent: false,
+            stream_size: size,
         })
     }
 
@@ -448,6 +452,39 @@ impl Stream {
         }
     }
 
+    /// The picture inside the `width` x `height` `CAPTURE` buffers: the driver's compose rectangle,
+    /// else its crop rectangle (msm_vidc answered COMPOSE on the single-planar type with an empty
+    /// rectangle for an H.264 stream, and the guest was told its frames were 0x0), else the size
+    /// the guest gave the stream, else the whole buffer.
+    fn visible_rect(&self, width: u32, height: u32) -> Rect {
+        for (type_, target) in [
+            (CAPTURE_MPLANE, bindings::V4L2_SEL_TGT_COMPOSE),
+            (bindings::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE, bindings::V4L2_SEL_TGT_COMPOSE),
+            (CAPTURE_MPLANE, bindings::V4L2_SEL_TGT_CROP),
+        ] {
+            let mut selection: bindings::v4l2_selection = zeroed();
+            selection.type_ = type_;
+            selection.target = target;
+            if xioctl(self.fd(), VIDIOC_G_SELECTION, &mut selection).is_ok()
+                && selection.r.width > 0
+                && selection.r.height > 0
+            {
+                return Rect::new(
+                    selection.r.left,
+                    selection.r.top,
+                    selection.r.width,
+                    selection.r.height,
+                );
+            }
+        }
+        let (w, h) = self.stream_size;
+        if w > 0 && h > 0 {
+            Rect::new(0, 0, w.min(width), h.min(height))
+        } else {
+            Rect::new(0, 0, width, height)
+        }
+    }
+
     /// The `SOURCE_CHANGE`: a linear `CAPTURE` format, its layout, the slots; then the
     /// announcement.
     fn set_capture_up(&mut self) -> Result<(), String> {
@@ -480,18 +517,7 @@ impl Stream {
         let pix = unsafe { format.fmt.pix_mp };
         let (width, height) = (pix.width, pix.height);
         let (bytesperline, sizeimage) = (pix.plane_fmt[0].bytesperline, pix.plane_fmt[0].sizeimage);
-        let mut selection: bindings::v4l2_selection = zeroed();
-        selection.type_ = bindings::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE;
-        selection.target = bindings::V4L2_SEL_TGT_COMPOSE;
-        let visible = match xioctl(fd, VIDIOC_G_SELECTION, &mut selection) {
-            Ok(()) => Rect::new(
-                selection.r.left,
-                selection.r.top,
-                selection.r.width,
-                selection.r.height,
-            ),
-            Err(_) => Rect::new(0, 0, width, height),
-        };
+        let visible = self.visible_rect(width, height);
         let mut control: bindings::v4l2_control = zeroed();
         control.id = bindings::V4L2_CID_MIN_BUFFERS_FOR_CAPTURE;
         self.min_capture = match xioctl(fd, VIDIOC_G_CTRL, &mut control) {
