@@ -230,6 +230,31 @@ struct Stream {
     stream_size: (u32, u32),
 }
 
+/// The driver gives every buffer back before its descriptor closes: both queues stopped and
+/// emptied (`REQBUFS(0)`), so vb2 drops its references to the guest's dma-bufs while this process
+/// still holds the session. Closing the node with `CAPTURE` buffers queued left msm_vidc holding
+/// them: the udmabufs outlived the VM (no attachment, no process), each pinning guest pages
+/// scattered over many of the 2 MiB pages the hugepage pool lends, and at the VM's stop the pool
+/// lost ~2000 of its 3072 pages to them (5566, 11-13).
+impl Drop for Stream {
+    fn drop(&mut self) {
+        let fd = self.fd();
+        for type_ in [CAPTURE_MPLANE, OUTPUT_MPLANE] {
+            let mut kind = type_ as libc::c_int;
+            let _ = xioctl(fd, VIDIOC_STREAMOFF, &mut kind);
+            let mut request: bindings::v4l2_requestbuffers = zeroed();
+            request.count = 0;
+            request.type_ = type_;
+            request.memory = MEMORY_DMABUF;
+            if let Err(e) = xioctl(fd, VIDIOC_REQBUFS, &mut request) {
+                warn!("decoder session {}: msm_vidc REQBUFS(0) of queue {}: errno {}", self.id, type_, e);
+            }
+        }
+        self.queued_capture.clear();
+        self.pending_capture.clear();
+    }
+}
+
 fn driver_us(tv: &bindings::timeval) -> i64 {
     tv.tv_sec as i64 * 1_000_000 + tv.tv_usec as i64
 }
@@ -465,16 +490,16 @@ impl Stream {
             let mut selection: bindings::v4l2_selection = zeroed();
             selection.type_ = type_;
             selection.target = target;
-            if xioctl(self.fd(), VIDIOC_G_SELECTION, &mut selection).is_ok()
-                && selection.r.width > 0
-                && selection.r.height > 0
-            {
-                return Rect::new(
-                    selection.r.left,
-                    selection.r.top,
-                    selection.r.width,
-                    selection.r.height,
-                );
+            let answer = xioctl(self.fd(), VIDIOC_G_SELECTION, &mut selection);
+            // Copied out: the bindings' structs may be packed.
+            let r = selection.r;
+            let (left, top, w, h) = (r.left, r.top, r.width, r.height);
+            info!(
+                "decoder session {}: G_SELECTION type {} target {:#x}: {:?} -> {},{} {}x{}",
+                self.id, type_, target, answer, left, top, w, h
+            );
+            if answer.is_ok() && w > 0 && h > 0 {
+                return Rect::new(left, top, w, h);
             }
         }
         let (w, h) = self.stream_size;
