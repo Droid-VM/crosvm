@@ -108,8 +108,8 @@ pub struct MediaBackendParams {
     /// `kind=encoder`; design §7.4).
     #[serde(default)]
     pub allow_sw: bool,
-    /// What decodes (`kind=decoder`): MediaCodec, or a direct driver with MediaCodec as the
-    /// fallback.
+    /// What decodes (`kind=decoder`) or encodes (`kind=encoder`): MediaCodec, or a direct driver
+    /// with MediaCodec as the fallback.
     #[serde(default)]
     pub decoder_backend: DecoderBackendKind,
     /// Guest-physical base of the `media_host` pool. The region that starts here in the memory

@@ -118,9 +118,12 @@ pub enum MediaDeviceKind {
     Encoder,
 }
 
-/// What decodes for a `kind=decoder` device: `--virtio-media backend=`.
+/// What decodes for a `kind=decoder` device, and encodes for a `kind=encoder` one:
+/// `--virtio-media backend=`.
 ///
-/// The guest sees the same stateful V4L2 decoder whichever it is. Lives here, like
+/// The guest sees the same stateful V4L2 decoder or encoder whichever it is. For an encoder,
+/// `auto` and a named driver are the same thing on a host that has the driver: the driver for
+/// every session it takes, MediaCodec for the rest (`android_codec_backend::direct_enc`). Lives here, like
 /// [`MediaDeviceKind`], because the helper is told the same thing in its parameters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

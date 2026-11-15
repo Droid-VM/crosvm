@@ -1084,6 +1084,9 @@ pub struct MediaDeviceConfig {
     /// cannot); or `auto`, the direct driver the host has for the sessions that ask for decode
     /// order and MediaCodec for the rest. Not the default: a direct driver's 10-bit stream comes
     /// out as P010 and its buffers have to be the guest's own memory, which a guest has to know.
+    /// The same key encodes for `kind=encoder`: `msm-vidc` (/dev/video33) or `auto` is the host's
+    /// direct encoder for every session it takes and MediaCodec for the rest -- the guest sees no
+    /// difference there, so `auto` asks nothing of it.
     #[serde(default)]
     pub backend: Option<DecoderBackendKind>,
     /// `vidc=true` is `backend=msm-vidc`, from before there was a choice of driver. `backend=`
@@ -1131,6 +1134,9 @@ mod media_device_config_tests {
         assert_eq!(backend("kind=decoder,vidc=true"), DecoderBackendKind::MsmVidc);
         assert_eq!(backend("kind=decoder,vidc=true,backend=mediacodec"), DecoderBackendKind::Mediacodec);
         assert!(from_key_values::<MediaDeviceConfig>("kind=decoder,backend=venus").is_err());
+        assert_eq!(backend("kind=encoder,backend=auto"), DecoderBackendKind::Auto);
+        assert_eq!(backend("kind=encoder,backend=msm-vidc"), DecoderBackendKind::MsmVidc);
+        assert_eq!(backend("kind=encoder"), DecoderBackendKind::Mediacodec);
     }
 
     #[test]

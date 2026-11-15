@@ -56,7 +56,7 @@ use super::direct::DirectDriver;
 use super::direct::DirectSession;
 
 const DEVICE: &str = "/dev/video32";
-const DMA_HEAP: &str = "/dev/dma_heap/system";
+pub(super) const DMA_HEAP: &str = "/dev/dma_heap/system";
 /// Bitstream buffers in flight: an access unit each.
 const OUTPUT_BUFFERS: u32 = 8;
 /// `CAPTURE` slots asked of the driver; the guest's buffer indices map onto them one to one.
@@ -73,25 +73,25 @@ const NV12: u32 = fourcc(b"NV12");
 const P010: u32 = fourcc(b"P010");
 
 // The ioctls used, as the kernel's `_IOC` makes them (`'V'` and the type's size).
-const IOC_WRITE: u32 = 1;
-const IOC_READ: u32 = 2;
-const fn ioc(dir: u32, kind: u8, nr: u32, size: usize) -> u32 {
+pub(super) const IOC_WRITE: u32 = 1;
+pub(super) const IOC_READ: u32 = 2;
+pub(super) const fn ioc(dir: u32, kind: u8, nr: u32, size: usize) -> u32 {
     (dir << 30) | ((size as u32) << 16) | ((kind as u32) << 8) | nr
 }
-const fn vidioc<T>(dir: u32, nr: u32) -> u32 {
+pub(super) const fn vidioc<T>(dir: u32, nr: u32) -> u32 {
     ioc(dir, b'V', nr, std::mem::size_of::<T>())
 }
-const VIDIOC_QUERYCAP: u32 = vidioc::<bindings::v4l2_capability>(IOC_READ, 0);
+pub(super) const VIDIOC_QUERYCAP: u32 = vidioc::<bindings::v4l2_capability>(IOC_READ, 0);
 const VIDIOC_ENUM_FMT: u32 = vidioc::<bindings::v4l2_fmtdesc>(IOC_READ | IOC_WRITE, 2);
-const VIDIOC_G_FMT: u32 = vidioc::<bindings::v4l2_format>(IOC_READ | IOC_WRITE, 4);
-const VIDIOC_S_FMT: u32 = vidioc::<bindings::v4l2_format>(IOC_READ | IOC_WRITE, 5);
-const VIDIOC_REQBUFS: u32 = vidioc::<bindings::v4l2_requestbuffers>(IOC_READ | IOC_WRITE, 8);
-const VIDIOC_QBUF: u32 = vidioc::<bindings::v4l2_buffer>(IOC_READ | IOC_WRITE, 15);
-const VIDIOC_DQBUF: u32 = vidioc::<bindings::v4l2_buffer>(IOC_READ | IOC_WRITE, 17);
+pub(super) const VIDIOC_G_FMT: u32 = vidioc::<bindings::v4l2_format>(IOC_READ | IOC_WRITE, 4);
+pub(super) const VIDIOC_S_FMT: u32 = vidioc::<bindings::v4l2_format>(IOC_READ | IOC_WRITE, 5);
+pub(super) const VIDIOC_REQBUFS: u32 = vidioc::<bindings::v4l2_requestbuffers>(IOC_READ | IOC_WRITE, 8);
+pub(super) const VIDIOC_QBUF: u32 = vidioc::<bindings::v4l2_buffer>(IOC_READ | IOC_WRITE, 15);
+pub(super) const VIDIOC_DQBUF: u32 = vidioc::<bindings::v4l2_buffer>(IOC_READ | IOC_WRITE, 17);
 /// CAPTURE buffers queued before STREAMON(CAPTURE), at most (the driver's minimum if lower).
 const CAPTURE_STREAMON_AT: u32 = 4;
-const VIDIOC_STREAMON: u32 = vidioc::<libc::c_int>(IOC_WRITE, 18);
-const VIDIOC_STREAMOFF: u32 = vidioc::<libc::c_int>(IOC_WRITE, 19);
+pub(super) const VIDIOC_STREAMON: u32 = vidioc::<libc::c_int>(IOC_WRITE, 18);
+pub(super) const VIDIOC_STREAMOFF: u32 = vidioc::<libc::c_int>(IOC_WRITE, 19);
 const VIDIOC_G_CTRL: u32 = vidioc::<bindings::v4l2_control>(IOC_READ | IOC_WRITE, 27);
 const VIDIOC_S_CTRL: u32 = vidioc::<bindings::v4l2_control>(IOC_READ | IOC_WRITE, 28);
 const VIDIOC_DQEVENT: u32 = vidioc::<bindings::v4l2_event>(IOC_READ, 89);
@@ -110,16 +110,16 @@ struct DmaHeapAllocation {
 const DMA_HEAP_IOCTL_ALLOC: u32 =
     ioc(IOC_READ | IOC_WRITE, b'H', 0, std::mem::size_of::<DmaHeapAllocation>());
 
-const OUTPUT_MPLANE: u32 = bindings::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-const CAPTURE_MPLANE: u32 = bindings::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-const MEMORY_DMABUF: u32 = bindings::v4l2_memory_V4L2_MEMORY_DMABUF;
+pub(super) const OUTPUT_MPLANE: u32 = bindings::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
+pub(super) const CAPTURE_MPLANE: u32 = bindings::v4l2_buf_type_V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+pub(super) const MEMORY_DMABUF: u32 = bindings::v4l2_memory_V4L2_MEMORY_DMABUF;
 
-fn errno() -> i32 {
+pub(super) fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
 }
 
 /// One ioctl on `fd`, retried on `EINTR`; the errno otherwise.
-fn xioctl<T>(fd: RawFd, request: u32, arg: &mut T) -> Result<(), i32> {
+pub(super) fn xioctl<T>(fd: RawFd, request: u32, arg: &mut T) -> Result<(), i32> {
     loop {
         // SAFETY: `arg` is the live, correctly sized structure `request` names.
         if unsafe { libc::ioctl(fd, request as _, arg as *mut T) } >= 0 {
@@ -132,7 +132,7 @@ fn xioctl<T>(fd: RawFd, request: u32, arg: &mut T) -> Result<(), i32> {
     }
 }
 
-fn zeroed<T>() -> T {
+pub(super) fn zeroed<T>() -> T {
     // SAFETY: only used for the kernel's plain-data V4L2 structures, for which all zeroes is valid.
     unsafe { std::mem::zeroed() }
 }
@@ -142,12 +142,13 @@ fn vidc_takes(format: PixelFormat) -> bool {
     matches!(&format.to_u32().to_le_bytes(), b"HEVC" | b"H264" | b"VP90")
 }
 
-/// A bitstream buffer of ours: a dma-heap buffer, mapped.
-struct BitstreamBuffer {
-    fd: OwnedFd,
-    map: *mut u8,
-    len: usize,
-    free: bool,
+/// A bitstream buffer of ours: a dma-heap buffer, mapped. (The direct encoder, `vidc_enc`, keeps its
+/// raw frames and bitstream in these too.)
+pub(super) struct BitstreamBuffer {
+    pub(super) fd: OwnedFd,
+    pub(super) map: *mut u8,
+    pub(super) len: usize,
+    pub(super) free: bool,
 }
 
 impl Drop for BitstreamBuffer {
@@ -158,7 +159,7 @@ impl Drop for BitstreamBuffer {
 }
 
 impl BitstreamBuffer {
-    fn new(heap: &File, len: usize) -> Result<Self, String> {
+    pub(super) fn new(heap: &File, len: usize) -> Result<Self, String> {
         let mut alloc = DmaHeapAllocation {
             len: len as u64,
             fd: 0,

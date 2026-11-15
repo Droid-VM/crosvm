@@ -1613,10 +1613,16 @@ fn create_unprivileged_virtio_media_device(
     // driver) the helper still tries the path itself and says why it gets nothing.
     // And the dma-bufs have to be ones the codec driver takes as the host's own
     // (`enable_udmabuf_msm_prime`), which only root may switch on.
+    // An encoder that may be direct needs only the group (msm_vidc's /dev/video33): it copies
+    // frames into dma-heap buffers of its own, no guest memory reaches the driver.
     let direct = config.decoder_backend().may_be_direct() && config.kind == MediaDeviceKind::Decoder;
+    let direct_encoder =
+        config.decoder_backend().may_be_direct() && config.kind == MediaDeviceKind::Encoder;
     let supp_gids = if direct {
         raise_udmabuf_list_limit(16384);
         enable_udmabuf_msm_prime();
+        vec![AID_CAMERA]
+    } else if direct_encoder {
         vec![AID_CAMERA]
     } else {
         Vec::new()

@@ -222,6 +222,13 @@ pub fn run_media_device(opts: Options) -> anyhow::Result<()> {
                     "the codec store (media.player) is not responding to this uid",
                     move || MediaCodecEncoderBackend::new(allow_sw),
                 )?;
+                // `backend=`, as the decoder's: MediaCodec alone, or a direct driver in front of
+                // it with MediaCodec for the sessions it does not take.
+                #[cfg(target_os = "android")]
+                let encoder = crate::virtio::media::android_codec_backend::HwEncoderBackend::new(
+                    encoder,
+                    params.decoder_backend,
+                );
                 let card = params
                     .card
                     .clone()

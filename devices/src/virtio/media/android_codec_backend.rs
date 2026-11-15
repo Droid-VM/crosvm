@@ -8,9 +8,10 @@
 //! through the `android_codec` crate. On any other OS the same names exist and the constructors
 //! fail, so the helper's codec arms are the same code everywhere.
 //!
-//! The decoder has a second way to decode, chosen with `backend=` ([`DecoderBackendKind`]): a
-//! *direct driver*, the SoC's own V4L2 codec driver (`direct`, with Qualcomm's msm_vidc in
-//! `vidc`). `HwDecoderBackend` is the decoder device's backend either way.
+//! Each has a second way, chosen with `backend=` ([`DecoderBackendKind`]): a *direct driver*,
+//! the SoC's own V4L2 codec driver (`direct` and `direct_enc`, with Qualcomm's msm_vidc in `vidc`
+//! and `vidc_enc`). `HwDecoderBackend` and `HwEncoderBackend` are the devices' backends either
+//! way.
 //!
 //! [`DecoderBackendKind`]: crate::virtio::media::DecoderBackendKind
 //!
@@ -25,7 +26,11 @@ mod android_encoder;
 #[cfg(target_os = "android")]
 mod direct;
 #[cfg(target_os = "android")]
+mod direct_enc;
+#[cfg(target_os = "android")]
 mod vidc;
+#[cfg(target_os = "android")]
+mod vidc_enc;
 #[cfg(target_os = "android")]
 pub use android::MediaCodecDecoderBackend;
 #[cfg(target_os = "android")]
@@ -36,6 +41,8 @@ pub use android_encoder::MediaCodecEncoderBackend;
 pub use android_encoder::MediaCodecEncoderSession;
 #[cfg(target_os = "android")]
 pub use direct::HwDecoderBackend;
+#[cfg(target_os = "android")]
+pub use direct_enc::HwEncoderBackend;
 
 #[cfg(not(target_os = "android"))]
 mod stub;
