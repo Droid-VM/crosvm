@@ -65,6 +65,12 @@ const CAPTURE_SLOTS: u32 = 32;
 const DRIVER_STEP_US: i64 = 4166;
 /// How long the session waits for the worker to answer a command it must finish first.
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
+/// The worker's poll timeout while the driver holds bitstream, and while it holds
+/// none. msm_vidc does not wake a poller for every buffer it finishes (vidcprobe -d -L, an access
+/// unit at a time: 236 fps at 720p with a 100 ms poll, 1400 with 1 ms; its encoder wakes none at
+/// all, `vidc_enc`), so while it works it is asked.
+const POLL_BUSY_MS: i32 = 1;
+const POLL_IDLE_MS: i32 = 100;
 
 const fn fourcc(code: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*code)
@@ -385,8 +391,9 @@ impl Stream {
                     revents: 0,
                 },
             ];
+            let busy = self.bitstream.iter().any(|b| !b.free);
             // SAFETY: two live pollfds.
-            unsafe { libc::poll(fds.as_mut_ptr(), 2, 100) };
+            unsafe { libc::poll(fds.as_mut_ptr(), 2, if busy { POLL_BUSY_MS } else { POLL_IDLE_MS }) };
             let mut count = 0u64;
             // SAFETY: draining 8 bytes from our non-blocking eventfd.
             unsafe { libc::read(self.wake.as_raw_fd(), &mut count as *mut u64 as *mut _, 8) };

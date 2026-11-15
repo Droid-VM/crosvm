@@ -98,6 +98,12 @@ const CODED_MAX: usize = 32;
 const ANSWER_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a `STREAMOFF(OUTPUT)` waits for the frames already acknowledged to come out.
 const STREAMOFF_DRAIN: Duration = Duration::from_millis(1500);
+/// The worker's poll timeout while the driver holds frames whose coded frames have not come out,
+/// and while it holds none (commands wake the worker through its eventfd either way). msm_vidc's
+/// encoder never wakes a poller for a finished frame (vencprobe -L: one frame at a time, 9.8 fps
+/// at any size with a 100 ms poll, 157 fps at 1080p with 1 ms), so while it works it is asked.
+const POLL_BUSY_MS: i32 = 1;
+const POLL_IDLE_MS: i32 = 100;
 
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
 
@@ -213,6 +219,8 @@ struct Encoder {
     finish: Option<(mpsc::Sender<()>, Instant)>,
     frames_in: u64,
     frames_out: u64,
+    /// When a frame last went in or a coded frame last came out.
+    progress: Instant,
     bytes_out: u64,
     keyframes: u64,
     started: Instant,
@@ -482,6 +490,7 @@ impl Encoder {
             finish: None,
             frames_in: 0,
             frames_out: 0,
+            progress: Instant::now(),
             bytes_out: 0,
             keyframes: 0,
             started: Instant::now(),
@@ -512,8 +521,12 @@ impl Encoder {
                     revents: 0,
                 },
             ];
+            // A frame the driver drops, or a drain that never ends, must not keep the worker
+            // asking for good: busy only while the driver is still giving something back.
+            let busy = (self.frames_in > self.frames_out || (self.drain_sent && !self.drained))
+                && self.progress.elapsed() < Duration::from_millis(500);
             // SAFETY: two live pollfds.
-            unsafe { libc::poll(fds.as_mut_ptr(), 2, 20) };
+            unsafe { libc::poll(fds.as_mut_ptr(), 2, if busy { POLL_BUSY_MS } else { POLL_IDLE_MS }) };
             let mut count = 0u64;
             // SAFETY: draining 8 bytes from our non-blocking eventfd.
             unsafe { libc::read(self.wake.as_raw_fd(), &mut count as *mut u64 as *mut _, 8) };
@@ -664,6 +677,7 @@ impl Encoder {
                 .map_err(|e| format!("QBUF(OUTPUT) frame {}: errno {}", self.frames_in, e))?;
             slot.free = false;
             self.frames_in += 1;
+            self.progress = Instant::now();
             fed = true;
             let mut shared = self.shared.lock().unwrap();
             shared.staged = shared.staged.saturating_sub(1);
@@ -697,6 +711,7 @@ impl Encoder {
             let flags = buffer.flags;
             let is_last = flags & bindings::V4L2_BUF_FLAG_LAST != 0;
             let error = flags & bindings::V4L2_BUF_FLAG_ERROR != 0;
+            self.progress = Instant::now();
             let start = (plane.data_offset as usize).min(slot.len);
             let end = (plane.bytesused as usize).min(slot.len).max(start);
             if error {
