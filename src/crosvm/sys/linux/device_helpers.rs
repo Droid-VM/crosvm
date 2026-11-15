@@ -1611,9 +1611,12 @@ fn create_unprivileged_virtio_media_device(
     // not open it and every guest buffer reached the driver without a dma-buf. It is opened here,
     // before the privileges go, and handed down by number (`--udmabuf-fd`); without it (no udmabuf
     // driver) the helper still tries the path itself and says why it gets nothing.
+    // And the dma-bufs have to be ones the codec driver takes as the host's own
+    // (`enable_udmabuf_msm_prime`), which only root may switch on.
     let direct = config.decoder_backend().may_be_direct() && config.kind == MediaDeviceKind::Decoder;
     let supp_gids = if direct {
         raise_udmabuf_list_limit(16384);
+        enable_udmabuf_msm_prime();
         vec![AID_CAMERA]
     } else {
         Vec::new()
@@ -1726,6 +1729,40 @@ fn raise_udmabuf_list_limit(wanted: u32) {
     match std::fs::write(PATH, wanted.to_string()) {
         Ok(()) => info!("udmabuf list_limit {:?} -> {}", current, wanted),
         Err(e) => warn!("cannot raise udmabuf list_limit ({:?}) to {}: {}", current, wanted, e),
+    }
+}
+
+/// Qualcomm's msm_vidc takes only dma-bufs the vendor mem_buf layer knows. Any other one it
+/// calls secure and refuses ("secure buffer mapping to non-secure region 8 not allowed", QBUF
+/// EINVAL), and the instance goes into its error state, keeping the guest buffers already queued
+/// for good (no REQBUFS(0) after that: EBUSY): a direct decoder got no frame, and the guest
+/// pages those udmabufs pinned outlived the VM (SM8850, 11-13 to 11-15). DroidVM's udmabuf module
+/// (gunyah_host_mod/udmabuf) exports through mem_buf, as the host's own buffers, while its
+/// `msm_prime` switch is on; it is read at each create, so it is turned on here, before the guest
+/// allocates anything -- as the KMS display does for msm_drm (`gpu_display_kms.rs` `MsmPrime`).
+/// It stays on: later udmabufs of every VM are mem_buf ones, which KGSL takes as it took them
+/// before (its access check passes a host-only buffer). A KMS display that ends puts back what it
+/// found, which may switch it off under a running direct decoder; its next sessions then fail as
+/// before this switch existed. Without the switch (an older module, a host with no mem_buf) the
+/// guest buffers stay plain and a Qualcomm direct driver refuses them.
+fn enable_udmabuf_msm_prime() {
+    let path = std::fs::read_dir("/sys/module").ok().and_then(|dir| {
+        dir.flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("udmabuf_gki_"))
+            .map(|e| e.path().join("parameters/msm_prime"))
+            .find(|p| p.exists())
+    });
+    let Some(path) = path else {
+        warn!("udmabuf msm_prime unavailable: a Qualcomm direct decoder will refuse guest buffers");
+        return;
+    };
+    let previous = std::fs::read_to_string(&path).unwrap_or_default();
+    if matches!(previous.trim(), "Y" | "1") {
+        return;
+    }
+    match std::fs::write(&path, "1") {
+        Ok(()) => info!("{} enabled (was {}), for a direct decoder", path.display(), previous.trim()),
+        Err(e) => warn!("cannot enable {}: {}", path.display(), e),
     }
 }
 

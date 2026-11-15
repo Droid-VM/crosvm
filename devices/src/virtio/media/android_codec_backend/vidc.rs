@@ -232,10 +232,13 @@ struct Stream {
 
 /// The driver gives every buffer back before its descriptor closes: both queues stopped and
 /// emptied (`REQBUFS(0)`), so vb2 drops its references to the guest's dma-bufs while this process
-/// still holds the session. Closing the node with `CAPTURE` buffers queued left msm_vidc holding
-/// them: the udmabufs outlived the VM (no attachment, no process), each pinning guest pages
-/// scattered over many of the 2 MiB pages the hugepage pool lends, and at the VM's stop the pool
-/// lost ~2000 of its 3072 pages to them (5566, 11-13).
+/// still holds the session. What it does not cover is msm_vidc's error state: once the driver
+/// refused a guest buffer (a udmabuf mem_buf did not know, `enable_udmabuf_msm_prime` in the VMM)
+/// it answered every REQBUFS with EBUSY ("inst in error state") and kept the dma-bufs it had taken
+/// for good -- no attachment, no process -- each pinning guest pages scattered over many of the
+/// 2 MiB pages the hugepage pool lends: at the VM's stop the pool lost ~2000 of its 3072 pages to
+/// them (5566, 11-13; the same leak reproduced without a VM, 11-15, by UniXNU-droidvm's
+/// tools/rig/vidcprobe.c, which replays this backend's ioctls).
 impl Drop for Stream {
     fn drop(&mut self) {
         let fd = self.fd();
