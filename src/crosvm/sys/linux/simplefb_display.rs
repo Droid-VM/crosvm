@@ -1095,7 +1095,20 @@ fn simplefb_display_loop(
         // behind. Skipped entirely when nothing on this side is going to read: the walk is ~99k
         // `dc civac` for a 1500x1060 framebuffer, and paying it 120 times a second to make a read
         // honest that never happens is the most expensive way to do nothing.
-        if debug.invalidate && (!gpu_presents_blind || dump_prefix.is_some()) {
+        //
+        // Nor on a tick with nobody to show it to, other than the one a second the liveness pass
+        // reads on: that is every tick of a GPU screen's boot fallback ("#boot") once the guest's
+        // own scanout presents, which is the rest of the VM's life. Walking the whole framebuffer
+        // there (130k lines at 1920x1080, poll_hz times a second) kept a framebuffer nobody looks
+        // at costing as much as one being shown.
+        let reads_this_tick = if gpu_presents_blind {
+            false
+        } else if has_consumer {
+            true
+        } else {
+            watcher.liveness_due()
+        };
+        if debug.invalidate && (reads_this_tick || dump_prefix.is_some()) {
             invalidate_dcache_range(fb.as_ptr(), fb_size);
         }
 
