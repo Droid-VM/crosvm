@@ -534,8 +534,19 @@ impl Rutabaga {
         // backend keeps it and aborts (createColorBufferWithResourceHandle) when the next guest
         // re-creates the same resource id.
         let resource_ids: Vec<u32> = self.resources.keys().copied().collect();
-        if let Some(component) = self.components.get_mut(&self.default_component) {
-            for resource_id in resource_ids {
+        for resource_id in resource_ids {
+            // Resolve the component from the resource's own mask, not the
+            // default. A resource can live on a different component (e.g. a
+            // virgl framebuffer while the default component is gfxstream);
+            // unreffing only the default leaves that component's backing
+            // attached, so the next ATTACH_BACKING fails with EINVAL.
+            let component_type = self
+                .resources
+                .get(&resource_id)
+                .and_then(|r| calculate_component(r.component_mask).ok())
+                .unwrap_or(self.default_component);
+            if let Some(component) = self.components.get_mut(&component_type) {
+                component.detach_backing(resource_id);
                 component.unref_resource(resource_id);
             }
         }
