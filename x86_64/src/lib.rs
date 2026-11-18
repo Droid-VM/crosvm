@@ -2116,6 +2116,7 @@ impl X8664arch {
                         mmio_bus,
                         irq_chip,
                         irq_num,
+                        None,
                         resources,
                         #[cfg(feature = "swap")]
                         swap_controller,

@@ -191,6 +191,12 @@ const AARCH64_RTC_IRQ: u32 = 1;
 
 // The Goldfish battery device gets the 3rd interrupt line
 const AARCH64_BAT_IRQ: u32 = 3;
+// and the page after the MBI frame, outside the PCI window. It came from the PCI window's own
+// allocator, after the BARs, and the FDT gives the guest that whole window: a guest that assigns
+// the BARs itself (macOS's IOPCIConfigurator) put a BAR over the battery as soon as its layout
+// ran past the last BAR crosvm had placed (one xHCI controller more), and that device never
+// answered. Its address no longer moves with the PCI devices a VM has either.
+const AARCH64_BAT_MMIO_ADDR: u64 = 0x8000;
 
 // Place the virtual watchdog device at page 3
 const AARCH64_VMWDT_ADDR: u64 = 0x3000;
@@ -1809,6 +1815,7 @@ impl arch::LinuxArch for AArch64 {
                     &mmio_bus,
                     irq_chip.as_irq_chip_mut(),
                     bat_irq,
+                    Some(AARCH64_BAT_MMIO_ADDR),
                     system_allocator,
                     #[cfg(feature = "swap")]
                     swap_controller,

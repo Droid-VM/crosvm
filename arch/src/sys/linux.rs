@@ -42,18 +42,26 @@ pub fn add_goldfish_battery(
     mmio_bus: &Bus,
     irq_chip: &mut dyn IrqChip,
     irq_num: u32,
+    fixed_mmio_base: Option<u64>,
     resources: &mut SystemAllocator,
     #[cfg(feature = "swap")] swap_controller: &mut Option<swap::SwapController>,
 ) -> Result<(Tube, u64), DeviceRegistrationError> {
-    let alloc = resources.get_anon_alloc();
-    let mmio_base = resources
-        .allocate_mmio(
-            devices::bat::GOLDFISHBAT_MMIO_LEN,
-            alloc,
-            "GoldfishBattery".to_string(),
-            AllocOptions::new().align(devices::bat::GOLDFISHBAT_MMIO_LEN),
-        )
-        .map_err(DeviceRegistrationError::AllocateIoResource)?;
+    // An architecture that places the battery itself (aarch64: outside the PCI window) gives its
+    // page; otherwise it comes from the MMIO allocator, after whatever took addresses before it.
+    let mmio_base = match fixed_mmio_base {
+        Some(base) => base,
+        None => {
+            let alloc = resources.get_anon_alloc();
+            resources
+                .allocate_mmio(
+                    devices::bat::GOLDFISHBAT_MMIO_LEN,
+                    alloc,
+                    "GoldfishBattery".to_string(),
+                    AllocOptions::new().align(devices::bat::GOLDFISHBAT_MMIO_LEN),
+                )
+                .map_err(DeviceRegistrationError::AllocateIoResource)?
+        }
+    };
 
     let (control_tube, response_tube) =
         Tube::pair().map_err(DeviceRegistrationError::CreateTube)?;

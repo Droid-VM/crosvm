@@ -699,6 +699,32 @@ impl Bus {
         }
     }
 
+    /// Whether `device` is what holds exactly the range `base`..+`len` on this bus.
+    pub fn has_range_of(&self, device: &Arc<Mutex<dyn BusDevice>>, base: u64, len: u64) -> bool {
+        let devices = self.devices.lock();
+        match devices.get_key_value(&BusRange { base, len }) {
+            Some((range, entry)) if range.len == len => match &entry.device {
+                BusDeviceEntry::OuterSync(owner) => {
+                    Arc::as_ptr(owner) as *const u8 == Arc::as_ptr(device) as *const u8
+                }
+                BusDeviceEntry::InnerSync(_) => false,
+            },
+            _ => false,
+        }
+    }
+
+    /// Removes the range `base`..+`len` when `device` is what holds it (`remove` takes whatever
+    /// device has a range there); true if it did.
+    pub fn remove_owned(&self, device: &Arc<Mutex<dyn BusDevice>>, base: u64, len: u64) -> bool {
+        if !self.has_range_of(device, base, len) {
+            return false;
+        }
+        self.devices
+            .lock()
+            .remove(&BusRange { base, len })
+            .is_some()
+    }
+
     /// Reads data from the device that owns the range containing `addr` and puts it into `data`.
     ///
     /// Returns true on success, otherwise `data` is filled with zeroes.
