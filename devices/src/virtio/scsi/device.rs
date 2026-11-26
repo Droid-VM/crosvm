@@ -10,6 +10,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::io;
 use std::io::Read;
 use std::io::Write;
@@ -25,6 +26,9 @@ use cros_async::Executor;
 use cros_async::ExecutorKind;
 use disk::AsyncDisk;
 use disk::DiskFile;
+use futures::channel::mpsc;
+use futures::channel::oneshot;
+use futures::future::Fuse;
 use futures::pin_mut;
 use futures::stream::FuturesUnordered;
 use futures::FutureExt;
@@ -361,8 +365,18 @@ impl Targets {
         Ok(Self(logical_units))
     }
 
-    fn target_ids(&self) -> BTreeSet<TargetId> {
-        self.0.keys().cloned().collect()
+    fn into_async(self, ex: &Executor) -> QueueType {
+        let targets = self
+            .0
+            .into_iter()
+            .map(|(id, unit)| {
+                (
+                    id,
+                    unit.make_async(ex).expect("Failed to create async target"),
+                )
+            })
+            .collect();
+        QueueType::Request(targets)
     }
 }
 
@@ -392,8 +406,10 @@ pub struct Controller {
     cdb_size: u32,
     executor_kind: ExecutorKind,
     worker_threads: Vec<WorkerThread<()>>,
+    single_request_worker: Option<SingleRequestWorker>,
     // Stores target devices by its target id. Currently we only support bus id 0.
     targets: Option<Targets>,
+    target_ids: BTreeSet<TargetId>,
     // Whether the devices handles requests in multiple request queues.
     // If true, each virtqueue will be handled in a separate worker thread.
     multi_queue: bool,
@@ -426,7 +442,8 @@ impl Controller {
                 };
                 Ok((i as TargetId, target))
             })
-            .collect::<anyhow::Result<_>>()?;
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let target_ids = logical_units.keys().copied().collect();
         // b/300560198: Support feature bits in virtio-scsi.
         Ok(Self {
             avail_features: base_features,
@@ -436,7 +453,9 @@ impl Controller {
             cdb_size: VIRTIO_SCSI_CDB_DEFAULT_SIZE,
             executor_kind: ExecutorKind::default(),
             worker_threads: vec![],
+            single_request_worker: None,
             targets: Some(Targets(logical_units)),
+            target_ids,
             multi_queue,
         })
     }
@@ -639,84 +658,65 @@ impl VirtioDevice for Controller {
         // 1st virtqueue is the eventq.
         // We do not send any events through eventq.
         let _eventq = queues.remove(&1).context("eventq should be present")?;
-        let targets = self
-            .targets
-            .as_ref()
-            .context("failed to get SCSI targets")?
-            .try_clone()
-            .context("failed to clone SCSI targets")?;
-        let target_ids = targets.target_ids();
+        let target_ids = self.target_ids.clone();
         let sense_size = self.sense_size;
         let cdb_size = self.cdb_size;
-        // The rest of the queues are request queues.
-        let request_queues = if self.multi_queue {
-            queues
-                .into_values()
-                .map(|queue| {
+        if self.multi_queue {
+            let targets = self.targets.as_ref().context("missing SCSI targets")?;
+            let request_queues = queues
+                .into_iter()
+                .map(|(index, queue)| {
                     let targets = targets
                         .try_clone()
-                        .context("Failed to clone a disk image")?;
-                    Ok((queue, targets))
+                        .context("failed to clone SCSI targets")?;
+                    Ok((index, queue, targets))
                 })
-                .collect::<anyhow::Result<_>>()?
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            for (index, queue, targets) in request_queues {
+                self.worker_threads.push(WorkerThread::start(
+                    format!("v_scsi_req_{index}"),
+                    move |kill_evt| {
+                        let ex = Executor::with_executor_kind(executor_kind)
+                            .expect("Failed to create an executor");
+                        let targets = targets.into_async(&ex);
+                        run_worker(
+                            &ex,
+                            kill_evt,
+                            run_queue(&ex, queue, &targets, sense_size, cdb_size),
+                        );
+                    },
+                ));
+            }
         } else {
-            // Handle all virtio requests with one thread.
-            vec![(
-                queues
-                    .remove(&2)
-                    .context("request queue should be present")?,
-                targets,
-            )]
-        };
+            let queue = queues
+                .remove(&2)
+                .context("request queue should be present")?;
+            let worker = match &self.single_request_worker {
+                Some(worker) => worker,
+                None => {
+                    let targets = self.targets.take().context("missing SCSI targets")?;
+                    self.single_request_worker
+                        .insert(SingleRequestWorker::start(executor_kind, targets))
+                }
+            };
+            worker.send(RequestQueueCommand::Start {
+                queue,
+                sense_size,
+                cdb_size,
+            })?;
+        }
 
         let worker_thread = WorkerThread::start("v_scsi_ctrlq", move |kill_evt| {
             let ex =
                 Executor::with_executor_kind(executor_kind).expect("Failed to create an executor");
-            if let Err(err) = ex
-                .run_until(run_worker(
-                    &ex,
-                    controlq,
-                    kill_evt,
-                    QueueType::Control { target_ids },
-                    sense_size,
-                    cdb_size,
-                ))
-                .expect("run_until failed")
-            {
-                error!("run_worker failed: {err}");
-            }
+            let control = QueueType::Control { target_ids };
+            run_worker(
+                &ex,
+                kill_evt,
+                run_queue(&ex, controlq, &control, sense_size, cdb_size),
+            );
         });
         self.worker_threads.push(worker_thread);
-
-        for (i, (queue, targets)) in request_queues.into_iter().enumerate() {
-            let worker_thread =
-                WorkerThread::start(format!("v_scsi_req_{}", i + 2), move |kill_evt| {
-                    let ex = Executor::with_executor_kind(executor_kind)
-                        .expect("Failed to create an executor");
-                    let async_logical_unit = targets
-                        .0
-                        .into_iter()
-                        .map(|(idx, unit)| match unit.make_async(&ex) {
-                            Ok(async_unit) => (idx, async_unit),
-                            Err(err) => panic!("{err}"),
-                        })
-                        .collect();
-                    if let Err(err) = ex
-                        .run_until(run_worker(
-                            &ex,
-                            queue,
-                            kill_evt,
-                            QueueType::Request(async_logical_unit),
-                            sense_size,
-                            cdb_size,
-                        ))
-                        .expect("run_until failed")
-                    {
-                        error!("run_worker failed: {err}");
-                    }
-                });
-            self.worker_threads.push(worker_thread);
-        }
         Ok(())
     }
 
@@ -724,7 +724,50 @@ impl VirtioDevice for Controller {
         for worker in self.worker_threads.drain(..) {
             let _ = worker.stop();
         }
+        if let Some(worker) = &self.single_request_worker {
+            let (stopped, wait) = oneshot::channel();
+            worker.send(RequestQueueCommand::Reset(stopped))?;
+            cros_async::block_on(wait).context("waiting for SCSI request queue reset")?;
+        }
         Ok(())
+    }
+}
+
+enum RequestQueueCommand {
+    Start {
+        queue: Queue,
+        sense_size: u32,
+        cdb_size: u32,
+    },
+    Reset(oneshot::Sender<()>),
+}
+
+// Uncloneable targets stay on this thread across device resets. Each activation supplies a
+// new virtqueue and its current configuration.
+struct SingleRequestWorker {
+    commands: mpsc::UnboundedSender<RequestQueueCommand>,
+    _thread: WorkerThread<()>,
+}
+
+impl SingleRequestWorker {
+    fn start(executor_kind: ExecutorKind, targets: Targets) -> Self {
+        let (commands, receiver) = mpsc::unbounded();
+        let thread = WorkerThread::start("v_scsi_req_2", move |kill_evt| {
+            let ex =
+                Executor::with_executor_kind(executor_kind).expect("Failed to create an executor");
+            let targets = targets.into_async(&ex);
+            run_worker(&ex, kill_evt, run_request_queues(&ex, &targets, receiver));
+        });
+        Self {
+            commands,
+            _thread: thread,
+        }
+    }
+
+    fn send(&self, command: RequestQueueCommand) -> anyhow::Result<()> {
+        self.commands
+            .unbounded_send(command)
+            .map_err(|_| anyhow::anyhow!("SCSI request worker has stopped"))
     }
 }
 
@@ -733,41 +776,73 @@ enum QueueType {
     Request(BTreeMap<TargetId, AsyncLogicalUnit>),
 }
 
-async fn run_worker(
+async fn run_request_queues(
+    ex: &Executor,
+    targets: &QueueType,
+    mut commands: mpsc::UnboundedReceiver<RequestQueueCommand>,
+) -> anyhow::Result<()> {
+    let queue_handler = Fuse::terminated();
+    pin_mut!(queue_handler);
+    loop {
+        futures::select! {
+            result = queue_handler => return result,
+            command = commands.next() => match command {
+                Some(RequestQueueCommand::Start { queue, sense_size, cdb_size }) => {
+                    queue_handler.set(run_queue(ex, queue, targets, sense_size, cdb_size).fuse());
+                }
+                Some(RequestQueueCommand::Reset(stopped)) => {
+                    queue_handler.set(Fuse::terminated());
+                    let _ = stopped.send(());
+                }
+                None => return Ok(()),
+            },
+        }
+    }
+}
+
+fn run_worker(ex: &Executor, kill_evt: Event, worker: impl Future<Output = anyhow::Result<()>>) {
+    let result = ex
+        .run_until(async {
+            let kill = async_utils::await_and_exit(ex, kill_evt).fuse();
+            let worker = worker.fuse();
+            pin_mut!(kill, worker);
+            futures::select! {
+                result = worker => result,
+                result = kill => result.context("failed to wait on the kill event"),
+            }
+        })
+        .expect("run_until failed");
+    if let Err(err) = result {
+        error!("run_worker failed: {err}");
+    }
+}
+
+async fn run_queue(
     ex: &Executor,
     queue: Queue,
-    kill_evt: Event,
-    queue_type: QueueType,
+    queue_type: &QueueType,
     sense_size: u32,
     cdb_size: u32,
 ) -> anyhow::Result<()> {
-    let kill = async_utils::await_and_exit(ex, kill_evt).fuse();
-    pin_mut!(kill);
-
     let kick_evt = queue
         .event()
         .try_clone()
         .expect("Failed to clone queue event");
-    let queue_handler = handle_queue(
+    handle_queue(
         Rc::new(RefCell::new(queue)),
         EventAsync::new(kick_evt, ex).expect("Failed to create async event for queue"),
         queue_type,
         sense_size,
         cdb_size,
     )
-    .fuse();
-    pin_mut!(queue_handler);
-
-    futures::select! {
-        _ = queue_handler => anyhow::bail!("queue handler exited unexpectedly"),
-        r = kill => r.context("failed to wait on the kill event"),
-    }
+    .await;
+    anyhow::bail!("queue handler exited unexpectedly")
 }
 
 async fn handle_queue(
     queue: Rc<RefCell<Queue>>,
     evt: EventAsync,
-    queue_type: QueueType,
+    queue_type: &QueueType,
     sense_size: u32,
     cdb_size: u32,
 ) {
@@ -787,11 +862,7 @@ async fn handle_queue(
         }
         while let Some(chain) = queue.borrow_mut().pop() {
             background_tasks.push(process_one_chain(
-                &queue,
-                chain,
-                &queue_type,
-                sense_size,
-                cdb_size,
+                &queue, chain, queue_type, sense_size, cdb_size,
             ));
         }
     }
@@ -863,10 +934,18 @@ mod tests {
     use std::mem::size_of;
     use std::mem::size_of_val;
     use std::rc::Rc;
+    use std::time::Duration;
 
+    use base::EventWaitResult;
+    use base::FileReadWriteAtVolatile;
+    use base::VolatileSlice;
     use cros_async::Executor;
+    use data_model::Le16;
+    use disk::DiskFileParams;
+    use disk::QcowFile;
     use disk::SingleFileDisk;
     use tempfile::tempfile;
+    use tempfile::NamedTempFile;
     use virtio_sys::virtio_scsi::virtio_scsi_cmd_req;
     use virtio_sys::virtio_scsi::virtio_scsi_cmd_resp;
     use virtio_sys::virtio_scsi::VIRTIO_SCSI_S_OK;
@@ -877,6 +956,7 @@ mod tests {
     use crate::virtio::create_descriptor_chain;
     use crate::virtio::scsi::constants::READ_10;
     use crate::virtio::DescriptorType;
+    use crate::virtio::QueueConfig;
 
     fn setup_disk(disk_size: u64) -> (File, Vec<u8>) {
         let mut file_content = vec![0; disk_size as usize];
@@ -927,6 +1007,85 @@ mod tests {
             0,
         )
         .expect("create_descriptor_chain failed")
+    }
+
+    #[test]
+    fn qcow2_read_before_and_after_reset() {
+        let image = NamedTempFile::new().unwrap();
+        let params = DiskFileParams {
+            path: image.path().to_path_buf(),
+            is_read_only: false,
+            is_sparse_file: false,
+            is_overlapped: false,
+            is_direct: false,
+            lock: false,
+            depth: 0,
+        };
+        let disk = QcowFile::new(image.reopen().unwrap(), params, 1024 * 1024).unwrap();
+        let mut data = [0x5a; 512];
+        assert_eq!(
+            disk.write_at_volatile(VolatileSlice::new(&mut data), 0)
+                .unwrap(),
+            data.len()
+        );
+        let mut controller = Controller::new(
+            0,
+            vec![DiskConfig {
+                file: Box::new(disk),
+                block_size: data.len() as u32,
+                read_only: false,
+                device_type: ScsiDeviceType::Disk,
+            }],
+        )
+        .unwrap();
+        assert_eq!(controller.queue_max_sizes().len(), MIN_NUM_QUEUES);
+
+        for _ in 0..2 {
+            let mem = Rc::new(GuestMemory::new(&[(GuestAddress(0), 0x4000)]).unwrap());
+            let irq = Event::new().unwrap();
+            let interrupt = Interrupt::new_vhost_user(irq.try_clone().unwrap(), Box::new(|| {}));
+            let kick = Event::new().unwrap();
+            let queues = (0..MIN_NUM_QUEUES)
+                .map(|index| {
+                    let mut queue = QueueConfig::new(8, 0);
+                    let evt = if index == 2 {
+                        queue.set_desc_table(GuestAddress(0x100));
+                        queue.set_avail_ring(GuestAddress(0x400));
+                        queue.set_used_ring(GuestAddress(0x800));
+                        kick.try_clone().unwrap()
+                    } else {
+                        Event::new().unwrap()
+                    };
+                    queue.set_ready(true);
+                    (index, queue.activate(&mem, evt, interrupt.clone()).unwrap())
+                })
+                .collect();
+            let req = build_read_req_header(0, 0, 1);
+            mem.write_obj_at_addr(req, GuestAddress(0x1000)).unwrap();
+            setup_desciptor_chain(0, 0, 1, data.len() as u32, &mem);
+            mem.write_obj_at_addr(Le16::from(1u16), GuestAddress(0x402))
+                .unwrap();
+
+            controller
+                .activate((*mem).clone(), interrupt, queues)
+                .unwrap();
+            kick.signal().unwrap();
+            assert_eq!(
+                irq.wait_timeout(Duration::from_secs(5)).unwrap(),
+                EventWaitResult::Signaled
+            );
+            let response = GuestAddress(0x1000 + size_of::<virtio_scsi_cmd_req>() as u64);
+            let resp: virtio_scsi_cmd_resp = mem.read_obj_from_addr(response).unwrap();
+            assert_eq!(resp.status, GOOD);
+            assert_eq!(resp.response, VIRTIO_SCSI_S_OK as u8);
+            let data_addr =
+                GuestAddress(response.offset() + size_of::<virtio_scsi_cmd_resp>() as u64);
+            assert_eq!(
+                mem.read_obj_from_addr::<[u8; 512]>(data_addr).unwrap(),
+                data
+            );
+            controller.reset().unwrap();
+        }
     }
 
     fn read_blocks(
